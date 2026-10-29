@@ -311,7 +311,8 @@ static void prepare(cdb_header_state *hs)
 
 static void test_crash_sweep(void)
 {
-    const cdb_crash_mode modes[3] = { CDB_CRASH_DROP_UNSYNCED, CDB_CRASH_KEEP_PREFIX, CDB_CRASH_TORN };
+    const cdb_crash_mode modes[4] = { CDB_CRASH_DROP_UNSYNCED, CDB_CRASH_KEEP_PREFIX, CDB_CRASH_TORN,
+                                      CDB_CRASH_REORDER };
     const size_t torn_points[5] = { 0, 1, 255, 508, 511 };
     cdb_header_state hs;
     uint64_t total_ops, op;
@@ -328,7 +329,7 @@ static void test_crash_sweep(void)
     TEST_ASSERT_EQUAL_UINT64(4, total_ops);
 
     for (op = 1; op <= total_ops; op++) {
-        for (m = 0; m < 3; m++) {
+        for (m = 0; m < 4; m++) {
             size_t t, tears = modes[m] == CDB_CRASH_TORN ? 5 : 1;
             for (t = 0; t < tears; t++) {
                 cdb_header_state after;

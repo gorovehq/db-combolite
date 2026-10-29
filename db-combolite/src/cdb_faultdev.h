@@ -21,7 +21,9 @@
 typedef enum cdb_crash_mode {
     CDB_CRASH_DROP_UNSYNCED, /* every write since the last sync is lost */
     CDB_CRASH_KEEP_PREFIX,   /* the first keep_writes logged writes survive */
-    CDB_CRASH_TORN           /* as KEEP_PREFIX, then only torn_bytes of the next write survive */
+    CDB_CRASH_TORN,          /* as KEEP_PREFIX, then only torn_bytes of the next write survive */
+    CDB_CRASH_REORDER        /* only the most recent unsynced write survives: the device
+                              * wrote it before earlier ones, as real disks may */
 } cdb_crash_mode;
 
 #define CDB_FAULTDEV_FLASH 0x1u /* flash rules: program may only clear bits; erase sets 0xFF */

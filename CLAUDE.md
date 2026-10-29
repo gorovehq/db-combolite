@@ -16,8 +16,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M1 | CRC32C, varints, byte-order helpers, value encoding (spec 14.6) | done |
 | M2 | Storage backend interface, host-file backend, fault-injecting backend (spec 1.11.1) | done |
 | M3 | File header (spec 1.9, 14.1) | done |
-| M4 | Pages, anchor map, free-space list (spec 13, 14.2, 14.7) | next |
-| M5 | Delta tracks, transactions, reconciliation, recovery; the crash-point matrix becomes the main test suite (spec 3, 14.4) | |
+| M4 | Pages, anchor map, free-space list (spec 13, 14.2, 14.7) | done |
+| M5 | Delta tracks, transactions, reconciliation, recovery; the crash-point matrix becomes the main test suite (spec 3, 14.4) | next |
 | M6 | Catalog (spec 4, 14.3) | |
 
 ## Commands
@@ -50,6 +50,7 @@ cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release   # optimised build, sanitize
 - **Branch names** take the form `<prefix><short-kebab-description>`.
 - **Commit and merge only when the user asks.** Merging into `main` is the user's decision.
 - **Merges into `main` use `--no-ff`,** so every branch shows up in the history as a single unit.
+- **Keep merged branches.** Don't delete them; they are the audit trail of how development happened.
 - **No AI attribution in commits.** Don't add `Co-Authored-By: Claude` trailers or similar lines to commit messages or PR descriptions. Attribution lives only in `ATTRIBUTIONS.md` at the repo root. Add each new third-party dependency to the table there.
 
 ## Code rules
@@ -68,7 +69,9 @@ These were agreed with the user:
 
 - `include/combolite/`: the public API (`cdb_common.h`, `cdb_value.h`, `cdb_storage.h`).
 - `src/`: implementation and internal headers (`cdb_crc32c`, `cdb_varint`, `cdb_endian.h`, `cdb_value`). Tests include `src/` directly so they can test internal modules.
-- `src/cdb_faultdev.*`: an in-memory device that simulates power loss: unsynced writes are dropped, kept in part or torn. It is built only into the `combolite_testing` library, never into the production library. Crash-safety tests arm a crash at operation N, then call `cdb_faultdev_reboot()` and check what recovery sees.
+- `src/cdb_faultdev.*`: an in-memory device that simulates power loss: unsynced writes are dropped, kept in part or torn. It is built only into the `combolite_testing` library, never into the production library.
+  - **Crash modes:** drop every unsynced write, keep an in-order prefix of them, tear a write partway, or reorder (only the latest write survives, the way a real disk can land writes out of order).
+  - **Crash sweeps.** A test counts a workload's mutating operations, then crashes at each one in every mode, calls `cdb_faultdev_reboot()`, and checks what recovery sees. Every new write sequence needs a sweep, and the reorder mode is what catches a missing barrier.
 - `tests/`: one Unity executable per module. Scratch files go in `CDB_TEST_TMPDIR`, which is the build's `tests/` directory.
 
 ## What db-combolite is
