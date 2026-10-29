@@ -19,7 +19,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M4 | Pages, anchor map, free-space list (spec 13, 14.2, 14.7) | done |
 | M5 | Delta tracks, transactions, reconciliation, recovery; the crash-point matrix becomes the main test suite (spec 3, 14.4) | done (single process) |
 | M6 | Space reuse and compaction (spec 1.3, 3.4, 3.7) | done |
-| M7 | Catalog (spec 4, 14.3) | next |
+| M7 | Ordered index: order-preserving keys and a B+tree over pager pages (spec 14.8) | done |
+| M8 | Catalog (spec 4, 14.3) | next |
 
 ## Commands
 
@@ -73,6 +74,7 @@ These were agreed with the user:
 - **Engine layers, bottom up:**
   - `cdb_storage` and `cdb_env`: files and directories.
   - `cdb_header`, `cdb_page` and `cdb_pager`: the archive. The pager provides copy-on-write logical pages.
+  - `cdb_key` and `cdb_index`: order-preserving keys and the B+tree. Index nodes are logical pages, so the pager's copy-on-write sits underneath, and an index's root logical ID never changes.
   - `cdb_journal` and `cdb_db`: transactions, reconciliation and recovery. Changes reach pages only through the `cdb_apply_fn` hook, and the data models will plug in there.
 - `src/cdb_faultenv.*`: several fault devices on one shared crash clock, plus directory entries that are lost on crash unless their directory was synced. Test-only.
 - `src/cdb_faultdev.*`: an in-memory device that simulates power loss: unsynced writes are dropped, kept in part or torn. It is built only into the `combolite_testing` library, never into the production library.

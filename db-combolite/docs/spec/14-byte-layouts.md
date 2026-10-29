@@ -602,6 +602,52 @@ Index keys use their own encoding, separate from the value encoding in 14.6. Wit
 - **Binary collation** sorts strings in plain UTF-8 byte order. It is always available, and it is the only collation on microcontrollers.
 - **Language-aware collation** is available on hosts that are not microcontrollers. The collation for an index is taken from the **host locale** by default, and the operator can override it in configuration.
 
+### 14.8.7 Node page and entry layout
+
+Index nodes are logical pages of type `0x0003`. A child pointer is a **logical page ID**, so rewriting a node never changes its parent: the pager provides the copy-on-write. The root keeps its logical ID for the whole life of the index.
+
+**Node payload layout:**
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | Level (0 = leaf) |
+| 1 | 1 | Flags: bit 0 unique, bit 1 prefix compression |
+| 2 | 2 | Key count |
+| 4 | 2 | Shared prefix length |
+| 6 | 2 | Offset where the entry heap starts |
+| 8 | prefix length | Shared prefix |
+| … | 2 × key count | Slot directory: entry offsets from the payload start, in key order |
+| … | … | Free space |
+| heap … capacity | … | Entries |
+
+**Entries:**
+
+- **Leaf:** suffix length (varint), key suffix, value length (varint), value.
+- **Interior:** suffix length (varint), key suffix, child logical ID (8 or 4 bytes, the file's address width). The first entry of every interior node has an empty key, meaning *no lower bound*.
+
+**Rules:**
+
+- **Prefix compression** applies to leaves only. The stored prefix is at most 32 bytes.
+- **Splitting.** A node that overflows is split greedily into pieces about three quarters full, at most 16 pieces. The first key of each later piece becomes its separator.
+- **Splitting the root.** When the root splits, its contents move to new children, and the root, keeping its logical ID, becomes their parent one level higher.
+- **Deleting.** Underfull nodes are not merged. Empty nodes are removed, along with their parent entry. A root left with a single child absorbs that child.
+- **Size limits.** A key, and a value, may each be at most (capacity − 8) / 8 − 4 bytes, so that any four entries fit in one node.
+
+**Key type ranks (14.8.4):**
+
+| Type | Rank | Encoding after the rank |
+|---|---|---|
+| null | `0x10` | none |
+| false / true | `0x20` / `0x21` | none |
+| integer | `0x30` | 8 bytes big-endian, sign bit flipped |
+| float | `0x38` | 8 bytes; negative values are inverted, other values have the sign bit set; one NaN, sorted last; −0 = +0 |
+| timestamp | `0x40` | 8 bytes big-endian, sign bit flipped |
+| string | `0x50` | bytes with `00` escaped as `00 FF`, ended by `00 00` |
+| binary | `0x58` | as string |
+| reference | `0x60` | store ID and entry ID, 8 bytes each, big-endian |
+
+Decimals have no key encoding yet.
+
 ### 14.8.6 Collation is fixed at creation and provided by ICU
 
 - **Fixed at creation.** An index's collation is chosen **once, when the index is created**. The host locale supplies the default, and the operator can override it. The catalog records the collation together with its **collation version**. A host's current locale never changes the collation of an existing index.
