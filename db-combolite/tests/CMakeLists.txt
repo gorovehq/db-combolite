@@ -1,0 +1,20 @@
+# Unity is third-party code: built without the project's strict warnings.
+add_library(unity STATIC ${PROJECT_SOURCE_DIR}/third-party/unity/unity.c)
+target_include_directories(unity PUBLIC ${PROJECT_SOURCE_DIR}/third-party/unity)
+target_compile_definitions(unity PUBLIC UNITY_INCLUDE_DOUBLE UNITY_SUPPORT_64)
+if(CDB_SANITIZE)
+  target_compile_options(unity PRIVATE ${CDB_SANITIZER_FLAGS})
+endif()
+
+function(cdb_add_test name)
+  add_executable(${name} ${name}.c)
+  target_link_libraries(${name} PRIVATE combolite unity)
+  target_include_directories(${name} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  target_compile_options(${name} PRIVATE ${CDB_WARNINGS})
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+cdb_add_test(test_crc32c)
+cdb_add_test(test_varint)
+cdb_add_test(test_endian)
+cdb_add_test(test_value)

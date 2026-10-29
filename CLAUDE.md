@@ -1,0 +1,101 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project status
+
+**The spec is complete. Implementation in C99 has started.**
+
+- **Spec.** The spec is in `db-combolite/docs/spec/`. Start with `README.md` there, which lists every section, what it depends on, and what is still open. Every spec section records its confirmed decisions; code follows the spec, and spec section numbers are cited in code comments.
+- **Still open.** These items need measuring, not deciding: the device-class table values, the vector search-path thresholds, and how neuron weights are learned. Some crash-matrix rows still have to be written (spec 3.6).
+- **Implementation.** Work follows the milestone plan below. The user reviews each milestone before the next one starts.
+
+| Milestone | Scope | Status |
+|---|---|---|
+| M0 | Build skeleton, warnings, sanitizers, test runner | done |
+| M1 | CRC32C, varints, byte-order helpers, value encoding (spec 14.6) | done |
+| M2 | Storage backend interface, host-file backend, fault-injecting backend (spec 1.11.1) | next |
+| M3 | File header (spec 1.9, 14.1) | |
+| M4 | Pages, anchor map, free-space list (spec 13, 14.2, 14.7) | |
+| M5 | Delta tracks, transactions, reconciliation, recovery; the crash-point matrix becomes the main test suite (spec 3, 14.4) | |
+| M6 | Catalog (spec 4, 14.3) | |
+
+## Commands
+
+All commands run from `db-combolite/`:
+
+```sh
+cmake -S . -B build                          # configure (Debug by default: ASan and UBSan on)
+cmake --build build -j                       # build the library and the tests
+ctest --test-dir build --output-on-failure   # run every test
+ctest --test-dir build -R test_value         # run one test executable
+./build/tests/test_value                     # run one executable directly (Unity output)
+cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release   # optimised build, sanitizers off
+```
+
+## Code rules
+
+These were agreed with the user:
+
+- **C99 only.** `CMAKE_C_EXTENSIONS` is off.
+- **Warnings are errors.** The flags include `-Wconversion`, `-Wsign-conversion` and `-Wvla`, so write explicit casts and never use VLAs.
+- **No heap allocation in the core.** Memory comes from the caller, through buffers now and an allocator interface later, so microcontroller builds can use static pools. Readers return views into caller-owned buffers.
+- **Fallible functions return `cdb_status`**, defined in `include/combolite/cdb_common.h`. The value writer's errors are sticky.
+- **Explicit byte order.** Every multi-byte on-disk field goes through `src/cdb_endian.h`, using the file's declared byte order. Never cast raw bytes to integers.
+- **Canonical encoding.** Writers produce the one canonical form, and validators reject anything else (spec 14.6.5).
+- **Tests use Unity**, vendored in `third-party/unity/` (v2.6.1, MIT). Add a test executable with `cdb_add_test(<name>)` in `tests/CMakeLists.txt`.
+
+## Code layout
+
+- `include/combolite/`: the public API (`cdb_common.h`, `cdb_value.h`).
+- `src/`: implementation and internal headers (`cdb_crc32c`, `cdb_varint`, `cdb_endian.h`, `cdb_value`). Tests include `src/` directly so they can test internal modules.
+- `tests/`: one Unity executable per module.
+
+## What db-combolite is
+
+A lightweight, portable, embeddable database (SQLite-class footprint) that supports these data models natively in one store:
+
+- **Relational** tables and queries
+- **Document pools** (schemaless documents)
+- **Vector** storage and similarity retrieval
+- **Matrix ordinality / cardinality**: ordered and counted relationships between entries
+- **Stored procedures** and **cross-model queries** (one query can join relational, document and vector data)
+- **Active and passive keying** of entries
+- **Cardinal → Vector → Ordinal mapping** and **Neuron Mapping**
+
+The confirmed meanings of these terms are in `docs/spec/06-keys-links.md`:
+
+- **Active keys** are assigned explicitly by the user or application. **Passive keys** are derived by the database (content hash, auto-id or embedding).
+- **Cardinal→Vector→Ordinal** maps an entry's identity to its embedding and then to its similarity rank. It is a stored structure that is kept up to date.
+- **Cardinality** means relationship cardinality (1:1, 1:N, N:M).
+- **Neuron mapping** is a graph of links between entries whose weights are learned.
+
+### Hard constraints (these drive every design decision)
+
+1. **Serverless, portable and embeddable.** It ships as a library, and at rest the store is a single file. There is never a daemon, broker or server process. Sessions, CRUD, multi-tenancy, reconciliation and coordination between processes are all done by the library code running inside each application. Processes coordinate only through the files themselves. Each library instance runs an in-process **coordinator** that plays the role a server would. The first coordinator to start is primary, and later ones are subordinate (see spec 1.8.0). Scope is a **single host**. There is no clustering, and no multi-machine access to one database.
+2. **Microcontroller support is a long-term goal, not a current target.** The eventual aim is to package the library for PlatformIO, ESP-IDF and Arduino. The current focus is defining the **storage file format and its mechanics** as a standard. Don't add MCU build targets or a HAL yet. Do avoid format decisions that would block a constrained implementation later, such as unbounded page sizes or a format that can only be read by mapping the whole file into memory.
+3. **Scales up to production.** It needs crash safety (journal or WAL), integrity checks and concurrent readers.
+4. **Not a competitor to Postgres, MariaDB, Oracle, MySQL or MSSQL.** Turn down any feature that only makes sense for a server-class RDBMS.
+5. **Clean-room spec and implementation.** The file format, storage engine and query layer are new designs optimized for this project's use case. Ideas from existing systems (SQLite's pager, LMDB, HNSW and so on) can be studied and cited as background in design docs. Don't vendor, port, wrap or copy their code, and don't make the format compatible with theirs. `third-party/` is not for storage or index engines. Approved dependencies:
+   - **Unity**, for tests.
+   - **mbedTLS**, for cryptography, behind a crypto interface of our own. Never hand-roll cryptography.
+   - **ICU**, for language-aware collation on hosts that are not microcontrollers (spec 14.8.6).
+
+### Role in the larger effort
+
+db-combolite is the storage component of a future **portable governance framework for agentic development**, so a new project can start with governance and agent memory already in place. It must also stay **distributable on its own**. Keep governance-specific logic out of the core engine. Governance is a *consumer* (a schema or package on top of the engine).
+
+The first consumer is a project-governance store with these categories: **Architecture, Development, Security, Deployment, Contribution, CI/CD**. It also stores agentic memory: facts, links, retrieval by embedding.
+
+## How spec work proceeds
+
+Write the spec one section at a time, and stop before each section. First explain what the section covers and which decisions it involves, along with their trade-offs. Then ask the user for direction. Don't write design choices into the spec that the user hasn't confirmed. Use placeholders when the user is still undecided.
+
+## Directory intent (`db-combolite/`)
+
+- `include/`, `src/`, `tests/`: see the code layout above.
+- `docs/spec/`: the format specification.
+- `third-party/`: vendored dependencies. Anything that reaches the core must stay compatible with microcontrollers.
+- `governance/`: governance-category definitions and schemas, for the first consumer. Still empty.
+- `datastore/`, `workspace/`, `lib/`, `release/`, `package/`: empty placeholders for sample databases, scratch work and distribution.
+- `build/`: CMake output. Git ignores it.
