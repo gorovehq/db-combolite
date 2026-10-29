@@ -7,7 +7,9 @@ if(CDB_SANITIZE)
 endif()
 
 # Test-only support code: kept out of the production library.
-add_library(combolite_testing STATIC ${PROJECT_SOURCE_DIR}/src/cdb_faultdev.c)
+add_library(combolite_testing STATIC
+  ${PROJECT_SOURCE_DIR}/src/cdb_faultdev.c
+  ${PROJECT_SOURCE_DIR}/src/cdb_faultenv.c)
 target_include_directories(combolite_testing PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(combolite_testing PUBLIC combolite)
 target_compile_options(combolite_testing PRIVATE ${CDB_WARNINGS})
@@ -30,3 +32,6 @@ cdb_add_test(test_faultdev)
 cdb_add_test(test_header)
 cdb_add_test(test_page)
 cdb_add_test(test_pager)
+cdb_add_test(test_faultenv)
+cdb_add_test(test_journal)
+cdb_add_test(test_db)

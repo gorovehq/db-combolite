@@ -305,6 +305,22 @@ A data-change payload is an **operation code** followed by a value in the shared
 
 The exact encoding of each operation, per data model, is defined with the data-model layouts.
 
+### 14.4.6 Session, journal and recovery rules (single process)
+
+1. **One main journal.** It holds both the data records and the commit records. Typed tracks per data model are added together with the data models.
+2. **Companion slot 0 records the journal.**
+   - The slot holds: type `1` (main journal), class *incompatible*, state *provisioned*, and the reconciled-through watermark (14.1.8).
+   - **Setting "in use".** The slot is marked *in use* only after the journal and its directory entry are durable.
+   - **Clearing "in use".** At close, *in use* is cleared before the journal is removed.
+   - **Consequence.** A journal that is marked *in use* but is missing therefore always means possible loss. Opening is refused unless the operator accepts the loss (Section 1.12.5).
+3. **Which journal may be replayed.** A journal is replayed only onto the archive state it was unsealed from: its unsealed sequence must equal the archive's committed sequence.
+   - **Header sequence.** A journal created when a session opens records the sequence produced by the commit that marks it *in use*.
+   - **Damaged or foreign journals.** A journal that is unreadable, belongs to another database, or would need replaying onto a different state is renamed `main.<slot>.cdb.stray` and is never applied.
+4. **Journal rotation.** Reconciliation writes the new, empty journal as `main.<slot>.cdb.new`, makes it durable, then renames it over the old one and syncs the directory. A crash always leaves exactly one journal.
+5. **Commit numbers** start at 1. They are reserved in blocks of 1024, in the same way as page sequence numbers.
+6. **Durability.** The default is *normal*, with a barrier every 32 commits (configurable). *Off* has barriers only at reconciliation and close.
+7. **Visibility.** A transaction's changes are applied, and become visible, when it commits. A transaction cannot read its own changes before it commits.
+
 ## 14.5 Coordinator slot
 
 ### 14.5.1 Placement

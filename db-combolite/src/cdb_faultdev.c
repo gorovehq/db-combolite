@@ -7,10 +7,27 @@ static int in_bounds(const cdb_faultdev *d, uint64_t offset, uint64_t len)
     return offset <= d->cfg.capacity && len <= d->cfg.capacity - offset;
 }
 
+int cdb_fault_clock_tick(cdb_fault_clock *clock)
+{
+    clock->ops++;
+    if (clock->crash_at != 0 && clock->ops >= clock->crash_at) {
+        clock->crashed = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int is_crashed(const cdb_faultdev *d)
+{
+    return d->cfg.clock ? d->cfg.clock->crashed : d->crashed;
+}
+
 /* Counts a mutating operation. Returns 1 if the armed crash strikes it. */
 static int count_op(cdb_faultdev *d)
 {
     d->mutating_ops++;
+    if (d->cfg.clock)
+        return cdb_fault_clock_tick(d->cfg.clock);
     if (d->crash_at != 0 && d->mutating_ops >= d->crash_at) {
         d->crashed = 1;
         return 1;
@@ -40,7 +57,7 @@ static cdb_status log_write(cdb_faultdev *d, uint64_t offset, const void *data, 
 static cdb_status fd_read(void *ctx, uint64_t offset, void *buf, size_t len)
 {
     const cdb_faultdev *d = (const cdb_faultdev *)ctx;
-    if (d->crashed)
+    if (is_crashed(d))
         return CDB_E_IO;
     if (offset > d->current_size || len > d->current_size - offset)
         return CDB_E_TRUNCATED;
@@ -55,7 +72,7 @@ static cdb_status fd_program(void *ctx, uint64_t offset, const void *buf, size_t
     cdb_status s;
     size_t i;
 
-    if (d->crashed)
+    if (is_crashed(d))
         return CDB_E_IO;
     if (!in_bounds(d, offset, len))
         return CDB_E_IO; /* device full */
@@ -81,7 +98,7 @@ static cdb_status fd_erase(void *ctx, uint64_t offset, uint64_t len)
     uint32_t block = d->cfg.geometry.erase_block_size;
     cdb_status s;
 
-    if (d->crashed)
+    if (is_crashed(d))
         return CDB_E_IO;
     if (block == 0)
         return CDB_OK;
@@ -98,7 +115,7 @@ static cdb_status fd_erase(void *ctx, uint64_t offset, uint64_t len)
 static cdb_status fd_sync(void *ctx)
 {
     cdb_faultdev *d = (cdb_faultdev *)ctx;
-    if (d->crashed)
+    if (is_crashed(d))
         return CDB_E_IO;
     if (count_op(d))
         return CDB_E_IO;
@@ -119,7 +136,7 @@ static cdb_status fd_geometry(void *ctx, cdb_storage_geometry *out)
 static cdb_status fd_size(void *ctx, uint64_t *out)
 {
     const cdb_faultdev *d = (const cdb_faultdev *)ctx;
-    if (d->crashed)
+    if (is_crashed(d))
         return CDB_E_IO;
     *out = d->current_size;
     return CDB_OK;
@@ -143,6 +160,13 @@ cdb_status cdb_faultdev_init(cdb_faultdev *dev, const cdb_faultdev_config *cfg, 
     dev->cfg = *cfg;
     memset(dev->cfg.current, 0xFF, cfg->capacity);
     memset(dev->cfg.durable, 0xFF, cfg->capacity);
+    out->ops = &faultdev_ops;
+    out->ctx = dev;
+    return CDB_OK;
+}
+
+cdb_status cdb_faultdev_rebind(cdb_faultdev *dev, cdb_storage *out)
+{
     out->ops = &faultdev_ops;
     out->ctx = dev;
     return CDB_OK;
@@ -182,6 +206,12 @@ void cdb_faultdev_reboot(cdb_faultdev *dev)
     size_t keep = 0;
     size_t i;
 
+    if (dev->cfg.clock) {
+        dev->crashed = dev->cfg.clock->crashed;
+        dev->mode = dev->cfg.clock->mode;
+        dev->keep_writes = dev->cfg.clock->keep_writes;
+        dev->torn_bytes = dev->cfg.clock->torn_bytes;
+    }
     if (!dev->crashed) {
         /* Orderly restart: nothing is lost. */
         memcpy(dev->cfg.durable, dev->cfg.current, dev->cfg.capacity);
