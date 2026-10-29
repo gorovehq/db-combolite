@@ -744,6 +744,8 @@ The data-change payloads (14.4.5) for document pools, keyed by store and entry:
 
 **Applying never fails for logical reasons.** The built-in document apply runs again during recovery, so a change to a missing or deleted document, or to a dropped or non-document store, does nothing instead of failing. A failure there would recur on every reopen. Input is validated when the change is made, inside the transaction.
 
+**Every revision fits its page.** A change is checked against the document as the transaction sees it, including the transaction's own earlier changes. The resulting document, with the summary it will carry, must fit in one revision page, so a later checkpoint always fits. Otherwise the change is refused with *overflow* and nothing is journaled. A change to a document that is missing or deleted at that point is refused with *not found*. When a replace's patch form would not fit its page, the apply writes the whole document as a checkpoint instead.
+
 ### 14.9.4 Document schemas (Section 8.3)
 
 A schema is an object value (14.6), stored as a schema version in the catalog (14.3.3, key `03`).

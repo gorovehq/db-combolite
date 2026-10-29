@@ -287,9 +287,11 @@ static void test_delete_writes_tombstone(void)
     TEST_ASSERT_FALSE(doc_exists(pool, e));
     expect_doc(pool, e, 1, &v1); /* history survives deletion */
     TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_doc_get(&db, pool, e, 2, out, sizeof out, &len, NULL, 0, NULL, &info));
-    /* Changing a deleted document is a no-op, not a failure (it must replay). */
+    /* Changing a deleted document is refused when the change is made. */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
-    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_patch(&db, pool, e, p.b, p.n));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_doc_patch(&db, pool, e, p.b, p.n));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_doc_replace(&db, pool, e, NULL, 0, v1.b, v1.n));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_doc_delete(&db, pool, e));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
     TEST_ASSERT_FALSE(doc_exists(pool, e));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
@@ -689,6 +691,135 @@ static void test_staging_large(void) { staging_case(sizeof doc_stage); }
 static void test_staging_overflows(void) { staging_case(48); }
 static void test_staging_absent(void) { staging_case(0); }
 
+/* ------------------------------------------------------- page limits
+ *
+ * Every revision, including a later checkpoint that carries the summary,
+ * must fit in one page. A change that would break that is refused when it
+ * is made: failing at commit would fail again on every replay. */
+
+static doc string_patch(uint64_t field, size_t n)
+{
+    static char text[PAGE];
+    doc d;
+    cdb_value_writer w;
+    memset(text, 'x', n);
+    cdb_value_writer_init(&w, d.b, sizeof d.b, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_array(&w);
+    cdb_value_begin_array(&w);
+    cdb_value_write_int(&w, CDB_PATCH_SET);
+    cdb_value_begin_array(&w);
+    cdb_value_write_int(&w, (int64_t)field);
+    cdb_value_end_array(&w);
+    cdb_value_write_string(&w, text, n);
+    cdb_value_end_array(&w);
+    cdb_value_end_array(&w);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, w.error);
+    d.n = cdb_value_writer_len(&w);
+    return d;
+}
+
+static void test_growth_past_the_page_is_refused(void)
+{
+    static char sum[500];
+    doc v = make_doc("t", NULL, NULL), grow = string_patch(2, 200), more = string_patch(4, 200);
+    uint64_t pool, e, e2;
+    int round;
+
+    memset(sum, 's', sizeof sum);
+    cfg.checkpoint_every = 2;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    pool = make_pool("adr");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+    e = insert(pool, NULL, &v);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_insert(&db, pool, sum, sizeof sum, v.b, v.n, &e2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+
+    /* Each patch is small; the document with its 500-byte summary is not. */
+    for (round = 0; round < 2; round++) {
+        uint64_t target = round == 0 ? e2 : e;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_patch(&db, pool, target, grow.b, grow.n));
+        TEST_ASSERT_EQUAL_INT(round == 0 ? CDB_E_OVERFLOW : CDB_OK, cdb_doc_patch(&db, pool, target, more.b, more.n));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    }
+    /* A replace without a summary keeps the old one, and must fit with it. */
+    {
+        static uint8_t big[PAGE];
+        static char text[600];
+        cdb_value_writer w;
+        size_t n;
+        memset(text, 'y', sizeof text);
+        cdb_value_writer_init(&w, big, sizeof big, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+        cdb_value_begin_object(&w);
+        cdb_value_field(&w, 1);
+        cdb_value_write_string(&w, text, sizeof text);
+        cdb_value_end_object(&w);
+        n = cdb_value_writer_len(&w);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+        TEST_ASSERT_EQUAL_INT(CDB_E_OVERFLOW, cdb_doc_replace(&db, pool, e2, NULL, 0, big, n));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_replace(&db, pool, e2, "short", 5, big, n)); /* a new summary fits */
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    }
+    /* Every commit applied and survives a crash; checkpoints were written. */
+    cdb_faultenv_crash_now(&fe, CDB_CRASH_DROP_UNSYNCED, 0, 0);
+    cdb_faultenv_reboot(&fe);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_TRUE(doc_exists(pool, e));
+    TEST_ASSERT_TRUE(doc_exists(pool, e2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+/* A replace is stored as a patch of the changed fields unless that patch
+ * would not fit its page; then the whole document is written instead. */
+static void test_replace_falls_back_to_full_revision(void)
+{
+    static uint8_t a[4u * PAGE], b[4u * PAGE];
+    cdb_value_writer w;
+    cdb_doc_info info;
+    size_t an, bn, len;
+    uint64_t pool, e;
+    int i;
+
+    cdb_value_writer_init(&w, a, sizeof a, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_object(&w);
+    for (i = 1; i <= 120; i++) {
+        cdb_value_field(&w, (uint64_t)i);
+        cdb_value_write_int(&w, 0);
+    }
+    cdb_value_end_object(&w);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, w.error);
+    an = cdb_value_writer_len(&w);
+    cdb_value_writer_init(&w, b, sizeof b, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_object(&w);
+    for (i = 1; i <= 120; i++) {
+        cdb_value_field(&w, (uint64_t)i);
+        cdb_value_write_int(&w, 1);
+    }
+    cdb_value_end_object(&w);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, w.error);
+    bn = cdb_value_writer_len(&w);
+    {
+        char msg[64];
+        snprintf(msg, sizeof msg, "document %u bytes", (unsigned)bn);
+        TEST_MESSAGE(msg);
+    }
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    pool = make_pool("adr");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_insert(&db, pool, NULL, 0, a, an, &e));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_replace(&db, pool, e, NULL, 0, b, bn));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_get(&db, pool, e, 0, out, sizeof out, &len, NULL, 0, NULL, &info));
+    TEST_ASSERT_EQUAL_UINT8(CDB_REV_CHECKPOINT, info.kind);
+    TEST_ASSERT_EQUAL_MEMORY(b, out, bn);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_get(&db, pool, e, 1, out, sizeof out, &len, NULL, 0, NULL, NULL));
+    TEST_ASSERT_EQUAL_MEMORY(a, out, an); /* history intact */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 /* ------------------------------------------------------- crash sweep */
 
 /* Pool "adr". S0: nothing (or empty pool). S1: A = a1, B = b1. S2: A = a2 (patched).
@@ -829,6 +960,8 @@ int main(void)
     RUN_TEST(test_reopen_and_ids_continue);
     RUN_TEST(test_replay_after_crash_and_ids_not_reused);
     RUN_TEST(test_rejects_bad_input);
+    RUN_TEST(test_growth_past_the_page_is_refused);
+    RUN_TEST(test_replace_falls_back_to_full_revision);
     RUN_TEST(test_schema_enforced);
     RUN_TEST(test_set_schema_rejects_bad_schemas);
     RUN_TEST(test_staging_large);
