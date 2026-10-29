@@ -4,6 +4,7 @@
 #include "combolite/cdb_value.h"
 #include "cdb_doc.h"
 #include "cdb_endian.h"
+#include "cdb_fts.h"
 #include "cdb_key.h"
 #include "cdb_schema.h"
 #include "cdb_varint.h"
@@ -81,6 +82,19 @@ static cdb_status pool_get(cdb_db *db, uint64_t store, struct cdb_doc_pool **out
         if ((s = cdb_index_open(&free_slot->revs, &db->pager, info.rev_root, &db->cfg.catalog_work)) != CDB_OK)
             return s;
         free_slot->have_indexes = 1;
+    }
+    if (info.full_text_len) {
+        uint64_t terms, postings, lengths;
+        if (db->cfg.fts_buffers == NULL || db->cfg.fts_tokens == NULL || db->cfg.fts_tokens_cap < 2u * (size_t)db->pager.page_size)
+            return CDB_E_UNSUPPORTED; /* the index would fall behind its documents */
+        if ((s = cdb_fts_decode(info.full_text, info.full_text_len, db->pager.order, &free_slot->fts, &terms,
+                                &postings, &lengths)) != CDB_OK)
+            return s;
+        if ((s = cdb_index_open(&free_slot->fts_terms, &db->pager, terms, &db->cfg.catalog_work)) != CDB_OK
+            || (s = cdb_index_open(&free_slot->fts_postings, &db->pager, postings, &db->cfg.catalog_work)) != CDB_OK
+            || (s = cdb_index_open(&free_slot->fts_lengths, &db->pager, lengths, &db->cfg.catalog_work)) != CDB_OK)
+            return s;
+        free_slot->fts_on = 1;
     }
     free_slot->in_use = 1;
     *out = free_slot;
@@ -700,15 +714,13 @@ static cdb_status commit_revision(cdb_db *db, struct cdb_doc_pool *pool, envelop
  * deleted document, a dropped pool): it runs after the commit record is
  * durable and again during recovery, so a logical failure here would make
  * the database impossible to open. Only I/O and corruption fail. */
-cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
+static cdb_status apply_change(cdb_db *db, const cdb_delta *d)
 {
-    cdb_db *db = (cdb_db *)ctx;
     struct cdb_doc_pool *pool;
     head_rec head;
     envelope e;
     int found, live;
     cdb_status s;
-    (void)pager;
 
     s = pool_get(db, d->store_id, &pool);
     if (s == CDB_E_NOT_FOUND || s == CDB_E_INVALID_ARG)
@@ -816,6 +828,139 @@ cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
     default:
         return CDB_OK;
     }
+}
+
+/* The document's current state for the full-text index, copied out of the
+ * document buffers. body is NULL when it is not live. */
+static cdb_status fts_capture(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry, cdb_fts_doc *out,
+                              int copy)
+{
+    materialized m;
+    cdb_status s;
+    memset(out, 0, sizeof *out);
+    s = materialize(db, pool, entry, 0, &m);
+    if (s == CDB_E_NOT_FOUND)
+        return CDB_OK;
+    if (s != CDB_OK)
+        return s;
+    out->body = buf(db, m.buffer);
+    out->body_len = m.len;
+    if (m.has_summary) {
+        out->summary = buf(db, B_SUMMARY);
+        out->summary_len = m.summary_len;
+    }
+    if (copy) {
+        uint8_t *b = db->cfg.fts_buffers, *sm = db->cfg.fts_buffers + db->pager.page_size;
+        memcpy(b, out->body, out->body_len);
+        out->body = b;
+        if (out->summary) {
+            memcpy(sm, out->summary, out->summary_len);
+            out->summary = sm;
+        }
+    }
+    return CDB_OK;
+}
+
+/* The document apply: the change itself, then the full-text index from the
+ * document's state before and after it. */
+cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
+{
+    cdb_db *db = (cdb_db *)ctx;
+    struct cdb_doc_pool *pool;
+    cdb_fts_doc before, after;
+    head_rec h0, h1;
+    int had, has;
+    cdb_status s;
+    (void)pager;
+
+    s = pool_get(db, d->store_id, &pool);
+    if (s == CDB_E_NOT_FOUND || s == CDB_E_INVALID_ARG)
+        return CDB_OK; /* no such document pool: nothing to change */
+    if (s != CDB_OK)
+        return s;
+    if (!pool->fts_on || d->entry_id == 0)
+        return apply_change(db, d);
+    if ((s = head_get(pool, d->entry_id, &h0, &had)) != CDB_OK
+        || (s = fts_capture(db, pool, d->entry_id, &before, 1)) != CDB_OK)
+        return s;
+    if ((s = apply_change(db, d)) != CDB_OK)
+        return s;
+    if ((s = head_get(pool, d->entry_id, &h1, &has)) != CDB_OK)
+        return s;
+    if (!has || (had && h1.rev == h0.rev))
+        return CDB_OK; /* the change was a no-op */
+    if ((s = fts_capture(db, pool, d->entry_id, &after, 0)) != CDB_OK)
+        return s;
+    return cdb_fts_update(db, pool, d->entry_id, &before, &after);
+}
+
+/* -------------------------------------------------------- full text */
+
+cdb_status cdb_doc_create_full_text(cdb_db *db, uint64_t store, const cdb_fts_config *cfg)
+{
+    struct cdb_doc_pool *pool;
+    uint8_t settings[CDB_CATALOG_FULL_TEXT_MAX];
+    size_t len;
+    cdb_status s;
+
+    if (db->in_tx || db->failed)
+        return CDB_E_STATE;
+    if ((s = pool_get(db, store, &pool)) != CDB_OK)
+        return s;
+    if (pool->fts_on)
+        return CDB_E_EXISTS;
+    if ((s = cdb_fts_check_config(cfg)) != CDB_OK)
+        return s;
+    if (db->cfg.fts_buffers == NULL || db->cfg.fts_tokens == NULL || db->cfg.fts_tokens_cap < 2u * (size_t)db->pager.page_size)
+        return CDB_E_UNSUPPORTED;
+    if ((s = cdb_db_catalog_begin(db)) != CDB_OK)
+        return s;
+    pool->fts = *cfg;
+    s = cdb_fts_create(db, pool);
+    if (s == CDB_OK && pool->have_indexes) {
+        /* Index the documents already in the pool. */
+        cdb_index_cursor c;
+        uint8_t k[16], v[HEAD_SIZE];
+        size_t klen, vlen;
+        int done;
+        s = cdb_index_seek(&c, &pool->head, db->cfg.fts_buffers + 2u * db->pager.page_size, NULL, 0);
+        while (s == CDB_OK) {
+            cdb_fts_doc none, doc;
+            if ((s = cdb_index_next(&c, k, sizeof k, &klen, v, sizeof v, &vlen, &done)) != CDB_OK || done)
+                break;
+            if (klen != 8 || vlen != HEAD_SIZE) {
+                s = CDB_E_CORRUPT;
+                break;
+            }
+            if (v[20] == CDB_REV_TOMBSTONE)
+                continue;
+            memset(&none, 0, sizeof none);
+            if ((s = fts_capture(db, pool, cdb_load_u64(k, CDB_ORDER_BIG), &doc, 0)) == CDB_OK)
+                s = cdb_fts_update(db, pool, cdb_load_u64(k, CDB_ORDER_BIG), &none, &doc);
+        }
+    }
+    if (s == CDB_OK)
+        s = cdb_fts_encode(cfg, pool->fts_terms.root, pool->fts_postings.root, pool->fts_lengths.root,
+                           db->pager.order, settings, sizeof settings, &len);
+    if (s == CDB_OK)
+        s = cdb_catalog_set_full_text(&db->catalog, store, settings, len);
+    if (s == CDB_OK)
+        pool->fts_on = 1;
+    /* On failure the pages written so far are unreferenced: space, not damage. */
+    return cdb_db_catalog_end(db, s);
+}
+
+cdb_status cdb_doc_search(cdb_db *db, uint64_t store, const char *query, size_t len, int mode,
+                          cdb_fts_hit *hits, size_t max, size_t *n)
+{
+    struct cdb_doc_pool *pool;
+    cdb_status s;
+    *n = 0;
+    if ((s = pool_get(db, store, &pool)) != CDB_OK)
+        return s;
+    if (!pool->fts_on)
+        return CDB_E_NOT_FOUND;
+    return cdb_fts_search(db, pool, query, len, mode, hits, max, n);
 }
 
 /* -------------------------------------------------------- schemas */

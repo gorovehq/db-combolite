@@ -250,6 +250,7 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
   | 5 | encryption domain | 11 | flags; bit 0 = dropped |
   | 6 | page-size code (log₂) | 12 | document pools: head index root (optional) |
   | 13 | document pools: revisions index root (optional) | 14 | document pools: next entry ID (optional) |
+  | 15 | document pools: full-text settings, an object (14.14.1; optional) | | |
 
   Optional fields that are absent read as zero.
 
@@ -895,6 +896,33 @@ Every link is stored in **two** ordered indexes: one keyed by *(source, link typ
   - On microcontrollers, text is split on UTF-8 whitespace and punctuation, and only ASCII is case-folded.
   - The core does **no stemming**. Stemming can be added later as an extension.
   - Storing positions, which phrase search needs, can be switched on per index.
+
+### 14.14.1 Current layout
+
+The structures above are built from three ordered indexes (14.8). Prefix-compressed leaves of the postings index serve as the postings blocks, and a term's postings are found by its key prefix rather than a stored location.
+
+| Index | Key | Value |
+|---|---|---|
+| terms | term (key string, 14.8) | document frequency (4 bytes) |
+| postings | term, then entry ID (8 bytes, big-endian) | term frequency (4 bytes) |
+| lengths | entry ID | words indexed for the entry (4 bytes) |
+| lengths | 0 | live documents (8) · words indexed in all (8) |
+
+- **Settings.** One full-text index per pool. Its settings are an object in store record field 15 (14.3.3):
+
+  | Field | Value |
+  |---|---|
+  | 1, 2, 3 | root page IDs of the terms, postings and lengths indexes |
+  | 4 | splitter: 1 = simple (below). A build without the named splitter refuses the pool |
+  | 5 | bool: the summary is indexed |
+  | 6 | array of paths; each is an array of field IDs through nested objects (at most 8 paths, 8 deep) |
+
+- **What is indexed.** A path that ends at a string indexes it; one that ends at an array indexes the strings directly inside it. Other values, and paths that do not exist, contribute nothing.
+- **Simple splitter (1).** Words are broken on ASCII characters other than letters and digits, on U+0080–U+00BF (except ª, µ, º), ×, ÷, U+2000–U+206F, U+3000–U+303F and U+FEFF. ASCII letters fold to lower case. Words are cut to 64 bytes on a character boundary. Malformed UTF-8 bytes count as word characters. The ICU splitter will be a second splitter ID; an index changes splitter only by being rebuilt.
+- **Updates.** The index changes in the document apply, from the document's state before and after the change, so it is always consistent with committed documents and is rebuilt by replay. A deleted document leaves the index. Every word is indexed: the working area for words must hold two pages' worth (one per document version), and a document with its summary always fits in one page (14.9.3), so it can never run out. A pool whose configured area is smaller is refused.
+- **Creation.** Creating the index on a pool that has documents indexes them in the same commit.
+- **Search.** A query is split by the same splitter, has at most 16 distinct words, and matches documents containing *any* or *all* of them. Scores are BM25 with k1 = 1.2 and b = 0.75 and idf = ln(1 + (N − df + 0.5) / (df + 0.5)). Equal scores are ordered by entry ID.
+- **Not yet:** positions and phrase search, ICU, per-field weights, dropping an index.
 
 ---
 

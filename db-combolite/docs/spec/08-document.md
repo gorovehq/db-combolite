@@ -77,6 +77,8 @@ The application registers a **summarizer hook** in the same way as the embedding
 
 Keyword search with relevance ranking is part of db-combolite. Because a built-in tool is known to exist, other tools can rely on it; for example, MCP tools can be built on top of it. An application can still run its own search, but that is usually slower.
 
+A pool has at most one full-text index, over the fields the operator names and optionally the summary (the *declared* mode of 8.5). It is kept up to date at every commit and ranks results with BM25. The layout is in 14.14.1.
+
 ### 8.11 External attachments are verified and encrypted
 
 - The catalog records the **content hash** of every external attachment, so any tampering is detected.

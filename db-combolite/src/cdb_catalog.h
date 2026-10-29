@@ -30,6 +30,7 @@
 #define CDB_STORE_DROPPED 0x1u
 
 #define CDB_CATALOG_NAME_MAX 64u
+#define CDB_CATALOG_FULL_TEXT_MAX 512u
 
 typedef struct cdb_store_info {
     uint64_t id;
@@ -47,6 +48,8 @@ typedef struct cdb_store_info {
     uint64_t head_root;       /* index: entry ID -> head revision */
     uint64_t rev_root;        /* index: (entry ID, revision) -> revision page */
     uint64_t next_entry_id;   /* entry IDs are never reused (spec 6.1) */
+    uint8_t full_text[CDB_CATALOG_FULL_TEXT_MAX]; /* encoded settings (14.14); empty = none */
+    size_t full_text_len;
 } cdb_store_info;
 
 typedef struct cdb_catalog {
@@ -75,6 +78,10 @@ cdb_status cdb_catalog_drop_store(cdb_catalog *cat, uint64_t id);
  * caller's next pager commit (reconciliation) makes it durable. */
 cdb_status cdb_catalog_stage_pool(cdb_catalog *cat, uint64_t store_id, uint64_t head_root,
                                   uint64_t rev_root, uint64_t next_entry_id);
+
+/* Records a store's full-text settings (an encoded object, spec 14.14) and
+ * commits immediately. */
+cdb_status cdb_catalog_set_full_text(cdb_catalog *cat, uint64_t store_id, const void *settings, size_t len);
 
 /* Schema history (spec 4.3, 4.11): adds a version and makes it current. */
 cdb_status cdb_catalog_add_schema(cdb_catalog *cat, uint64_t store_id, const void *schema, size_t len,
