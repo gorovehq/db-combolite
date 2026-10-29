@@ -475,6 +475,18 @@ static void test_changes_reuse_slots(void)
         TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search(&db, coll, q.enc, q.n, CDB_VEC_BASE, h, 2, &got));
         TEST_ASSERT_EQUAL_size_t(0, got);
     }
+
+    /* Refilled after every block was released: each new block is filled
+     * before the next is started. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    for (i = 0; n < MAXN; i++) {
+        all[++n] = make_vec(CDB_VEC_F32, 0);
+        live[n] = 1;
+        insert(coll, &all[n], 0, 0);
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    blocks = verify_coll(coll, all, live, n);
+    TEST_ASSERT_EQUAL_UINT64(((uint64_t)i + coll_of(coll)->slots - 1u) / coll_of(coll)->slots, blocks);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
