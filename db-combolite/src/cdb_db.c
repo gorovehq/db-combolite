@@ -332,6 +332,8 @@ cdb_status cdb_tx_begin(cdb_db *db, cdb_durability durability)
     db->tx_id = ((uint64_t)JOURNAL_SLOT << 48) | db->next_tx++;
     db->tx_start = db->journal.end;
     db->tx_deltas = 0;
+    db->stage_used = 0;
+    db->stage_overflow = 0;
     db->tx_durability = durability == CDB_DURABILITY_DEFAULT ? db->cfg.durability : durability;
     return CDB_OK;
 }
@@ -510,6 +512,14 @@ cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
     cdb_status s = catalog_ready(db);
     if (s == CDB_OK)
         s = cdb_catalog_drop_store(&db->catalog, id);
+    return s == CDB_OK ? rotate_journal(db) : s;
+}
+
+cdb_status cdb_db_add_schema(cdb_db *db, uint64_t store_id, const void *schema, size_t len, uint32_t *version)
+{
+    cdb_status s = catalog_ready(db);
+    if (s == CDB_OK)
+        s = cdb_catalog_add_schema(&db->catalog, store_id, schema, len, version);
     return s == CDB_OK ? rotate_journal(db) : s;
 }
 

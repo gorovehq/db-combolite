@@ -23,7 +23,8 @@ static uint8_t record_buf[2u * PAGE];
 static uint8_t cat_work[24u * 1024u];
 static cdb_index_entry cat_entries[512];
 static uint8_t cat_page[PAGE];
-static uint8_t doc_buffers[5u * PAGE];
+static uint8_t doc_buffers[6u * PAGE];
+static uint8_t doc_stage[4096];
 static cdb_db_config cfg;
 static cdb_db db;
 
@@ -58,6 +59,8 @@ void setUp(void)
     cfg.catalog_work.entries_cap = 512;
     cfg.catalog_page = cat_page;
     cfg.doc_buffers = doc_buffers;
+    cfg.doc_stage = doc_stage;
+    cfg.doc_stage_size = sizeof doc_stage;
     cfg.durability = CDB_DURABILITY_FULL;
     TEST_ASSERT_TRUE(cdb_index_work_size(PAGE) <= sizeof cat_work);
 }
@@ -412,6 +415,280 @@ static void test_rejects_bad_input(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+/* ------------------------------------------------------- schemas */
+
+/* Closed: { 1: string, required, <= 32 bytes;  2: string;
+ *           3: object { 1: string, required } } -- the shape of make_doc. */
+static doc adr_schema(void)
+{
+    doc d;
+    cdb_value_writer w;
+    cdb_value_writer_init(&w, d.b, sizeof d.b, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, CDB_SCHEMA_OPEN);
+    cdb_value_write_bool(&w, 0);
+    cdb_value_field(&w, CDB_SCHEMA_FIELDS);
+    cdb_value_begin_array(&w);
+
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, CDB_RULE_FIELD);
+    cdb_value_write_int(&w, 1);
+    cdb_value_field(&w, CDB_RULE_TYPES);
+    cdb_value_write_int(&w, (int64_t)CDB_SCHEMA_TYPE(CDB_TYPE_STRING));
+    cdb_value_field(&w, CDB_RULE_REQUIRED);
+    cdb_value_write_bool(&w, 1);
+    cdb_value_field(&w, CDB_RULE_MAX_LEN);
+    cdb_value_write_int(&w, 32);
+    cdb_value_end_object(&w);
+
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, CDB_RULE_FIELD);
+    cdb_value_write_int(&w, 2);
+    cdb_value_field(&w, CDB_RULE_TYPES);
+    cdb_value_write_int(&w, (int64_t)CDB_SCHEMA_TYPE(CDB_TYPE_STRING));
+    cdb_value_end_object(&w);
+
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, CDB_RULE_FIELD);
+    cdb_value_write_int(&w, 3);
+    cdb_value_field(&w, CDB_RULE_TYPES);
+    cdb_value_write_int(&w, (int64_t)CDB_SCHEMA_TYPE(CDB_TYPE_OBJECT));
+    cdb_value_field(&w, CDB_RULE_OBJECT);
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, CDB_SCHEMA_FIELDS);
+    cdb_value_begin_array(&w);
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, CDB_RULE_FIELD);
+    cdb_value_write_int(&w, 1);
+    cdb_value_field(&w, CDB_RULE_TYPES);
+    cdb_value_write_int(&w, (int64_t)CDB_SCHEMA_TYPE(CDB_TYPE_STRING));
+    cdb_value_field(&w, CDB_RULE_REQUIRED);
+    cdb_value_write_bool(&w, 1);
+    cdb_value_end_object(&w);
+    cdb_value_end_array(&w);
+    cdb_value_end_object(&w);
+    cdb_value_end_object(&w);
+
+    cdb_value_end_array(&w);
+    cdb_value_end_object(&w);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, w.error);
+    d.n = cdb_value_writer_len(&w);
+    return d;
+}
+
+static uint32_t set_schema(uint64_t pool, const doc *schema)
+{
+    uint32_t version = 0;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_set_schema(&db, pool, schema->b, schema->n, &version));
+    return version;
+}
+
+static uint32_t schema_of(uint64_t pool, uint64_t entry, uint64_t rev)
+{
+    cdb_doc_info info;
+    size_t len;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_get(&db, pool, entry, rev, out, sizeof out, &len, NULL, 0, NULL, &info));
+    return info.schema_version;
+}
+
+static void test_schema_enforced(void)
+{
+    doc schema = adr_schema(), untitled = make_doc(NULL, "draft", NULL), good = make_doc("ADR-1", "draft", NULL);
+    const uint64_t extra[1] = { 9 }, owner_field[1] = { 3 }, owner[2] = { 3, 1 }, status[1] = { 2 },
+                   title[1] = { 1 };
+    doc p_extra = make_patch(extra, 1, "x"), p_owner_str = make_patch(owner_field, 1, "casey"),
+        p_owner = make_patch(owner, 2, "casey"), p_status = make_patch(status, 1, "accepted"),
+        p_title = make_patch(title, 1, "ADR-0");
+    uint64_t pool, old, e, e2;
+    uint32_t version;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    pool = make_pool("adr");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    old = insert(pool, NULL, &untitled); /* no schema yet: accepted */
+    TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_doc_set_schema(&db, pool, schema.b, schema.n, &version));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_UINT32(1, set_schema(pool, &schema));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_E_SCHEMA, cdb_doc_insert(&db, pool, NULL, 0, untitled.b, untitled.n, &e));
+    e = insert(pool, NULL, &good);
+    TEST_ASSERT_EQUAL_UINT64(old + 1u, e); /* the refused insert used no ID */
+    TEST_ASSERT_EQUAL_INT(CDB_E_SCHEMA, cdb_doc_replace(&db, pool, e, NULL, 0, untitled.b, untitled.n));
+    TEST_ASSERT_EQUAL_INT(CDB_E_SCHEMA, cdb_doc_patch(&db, pool, e, p_extra.b, p_extra.n));     /* closed */
+    TEST_ASSERT_EQUAL_INT(CDB_E_SCHEMA, cdb_doc_patch(&db, pool, e, p_owner_str.b, p_owner_str.n)); /* type */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_patch(&db, pool, e, p_owner.b, p_owner.n));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    {
+        doc want = make_doc("ADR-1", "draft", "casey");
+        expect_doc(pool, e, 0, &want); /* nothing refused reached the journal */
+    }
+    TEST_ASSERT_EQUAL_UINT32(1, schema_of(pool, e, 0));
+    TEST_ASSERT_EQUAL_UINT32(0, schema_of(pool, old, 0));
+
+    /* Old documents are not re-validated, but a new revision must conform. */
+    TEST_ASSERT_TRUE(doc_exists(pool, old));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_E_SCHEMA, cdb_doc_patch(&db, pool, old, p_status.b, p_status.n));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_patch(&db, pool, old, p_title.b, p_title.n));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_UINT32(1, schema_of(pool, old, 0));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+
+    /* The schema survives reopening. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_E_SCHEMA, cdb_doc_insert(&db, pool, NULL, 0, untitled.b, untitled.n, &e2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    {
+        uint8_t got[256];
+        size_t len;
+        uint32_t current;
+        uint8_t empty[64];
+        size_t empty_len;
+        {
+            cdb_value_writer w;
+            cdb_value_writer_init(&w, empty, sizeof empty, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+            cdb_value_begin_object(&w);
+            cdb_value_end_object(&w);
+            TEST_ASSERT_EQUAL_INT(CDB_OK, w.error);
+            empty_len = cdb_value_writer_len(&w);
+        }
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_get_schema(&db, pool, 0, got, sizeof got, &len, &current));
+        TEST_ASSERT_EQUAL_UINT32(1, current);
+        TEST_ASSERT_EQUAL_size_t(schema.n, len);
+        TEST_ASSERT_EQUAL_MEMORY(schema.b, got, len);
+
+        /* {} accepts everything: the way a schema is cleared. History stays. */
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_set_schema(&db, pool, empty, empty_len, &version));
+        TEST_ASSERT_EQUAL_UINT32(2, version);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_get_schema(&db, pool, 1, got, sizeof got, &len, &current));
+        TEST_ASSERT_EQUAL_UINT32(2, current);
+        TEST_ASSERT_EQUAL_MEMORY(schema.b, got, len);
+        TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_doc_get_schema(&db, pool, 3, got, sizeof got, &len, NULL));
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    e2 = insert(pool, NULL, &untitled);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_UINT32(2, schema_of(pool, e2, 0));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+static void test_set_schema_rejects_bad_schemas(void)
+{
+    const uint8_t not_object[] = { CDB_TAG_INT, 2 };
+    uint8_t unknown[64]; /* { 9: true } */
+    size_t unknown_len;
+    uint64_t pool, rows;
+    uint32_t version, current;
+    size_t len;
+    {
+        cdb_value_writer w;
+        cdb_value_writer_init(&w, unknown, sizeof unknown, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+        cdb_value_begin_object(&w);
+        cdb_value_field(&w, 9);
+        cdb_value_write_bool(&w, 1);
+        cdb_value_end_object(&w);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, w.error);
+        unknown_len = cdb_value_writer_len(&w);
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    pool = make_pool("adr");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_store(&db, "rows", 4, CDB_MODEL_RELATIONAL, &rows));
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_doc_set_schema(&db, pool, not_object, sizeof not_object, &version));
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_doc_set_schema(&db, pool, NULL, 0, &version));
+    {
+        int trivial;
+        TEST_ASSERT_EQUAL_INT(CDB_E_UNSUPPORTED, cdb_schema_check(unknown, unknown_len, CDB_ORDER_LITTLE, &trivial));
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_E_UNSUPPORTED, cdb_doc_set_schema(&db, pool, unknown, unknown_len, &version));
+    {
+        doc schema = adr_schema();
+        TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_doc_set_schema(&db, rows, schema.b, schema.n, &version));
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_doc_get_schema(&db, pool, 0, out, sizeof out, &len, &current));
+    TEST_ASSERT_EQUAL_UINT32(0, current); /* nothing was added */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+/* A transaction's later changes are validated against its earlier ones,
+ * whether the stage holds them, has overflowed, or is absent. */
+static void staging_case(size_t stage_size)
+{
+    doc schema = adr_schema(), t = make_doc("T", NULL, NULL), t2 = make_doc("T2", NULL, NULL);
+    const uint64_t owner[2] = { 3, 1 }, status[1] = { 2 }, title[1] = { 1 };
+    doc set_owner = make_patch(owner, 2, "sam"), drop_owner = make_patch(owner, 2, NULL),
+        set_status = make_patch(status, 1, "s"), drop_title = make_patch(title, 1, NULL);
+    uint64_t pool, e, n, many[40];
+    int i;
+
+    cfg.doc_stage = stage_size ? doc_stage : NULL;
+    cfg.doc_stage_size = stage_size;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    pool = make_pool("adr");
+    set_schema(pool, &schema);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    e = insert(pool, NULL, &t);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+
+    /* Each patch alone is valid against the committed {1: "T"}; together the
+     * second leaves the owner object without its required field. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    for (i = 0; i < 3; i++) { /* fill a small stage first */
+        doc filler = make_doc("filler", NULL, NULL);
+        (void)insert(pool, NULL, &filler);
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_patch(&db, pool, e, set_owner.b, set_owner.n));
+    TEST_ASSERT_EQUAL_INT(CDB_E_SCHEMA, cdb_doc_patch(&db, pool, e, drop_owner.b, drop_owner.n));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    {
+        doc want = make_doc("T", NULL, "sam");
+        expect_doc(pool, e, 0, &want);
+    }
+
+    /* Insert, patch and delete in one transaction; then it is gone. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    n = insert(pool, NULL, &t);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_patch(&db, pool, n, set_status.b, set_status.n));
+    TEST_ASSERT_EQUAL_INT(CDB_E_SCHEMA, cdb_doc_patch(&db, pool, n, drop_title.b, drop_title.n));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_delete(&db, pool, n));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_doc_patch(&db, pool, n, set_status.b, set_status.n));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_doc_replace(&db, pool, n, NULL, 0, t.b, t.n));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_doc_delete(&db, pool, n));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_FALSE(doc_exists(pool, n));
+
+    /* A replace, then a patch validated against the replacement. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_replace(&db, pool, e, NULL, 0, t2.b, t2.n));
+    TEST_ASSERT_EQUAL_INT(CDB_E_SCHEMA, cdb_doc_patch(&db, pool, e, drop_title.b, drop_title.n));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_patch(&db, pool, e, set_owner.b, set_owner.n));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    {
+        doc want = make_doc("T2", NULL, "sam");
+        expect_doc(pool, e, 0, &want);
+    }
+
+    /* A large transaction is never refused for lack of stage. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    for (i = 0; i < 40; i++)
+        many[i] = insert(pool, NULL, &t);
+    for (i = 0; i < 40; i++)
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_patch(&db, pool, many[i], set_status.b, set_status.n));
+    TEST_ASSERT_EQUAL_INT(CDB_E_SCHEMA, cdb_doc_patch(&db, pool, many[0], drop_title.b, drop_title.n));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    {
+        doc want = make_doc("T", "s", NULL);
+        for (i = 0; i < 40; i++)
+            expect_doc(pool, many[i], 0, &want);
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+static void test_staging_large(void) { staging_case(sizeof doc_stage); }
+static void test_staging_overflows(void) { staging_case(48); }
+static void test_staging_absent(void) { staging_case(0); }
+
 /* ------------------------------------------------------- crash sweep */
 
 /* Pool "adr". S0: nothing (or empty pool). S1: A = a1, B = b1. S2: A = a2 (patched).
@@ -427,6 +704,11 @@ static cdb_status workload(int *acked)
 #define TRY(call) do { if ((s = (call)) != CDB_OK) return s; } while (0)
     TRY(open_db());
     TRY(cdb_db_create_store(&db, "adr", 3, CDB_MODEL_DOCUMENT, &pool));
+    {
+        doc schema = adr_schema();
+        uint32_t version;
+        TRY(cdb_doc_set_schema(&db, pool, schema.b, schema.n, &version));
+    }
     TRY(cdb_tx_begin(&db, CDB_DURABILITY_FULL));
     TRY(cdb_doc_insert(&db, pool, "first", 5, a1.b, a1.n, &ea));
     TRY(cdb_doc_insert(&db, pool, NULL, 0, b1.b, b1.n, &eb));
@@ -511,8 +793,21 @@ static void test_crash_sweep(void)
                 k = observed_state(&pool);
                 TEST_ASSERT_TRUE_MESSAGE(k >= 0, "documents in a state that was never committed");
                 TEST_ASSERT_TRUE_MESSAGE(k >= acked, "an acknowledged commit was lost");
-                if (pool == 0)
+                if (pool == 0) {
                     pool = make_pool("adr");
+                } else {
+                    /* If the schema survived, it is enforced. */
+                    doc bad = make_doc(NULL, "x", NULL);
+                    uint32_t current;
+                    size_t len;
+                    cdb_status gs = cdb_doc_get_schema(&db, pool, 0, out, sizeof out, &len, &current);
+                    TEST_ASSERT_TRUE(gs == CDB_OK || (gs == CDB_E_NOT_FOUND && current == 0));
+                    TEST_ASSERT_TRUE_MESSAGE(k == 0 || current == 1, "a committed schema was lost");
+                    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+                    TEST_ASSERT_EQUAL_INT(current ? CDB_E_SCHEMA : CDB_OK,
+                                          cdb_doc_insert(&db, pool, NULL, 0, bad.b, bad.n, &e));
+                    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_abort(&db));
+                }
                 TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
                 TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_insert(&db, pool, NULL, 0, v.b, v.n, &e));
                 TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
@@ -534,6 +829,11 @@ int main(void)
     RUN_TEST(test_reopen_and_ids_continue);
     RUN_TEST(test_replay_after_crash_and_ids_not_reused);
     RUN_TEST(test_rejects_bad_input);
+    RUN_TEST(test_schema_enforced);
+    RUN_TEST(test_set_schema_rejects_bad_schemas);
+    RUN_TEST(test_staging_large);
+    RUN_TEST(test_staging_overflows);
+    RUN_TEST(test_staging_absent);
     RUN_TEST(test_crash_sweep);
     return UNITY_END();
 }
