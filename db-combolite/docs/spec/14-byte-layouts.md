@@ -250,7 +250,7 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
   | 5 | encryption domain | 11 | flags; bit 0 = dropped |
   | 6 | page-size code (log₂) | 12 | document pools: head index root (optional) |
   | 13 | document pools: revisions index root (optional) | 14 | document pools: next entry ID (optional) |
-  | 15 | document pools: full-text settings, an object (14.14.1; optional) | | |
+  | 15 | document pools: full-text settings, an object (14.14.1; optional) | 16 | vector collections: settings, an object (14.12.3) |
 
   Optional fields that are absent read as zero.
 
@@ -849,6 +849,33 @@ The element type and the number of dimensions are fixed for each collection and 
 | … | Vector data, packed contiguously and aligned to 16 bytes for SIMD |
 
 An ordered index maps each entry ID to *(block logical ID, slot)*.
+
+### 14.12.3 Current layout of a vector collection
+
+- **Blocks.** Vector blocks are logical pages of type `0x0006`, written in the file's byte order. The vector count is the number of slots in the block. A slot whose entry ID is 0 is empty; a block never ends with an empty slot, and a block left with no vectors is released. The vector data starts at the first 16-byte boundary of the page after the entry IDs and norms. Norms are cached when the base measure is cosine.
+- **Settings.** An object in store record field 16, written when the collection is created and never changed:
+
+  | Field | Value |
+  |---|---|
+  | 1 | element type (14.6): 0 f32 · 1 f16 · 2 bf16 · 3 int8 · 4 binary |
+  | 2 | dimensions (1–65535) |
+  | 3 | base measure: 1 cosine · 2 dot product · 3 Euclidean · 4 Hamming (binary only, and the only measure for binary) |
+  | 4, 5 | embedding model name and version, strings of at most 64 bytes (Section 7.3) |
+  | 6, 7, 8 | root page IDs of the entries, blocks and sources indexes |
+  | 9 | bool: blocks cache norms |
+
+- **Indexes.**
+
+  | Index | Key (big-endian) | Value |
+  |---|---|---|
+  | entries | entry ID | block ID (8) · slot (4) · source store (8) · source entry (8) · source revision (8) |
+  | blocks | block ID | slots in use (4) · slots (4) |
+  | sources | source store · source entry · entry ID | empty |
+
+- **Sources.** A vector may name the entry it was computed from. When the source is a document, its head revision at the vector's commit is recorded; a replace (re-embedding) records it again. A search reports each hit's source as *current*, *outdated* (the document has a newer revision), *deleted* (the document or its pool is gone), *unchecked* (the source is not a document) or *none*. Vectors are not removed with their source: references are kept by default (Section 6.7); cascading belongs with link types.
+- **Change payloads** (14.4.5). Insert and replace: flags (1 byte; bit 0 = a source follows) · source store and entry (varints) · the vector, an encoded vector value of the collection's type and dimensions. A replace keeps the source. Delete: empty. Vectors keep no history.
+- **Distances** (smaller is closer): cosine 1 − cos (a zero vector is at distance 1 from everything); dot product −dot; Euclidean the L2 distance; Hamming the number of differing bits. Ties are ordered by entry ID. f16 and bf16 are widened to f32 for arithmetic.
+- **Size.** One vector must fit in a block of one page, so the page size bounds the dimensions until per-store page sizes (Section 2.1) exist.
 
 ### 14.12.2 Neighbour-graph block (Sections 6.4, 7.4)
 

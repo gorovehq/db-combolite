@@ -40,6 +40,8 @@ Because of that reuse, one structure serves both the stored rankings and approxi
 
 Each entry has exactly one vector. Chunks and variants of a source, such as a title embedding, a body embedding or the chunks of a long document, are **separate entries linked to their parent** (Section 6).
 
+A vector can record its **source**, the entry it was computed from. Search reports whether each hit's source document is unchanged, has been edited since the vector was written, or is gone, so stale embeddings are never returned silently (14.12.3).
+
 Because each chunk is an entry of its own, it gets its own neighbour list. At runtime, a chunk of document A can therefore become a neighbour of a chunk of document B. This reveals connections that weren't known before, without going through either parent.
 
 ### 7.6 Encrypted enclaves must be unlocked to be searched

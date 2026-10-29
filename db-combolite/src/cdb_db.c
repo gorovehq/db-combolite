@@ -516,9 +516,12 @@ cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
     if (s != CDB_OK)
         return s;
     /* Forget the store's open state, so it reads as dropped from now on. */
-    for (i = 0; i < CDB_DB_MAX_POOLS; i++)
+    for (i = 0; i < CDB_DB_MAX_POOLS; i++) {
         if (db->pools[i].in_use && db->pools[i].store_id == id)
             db->pools[i].in_use = 0;
+        if (db->vecs[i].in_use && db->vecs[i].store_id == id)
+            db->vecs[i].in_use = 0;
+    }
     return rotate_journal(db);
 }
 

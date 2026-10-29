@@ -21,7 +21,8 @@ enum {
     F_KIND = 1, F_ID, F_NAME, F_MODEL, F_DOMAIN, F_PAGE_LOG2, F_COMPRESSION,
     F_SCHEMA_VERSION, F_NEXT_FIELD, F_CREATED, F_FLAGS,
     F_HEAD_ROOT, F_REV_ROOT, F_NEXT_ENTRY, /* optional: document pools */
-    F_FULL_TEXT                            /* optional: full-text index settings */
+    F_FULL_TEXT,                           /* optional: full-text index settings */
+    F_VECTOR                               /* optional: vector collection settings */
 };
 
 /* -------------------------------------------------------- keys */
@@ -201,6 +202,10 @@ static cdb_status encode_store(cdb_catalog *cat, const cdb_store_info *in, size_
         cdb_value_field(&w, F_FULL_TEXT);
         cdb_value_write_encoded(&w, in->full_text, in->full_text_len);
     }
+    if (in->vector_len) {
+        cdb_value_field(&w, F_VECTOR);
+        cdb_value_write_encoded(&w, in->vector, in->vector_len);
+    }
     cdb_value_end_object(&w);
     *len = cdb_value_writer_len(&w);
     return w.error;
@@ -278,6 +283,14 @@ static cdb_status decode_store(cdb_catalog *cat, const uint8_t *p, size_t len, c
                 return CDB_E_CORRUPT;
             memcpy(out->full_text, name.start, name.encoded_len);
             out->full_text_len = name.encoded_len;
+        }
+        if ((s = cdb_value_object_get(&obj, o, F_VECTOR, &name, &found)) != CDB_OK)
+            return s;
+        if (found) {
+            if (name.type != CDB_TYPE_OBJECT || name.encoded_len > CDB_CATALOG_SETTINGS_MAX)
+                return CDB_E_CORRUPT;
+            memcpy(out->vector, name.start, name.encoded_len);
+            out->vector_len = name.encoded_len;
         }
     }
     return CDB_OK;
@@ -414,8 +427,19 @@ cdb_status cdb_catalog_find_store(cdb_catalog *cat, const char *name, size_t len
     return CDB_OK;
 }
 
+uint64_t cdb_catalog_next_store_id(const cdb_catalog *cat)
+{
+    return cat->pager->catroot.next_object_id ? cat->pager->catroot.next_object_id : 1; /* 0 is the catalog */
+}
+
 cdb_status cdb_catalog_create_store(cdb_catalog *cat, const char *name, size_t len, uint32_t model,
                                     uint64_t *id)
+{
+    return cdb_catalog_create_store_ex(cat, name, len, model, NULL, 0, id);
+}
+
+cdb_status cdb_catalog_create_store_ex(cdb_catalog *cat, const char *name, size_t len, uint32_t model,
+                                       const void *vector, size_t vector_len, uint64_t *id)
 {
     cdb_store_info info;
     uint8_t ref[REF_SIZE], idv[8];
@@ -424,7 +448,8 @@ cdb_status cdb_catalog_create_store(cdb_catalog *cat, const char *name, size_t l
     key k;
     cdb_status s;
 
-    if (model < CDB_MODEL_RELATIONAL || model > CDB_MODEL_TIME_SERIES)
+    if (model < CDB_MODEL_RELATIONAL || model > CDB_MODEL_TIME_SERIES || (vector == NULL && vector_len)
+        || vector_len > CDB_CATALOG_SETTINGS_MAX)
         return CDB_E_INVALID_ARG;
     if ((s = ensure_created(cat)) != CDB_OK)
         return s;
@@ -435,7 +460,7 @@ cdb_status cdb_catalog_create_store(cdb_catalog *cat, const char *name, size_t l
     if (found)
         return CDB_E_EXISTS;
 
-    next = cat->pager->catroot.next_object_id ? cat->pager->catroot.next_object_id : 1; /* 0 is the catalog */
+    next = cdb_catalog_next_store_id(cat);
     memset(&info, 0, sizeof info);
     info.id = next;
     memcpy(info.name, name, len);
@@ -444,6 +469,10 @@ cdb_status cdb_catalog_create_store(cdb_catalog *cat, const char *name, size_t l
     info.page_log2 = cat->pager->hs.record.default_page_log2;
     info.next_field_id = 1;
     info.created_commit = cat->pager->hs.record.committed_seq + 1;
+    if (vector_len) {
+        memcpy(info.vector, vector, vector_len);
+        info.vector_len = vector_len;
+    }
     if ((s = save_store(cat, &info, ref, 1)) != CDB_OK)
         return s;
     if ((s = k_object(&k, info.id)) != CDB_OK || (s = put_both(cat, &k, ref, REF_SIZE)) != CDB_OK)
@@ -525,6 +554,22 @@ cdb_status cdb_catalog_stage_pool(cdb_catalog *cat, uint64_t store_id, uint64_t 
         return CDB_OK;
     info.head_root = head_root;
     info.rev_root = rev_root;
+    info.next_entry_id = next_entry_id;
+    if ((s = save_store(cat, &info, ref, 0)) != CDB_OK)
+        return s;
+    cdb_pager_set_catroot(cat->pager, &cat->pager->catroot);
+    return CDB_OK;
+}
+
+cdb_status cdb_catalog_stage_next_entry(cdb_catalog *cat, uint64_t store_id, uint64_t next_entry_id)
+{
+    cdb_store_info info;
+    uint8_t ref[REF_SIZE];
+    cdb_status s;
+    if ((s = load_store(cat, store_id, &info, ref)) != CDB_OK)
+        return s;
+    if (info.next_entry_id == next_entry_id)
+        return CDB_OK;
     info.next_entry_id = next_entry_id;
     if ((s = save_store(cat, &info, ref, 0)) != CDB_OK)
         return s;

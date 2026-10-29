@@ -456,6 +456,27 @@ cdb_status cdb_value_write_decimal_i64(cdb_value_writer *w, uint64_t scale, int6
     return cdb_value_write_decimal(w, scale, be + start, 8 - start);
 }
 
+cdb_status cdb_value_write_vector_raw(cdb_value_writer *w, cdb_vector_elem elem, uint64_t dims,
+                                      const void *data, size_t len)
+{
+    size_t payload;
+    cdb_status s = w_begin_value(w);
+    if (s != CDB_OK)
+        return s;
+    if (data == NULL || len == 0 || vector_data_len(elem, dims) != len)
+        return w_fail(w, CDB_E_INVALID_ARG);
+    payload = 1 + cdb_varint_size(dims) + len;
+    if ((s = w_room(w, 1 + cdb_varint_size(payload) + payload)) != CDB_OK)
+        return s;
+    w_put_byte(w, CDB_TAG_VECTOR);
+    w_put_varint(w, payload);
+    w_put_byte(w, (uint8_t)elem);
+    w_put_varint(w, dims);
+    w_put(w, data, len);
+    w_end_value(w);
+    return CDB_OK;
+}
+
 cdb_status cdb_value_write_vector(cdb_value_writer *w, cdb_vector_elem elem,
                                   uint64_t dims, const void *elems)
 {
