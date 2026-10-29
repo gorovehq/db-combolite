@@ -19,7 +19,8 @@ typedef enum cdb_status {
     CDB_E_UNSUPPORTED = -9,      /* recognised, but not supported by this build */
     CDB_E_IO = -10,              /* the storage device reported an error */
     CDB_E_NOT_FOUND = -11,       /* the named file or object does not exist */
-    CDB_E_READ_ONLY = -12        /* write attempted on read-only storage */
+    CDB_E_READ_ONLY = -12,       /* write attempted on read-only storage */
+    CDB_E_CORRUPT = -13          /* a checksum or integrity check failed */
 } cdb_status;
 
 const char *cdb_status_str(cdb_status status);

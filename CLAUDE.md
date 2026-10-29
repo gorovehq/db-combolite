@@ -15,8 +15,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M0 | Build skeleton, warnings, sanitizers, test runner | done |
 | M1 | CRC32C, varints, byte-order helpers, value encoding (spec 14.6) | done |
 | M2 | Storage backend interface, host-file backend, fault-injecting backend (spec 1.11.1) | done |
-| M3 | File header (spec 1.9, 14.1) | next |
-| M4 | Pages, anchor map, free-space list (spec 13, 14.2, 14.7) | |
+| M3 | File header (spec 1.9, 14.1) | done |
+| M4 | Pages, anchor map, free-space list (spec 13, 14.2, 14.7) | next |
 | M5 | Delta tracks, transactions, reconciliation, recovery; the crash-point matrix becomes the main test suite (spec 3, 14.4) | |
 | M6 | Catalog (spec 4, 14.3) | |
 
@@ -32,6 +32,21 @@ ctest --test-dir build -R test_value         # run one test executable
 ./build/tests/test_value                     # run one executable directly (Unity output)
 cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release   # optimised build, sanitizers off
 ```
+
+## Git workflow
+
+- **Never commit directly to `main`.** Every piece of work goes on its own branch, named with a type prefix:
+
+  | Prefix | Use |
+  |---|---|
+  | `feat_` | new functionality, such as a milestone (`feat_m4-pages-anchor-map`) |
+  | `fix_` | bug fixes |
+  | `test_` | test-only changes |
+  | `docs_` | spec and documentation changes |
+  | `merge_` | integration branches that bring other branches together |
+
+- **Branch names** take the form `<prefix><short-kebab-description>`.
+- **Commit and merge only when the user asks.** Merging into `main` is the user's decision.
 
 ## Code rules
 

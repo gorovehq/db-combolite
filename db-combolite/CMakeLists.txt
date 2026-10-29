@@ -37,7 +37,8 @@ add_library(combolite
   src/cdb_crc32c.c
   src/cdb_varint.c
   src/cdb_value.c
-  src/cdb_hostfile.c)
+  src/cdb_hostfile.c
+  src/cdb_header.c)
 target_include_directories(combolite
   PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
