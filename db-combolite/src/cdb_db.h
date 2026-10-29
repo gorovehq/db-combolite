@@ -41,6 +41,28 @@ typedef struct cdb_delta {
     uint64_t commit_number; /* of the transaction this change belongs to */
 } cdb_delta;
 
+/* Full-text search (spec 8.10, 14.14; cdb_fts.h). */
+#define CDB_FTS_MAX_PATHS 8u
+#define CDB_FTS_MAX_DEPTH 8u
+
+typedef struct cdb_fts_path {
+    uint64_t ids[CDB_FTS_MAX_DEPTH]; /* field IDs through nested objects */
+    unsigned depth;
+} cdb_fts_path;
+
+typedef struct cdb_fts_config {
+    cdb_fts_path paths[CDB_FTS_MAX_PATHS];
+    unsigned npaths;
+    int summary;                     /* index the summary too */
+} cdb_fts_config;
+
+/* A word in caller memory; tf counts its occurrences once grouped. */
+typedef struct cdb_fts_token {
+    const uint8_t *p;
+    uint32_t len;
+    uint32_t tf;
+} cdb_fts_token;
+
 /* Applies one committed change to the pages. It must be deterministic:
  * recovery replays the same changes in the same order. */
 typedef cdb_status (*cdb_apply_fn)(void *ctx, cdb_pager *pager, const cdb_delta *d);
@@ -60,6 +82,9 @@ typedef struct cdb_db_config {
     unsigned checkpoint_every;    /* documents: full revision every N; 0 means 16 */
     uint8_t *doc_stage;           /* documents: per-transaction staging (cdb_doc.h) */
     size_t doc_stage_size;
+    uint8_t *fts_buffers;         /* full-text: 3 * page_size bytes (cdb_fts.h) */
+    cdb_fts_token *fts_tokens;    /* full-text: words of two document versions */
+    size_t fts_tokens_cap;
 } cdb_db_config;
 
 typedef struct cdb_db {
@@ -97,6 +122,11 @@ typedef struct cdb_db {
         int have_indexes;
         uint64_t next_entry;
         uint32_t schema_version; /* current; 0 = no schema */
+        int fts_on;              /* the pool has a full-text index */
+        cdb_fts_config fts;
+        cdb_index fts_terms;     /* term -> document frequency */
+        cdb_index fts_postings;  /* (term, entry) -> term frequency */
+        cdb_index fts_lengths;   /* entry -> words indexed; 0 -> pool totals */
     } pools[CDB_DB_MAX_POOLS];
     /* The schema held in the schema buffer (cdb_doc.h). */
     uint64_t schema_store;
@@ -132,6 +162,12 @@ cdb_status cdb_db_create_store(cdb_db *db, const char *name, size_t len, uint32_
 cdb_status cdb_db_find_store(cdb_db *db, const char *name, size_t len, uint64_t *id, int *found);
 cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id);
 cdb_status cdb_db_add_schema(cdb_db *db, uint64_t store_id, const void *schema, size_t len, uint32_t *version);
+
+/* For catalog changes made by the data models: begin reconciles; the caller
+ * then changes pages and commits through the catalog; end starts the new
+ * journal if s is CDB_OK and returns s otherwise. */
+cdb_status cdb_db_catalog_begin(cdb_db *db);
+cdb_status cdb_db_catalog_end(cdb_db *db, cdb_status s);
 
 /* Maintenance (spec 3.4, 3.7): reconciles, moves up to max_moves live pages
  * down into reusable space, and releases the free tail of the archive. */

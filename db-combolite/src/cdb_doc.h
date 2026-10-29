@@ -26,6 +26,7 @@
 #define CDB_DOC_H
 
 #include "cdb_db.h"
+#include "cdb_fts.h"
 #include "cdb_schema.h"
 
 /* Revision kinds (spec 14.9.1). */
@@ -73,6 +74,17 @@ cdb_status cdb_doc_set_schema(cdb_db *db, uint64_t store, const void *schema, si
  * CDB_E_NOT_FOUND if the pool has no such version. */
 cdb_status cdb_doc_get_schema(cdb_db *db, uint64_t store, uint32_t version, void *schema, size_t cap,
                               size_t *len, uint32_t *current);
+
+/* Full-text search (spec 8.10, 14.14; cdb_fts.h). create builds the index
+ * over the documents already in the pool and commits immediately, like other
+ * catalog changes; CDB_E_EXISTS if the pool has one. Needs fts_buffers and
+ * fts_tokens in the configuration, from then on whenever the pool is used.
+ * search ranks live documents by BM25: CDB_FTS_ANY matches any query word,
+ * CDB_FTS_ALL every word. At most max hits, best first (ties: lower entry
+ * ID first). A query has at most 16 distinct words. */
+cdb_status cdb_doc_create_full_text(cdb_db *db, uint64_t store, const cdb_fts_config *cfg);
+cdb_status cdb_doc_search(cdb_db *db, uint64_t store, const char *query, size_t len, int mode,
+                          cdb_fts_hit *hits, size_t max, size_t *n);
 
 /* Engine hooks used by cdb_db. */
 cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d);

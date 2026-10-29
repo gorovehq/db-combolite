@@ -23,7 +23,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M8 | Catalog: root slots, mirrored body, stores, schema history, field dictionary (spec 4, 14.3) | done |
 | M9 | Documents: revision chains, patches, checkpoints, built-in document apply (spec 8, 14.9) | done |
 | M10 | Document schemas: validation at write time, per-transaction staging (spec 8.3, 14.9.4) | done |
-| M11 | Full-text search: term dictionary, postings, BM25 (spec 8.10, 14.14) | next |
+| M11 | Full-text search: term dictionary, postings, BM25 (spec 8.10, 14.14) | done |
 
 ## Commands
 
@@ -80,6 +80,7 @@ These were agreed with the user:
   - `cdb_key` and `cdb_index`: order-preserving keys and the B+tree. Index nodes are logical pages, so the pager's copy-on-write sits underneath, and an index's root logical ID never changes.
   - `cdb_catroot` and `cdb_catalog`: the catalog. Root slots sit at location 0, and the body is one mirrored B+tree with prefixed keys. Catalog changes commit immediately.
   - `cdb_doc`: document pools. It provides insert, replace, patch and delete inside transactions, revision history, and the built-in apply hook. **The apply hook must never fail for logical reasons**, because it runs again during recovery.
+  - `cdb_fts`: full-text search. Splits words, maintains the terms, postings and lengths indexes from each document's state before and after a change (called from the document apply), and ranks searches with BM25.
   - `cdb_schema`: checks schemas and validates documents against them. Validation happens in `cdb_doc` when a change is made, against the document as the open transaction sees it: from the staging cache (`doc_stage`), or, after the cache overflows, from the transaction's own journal records.
   - `cdb_journal` and `cdb_db`: transactions, reconciliation and recovery. Changes reach pages only through the `cdb_apply_fn` hook, and the data models will plug in there.
 - `src/cdb_faultenv.*`: several fault devices on one shared crash clock, plus directory entries that are lost on crash unless their directory was synced. Test-only.

@@ -20,7 +20,8 @@
 enum {
     F_KIND = 1, F_ID, F_NAME, F_MODEL, F_DOMAIN, F_PAGE_LOG2, F_COMPRESSION,
     F_SCHEMA_VERSION, F_NEXT_FIELD, F_CREATED, F_FLAGS,
-    F_HEAD_ROOT, F_REV_ROOT, F_NEXT_ENTRY /* optional: document pools */
+    F_HEAD_ROOT, F_REV_ROOT, F_NEXT_ENTRY, /* optional: document pools */
+    F_FULL_TEXT                            /* optional: full-text index settings */
 };
 
 /* -------------------------------------------------------- keys */
@@ -196,6 +197,10 @@ static cdb_status encode_store(cdb_catalog *cat, const cdb_store_info *in, size_
     cdb_value_field(&w, F_HEAD_ROOT);      cdb_value_write_int(&w, (int64_t)in->head_root);
     cdb_value_field(&w, F_REV_ROOT);       cdb_value_write_int(&w, (int64_t)in->rev_root);
     cdb_value_field(&w, F_NEXT_ENTRY);     cdb_value_write_int(&w, (int64_t)in->next_entry_id);
+    if (in->full_text_len) {
+        cdb_value_field(&w, F_FULL_TEXT);
+        cdb_value_write_encoded(&w, in->full_text, in->full_text_len);
+    }
     cdb_value_end_object(&w);
     *len = cdb_value_writer_len(&w);
     return w.error;
@@ -265,6 +270,14 @@ static cdb_status decode_store(cdb_catalog *cat, const uint8_t *p, size_t len, c
                 out->rev_root = (uint64_t)fv.as.i64;
             else
                 out->next_entry_id = (uint64_t)fv.as.i64;
+        }
+        if ((s = cdb_value_object_get(&obj, o, F_FULL_TEXT, &name, &found)) != CDB_OK)
+            return s;
+        if (found) {
+            if (name.type != CDB_TYPE_OBJECT || name.encoded_len > CDB_CATALOG_FULL_TEXT_MAX)
+                return CDB_E_CORRUPT;
+            memcpy(out->full_text, name.start, name.encoded_len);
+            out->full_text_len = name.encoded_len;
         }
     }
     return CDB_OK;
@@ -517,6 +530,25 @@ cdb_status cdb_catalog_stage_pool(cdb_catalog *cat, uint64_t store_id, uint64_t 
         return s;
     cdb_pager_set_catroot(cat->pager, &cat->pager->catroot);
     return CDB_OK;
+}
+
+cdb_status cdb_catalog_set_full_text(cdb_catalog *cat, uint64_t store_id, const void *settings, size_t len)
+{
+    cdb_store_info info;
+    uint8_t ref[REF_SIZE];
+    cdb_status s;
+    if ((settings == NULL && len) || len > CDB_CATALOG_FULL_TEXT_MAX)
+        return CDB_E_INVALID_ARG;
+    if ((s = load_store(cat, store_id, &info, ref)) != CDB_OK)
+        return s;
+    if (info.flags & CDB_STORE_DROPPED)
+        return CDB_E_NOT_FOUND;
+    if (len)
+        memcpy(info.full_text, settings, len);
+    info.full_text_len = len;
+    if ((s = save_store(cat, &info, ref, 0)) != CDB_OK)
+        return s;
+    return finish(cat, cat->pager->catroot.next_object_id);
 }
 
 cdb_status cdb_catalog_add_schema(cdb_catalog *cat, uint64_t store_id, const void *schema, size_t len,

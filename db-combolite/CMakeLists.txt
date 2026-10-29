@@ -49,11 +49,15 @@ add_library(combolite
   src/cdb_catroot.c
   src/cdb_catalog.c
   src/cdb_doc.c
-  src/cdb_schema.c)
+  src/cdb_schema.c
+  src/cdb_fts.c)
 target_include_directories(combolite
   PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(combolite PRIVATE ${CDB_WARNINGS})
+if(UNIX)
+  target_link_libraries(combolite PUBLIC m) # log() for BM25 ranking
+endif()
 if(CDB_SANITIZE)
   target_compile_options(combolite PUBLIC ${CDB_SANITIZER_FLAGS})
   target_link_options(combolite PUBLIC ${CDB_SANITIZER_FLAGS})

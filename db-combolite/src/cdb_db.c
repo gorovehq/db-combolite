@@ -515,6 +515,16 @@ cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
     return s == CDB_OK ? rotate_journal(db) : s;
 }
 
+cdb_status cdb_db_catalog_begin(cdb_db *db)
+{
+    return catalog_ready(db);
+}
+
+cdb_status cdb_db_catalog_end(cdb_db *db, cdb_status s)
+{
+    return s == CDB_OK ? rotate_journal(db) : s;
+}
+
 cdb_status cdb_db_add_schema(cdb_db *db, uint64_t store_id, const void *schema, size_t len, uint32_t *version)
 {
     cdb_status s = catalog_ready(db);
