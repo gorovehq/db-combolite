@@ -80,7 +80,7 @@ Keyword search with relevance ranking is part of db-combolite. Because a built-i
 
 ### 8.12 Revision chains are checkpointed and attributed
 
-- **Checkpoints.** Periodically, the chain of deltas is merged into a **checkpoint version**: a full copy of the current state. The history behind it is kept, and rollback through that history still works (8.6).
+- **Checkpoints.** Periodically, the chain of deltas is merged into a **checkpoint version**: a full copy of the current state. The history behind it is kept, and rollback through that history still works (8.6). The interval is configurable; the default is every 16 revisions (14.9.2).
 - **Attribution.** Every revision records the **principal identity** (Sections 5.1 and 12.5) that made it, which gives the document a full audit trail.
 
 ### 8.13 When the embedding hook runs is configurable

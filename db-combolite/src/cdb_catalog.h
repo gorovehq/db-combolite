@@ -43,6 +43,10 @@ typedef struct cdb_store_info {
     uint64_t next_field_id;
     uint64_t created_commit;
     uint32_t flags;
+    /* Document pools (spec 8, 14.9). Optional fields; 0 when absent. */
+    uint64_t head_root;       /* index: entry ID -> head revision */
+    uint64_t rev_root;        /* index: (entry ID, revision) -> revision page */
+    uint64_t next_entry_id;   /* entry IDs are never reused (spec 6.1) */
 } cdb_store_info;
 
 typedef struct cdb_catalog {
@@ -66,6 +70,11 @@ cdb_status cdb_catalog_find_store(cdb_catalog *cat, const char *name, size_t len
 cdb_status cdb_catalog_get_store(cdb_catalog *cat, uint64_t id, cdb_store_info *info);
 cdb_status cdb_catalog_rename_store(cdb_catalog *cat, uint64_t id, const char *name, size_t len);
 cdb_status cdb_catalog_drop_store(cdb_catalog *cat, uint64_t id);
+
+/* Records a pool's index roots and entry counter without committing: the
+ * caller's next pager commit (reconciliation) makes it durable. */
+cdb_status cdb_catalog_stage_pool(cdb_catalog *cat, uint64_t store_id, uint64_t head_root,
+                                  uint64_t rev_root, uint64_t next_entry_id);
 
 /* Schema history (spec 4.3, 4.11): adds a version and makes it current. */
 cdb_status cdb_catalog_add_schema(cdb_catalog *cat, uint64_t store_id, const void *schema, size_t len,

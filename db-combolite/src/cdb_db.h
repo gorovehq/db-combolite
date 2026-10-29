@@ -17,6 +17,7 @@
 #include "cdb_pager.h"
 
 #define CDB_DB_PATH_MAX 200
+#define CDB_DB_MAX_POOLS 8
 #define CDB_COMMIT_RESERVE_BLOCK 1024u
 
 /* Durability levels (spec 3.1). */
@@ -37,6 +38,7 @@ typedef struct cdb_delta {
     uint8_t op;          /* CDB_OP_* */
     const uint8_t *data;
     size_t len;
+    uint64_t commit_number; /* of the transaction this change belongs to */
 } cdb_delta;
 
 /* Applies one committed change to the pages. It must be deterministic:
@@ -47,13 +49,15 @@ typedef struct cdb_db_config {
     cdb_pager_config pager;
     uint8_t *record_buf;          /* largest record: 64 bytes + payload */
     size_t record_buf_size;
-    cdb_apply_fn apply;
+    cdb_apply_fn apply;           /* NULL: the built-in document apply (spec 8) */
     void *apply_ctx;
     cdb_durability durability;    /* default level; DEFAULT means NORMAL (spec 3.1) */
     unsigned normal_sync_every;   /* 0 means 32 */
     unsigned flags;
     cdb_index_work catalog_work;  /* optional: the catalog is available when set */
     uint8_t *catalog_page;        /* page_size bytes, with catalog_work */
+    uint8_t *doc_buffers;         /* documents: 5 * page_size bytes (cdb_doc.h) */
+    unsigned checkpoint_every;    /* documents: full revision every N; 0 means 16 */
 } cdb_db_config;
 
 typedef struct cdb_db {
@@ -81,6 +85,16 @@ typedef struct cdb_db {
     int failed;           /* an apply failed: the database must be reopened */
     cdb_catalog catalog;
     int has_catalog;
+    /* Open document pools (cdb_doc.h). */
+    struct cdb_doc_pool {
+        int in_use;
+        int dirty;
+        uint64_t store_id;
+        cdb_index head;
+        cdb_index revs;
+        int have_indexes;
+        uint64_t next_entry;
+    } pools[CDB_DB_MAX_POOLS];
     int set_aside;        /* recovery set a companion aside (spec 1.12.2) */
 } cdb_db;
 
