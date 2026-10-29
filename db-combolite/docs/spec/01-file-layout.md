@@ -102,15 +102,19 @@ The header is stored twice, and each copy carries its own checksum and sequence 
 - **Committed copy.** This is the record of the last reconciled state.
 - **Working copy.** This is a *digital twin* that describes the working deltas and how far reconciliation has progressed.
 
-Each copy records its **role** (committed or working) and a **committed sequence** (review R4).
+Each copy records its **role** (committed or working), a **committed sequence** (review R4) and a **write counter**.
 
-- **Checkpoints.** A checkpoint rewrites the working copy but leaves the committed sequence unchanged.
-- **Commits.** A commit writes the working copy with a higher committed sequence. That copy becomes the committed copy, and the previous committed copy becomes the next working copy.
-- **Choosing a copy on open.** The valid copy with the highest committed sequence wins. If both copies have the same committed sequence, the copy whose role is *committed* wins.
+- **Writes rotate.** Every header write, whether a checkpoint or a commit, goes to the slot that was **not** written most recently. This is the ring of 1.11.3 with N = 2. A torn write can therefore damage only the older slot, and the most recent durable write always survives.
+- **Every write carries the full committed record.**
+  - A **checkpoint** rewrites the committed record unchanged, except for the reservation high-water marks. It keeps the committed sequence and has the role *working*.
+  - A **commit** writes the new committed record with a higher committed sequence and the role *committed*.
+- **Choosing the record on open.** The valid copy with the highest committed sequence wins. If both copies have the same committed sequence, the copy whose role is *committed* wins. If the roles are also equal, the higher write counter wins.
 
 A torn write or a bad sector can damage only one copy.
 
-**Sequence high-water marks (review R1).** The header also stores the high-water marks of the reserved ranges of sequence numbers (Section 12.1).
+**Sequence high-water marks (review R1).** The header also stores the high-water marks of the reserved ranges of sequence numbers (Section 12.1). On open, each mark is the **maximum across all valid copies**, because a checkpoint written after the last commit may have raised it. No header write ever lowers a mark.
+
+*Why writes rotate:* if checkpoints and commits both rewrote one fixed working slot, a crash that tore a commit would also destroy the reservation saved by the checkpoint before it, and sequence numbers (nonces) could then be issued twice. The crash sweep in `tests/test_header.c` checks for exactly this.
 
 **Slot rings on raw flash.** On raw flash, a ring of N slots replaces the A/B pair (1.11.3).
 
