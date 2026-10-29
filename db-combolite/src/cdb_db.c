@@ -510,9 +510,16 @@ cdb_status cdb_db_find_store(cdb_db *db, const char *name, size_t len, uint64_t 
 cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
 {
     cdb_status s = catalog_ready(db);
+    int i;
     if (s == CDB_OK)
         s = cdb_catalog_drop_store(&db->catalog, id);
-    return s == CDB_OK ? rotate_journal(db) : s;
+    if (s != CDB_OK)
+        return s;
+    /* Forget the store's open state, so it reads as dropped from now on. */
+    for (i = 0; i < CDB_DB_MAX_POOLS; i++)
+        if (db->pools[i].in_use && db->pools[i].store_id == id)
+            db->pools[i].in_use = 0;
+    return rotate_journal(db);
 }
 
 cdb_status cdb_db_catalog_begin(cdb_db *db)
