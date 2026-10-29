@@ -820,6 +820,26 @@ static void test_replace_falls_back_to_full_revision(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+/* A dropped pool reads as dropped at once, not only after reopening. */
+static void test_dropped_pool_is_gone(void)
+{
+    doc v = make_doc("x", NULL, NULL);
+    uint64_t pool, e, e2;
+    size_t len;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    pool = make_pool("adr");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    e = insert(pool, NULL, &v);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_TRUE(doc_exists(pool, e)); /* the pool is now open */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_drop_store(&db, pool));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_doc_get(&db, pool, e, 0, out, sizeof out, &len, NULL, 0, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_doc_insert(&db, pool, NULL, 0, v.b, v.n, &e2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 /* ------------------------------------------------------- crash sweep */
 
 /* Pool "adr". S0: nothing (or empty pool). S1: A = a1, B = b1. S2: A = a2 (patched).
@@ -962,6 +982,7 @@ int main(void)
     RUN_TEST(test_rejects_bad_input);
     RUN_TEST(test_growth_past_the_page_is_refused);
     RUN_TEST(test_replace_falls_back_to_full_revision);
+    RUN_TEST(test_dropped_pool_is_gone);
     RUN_TEST(test_schema_enforced);
     RUN_TEST(test_set_schema_rejects_bad_schemas);
     RUN_TEST(test_staging_large);
