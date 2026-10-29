@@ -17,7 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M2 | Storage backend interface, host-file backend, fault-injecting backend (spec 1.11.1) | done |
 | M3 | File header (spec 1.9, 14.1) | done |
 | M4 | Pages, anchor map, free-space list (spec 13, 14.2, 14.7) | done |
-| M5 | Delta tracks, transactions, reconciliation, recovery; the crash-point matrix becomes the main test suite (spec 3, 14.4) | next |
+| M5 | Delta tracks, transactions, reconciliation, recovery; the crash-point matrix becomes the main test suite (spec 3, 14.4) | done (single process) |
 | M6 | Catalog (spec 4, 14.3) | |
 
 ## Commands
@@ -67,8 +67,13 @@ These were agreed with the user:
 
 ## Code layout
 
-- `include/combolite/`: the public API (`cdb_common.h`, `cdb_value.h`, `cdb_storage.h`).
+- `include/combolite/`: the public API (`cdb_common.h`, `cdb_value.h`, `cdb_storage.h`, `cdb_env.h`).
 - `src/`: implementation and internal headers (`cdb_crc32c`, `cdb_varint`, `cdb_endian.h`, `cdb_value`). Tests include `src/` directly so they can test internal modules.
+- **Engine layers, bottom up:**
+  - `cdb_storage` and `cdb_env`: files and directories.
+  - `cdb_header`, `cdb_page` and `cdb_pager`: the archive. The pager provides copy-on-write logical pages.
+  - `cdb_journal` and `cdb_db`: transactions, reconciliation and recovery. Changes reach pages only through the `cdb_apply_fn` hook, and the data models will plug in there.
+- `src/cdb_faultenv.*`: several fault devices on one shared crash clock, plus directory entries that are lost on crash unless their directory was synced. Test-only.
 - `src/cdb_faultdev.*`: an in-memory device that simulates power loss: unsynced writes are dropped, kept in part or torn. It is built only into the `combolite_testing` library, never into the production library.
   - **Crash modes:** drop every unsynced write, keep an in-order prefix of them, tear a write partway, or reorder (only the latest write survives, the way a real disk can land writes out of order).
   - **Crash sweeps.** A test counts a workload's mutating operations, then crashes at each one in every mode, calls `cdb_faultdev_reboot()`, and checks what recovery sees. Every new write sequence needs a sweep, and the reorder mode is what catches a missing barrier.
