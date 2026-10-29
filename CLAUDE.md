@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **The spec is complete. Implementation in C99 has started.**
 
 - **Spec.** The spec is in `db-combolite/docs/spec/`. Start with `README.md` there, which lists every section, what it depends on, and what is still open. Every spec section records its confirmed decisions; code follows the spec, and spec section numbers are cited in code comments.
-- **Still open.** These items need measuring, not deciding: the device-class table values, the vector search-path thresholds, and how neuron weights are learned. Some crash-matrix rows still have to be written (spec 3.6).
+- **Still open.** These items need measuring, not deciding: the device-class table values, the vector search-path threshold (provisionally 10,000 vectors; spec 7.7), and how neuron weights are learned. Some crash-matrix rows still have to be written (spec 3.6).
 - **Implementation.** Work follows the milestone plan below. The user reviews each milestone before the next one starts.
 
 | Milestone | Scope | Status |
@@ -25,7 +25,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M10 | Document schemas: validation at write time, per-transaction staging (spec 8.3, 14.9.4) | done |
 | M11 | Full-text search: term dictionary, postings, BM25 (spec 8.10, 14.14) | done |
 | M12 | Vector collections: blocks, exact search, sources with staleness (spec 7, 14.12) | done |
-| M13 | Neighbour graph: stored rankings and approximate search (spec 6.4, 6.8, 7.4) | next |
+| M13 | Neighbour graph: stored rankings and approximate search (spec 6.4, 6.8, 7.4) | done |
 
 ## Commands
 
@@ -83,7 +83,11 @@ These were agreed with the user:
   - `cdb_catroot` and `cdb_catalog`: the catalog. Root slots sit at location 0, and the body is one mirrored B+tree with prefixed keys. Catalog changes commit immediately.
   - `cdb_doc`: document pools. It provides insert, replace, patch and delete inside transactions, revision history, and the built-in apply hook. **The apply hook must never fail for logical reasons**, because it runs again during recovery.
   - `cdb_fts`: full-text search. Splits words, maintains the terms, postings and lengths indexes from each document's state before and after a change (called from the document apply), and ranks searches with BM25.
-  - `cdb_vec`: vector collections. Vectors are packed into vector blocks, with entries, blocks and sources indexes. Search is exact. The built-in apply (`cdb_doc_apply`) dispatches vector stores here. Hits report whether their source document has changed since the vector was written.
+  - `cdb_vec`: vector collections. Vectors are packed into vector blocks, with entries, blocks and sources indexes. The built-in apply (`cdb_doc_apply`) dispatches vector stores here. Hits report whether their source document has changed since the vector was written.
+    - **Neighbour graph** (optional, `cdb_vec_create_graph`): each entry's exact K nearest neighbours, in graph, reverse and pending indexes (spec 14.12.4). Commits only queue work; reconciliation refreshes a budget of pending entries, and `cdb_vec_refresh` does the rest.
+    - **Entry points:** spread points (about √N) plus reach points, which are added wherever a walk can't reach an entry, because an exact graph falls apart on clustered data.
+    - **Search:** exact below `vec_exact_below` (default 10,000), otherwise a best-first walk from the entry points plus a direct pass over pending vectors.
+    - `tests/bench_graph` (not run by ctest) measures build time, exact and approximate query time, and recall. Run it from the Release build.
   - `cdb_schema`: checks schemas and validates documents against them. Validation happens in `cdb_doc` when a change is made, against the document as the open transaction sees it: from the staging cache (`doc_stage`), or, after the cache overflows, from the transaction's own journal records.
   - `cdb_journal` and `cdb_db`: transactions, reconciliation and recovery. Changes reach pages only through the `cdb_apply_fn` hook, and the data models will plug in there.
 - `src/cdb_faultenv.*`: several fault devices on one shared crash clock, plus directory entries that are lost on crash unless their directory was synced. Test-only.
@@ -136,6 +140,7 @@ Write the spec one section at a time, and stop before each section. First explai
 
 - `include/`, `src/`, `tests/`: see the code layout above.
 - `docs/spec/`: the format specification.
+- `tools/`: generators for checked-in source, such as the CRC-32C tables.
 - `third-party/`: vendored dependencies. Anything that reaches the core must stay compatible with microcontrollers.
 - `governance/`: governance-category definitions and schemas, for the first consumer. Still empty.
 - `datastore/`, `workspace/`, `lib/`, `release/`, `package/`: empty placeholders for sample databases, scratch work and distribution.

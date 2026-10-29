@@ -615,6 +615,11 @@ static cdb_status setup(cdb_index *ix, cdb_pager *p, const cdb_index_work *w)
     return CDB_OK;
 }
 
+size_t cdb_index_max_value(const cdb_pager *p)
+{
+    return max_item(capacity_of(p));
+}
+
 cdb_status cdb_index_create(cdb_index *ix, cdb_pager *p, uint64_t store_id, unsigned flags,
                             const cdb_index_work *w)
 {

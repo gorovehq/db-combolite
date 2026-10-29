@@ -76,6 +76,8 @@ cdb_status cdb_catalog_create_store_ex(cdb_catalog *cat, const char *name, size_
                                        const void *vector, size_t vector_len, uint64_t *id);
 /* The ID the next created store will get, for pages written before it. */
 uint64_t cdb_catalog_next_store_id(const cdb_catalog *cat);
+/* Replaces a vector collection's settings and commits immediately. */
+cdb_status cdb_catalog_set_vector(cdb_catalog *cat, uint64_t store_id, const void *settings, size_t len);
 /* Records a store's next entry ID without committing (like stage_pool). */
 cdb_status cdb_catalog_stage_next_entry(cdb_catalog *cat, uint64_t store_id, uint64_t next_entry_id);
 

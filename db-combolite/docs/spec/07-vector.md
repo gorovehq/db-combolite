@@ -60,6 +60,8 @@ There is no support for searching encrypted vectors without decrypting them.
 
 **Choosing the path.** By default an automatic rule picks between the two paths. For example, the exact path is used when the collection is small or when the requested measure diverges from the base measure; otherwise the approximate path is used. The operator can override the rule in configuration, and a query can override it for itself. When both overrides are set, the query's choice wins over the operator's.
 
+**Current rule (provisional).** The approximate path is taken only when the collection has a neighbour graph, the query uses the base measure, and the collection holds at least **10,000** live vectors; the operator can set another number. Any other measure takes the exact path. The number comes from the M13 benchmark (128-dimension f32 vectors, cosine, 4 KB pages, clustered data): exact search was faster at every size measured, up to 8,000 vectors.
+
 ## Open questions (do not specify until answered)
 
-1. **The automatic path rule (7.7).** The size threshold, and how to tell when a requested measure diverges from the base measure. *These will be set by benchmarking during development.*
+1. **The automatic path rule (7.7).** The provisional threshold is to be revisited with real embeddings and larger collections, along with how to tell when a requested measure is close enough to the base measure to use the graph.

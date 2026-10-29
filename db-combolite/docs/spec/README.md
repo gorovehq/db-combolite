@@ -12,7 +12,7 @@ This is a clean-room specification for a portable, serverless, multi-model embed
 | 4 | [Catalog](04-catalog.md) | 1, 2, 3 | — |
 | 5 | [Concurrency and coordination](05-concurrency.md) | 1, 3 | — |
 | 6 | [Keys and links](06-keys-links.md) | 1, 4 | how neuron weights are learned (decide by experiment during development) |
-| 7 | [Vector](07-vector.md) | 2, 4, 6 | thresholds for the automatic search-path rule (needs benchmarking) |
+| 7 | [Vector](07-vector.md) | 2, 4, 6 | automatic search-path rule: provisional threshold of 10,000 vectors, to revisit with real embeddings |
 | 8 | [Document](08-document.md) | 2, 4, 6, 7 | — |
 | 9 | [Relational](09-relational.md) | 2, 4, 6, 8 | — |
 | 10 | [Time series](10-time-series.md) | 2, 4, 5, 9 | — |

@@ -66,6 +66,8 @@ Neuron mapping is a **weighted graph of links between entries**, designed for ag
 - **K neighbours per entry.** Each entry stores rankings for K neighbours. K can be configured and has a sensible default.
 - **Crossing collections is optional.** Rankings can span more than one collection that shares an embedding space. This is a configuration option, so each user can keep rankings inside a single collection when their sensitivity requirements call for it.
 - **Refresh.** Rankings are refreshed both during reconciliation and in maintenance windows. Which one does the work at any given moment depends on the resources available.
+  - A commit only queues the entries whose rankings changed. Each reconciliation refreshes up to a budget of them (default 256, set by the operator), and a maintenance call can refresh any number (14.12.4).
+  - A lookup reports whether the entry's rankings are current or still queued.
 
 ### 6.9 Enforcing relationship cardinality is configurable
 

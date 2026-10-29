@@ -854,7 +854,7 @@ An ordered index maps each entry ID to *(block logical ID, slot)*.
 ### 14.12.3 Current layout of a vector collection
 
 - **Blocks.** Vector blocks are logical pages of type `0x0006`, written in the file's byte order. The vector count is the number of slots in the block. A slot whose entry ID is 0 is empty; a block never ends with an empty slot, and a block left with no vectors is released. The vector data starts at the first 16-byte boundary of the page after the entry IDs and norms. Norms are cached when the base measure is cosine.
-- **Settings.** An object in store record field 16, written when the collection is created and never changed:
+- **Settings.** An object in store record field 16, written when the collection is created:
 
   | Field | Value |
   |---|---|
@@ -864,6 +864,10 @@ An ordered index maps each entry ID to *(block logical ID, slot)*.
   | 4, 5 | embedding model name and version, strings of at most 64 bytes (Section 7.3) |
   | 6, 7, 8 | root page IDs of the entries, blocks and sources indexes |
   | 9 | bool: blocks cache norms |
+  | 10 | K, neighbours kept per entry (1–64), present once a neighbour graph exists (14.12.4) |
+  | 11, 12, 13 | root page IDs of the graph, reverse and pending indexes (14.12.4) |
+
+  Fields 10–13 are added when the graph is created; the rest never change.
 
 - **Indexes.**
 
@@ -890,7 +894,29 @@ One record per entry:
 | 1 | Version of the base measure |
 | per neighbour | Neighbour reference (store ID only when cross-collection, then entry ID) and distance (f32) |
 
-**Entry points.** Approximate search begins from a small set of **entry points** chosen to cover the collection, for example the medoid and a few well-spread entries. They are stored in the collection's catalog entry. A plain nearest-neighbour graph doesn't always lead the search everywhere, and starting from points that cover the collection solves this.
+**Entry points.** Approximate search begins from a set of **entry points** chosen to cover the collection. A graph of exact nearest neighbours doesn't always lead the search everywhere: on clustered data it falls apart into one piece per cluster, with no links between them. Starting from points that cover the collection solves this. They are stored with the graph (14.12.4).
+
+### 14.12.4 Current layout of the neighbour graph
+
+- **Creation.** A collection gets a graph by an explicit call that names K (default 16, at most 64; a record of K neighbours must fit one index value). Every vector already there is queued. Settings fields 10–13 (14.12.3) record it.
+- **Indexes.**
+
+  | Index | Key (big-endian) | Value |
+  |---|---|---|
+  | graph | entry ID | record: entry ID (8) · neighbour count (2) · flags (1, 0: no cross-collection neighbours yet) · measure version (1, currently 1) · per neighbour: entry ID (8) · distance (f32 bits, 4) |
+  | graph | 0 | live vector count (8) |
+  | reverse | neighbour ID · entry ID | empty: *entry* lists *neighbour* |
+  | reverse | 0 · entry ID | kind (1): *entry* is an entry point, 1 spread or 2 reach |
+  | pending | entry ID | empty: the entry's list must be worked out again |
+
+  All values are big-endian. A list holds the entry's K nearest other vectors under the base measure, ordered by distance and then entry ID: it is exact once the entry is no longer pending. Entry ID 0 is never used, so the rows under 0 can't be mistaken for an entry's.
+- **Commits only queue work.** An insert adds the entry to *pending*. A replace takes the entry out of the graph (its record, its reverse rows, and itself from every list that holds it) and queues it, and every entry that listed it. A delete does the same without queuing the entry itself, and drops its entry-point row. The live count follows inserts and deletes.
+- **Refresh** (Section 6.8). Pending entries are refreshed in batches that fit the caller's working memory. A batch reads every vector once: it builds each batch entry's list exactly, and offers each batch vector to the lists of the other entries, which keep their K nearest. Reconciliation refreshes up to a budget of entries (default 256); a maintenance call refreshes any number. Refresh writes only pages, inside the reconciliation or a commit of its own.
+- **Entry points** are of two kinds, and both are reviewed after every refresh. A query measures every entry point.
+  - **Spread** (kind 1) are chosen again each time. There are about √live of them, at least 8, at most 1024 and no more than the working memory holds. One pass over the blocks keeps each vector farther than a radius r from those already chosen, under Euclidean distance (Hamming for binary vectors); when too many are chosen, r grows to the distance of the closest pair of those chosen, and they are thinned to points farther than r apart. Only spread rows are added or removed by this choice.
+  - **Reach** (kind 2) cover the pieces the spread points miss: an exact neighbour graph can fall apart into more pieces than there are spread points. A refresh checks the entries it touched: each refreshed entry, each entry it dropped from a list or from a list it rewrote, and every reach entry point. A check walks from the other entry points with the entry's own vector and stops once a list leads to it. An entry the walk doesn't reach becomes a reach entry point; a reach entry point the walk does reach stops being one. Pending entries are not checked, since searches measure them directly. When the entries to check don't fit the working memory, every entry with a list and every entry point is checked.
+- **Approximate search** (Section 7.4). A best-first walk under the base measure starts from the nearest entry points and keeps the *ef* best vectors found (default 64, at least the number asked for). Pending vectors are not in the graph, so each one is measured directly. What was found is ranked with the requested measure.
+- **Neighbour lookup.** Returns an entry's stored list, and whether it is current (the entry is not pending).
 
 ---
 

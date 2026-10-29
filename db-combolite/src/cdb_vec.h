@@ -21,7 +21,21 @@
  * built-in apply, which never fails for logical reasons. Search is exact:
  * every vector is compared with the query (spec 7.4).
  *
- * Buffers: cdb_db_config.vec_buffers holds three page_size buffers. */
+ * Neighbour graph (spec 6.4, 6.8, 7.4): optional, added with
+ * cdb_vec_create_graph. Each entry's record lists its K nearest neighbours
+ * under the base measure, nearest first (spec 14.12.4):
+ *   graph:   entry ID -> record; 0 -> live count
+ *   reverse: (neighbour, entry) -> nothing: entry lists neighbour;
+ *            (0, entry) -> nothing: entry is an entry point
+ *   pending: entry ID -> nothing: its list needs work
+ * A commit only queues work: changed entries become pending, and a deleted
+ * or replaced vector is removed from every list that held it, queuing those
+ * entries too. Reconciliation refreshes up to vec_refresh_budget pending
+ * entries per collection; cdb_vec_refresh does the rest. A fresh list is
+ * exact: the K nearest live vectors, ties to the lower entry ID.
+ *
+ * Buffers: cdb_db_config.vec_buffers holds three page_size buffers. A
+ * collection with a graph also needs vec_work (cdb_vec_work_size). */
 #ifndef CDB_VEC_H
 #define CDB_VEC_H
 
@@ -37,6 +51,14 @@
 
 #define CDB_VEC_MODEL_MAX 64u
 #define CDB_VEC_MAX_DIMS 65535u
+#define CDB_VEC_MAX_K 64u
+#define CDB_VEC_DEFAULT_K 16u
+
+/* Search paths (spec 7.7). AUTO: exact below vec_exact_below vectors, for
+ * a measure other than the base one, or without a graph; else approximate. */
+#define CDB_VEC_AUTO 0u
+#define CDB_VEC_EXACT 1u
+#define CDB_VEC_APPROX 2u
 
 typedef struct cdb_vec_config {
     cdb_vector_elem elem;
@@ -94,6 +116,32 @@ cdb_status cdb_vec_by_source(cdb_db *db, uint64_t store, uint64_t source_store, 
  * collection's base measure. */
 cdb_status cdb_vec_search(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
                           cdb_vec_hit *hits, size_t k, size_t *n);
+
+/* As cdb_vec_search, choosing the path: CDB_VEC_AUTO defers to the
+ * operator's vec_mode, then to the automatic rule. APPROX without a graph
+ * searches exactly. The approximate path walks the graph from its entry
+ * points under the base measure, adds pending vectors exactly, and ranks
+ * what it found with the requested measure. */
+cdb_status cdb_vec_search_mode(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
+                               unsigned mode, cdb_vec_hit *hits, size_t k, size_t *n);
+
+/* Adds a neighbour graph with k neighbours per entry (0: 16) and queues
+ * every vector; commits immediately. CDB_E_EXISTS if there is one,
+ * CDB_E_OVERFLOW if a record of k neighbours does not fit an index value. */
+cdb_status cdb_vec_create_graph(cdb_db *db, uint64_t store, uint32_t k);
+
+/* Refreshes up to budget pending entries (0: all) and commits. *remaining
+ * (if not NULL) is how many stay pending. Not inside a transaction. */
+cdb_status cdb_vec_refresh(cdb_db *db, uint64_t store, size_t budget, size_t *remaining);
+
+/* The stored ranking of an entry (spec 6.4): its neighbours, nearest
+ * first. *fresh is 0 while the entry is pending (its list may be empty or
+ * incomplete). CDB_E_NOT_FOUND for an entry that does not exist. */
+cdb_status cdb_vec_neighbours(cdb_db *db, uint64_t store, uint64_t entry, cdb_vec_hit *hits, size_t max,
+                              size_t *n, int *fresh);
+
+/* Bytes of vec_work a collection with this shape and k needs. */
+size_t cdb_vec_work_size(cdb_vector_elem elem, uint32_t dims, uint32_t k);
 
 /* Engine hooks used by the built-in apply and reconciliation. *handled is
  * 0 when the store is not a vector collection. */

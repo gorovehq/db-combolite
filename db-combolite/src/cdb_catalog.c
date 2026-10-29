@@ -577,6 +577,24 @@ cdb_status cdb_catalog_stage_next_entry(cdb_catalog *cat, uint64_t store_id, uin
     return CDB_OK;
 }
 
+cdb_status cdb_catalog_set_vector(cdb_catalog *cat, uint64_t store_id, const void *settings, size_t len)
+{
+    cdb_store_info info;
+    uint8_t ref[REF_SIZE];
+    cdb_status s;
+    if (settings == NULL || len == 0 || len > CDB_CATALOG_SETTINGS_MAX)
+        return CDB_E_INVALID_ARG;
+    if ((s = load_store(cat, store_id, &info, ref)) != CDB_OK)
+        return s;
+    if (info.flags & CDB_STORE_DROPPED)
+        return CDB_E_NOT_FOUND;
+    memcpy(info.vector, settings, len);
+    info.vector_len = len;
+    if ((s = save_store(cat, &info, ref, 0)) != CDB_OK)
+        return s;
+    return finish(cat, cat->pager->catroot.next_object_id);
+}
+
 cdb_status cdb_catalog_set_full_text(cdb_catalog *cat, uint64_t store_id, const void *settings, size_t len)
 {
     cdb_store_info info;
