@@ -46,6 +46,7 @@ static cdb_status log_write(cdb_faultdev *d, uint64_t offset, const void *data, 
     r->offset = offset;
     r->len = len;
     r->is_erase = is_erase;
+    r->is_truncate = 0;
     r->data_off = d->log_data_len;
     if (!is_erase) {
         memcpy(d->cfg.log_data + d->log_data_len, data, len);
@@ -142,13 +143,33 @@ static cdb_status fd_size(void *ctx, uint64_t *out)
     return CDB_OK;
 }
 
+static cdb_status fd_truncate(void *ctx, uint64_t size)
+{
+    cdb_faultdev *d = (cdb_faultdev *)ctx;
+    cdb_status s;
+    if (is_crashed(d))
+        return CDB_E_IO;
+    if (size > d->cfg.capacity)
+        return CDB_E_INVALID_ARG;
+    if ((s = log_write(d, size, NULL, 0, 1)) != CDB_OK)
+        return s;
+    d->cfg.log[d->log_len - 1].is_erase = 0;
+    d->cfg.log[d->log_len - 1].is_truncate = 1;
+    if (count_op(d))
+        return CDB_E_IO;
+    if (size < d->current_size)
+        memset(d->cfg.current + size, 0xFF, (size_t)(d->current_size - size));
+    d->current_size = size;
+    return CDB_OK;
+}
+
 static void fd_close(void *ctx)
 {
     (void)ctx;
 }
 
 static const cdb_storage_ops faultdev_ops = {
-    fd_read, fd_program, fd_erase, fd_sync, fd_geometry, fd_size, fd_close
+    fd_read, fd_program, fd_erase, fd_sync, fd_geometry, fd_size, fd_close, fd_truncate
 };
 
 cdb_status cdb_faultdev_init(cdb_faultdev *dev, const cdb_faultdev_config *cfg, cdb_storage *out)
@@ -192,7 +213,11 @@ void cdb_faultdev_crash_now(cdb_faultdev *dev, cdb_crash_mode mode,
 
 static void apply_record(cdb_faultdev *d, const cdb_fault_record *r, size_t len)
 {
-    if (r->is_erase) {
+    if (r->is_truncate) {
+        if (r->offset < d->durable_size)
+            memset(d->cfg.durable + r->offset, 0xFF, (size_t)(d->durable_size - r->offset));
+        d->durable_size = r->offset;
+    } else if (r->is_erase) {
         memset(d->cfg.durable + r->offset, 0xFF, len);
     } else {
         memcpy(d->cfg.durable + r->offset, d->cfg.log_data + r->data_off, len);

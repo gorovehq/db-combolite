@@ -45,6 +45,7 @@ typedef struct cdb_fault_record {
     size_t len;
     size_t data_off; /* into the log data buffer; unused for erases */
     int is_erase;
+    int is_truncate; /* offset holds the new size */
 } cdb_fault_record;
 
 typedef struct cdb_faultdev_config {

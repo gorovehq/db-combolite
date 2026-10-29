@@ -31,6 +31,9 @@ typedef struct cdb_storage_ops {
     /* Current size in bytes: the end of the furthest byte ever written. */
     cdb_status (*size)(void *ctx, uint64_t *out);
     void (*close)(void *ctx);
+    /* Optional: shrinks the medium to size bytes; durable after the next sync.
+     * NULL on media that cannot shrink (raw flash partitions). */
+    cdb_status (*truncate)(void *ctx, uint64_t size);
 } cdb_storage_ops;
 
 typedef struct cdb_storage {
@@ -66,6 +69,11 @@ static inline cdb_status cdb_storage_geometry_of(const cdb_storage *s, cdb_stora
 static inline cdb_status cdb_storage_size(const cdb_storage *s, uint64_t *out)
 {
     return s->ops->size(s->ctx, out);
+}
+
+static inline cdb_status cdb_storage_truncate(const cdb_storage *s, uint64_t size)
+{
+    return s->ops->truncate ? s->ops->truncate(s->ctx, size) : CDB_E_UNSUPPORTED;
 }
 
 static inline void cdb_storage_close(const cdb_storage *s)

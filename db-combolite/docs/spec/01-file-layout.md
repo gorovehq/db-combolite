@@ -147,7 +147,8 @@ The library reaches storage only through a small backend interface:
 - program (write) a page;
 - erase a block;
 - sync;
-- report geometry: erase-block size, smallest programmable unit and total size.
+- report geometry: erase-block size, smallest programmable unit and total size;
+- truncate. This operation is optional. A backend that cannot shrink its medium leaves it unset; raw flash is an example.
 
 Two backends ship with the library:
 

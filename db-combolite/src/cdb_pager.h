@@ -24,6 +24,9 @@
 #define CDB_ANCHOR_RESERVED 2u
 #define CDB_ANCHOR_RELEASED 3u
 
+/* Most pages one free-space chain may use; a longer list needs compaction. */
+#define CDB_PAGER_CHAIN_MAX 128u
+
 /* Page sequence numbers are reserved durably in blocks of this size (spec 12.1). */
 #define CDB_SEQ_RESERVE_BLOCK 1024u
 
@@ -56,7 +59,7 @@ typedef struct cdb_pager_node {
 } cdb_pager_node;
 
 typedef struct cdb_pager_config {
-    uint8_t *arena;              /* 2 * page_size bytes per node, plus one scratch page */
+    uint8_t *arena;              /* 2 * page_size bytes per node, plus two scratch pages */
     size_t arena_size;
     cdb_pager_node *nodes;
     size_t node_cap;
@@ -70,6 +73,8 @@ typedef struct cdb_pager {
     cdb_pager_config cfg;
     size_t node_count;
     uint8_t *scratch;
+    uint8_t *page2;       /* second scratch page, used by compaction */
+    uint64_t chain_pages[2 * CDB_PAGER_CHAIN_MAX];
     size_t page_size;
     cdb_page_format fmt;
     cdb_byte_order order;
@@ -119,5 +124,23 @@ cdb_status cdb_pager_lookup(cdb_pager *p, uint64_t lid, cdb_anchor_entry *e);
 
 /* Commits every change since the last commit (spec 3.2 steps 1, 2 and 4). */
 cdb_status cdb_pager_commit(cdb_pager *p);
+
+/* Space reuse and compaction (spec 1.3, 3.4, 3.7).
+ *
+ * A freed page is reused only once its freeing commit is older than the
+ * latest commit: the other header slot may still hold the previous state,
+ * which can reference pages the latest commit freed. New writes always take
+ * the lowest reusable page before growing the file. */
+
+/* Releases the free tail of the file: lowers the append point past every
+ * reusable extent that reaches it, commits, then truncates the storage. Also
+ * trims pages a crash left past the append point. Requires no uncommitted
+ * changes. *reclaimed is the number of pages released. */
+cdb_status cdb_pager_reclaim_tail(cdb_pager *p, uint64_t *reclaimed);
+
+/* Makes all freed space reusable (with a fence commit if needed), moves up to
+ * max_moves live pages down into reusable holes, commits twice (so the
+ * vacated pages become reusable), then reclaims the tail. */
+cdb_status cdb_pager_compact(cdb_pager *p, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed);
 
 #endif

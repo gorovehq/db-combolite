@@ -18,7 +18,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M3 | File header (spec 1.9, 14.1) | done |
 | M4 | Pages, anchor map, free-space list (spec 13, 14.2, 14.7) | done |
 | M5 | Delta tracks, transactions, reconciliation, recovery; the crash-point matrix becomes the main test suite (spec 3, 14.4) | done (single process) |
-| M6 | Catalog (spec 4, 14.3) | |
+| M6 | Space reuse and compaction (spec 1.3, 3.4, 3.7) | done |
+| M7 | Catalog (spec 4, 14.3) | next |
 
 ## Commands
 

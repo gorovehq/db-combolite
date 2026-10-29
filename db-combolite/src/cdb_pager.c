@@ -97,18 +97,44 @@ static cdb_status next_seq(cdb_pager *p, uint64_t *seq)
     return CDB_OK;
 }
 
-/* Seals the image in buf and appends it at the append point. */
-static cdb_status append_page(cdb_pager *p, uint8_t *buf, cdb_page_header *h, uint64_t *phys)
+/* Physical page for a new write: the lowest free page whose freeing commit is
+ * older than the latest commit, else the append point. Pages freed by the
+ * latest commit stay untouched: the previous header slot's state may still
+ * reference them (spec 1.9, 3.5). */
+static uint64_t alloc_phys(cdb_pager *p)
+{
+    uint64_t committed = p->hs.record.committed_seq;
+    size_t i;
+    for (i = 0; i < p->free_len; i++) {
+        cdb_free_extent *x = &p->cfg.free_list[i];
+        if (x->freed_seq < committed) {
+            uint64_t phys = x->start;
+            x->start++;
+            if (--x->len == 0) {
+                memmove(x, x + 1, (p->free_len - i - 1) * sizeof *x);
+                p->free_len--;
+            }
+            return phys;
+        }
+    }
+    return p->append_point++;
+}
+
+/* Seals the image in buf with a fresh sequence number and writes it at phys. */
+static cdb_status write_page_at(cdb_pager *p, uint8_t *buf, cdb_page_header *h, uint64_t phys)
 {
     cdb_status s;
     if ((s = next_seq(p, &h->write_seq)) != CDB_OK)
         return s;
     if ((s = cdb_page_seal(buf, p->page_size, p->fmt, p->order, p->checksum_alg, h)) != CDB_OK)
         return s;
-    if ((s = cdb_storage_program(&p->st, phys_offset(p, p->append_point), buf, p->page_size)) != CDB_OK)
-        return s;
-    *phys = p->append_point++;
-    return CDB_OK;
+    return cdb_storage_program(&p->st, phys_offset(p, phys), buf, p->page_size);
+}
+
+static cdb_status append_page(cdb_pager *p, uint8_t *buf, cdb_page_header *h, uint64_t *phys)
+{
+    *phys = alloc_phys(p);
+    return write_page_at(p, buf, h, *phys);
 }
 
 static cdb_status read_page(cdb_pager *p, uint64_t phys, uint8_t *buf, uint16_t type, cdb_page_header *h)
@@ -125,24 +151,64 @@ static cdb_status read_page(cdb_pager *p, uint64_t phys, uint8_t *buf, uint16_t 
 
 /* -------------------------------------------------------- free list */
 
+/* Records [start, start+len) as freed by the next commit. The list stays
+ * sorted by start. Touching extents merge only when they were freed by the
+ * same commit, so no page is ever held back longer than its own freeing
+ * commit requires. */
 static cdb_status free_push(cdb_pager *p, uint64_t start, uint64_t len)
 {
     uint64_t freed = p->hs.record.committed_seq + 1;
-    cdb_free_extent *last = p->free_len ? &p->cfg.free_list[p->free_len - 1] : NULL;
+    cdb_free_extent *list = p->cfg.free_list;
+    size_t i = 0;
 
     if (start == 0 || len == 0)
         return CDB_OK;
-    if (last && last->freed_seq == freed && last->start + last->len == start) {
-        last->len += len;
+    while (i < p->free_len && list[i].start < start)
+        i++;
+    if ((i > 0 && list[i - 1].start + list[i - 1].len > start)
+        || (i < p->free_len && start + len > list[i].start))
+        return CDB_E_CORRUPT; /* freeing space that is already free */
+    if (i > 0 && list[i - 1].freed_seq == freed && list[i - 1].start + list[i - 1].len == start) {
+        list[i - 1].len += len;
+        if (i < p->free_len && list[i].freed_seq == freed && list[i - 1].start + list[i - 1].len == list[i].start) {
+            list[i - 1].len += list[i].len;
+            memmove(&list[i], &list[i + 1], (p->free_len - i - 1) * sizeof *list);
+            p->free_len--;
+        }
+        return CDB_OK;
+    }
+    if (i < p->free_len && list[i].freed_seq == freed && start + len == list[i].start) {
+        list[i].start = start;
+        list[i].len += len;
         return CDB_OK;
     }
     if (p->free_len >= p->cfg.free_cap)
         return CDB_E_BUFFER_TOO_SMALL;
-    p->cfg.free_list[p->free_len].start = start;
-    p->cfg.free_list[p->free_len].len = len;
-    p->cfg.free_list[p->free_len].freed_seq = freed;
+    memmove(&list[i + 1], &list[i], (p->free_len - i) * sizeof *list);
+    list[i].start = start;
+    list[i].len = len;
+    list[i].freed_seq = freed;
     p->free_len++;
     return CDB_OK;
+}
+
+/* Extents freed before the latest commit are reusable for good: mark them 0
+ * ("reusable") and merge touching extents that share a sequence. */
+static void free_normalize(cdb_pager *p)
+{
+    cdb_free_extent *list = p->cfg.free_list;
+    size_t i, out = 0;
+    for (i = 0; i < p->free_len; i++) {
+        cdb_free_extent x = list[i];
+        if (x.freed_seq < p->hs.record.committed_seq)
+            x.freed_seq = 0;
+        if (out > 0 && list[out - 1].freed_seq == x.freed_seq
+            && list[out - 1].start + list[out - 1].len == x.start)
+            list[out - 1].len += x.len;
+        else
+            list[out++] = x;
+    }
+    p->free_len = out;
 }
 
 static size_t free_entry_size(const cdb_pager *p)
@@ -208,40 +274,52 @@ static cdb_status free_old_chain(cdb_pager *p, uint64_t root)
     return CDB_OK;
 }
 
-/* Writes the whole list as a new chain, tail first, so each page knows its
- * successor. Returns the head page, or 0 for an empty list. */
-static cdb_status write_free_chain(cdb_pager *p, uint64_t *root)
+/* Writes the list as two chains, primary and mirror. All chain pages are
+ * allocated first; taking them can only shorten the list, so it then fits.
+ * Spare pages are written as empty links and freed by the next commit. */
+static cdb_status write_free_chains(cdb_pager *p)
 {
     size_t per = free_per_page(p);
-    size_t pages = (p->free_len + per - 1) / per;
-    uint64_t next = 0;
-    size_t pg;
+    size_t n = (p->free_len + per - 1) / per;
+    size_t copy, i;
 
-    for (pg = pages; pg-- > 0;) {
-        size_t first = pg * per;
-        size_t count = p->free_len - first < per ? p->free_len - first : per;
-        uint8_t *pl = p->scratch + payload_off(p);
-        cdb_page_header h;
-        size_t i;
-        cdb_status s;
+    if (n > CDB_PAGER_CHAIN_MAX)
+        return CDB_E_BUFFER_TOO_SMALL; /* compact to shorten the list */
+    for (i = 0; i < 2 * n; i++)
+        p->chain_pages[i] = alloc_phys(p);
+    p->free_root = 0;
+    p->free_mirror = 0;
+    for (copy = 0; copy < 2 && n > 0; copy++) {
+        const uint64_t *pages = p->chain_pages + copy * n;
+        for (i = 0; i < n; i++) {
+            size_t first = i * per;
+            size_t count = first >= p->free_len ? 0 : (p->free_len - first < per ? p->free_len - first : per);
+            uint8_t *pl = p->scratch + payload_off(p);
+            cdb_page_header h;
+            size_t k;
+            cdb_status s;
 
-        memset(p->scratch, 0, p->page_size);
-        cdb_store_u32(pl, (uint32_t)count, p->order);
-        cdb_store_u64(pl + 8, next, p->order);
-        for (i = 0; i < count; i++) {
-            const cdb_free_extent *x = &p->cfg.free_list[first + i];
-            uint8_t *e = pl + FREE_HDR + i * free_entry_size(p);
-            store_addr(p, e, x->start);
-            store_addr(p, e + p->addr_width, x->len);
-            cdb_store_u64(e + 2u * p->addr_width, x->freed_seq, p->order);
+            memset(p->scratch, 0, p->page_size);
+            cdb_store_u32(pl, (uint32_t)count, p->order);
+            cdb_store_u64(pl + 8, i + 1 < n ? pages[i + 1] : 0, p->order);
+            for (k = 0; k < count; k++) {
+                const cdb_free_extent *x = &p->cfg.free_list[first + k];
+                uint8_t *e = pl + FREE_HDR + k * free_entry_size(p);
+                store_addr(p, e, x->start);
+                store_addr(p, e + p->addr_width, x->len);
+                cdb_store_u64(e + 2u * p->addr_width, x->freed_seq, p->order);
+            }
+            memset(&h, 0, sizeof h);
+            h.type = CDB_PAGE_TYPE_FREE_SPACE;
+            h.payload_len = (uint32_t)cdb_page_capacity(p->fmt, p->page_size);
+            if ((s = write_page_at(p, p->scratch, &h, pages[i])) != CDB_OK)
+                return s;
         }
-        memset(&h, 0, sizeof h);
-        h.type = CDB_PAGE_TYPE_FREE_SPACE;
-        h.payload_len = (uint32_t)cdb_page_capacity(p->fmt, p->page_size);
-        if ((s = append_page(p, p->scratch, &h, &next)) != CDB_OK)
-            return s;
+        if (copy == 0)
+            p->free_root = pages[0];
+        else
+            p->free_mirror = pages[0];
     }
-    *root = next;
     return CDB_OK;
 }
 
@@ -516,9 +594,10 @@ static cdb_status setup(cdb_pager *p, const cdb_storage *st, const cdb_pager_con
     p->data_start = round_up(loc0 + LOCATION0_SLOTS_BYTES, p->page_size) / p->page_size;
 
     per_node = 2u * p->page_size;
-    if (cfg->arena == NULL || cfg->nodes == NULL || cfg->free_list == NULL || cfg->arena_size < per_node)
+    if (cfg->arena == NULL || cfg->nodes == NULL || cfg->free_list == NULL
+        || cfg->arena_size < per_node + 2u * p->page_size)
         return CDB_E_INVALID_ARG;
-    p->node_count = (cfg->arena_size - p->page_size) / per_node;
+    p->node_count = (cfg->arena_size - 2u * p->page_size) / per_node;
     if (p->node_count > cfg->node_cap)
         p->node_count = cfg->node_cap;
     if (p->node_count < MAX_DEPTH + 2u)
@@ -532,6 +611,7 @@ static cdb_status setup(cdb_pager *p, const cdb_storage *st, const cdb_pager_con
         }
     }
     p->scratch = cfg->arena + p->node_count * per_node;
+    p->page2 = p->scratch + p->page_size;
     return CDB_OK;
 }
 
@@ -720,12 +800,12 @@ cdb_status cdb_pager_lookup(cdb_pager *p, uint64_t lid, cdb_anchor_entry *out)
     return entry_get(p, lid, &leaf, &slot, out);
 }
 
-/* Writes one dirty node: both copies, then points its parent at them. */
-static cdb_status flush_node(cdb_pager *p, cdb_pager_node *n)
+/* Writes one dirty node's two copies at the given pages, then points its
+ * parent at them. */
+static cdb_status flush_node(cdb_pager *p, cdb_pager_node *n, uint64_t new_p, uint64_t new_m)
 {
     int root = node_is_root(p, n->level, n->number);
     cdb_page_header h;
-    uint64_t new_p, new_m;
     cdb_status s;
 
     if (root) {
@@ -744,9 +824,9 @@ static cdb_status flush_node(cdb_pager *p, cdb_pager_node *n)
     memset(&h, 0, sizeof h);
     h.type = CDB_PAGE_TYPE_ANCHOR_MAP;
     h.payload_len = (uint32_t)cdb_page_capacity(p->fmt, p->page_size);
-    if ((s = append_page(p, n->primary, &h, &new_p)) != CDB_OK)
+    if ((s = write_page_at(p, n->primary, &h, new_p)) != CDB_OK)
         return s;
-    if ((s = append_page(p, n->mirror, &h, &new_m)) != CDB_OK)
+    if ((s = write_page_at(p, n->mirror, &h, new_m)) != CDB_OK)
         return s;
     n->phys_primary = new_p;
     n->phys_mirror = new_m;
@@ -770,6 +850,8 @@ static cdb_status flush_node(cdb_pager *p, cdb_pager_node *n)
 
 cdb_status cdb_pager_commit(cdb_pager *p)
 {
+    cdb_pager_node *root;
+    uint64_t root_p, root_m;
     cdb_header rec;
     unsigned level;
     size_t i;
@@ -783,6 +865,13 @@ cdb_status cdb_pager_commit(cdb_pager *p)
     /* Step 1 barrier: data pages written since the last commit are durable. */
     if ((s = cdb_storage_sync(&p->st)) != CDB_OK)
         return s;
+
+    free_normalize(p);
+
+    /* Every commit rewrites the root, since the root records the chains. */
+    if ((s = get_node(p, p->depth - 1, 0, &root)) != CDB_OK)
+        return s;
+    root->dirty = 1;
 
     /* Everything this commit replaces becomes free: the previous free-space
      * chains and the old copies of every node about to be rewritten. */
@@ -799,20 +888,26 @@ cdb_status cdb_pager_commit(cdb_pager *p)
                 return s;
         }
     }
-    if ((s = write_free_chain(p, &p->free_root)) != CDB_OK)
-        return s;
-    if ((s = write_free_chain(p, &p->free_mirror)) != CDB_OK)
-        return s;
 
-    /* Step 2: the anchor map, bottom up, so parents learn their children's
-     * new locations. The root is written last. */
-    for (level = 0; level < p->depth; level++) {
+    /* Step 2: the anchor map from the leaves up. The root's pages and the
+     * chains are allocated last, so the chains record the final list. */
+    for (level = 0; level + 1 < p->depth; level++) {
         for (i = 0; i < p->node_count; i++) {
             cdb_pager_node *n = &p->cfg.nodes[i];
-            if (n->in_use && n->dirty && n->level == level && (s = flush_node(p, n)) != CDB_OK)
-                return s;
+            if (n->in_use && n->dirty && n->level == level) {
+                uint64_t np = alloc_phys(p), nm = alloc_phys(p);
+                if ((s = flush_node(p, n, np, nm)) != CDB_OK)
+                    return s;
+            }
         }
     }
+    root_p = alloc_phys(p);
+    root_m = alloc_phys(p);
+    free_normalize(p);
+    if ((s = write_free_chains(p)) != CDB_OK)
+        return s;
+    if ((s = flush_node(p, root, root_p, root_m)) != CDB_OK)
+        return s;
     if ((s = cdb_storage_sync(&p->st)) != CDB_OK)
         return s;
 
@@ -826,4 +921,166 @@ cdb_status cdb_pager_commit(cdb_pager *p)
         return s;
     p->dirty = 0;
     return CDB_OK;
+}
+
+/* -------------------------------------------------------- compaction */
+
+/* Lowest page that may be reused now, or 0 if none. */
+static uint64_t lowest_reusable(const cdb_pager *p)
+{
+    size_t i;
+    for (i = 0; i < p->free_len; i++)
+        if (p->cfg.free_list[i].freed_seq < p->hs.record.committed_seq)
+            return p->cfg.free_list[i].start;
+    return 0;
+}
+
+cdb_status cdb_pager_reclaim_tail(cdb_pager *p, uint64_t *reclaimed)
+{
+    uint64_t committed = p->hs.record.committed_seq;
+    uint64_t end = p->append_point, size;
+    cdb_status s;
+
+    *reclaimed = 0;
+    if (p->read_only)
+        return CDB_E_READ_ONLY;
+    if (p->dirty)
+        return CDB_E_STATE; /* commit first */
+    /* The free tail: extents that reach the append point and may be reused. */
+    while (p->free_len > 0) {
+        cdb_free_extent *last = &p->cfg.free_list[p->free_len - 1];
+        if (last->start + last->len != end || last->freed_seq >= committed)
+            break;
+        end = last->start;
+        p->free_len--;
+    }
+    if (end < p->append_point) {
+        *reclaimed = p->append_point - end;
+        p->append_point = end;
+        p->dirty = 1;
+        if ((s = cdb_pager_commit(p)) != CDB_OK)
+            return s;
+    }
+    /* Neither header slot's state references anything past the append point,
+     * including pages a crash left behind (spec 3.7). */
+    if ((s = cdb_storage_size(&p->st, &size)) != CDB_OK)
+        return s;
+    if (size > phys_offset(p, p->append_point)) {
+        s = cdb_storage_truncate(&p->st, phys_offset(p, p->append_point));
+        if (s == CDB_E_UNSUPPORTED)
+            return CDB_OK; /* this medium keeps its size */
+        if (s != CDB_OK)
+            return s;
+        return cdb_storage_sync(&p->st);
+    }
+    return CDB_OK;
+}
+
+static size_t dirty_nodes(const cdb_pager *p)
+{
+    size_t i, n = 0;
+    for (i = 0; i < p->node_count; i++)
+        if (p->cfg.nodes[i].in_use && p->cfg.nodes[i].dirty)
+            n++;
+    return n;
+}
+
+/* Marks every anchor-map node with a copy at or beyond target dirty, so the
+ * next commit rewrites it into lower space. Commits along the way whenever
+ * the node cache is nearly full of dirty nodes. */
+static cdb_status relocate_nodes(cdb_pager *p, uint64_t target, uint64_t max_moves, uint64_t *moved)
+{
+    uint64_t count = p->depth == 1 ? 1 : (p->next_lid + p->leaf_fan - 1) / p->leaf_fan;
+    unsigned level;
+    cdb_status s;
+
+    for (level = 0; level + 1 < p->depth; level++) {
+        uint64_t number;
+        for (number = 0; number < count && *moved < max_moves; number++) {
+            cdb_pager_node *n;
+            if ((s = get_node(p, level, number, &n)) != CDB_OK)
+                return s;
+            if (n->dirty || (n->phys_primary < target && n->phys_mirror < target))
+                continue;
+            if (n->phys_primary == 0 && n->phys_mirror == 0)
+                continue; /* never written: nothing to move */
+            if ((s = mark_dirty(p, n)) != CDB_OK)
+                return s;
+            (*moved)++;
+            if (dirty_nodes(p) + p->depth + 2u >= p->node_count && (s = cdb_pager_commit(p)) != CDB_OK)
+                return s;
+        }
+        count = (count + p->inner_fan - 1) / p->inner_fan;
+    }
+    return CDB_OK;
+}
+
+cdb_status cdb_pager_compact(cdb_pager *p, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed)
+{
+    uint64_t lid, target;
+    cdb_status s;
+
+    *moved = 0;
+    *reclaimed = 0;
+    if (p->read_only)
+        return CDB_E_READ_ONLY;
+    if (p->dirty)
+        return CDB_E_STATE; /* commit first */
+
+    /* Space freed by the latest commit is not reusable yet. A fence commit
+     * makes everything freed so far eligible. */
+    {
+        size_t i;
+        for (i = 0; i < p->free_len; i++) {
+            if (p->cfg.free_list[i].freed_seq >= p->hs.record.committed_seq) {
+                p->dirty = 1;
+                if ((s = cdb_pager_commit(p)) != CDB_OK)
+                    return s;
+                break;
+            }
+        }
+    }
+
+    /* The file could end at `target` if every reusable page were filled.
+     * Copy live pages at or beyond it down into holes below it
+     * (spec 3.4 step 1). Pages already below it stay where they are, so
+     * compacting a compact file moves nothing. */
+    {
+        uint64_t reusable = 0;
+        size_t i;
+        for (i = 0; i < p->free_len; i++)
+            if (p->cfg.free_list[i].freed_seq < p->hs.record.committed_seq)
+                reusable += p->cfg.free_list[i].len;
+        target = p->append_point - reusable;
+    }
+    for (lid = 1; lid < p->next_lid && *moved < max_moves; lid++) {
+        cdb_anchor_entry e;
+        cdb_page_header h;
+        uint64_t hole = lowest_reusable(p);
+        if (hole == 0 || hole >= target)
+            break;
+        if ((s = cdb_pager_lookup(p, lid, &e)) != CDB_OK)
+            return s;
+        if (e.state != CDB_ANCHOR_LIVE || e.phys < target)
+            continue;
+        if ((s = cdb_pager_read(p, lid, p->page2, &h)) != CDB_OK)
+            return s;
+        if ((s = cdb_pager_write(p, lid, &h, p->page2 + payload_off(p), h.payload_len)) != CDB_OK)
+            return s;
+        (*moved)++;
+    }
+    if ((s = relocate_nodes(p, target, max_moves, moved)) != CDB_OK)
+        return s;
+    if (*moved > 0) {
+        /* Steps 2 and 3: the anchors and the header. The old copies are freed
+         * by this commit, so they become reusable one commit later. */
+        p->dirty = 1;
+        if ((s = cdb_pager_commit(p)) != CDB_OK)
+            return s;
+        p->dirty = 1;
+        if ((s = cdb_pager_commit(p)) != CDB_OK)
+            return s;
+    }
+    /* Step 4: release the freed tail. */
+    return cdb_pager_reclaim_tail(p, reclaimed);
 }
