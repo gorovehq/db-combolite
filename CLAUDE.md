@@ -14,8 +14,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 |---|---|---|
 | M0 | Build skeleton, warnings, sanitizers, test runner | done |
 | M1 | CRC32C, varints, byte-order helpers, value encoding (spec 14.6) | done |
-| M2 | Storage backend interface, host-file backend, fault-injecting backend (spec 1.11.1) | next |
-| M3 | File header (spec 1.9, 14.1) | |
+| M2 | Storage backend interface, host-file backend, fault-injecting backend (spec 1.11.1) | done |
+| M3 | File header (spec 1.9, 14.1) | next |
 | M4 | Pages, anchor map, free-space list (spec 13, 14.2, 14.7) | |
 | M5 | Delta tracks, transactions, reconciliation, recovery; the crash-point matrix becomes the main test suite (spec 3, 14.4) | |
 | M6 | Catalog (spec 4, 14.3) | |
@@ -47,9 +47,10 @@ These were agreed with the user:
 
 ## Code layout
 
-- `include/combolite/`: the public API (`cdb_common.h`, `cdb_value.h`).
+- `include/combolite/`: the public API (`cdb_common.h`, `cdb_value.h`, `cdb_storage.h`).
 - `src/`: implementation and internal headers (`cdb_crc32c`, `cdb_varint`, `cdb_endian.h`, `cdb_value`). Tests include `src/` directly so they can test internal modules.
-- `tests/`: one Unity executable per module.
+- `src/cdb_faultdev.*`: an in-memory device that simulates power loss: unsynced writes are dropped, kept in part or torn. It is built only into the `combolite_testing` library, never into the production library. Crash-safety tests arm a crash at operation N, then call `cdb_faultdev_reboot()` and check what recovery sees.
+- `tests/`: one Unity executable per module. Scratch files go in `CDB_TEST_TMPDIR`, which is the build's `tests/` directory.
 
 ## What db-combolite is
 

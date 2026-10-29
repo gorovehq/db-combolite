@@ -13,6 +13,9 @@ const char *cdb_status_str(cdb_status status)
     case CDB_E_DEPTH: return "nesting too deep";
     case CDB_E_STATE: return "invalid state";
     case CDB_E_UNSUPPORTED: return "unsupported";
+    case CDB_E_IO: return "I/O error";
+    case CDB_E_NOT_FOUND: return "not found";
+    case CDB_E_READ_ONLY: return "read-only storage";
     }
     return "unknown status";
 }

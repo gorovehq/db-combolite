@@ -16,7 +16,10 @@ typedef enum cdb_status {
     CDB_E_OVERFLOW = -6,         /* a number does not fit its type or limit */
     CDB_E_DEPTH = -7,            /* nesting deeper than CDB_VALUE_MAX_DEPTH */
     CDB_E_STATE = -8,            /* call not valid in the current writer state */
-    CDB_E_UNSUPPORTED = -9       /* recognised, but not supported by this build */
+    CDB_E_UNSUPPORTED = -9,      /* recognised, but not supported by this build */
+    CDB_E_IO = -10,              /* the storage device reported an error */
+    CDB_E_NOT_FOUND = -11,       /* the named file or object does not exist */
+    CDB_E_READ_ONLY = -12        /* write attempted on read-only storage */
 } cdb_status;
 
 const char *cdb_status_str(cdb_status status);
