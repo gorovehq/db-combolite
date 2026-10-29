@@ -125,6 +125,10 @@ cdb_status cdb_value_write_decimal_i64(cdb_value_writer *w, uint64_t scale, int6
 cdb_status cdb_value_write_vector(cdb_value_writer *w, cdb_vector_elem elem,
                                   uint64_t dims, const void *elems);
 
+/* Copies one value that is already encoded (for example, read from another
+ * document). It is validated against the writer's decimal mode first. */
+cdb_status cdb_value_write_encoded(cdb_value_writer *w, const void *value, size_t len);
+
 cdb_status cdb_value_begin_array(cdb_value_writer *w);
 cdb_status cdb_value_end_array(cdb_value_writer *w);
 cdb_status cdb_value_begin_object(cdb_value_writer *w);
@@ -137,6 +141,7 @@ cdb_status cdb_value_end_object(cdb_value_writer *w);
 typedef struct cdb_value {
     cdb_value_type type;
     uint8_t tag;
+    const uint8_t *start;   /* the value's first byte (its tag) */
     size_t encoded_len;     /* bytes taken by the whole value, tag included */
     const uint8_t *payload; /* variable types: bytes after the length prefix */
     size_t payload_len;

@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "cdb_db.h"
+#include "cdb_doc.h"
 
 #define JOURNAL_SLOT 0u
 #define DEFAULT_SYNC_EVERY 32u
@@ -106,7 +107,7 @@ static cdb_status new_journal(cdb_db *db, const char *path, uint64_t unsealed_se
 }
 
 /* Applies the data records of transaction tx_id found between start and end. */
-static cdb_status apply_range(cdb_db *db, uint64_t tx_id, uint64_t start, uint64_t end)
+static cdb_status apply_range(cdb_db *db, uint64_t tx_id, uint64_t start, uint64_t end, uint64_t commit_number)
 {
     uint64_t off = start;
     while (off < end) {
@@ -125,6 +126,7 @@ static cdb_status apply_range(cdb_db *db, uint64_t tx_id, uint64_t start, uint64
             d.op = r.payload[0];
             d.data = r.payload + 1;
             d.len = r.payload_len - 1u;
+            d.commit_number = commit_number;
             if ((s = db->cfg.apply(db->cfg.apply_ctx, &db->pager, &d)) != CDB_OK)
                 return s;
         }
@@ -189,7 +191,7 @@ static cdb_status replay(cdb_db *db, int *journal_ok)
                  * replayed onto it. */
                 if (db->journal.hdr.unsealed_seq != archive_seq)
                     return set_aside(db);
-                if ((s = apply_range(db, cur_tx, tx_start, off)) != CDB_OK)
+                if ((s = apply_range(db, cur_tx, tx_start, off, ci.commit_number)) != CDB_OK)
                     return s;
                 db->applied = ci.commit_number;
             }
@@ -215,6 +217,8 @@ static cdb_status recover(cdb_db *db)
 
     /* Fold whatever was replayed into the archive before discarding the journal. */
     if (db->applied != watermark_of(db) || in_use) {
+        if ((s = cdb_doc_flush_pools(db)) != CDB_OK)
+            return s;
         set_journal_slot(db, 0, db->applied);
         if ((s = cdb_pager_commit(&db->pager)) != CDB_OK)
             return s;
@@ -259,7 +263,8 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
     int exists;
     cdb_status s;
 
-    if (db == NULL || env == NULL || base == NULL || cfg == NULL || cfg->apply == NULL
+    if (db == NULL || env == NULL || base == NULL || cfg == NULL
+        || (cfg->apply == NULL && (cfg->doc_buffers == NULL || cfg->catalog_page == NULL))
         || cfg->record_buf == NULL || cfg->record_buf_size < CDB_JOURNAL_HEADER_SIZE + CDB_COMMIT_PAYLOAD_SIZE)
         return CDB_E_INVALID_ARG;
     memset(db, 0, sizeof *db);
@@ -269,6 +274,10 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
         db->cfg.durability = CDB_DURABILITY_NORMAL;
     if (db->cfg.normal_sync_every == 0)
         db->cfg.normal_sync_every = DEFAULT_SYNC_EVERY;
+    if (db->cfg.apply == NULL) {
+        db->cfg.apply = cdb_doc_apply; /* documents (spec 8) */
+        db->cfg.apply_ctx = db;
+    }
     if ((s = set_paths(db, base)) != CDB_OK)
         return s;
 
@@ -294,19 +303,18 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
 
     db->commit_hwm = db->pager.hs.record.commit_hwm;
     db->next_commit = db->commit_hwm > 0 ? db->commit_hwm : 1;
-    if ((s = recover(db)) != CDB_OK)
-        return s;
-    if (db->next_commit <= db->applied)
-        db->next_commit = db->applied + 1;
-    db->next_tx = 1;
-    if ((s = start_session(db)) != CDB_OK)
-        return s;
+    /* The catalog first: replaying document changes needs it. */
     if (cfg->catalog_page != NULL) {
         if ((s = cdb_catalog_open(&db->catalog, &db->pager, &cfg->catalog_work, cfg->catalog_page)) != CDB_OK)
             return s;
         db->has_catalog = 1;
     }
-    return CDB_OK;
+    if ((s = recover(db)) != CDB_OK)
+        return s;
+    if (db->next_commit <= db->applied)
+        db->next_commit = db->applied + 1;
+    db->next_tx = 1;
+    return start_session(db);
 }
 
 /* -------------------------------------------------------- transactions */
@@ -414,7 +422,7 @@ cdb_status cdb_tx_commit(cdb_db *db)
     }
 
     /* The transaction is committed; make it visible through the pager. */
-    if ((s = apply_range(db, db->tx_id, db->tx_start, record_at)) != CDB_OK) {
+    if ((s = apply_range(db, db->tx_id, db->tx_start, record_at, ci.commit_number)) != CDB_OK) {
         db->failed = 1; /* the journal holds it; reopening replays it */
         return s;
     }
@@ -438,21 +446,15 @@ cdb_status cdb_tx_abort(cdb_db *db)
 
 /* -------------------------------------------------------- reconcile/close */
 
-cdb_status cdb_db_reconcile(cdb_db *db)
+/* Replaces the journal with an empty one unsealed from the current archive
+ * state. Called after every archive commit made while nothing in the journal
+ * is above the watermark: reconciliation, catalog changes and compaction.
+ * The new journal is written under a temporary name and renamed over the
+ * old one, so a crash always leaves exactly one journal (spec 14.4.6). */
+static cdb_status rotate_journal(cdb_db *db)
 {
     cdb_storage old = db->journal_st;
     cdb_status s;
-
-    if (usable(db) != CDB_OK || db->in_tx)
-        return CDB_E_STATE;
-    if (db->applied == watermark_of(db) && !db->pager.dirty)
-        return CDB_OK;
-    set_journal_slot(db, 1, db->applied);
-    if ((s = cdb_pager_commit(&db->pager)) != CDB_OK)
-        return s;
-    /* Every change in the journal is now in the archive. Replace the journal
-     * with an empty one: write it under a temporary name, then rename it over
-     * the old one, so a crash always leaves exactly one journal. */
     if ((s = new_journal(db, db->journal_tmp, db->pager.hs.record.committed_seq)) != CDB_OK)
         return s;
     cdb_storage_close(&old);
@@ -460,6 +462,23 @@ cdb_status cdb_db_reconcile(cdb_db *db)
         return s;
     db->unsynced = 0;
     return env_sync_dir(db, db->workdir);
+}
+
+cdb_status cdb_db_reconcile(cdb_db *db)
+{
+    cdb_status s;
+
+    if (usable(db) != CDB_OK || db->in_tx)
+        return CDB_E_STATE;
+    if (db->applied == watermark_of(db) && !db->pager.dirty)
+        return CDB_OK;
+    if ((s = cdb_doc_flush_pools(db)) != CDB_OK)
+        return s;
+    set_journal_slot(db, 1, db->applied);
+    if ((s = cdb_pager_commit(&db->pager)) != CDB_OK)
+        return s;
+    /* Every change in the journal is now in the archive. */
+    return rotate_journal(db);
 }
 
 static cdb_status catalog_ready(cdb_db *db)
@@ -474,7 +493,9 @@ static cdb_status catalog_ready(cdb_db *db)
 cdb_status cdb_db_create_store(cdb_db *db, const char *name, size_t len, uint32_t model, uint64_t *id)
 {
     cdb_status s = catalog_ready(db);
-    return s != CDB_OK ? s : cdb_catalog_create_store(&db->catalog, name, len, model, id);
+    if (s == CDB_OK)
+        s = cdb_catalog_create_store(&db->catalog, name, len, model, id);
+    return s == CDB_OK ? rotate_journal(db) : s;
 }
 
 cdb_status cdb_db_find_store(cdb_db *db, const char *name, size_t len, uint64_t *id, int *found)
@@ -487,7 +508,9 @@ cdb_status cdb_db_find_store(cdb_db *db, const char *name, size_t len, uint64_t 
 cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
 {
     cdb_status s = catalog_ready(db);
-    return s != CDB_OK ? s : cdb_catalog_drop_store(&db->catalog, id);
+    if (s == CDB_OK)
+        s = cdb_catalog_drop_store(&db->catalog, id);
+    return s == CDB_OK ? rotate_journal(db) : s;
 }
 
 cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed)
@@ -497,7 +520,9 @@ cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint6
         return CDB_E_STATE;
     if ((s = cdb_db_reconcile(db)) != CDB_OK)
         return s;
-    return cdb_pager_compact(&db->pager, max_moves, moved, reclaimed);
+    if ((s = cdb_pager_compact(&db->pager, max_moves, moved, reclaimed)) != CDB_OK)
+        return s;
+    return rotate_journal(db);
 }
 
 cdb_status cdb_db_close(cdb_db *db)
@@ -507,6 +532,8 @@ cdb_status cdb_db_close(cdb_db *db)
     if (db->failed)
         return CDB_E_STATE;
     if (db->in_tx && (s = cdb_tx_abort(db)) != CDB_OK)
+        return s;
+    if ((s = cdb_doc_flush_pools(db)) != CDB_OK)
         return s;
     set_journal_slot(db, 0, db->applied);
     if ((s = cdb_pager_commit(&db->pager)) != CDB_OK)

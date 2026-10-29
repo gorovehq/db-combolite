@@ -248,7 +248,10 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
   | 3 | name | 9 | next field ID |
   | 4 | data model | 10 | creating commit |
   | 5 | encryption domain | 11 | flags; bit 0 = dropped |
-  | 6 | page-size code (log₂) | | |
+  | 6 | page-size code (log₂) | 12 | document pools: head index root (optional) |
+  | 13 | document pools: revisions index root (optional) | 14 | document pools: next entry ID (optional) |
+
+  Optional fields that are absent read as zero.
 
 - **Writing the root slots.** The first catalog commit writes both root slots. Later commits alternate between them.
 - **Choosing a slot on open.**
@@ -336,7 +339,7 @@ A data-change payload is an **operation code** followed by a value in the shared
 | link | create a link (Section 6) |
 | unlink | remove a link |
 
-The exact encoding of each operation, per data model, is defined with the data-model layouts.
+The exact encoding of each operation, per data model, is defined with the data-model layouts. Document payloads are defined in 14.9.3.
 
 ### 14.4.6 Session, journal and recovery rules (single process)
 
@@ -349,7 +352,7 @@ The exact encoding of each operation, per data model, is defined with the data-m
 3. **Which journal may be replayed.** A journal is replayed only onto the archive state it was unsealed from: its unsealed sequence must equal the archive's committed sequence.
    - **Header sequence.** A journal created when a session opens records the sequence produced by the commit that marks it *in use*.
    - **Damaged or foreign journals.** A journal that is unreadable, belongs to another database, or would need replaying onto a different state is renamed `main.<slot>.cdb.stray` and is never applied.
-4. **Journal rotation.** Reconciliation writes the new, empty journal as `main.<slot>.cdb.new`, makes it durable, then renames it over the old one and syncs the directory. A crash always leaves exactly one journal.
+4. **Journal rotation.** Every commit of the archive starts a new, empty journal: reconciliation, and also commits made outside it (catalog changes, compaction), which reconcile first. Otherwise later transactions would be journaled against a state the archive has moved past, and rule 3 would set them aside after a crash. The new journal is written as `main.<slot>.cdb.new`, made durable, then renamed over the old one, and the directory is synced. A crash always leaves exactly one journal.
 5. **Commit numbers** start at 1. They are reserved in blocks of 1024, in the same way as page sequence numbers.
 6. **Durability.** The default is *normal*, with a barrier every 32 commits (configurable). *Off* has barriers only at reconciliation and close.
 7. **Visibility.** A transaction's changes are applied, and become visible, when it commits. A transaction cannot read its own changes before it commits.
@@ -715,6 +718,31 @@ Documents (Section 8) and rows of row-oriented tables (Section 9) share one **re
   - An ordered index keyed by *(entry ID, revision ID)* locates every revision.
   - A second index, keyed by entry ID, points to each entry's **head** revision.
 - **Pages.** Records are packed into document or row pages behind a slot directory, in the same way as index leaves (14.8.3).
+  - *Current implementation:* each document revision occupies one logical page of type `0x0005`: the page header (13), then the envelope. A revision must fit in one page until overflow pages (14.15) exist. Packing several revisions per page is deferred.
+- **Index values.**
+  - **Head index** (key: entry ID): 21 bytes — head revision ID (8), revision page ID (8), chain length since the last original or checkpoint (4), revision kind (1).
+  - **Revisions index** (key: entry ID, revision ID): the revision page ID (8).
+  - Both roots and the pool's next entry ID are kept in the store record (14.3.3, fields 12–14). These fields are optional: a record written without them reads as zero.
+- **Patch encoding.** A patch is an array value whose elements are arrays `[op, path, value]`:
+  - `op` 1 = set (the value is required) · 2 = remove (no value).
+  - `path` is an array of field IDs leading through nested objects. Array-index steps are reserved; arrays are currently replaced whole.
+  - Setting through a missing field creates the object; setting through a field that is not an object replaces it. Removing a missing field does nothing.
+- **Replace.** A replace is stored as a delta holding the top-level differences from the current state.
+- **Checkpoints.** A checkpoint is written in place of a delta when the chain length would reach the configured interval (default 16).
+- **Summaries.** A revision's summary changes only when the change supplies one. Checkpoints carry the current summary forward.
+- **Tombstones.** A delete writes a tombstone revision. Earlier revisions stay readable; the current state reads as not found.
+
+### 14.9.3 Document change payloads
+
+The data-change payloads (14.4.5) for document pools, keyed by store and entry:
+
+| Operation | Payload |
+|---|---|
+| insert, replace | flags (1 byte: bit 0 = has summary) · if set, summary length (varint) and summary bytes · body (an object value) |
+| patch | a patch (14.9.2) |
+| delete | empty |
+
+**Applying never fails for logical reasons.** The built-in document apply runs again during recovery, so a change to a missing or deleted document, or to a dropped or non-document store, does nothing instead of failing. A failure there would recur on every reopen. Input is validated when the change is made, inside the transaction.
 
 ---
 

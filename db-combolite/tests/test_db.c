@@ -333,6 +333,28 @@ static void test_catalog_through_db(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+/* Regression: compaction commits the archive, so it must start a new journal.
+ * Otherwise a transaction committed afterwards is journaled against an older
+ * archive state, and after a crash recovery sets the journal aside. */
+static void test_commit_after_compaction_replays(void)
+{
+    uint64_t moved, reclaimed;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db(&env, "t"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put(1, "before"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_compact(&db, 100, &moved, &reclaimed));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put(2, "after"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    cdb_faultenv_crash_now(&fe, CDB_CRASH_DROP_UNSYNCED, 0, 0);
+    cdb_faultenv_reboot(&fe);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db(&env, "t"));
+    expect(1, "before");
+    expect(2, "after");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 /* ------------------------------------------------------- crash sweep */
 
 /* Committed states, in order. Entries 1..3; NULL = absent. */
@@ -489,6 +511,7 @@ int main(void)
     RUN_TEST(test_damaged_journal_is_set_aside);
     RUN_TEST(test_compaction_through_db);
     RUN_TEST(test_catalog_through_db);
+    RUN_TEST(test_commit_after_compaction_replays);
     RUN_TEST(test_crash_sweep);
     RUN_TEST(test_host_filesystem);
     return UNITY_END();

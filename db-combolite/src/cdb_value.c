@@ -510,6 +510,22 @@ cdb_status cdb_value_write_vector(cdb_value_writer *w, cdb_vector_elem elem,
     return CDB_OK;
 }
 
+cdb_status cdb_value_write_encoded(cdb_value_writer *w, const void *value, size_t len)
+{
+    cdb_status s = w_begin_value(w);
+    if (s != CDB_OK)
+        return s;
+    if (value == NULL || len == 0)
+        return w_fail(w, CDB_E_INVALID_ARG);
+    if ((s = cdb_value_validate((const uint8_t *)value, len, w->order, w->decimal_mode, 0)) != CDB_OK)
+        return w_fail(w, s);
+    if ((s = w_room(w, len)) != CDB_OK)
+        return s;
+    w_put(w, value, len);
+    w_end_value(w);
+    return CDB_OK;
+}
+
 static cdb_status w_begin_container(cdb_value_writer *w, uint8_t tag)
 {
     cdb_value_frame *f;
@@ -668,6 +684,7 @@ cdb_status cdb_value_read(const uint8_t *buf, size_t len, cdb_byte_order order, 
         return CDB_E_TRUNCATED;
     memset(out, 0, sizeof *out);
     out->tag = buf[0];
+    out->start = buf;
 
     switch (buf[0]) {
     case CDB_TAG_NULL:

@@ -19,7 +19,8 @@
 /* Field IDs of a store record (the catalog's own field dictionary). */
 enum {
     F_KIND = 1, F_ID, F_NAME, F_MODEL, F_DOMAIN, F_PAGE_LOG2, F_COMPRESSION,
-    F_SCHEMA_VERSION, F_NEXT_FIELD, F_CREATED, F_FLAGS
+    F_SCHEMA_VERSION, F_NEXT_FIELD, F_CREATED, F_FLAGS,
+    F_HEAD_ROOT, F_REV_ROOT, F_NEXT_ENTRY /* optional: document pools */
 };
 
 /* -------------------------------------------------------- keys */
@@ -192,6 +193,9 @@ static cdb_status encode_store(cdb_catalog *cat, const cdb_store_info *in, size_
     cdb_value_field(&w, F_NEXT_FIELD);     cdb_value_write_int(&w, (int64_t)in->next_field_id);
     cdb_value_field(&w, F_CREATED);        cdb_value_write_int(&w, (int64_t)in->created_commit);
     cdb_value_field(&w, F_FLAGS);          cdb_value_write_int(&w, in->flags);
+    cdb_value_field(&w, F_HEAD_ROOT);      cdb_value_write_int(&w, (int64_t)in->head_root);
+    cdb_value_field(&w, F_REV_ROOT);       cdb_value_write_int(&w, (int64_t)in->rev_root);
+    cdb_value_field(&w, F_NEXT_ENTRY);     cdb_value_write_int(&w, (int64_t)in->next_entry_id);
     cdb_value_end_object(&w);
     *len = cdb_value_writer_len(&w);
     return w.error;
@@ -244,6 +248,25 @@ static cdb_status decode_store(cdb_catalog *cat, const uint8_t *p, size_t len, c
     out->next_field_id = (uint64_t)v[F_NEXT_FIELD - 1];
     out->created_commit = (uint64_t)v[F_CREATED - 1];
     out->flags = (uint32_t)v[F_FLAGS - 1];
+    {
+        /* Optional fields: records written before they existed lack them. */
+        uint64_t f;
+        for (f = F_HEAD_ROOT; f <= F_NEXT_ENTRY; f++) {
+            cdb_value fv;
+            if ((s = cdb_value_object_get(&obj, o, f, &fv, &found)) != CDB_OK)
+                return s;
+            if (!found)
+                continue;
+            if (fv.type != CDB_TYPE_INT || fv.as.i64 < 0)
+                return CDB_E_CORRUPT;
+            if (f == F_HEAD_ROOT)
+                out->head_root = (uint64_t)fv.as.i64;
+            else if (f == F_REV_ROOT)
+                out->rev_root = (uint64_t)fv.as.i64;
+            else
+                out->next_entry_id = (uint64_t)fv.as.i64;
+        }
+    }
     return CDB_OK;
 }
 
@@ -475,6 +498,25 @@ cdb_status cdb_catalog_drop_store(cdb_catalog *cat, uint64_t id)
     if ((s = save_store(cat, &info, ref, 0)) != CDB_OK)
         return s;
     return finish(cat, cat->pager->catroot.next_object_id);
+}
+
+cdb_status cdb_catalog_stage_pool(cdb_catalog *cat, uint64_t store_id, uint64_t head_root,
+                                  uint64_t rev_root, uint64_t next_entry_id)
+{
+    cdb_store_info info;
+    uint8_t ref[REF_SIZE];
+    cdb_status s;
+    if ((s = load_store(cat, store_id, &info, ref)) != CDB_OK)
+        return s;
+    if (info.head_root == head_root && info.rev_root == rev_root && info.next_entry_id == next_entry_id)
+        return CDB_OK;
+    info.head_root = head_root;
+    info.rev_root = rev_root;
+    info.next_entry_id = next_entry_id;
+    if ((s = save_store(cat, &info, ref, 0)) != CDB_OK)
+        return s;
+    cdb_pager_set_catroot(cat->pager, &cat->pager->catroot);
+    return CDB_OK;
 }
 
 cdb_status cdb_catalog_add_schema(cdb_catalog *cat, uint64_t store_id, const void *schema, size_t len,
