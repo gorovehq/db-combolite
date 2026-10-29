@@ -499,6 +499,7 @@ Logical page IDs are allocated densely from a counter. The anchor map is therefo
 - **Leaf pages** hold an array of entries. The entry for a logical ID is found by that ID's position in the array.
 - **Interior pages** hold the physical locations of their child pages.
 - **Updates are copy-on-write.** A changed leaf, and every page on its path to the root, is written as a new appended page. Existing pages are never modified (Section 1.7). Reconciliation batches these updates.
+- **Data pages between commits.** The first change to a logical page after a commit always goes to a new physical page, so the committed version stays intact. A further change before the next commit overwrites that new page in place. No committed state refers to it, which the pager recognises from its sealed sequence number: at or above the pager's sequence at the last commit or open, since sequences are never reused. A page changed many times between commits therefore takes one physical page, not one per change. Pages that compaction moves are always written to new pages.
 - **Roots.** The root's location is at header offset 56. The root of the mirror copy is at header offset 472.
 - **Entries per page** follow from the page size. For example, a 4 KiB page in a 64-bit file holds about 335 leaf entries.
 

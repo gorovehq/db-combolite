@@ -85,6 +85,7 @@ typedef struct cdb_pager {
     uint64_t append_point;
     uint64_t next_seq;
     uint64_t seq_hwm;
+    uint64_t seq_at_commit;  /* next_seq after the last commit or open */
     uint64_t next_lid;
     unsigned depth;
     uint64_t root_primary;

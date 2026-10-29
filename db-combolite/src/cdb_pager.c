@@ -713,6 +713,7 @@ cdb_status cdb_pager_open(cdb_pager *p, const cdb_storage *st, const cdb_pager_c
      * been used before a crash (spec 12.1). */
     p->next_seq = r->page_seq_hwm;
     p->seq_hwm = r->page_seq_hwm;
+    p->seq_at_commit = p->next_seq;
     p->root_primary = r->anchor_root;
     p->root_mirror = r->anchor_mirror_root;
     p->depth = 1;
@@ -796,8 +797,25 @@ cdb_status cdb_pager_alloc(cdb_pager *p, uint64_t *lid)
     return mark_dirty(p, root); /* the root records the next logical ID */
 }
 
-cdb_status cdb_pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header *tmpl,
-                           const void *payload, size_t len)
+/* Whether the page at phys was written since the last commit. Its sealed
+ * sequence is then at or above the mark: sequences are never reused, so
+ * every page of a committed state is below it. No committed state refers to
+ * such a page, so it may be overwritten in place. A page that does not
+ * verify is not trusted. */
+static int written_since_commit(cdb_pager *p, uint64_t phys, uint64_t lid)
+{
+    cdb_page_header h;
+    if (phys < p->data_start || cdb_storage_read(&p->st, phys_offset(p, phys), p->scratch, p->page_size) != CDB_OK
+        || cdb_page_open(p->scratch, p->page_size, p->fmt, p->order, p->checksum_alg, &h) != CDB_OK)
+        return 0;
+    return h.write_seq >= p->seq_at_commit && h.logical_id == lid;
+}
+
+/* Writes lid. A page already written since the last commit is overwritten
+ * in place (unless moving it is the point), so a page changed many times
+ * between commits takes one physical page, not one per change. */
+static cdb_status pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header *tmpl, const void *payload,
+                              size_t len, int may_rewrite)
 {
     cdb_pager_node *leaf;
     cdb_anchor_entry e;
@@ -815,6 +833,15 @@ cdb_status cdb_pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header *tm
     if (e.state == CDB_ANCHOR_RELEASED)
         return CDB_E_NOT_FOUND;
     leaf->dirty = 1; /* pin the leaf while the page is written */
+    if (may_rewrite && e.state == CDB_ANCHOR_LIVE && written_since_commit(p, e.phys, lid)) {
+        memset(p->scratch, 0, p->page_size);
+        if (len)
+            memcpy(p->scratch + payload_off(p), payload, len);
+        h = *tmpl;
+        h.logical_id = lid;
+        h.payload_len = (uint32_t)len;
+        return write_page_at(p, p->scratch, &h, e.phys);
+    }
 
     memset(p->scratch, 0, p->page_size);
     if (len)
@@ -831,6 +858,12 @@ cdb_status cdb_pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header *tm
     e.state = CDB_ANCHOR_LIVE;
     e.extent_len = 0;
     return entry_set(p, leaf, slot, &e);
+}
+
+cdb_status cdb_pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header *tmpl,
+                           const void *payload, size_t len)
+{
+    return pager_write(p, lid, tmpl, payload, len, 1);
 }
 
 cdb_status cdb_pager_read(cdb_pager *p, uint64_t lid, uint8_t *page, cdb_page_header *h)
@@ -1007,6 +1040,7 @@ cdb_status cdb_pager_commit(cdb_pager *p)
     if ((s = cdb_header_commit(&p->st, &p->hs, &rec)) != CDB_OK)
         return s;
     p->dirty = 0;
+    p->seq_at_commit = p->next_seq;
     if (p->cat_dirty) {
         p->cat_dirty = 0;
         p->cat_exists = 1;
@@ -1156,7 +1190,7 @@ cdb_status cdb_pager_compact(cdb_pager *p, uint64_t max_moves, uint64_t *moved, 
             continue;
         if ((s = cdb_pager_read(p, lid, p->page2, &h)) != CDB_OK)
             return s;
-        if ((s = cdb_pager_write(p, lid, &h, p->page2 + payload_off(p), h.payload_len)) != CDB_OK)
+        if ((s = pager_write(p, lid, &h, p->page2 + payload_off(p), h.payload_len, 0)) != CDB_OK)
             return s;
         (*moved)++;
     }

@@ -339,6 +339,59 @@ static void test_space_is_reused(void)
     expect_text(&p, lid, "v199");
 }
 
+/* A page changed many times between commits takes one physical page; the
+ * first change after a commit still goes to a new page, so the committed
+ * version survives a crash whatever happens to the rewrites. */
+static void test_rewrites_between_commits_stay_in_place(void)
+{
+    const cdb_crash_mode modes[4] = { CDB_CRASH_DROP_UNSYNCED, CDB_CRASH_KEEP_PREFIX, CDB_CRASH_TORN,
+                                      CDB_CRASH_REORDER };
+    cdb_pager p;
+    cdb_anchor_entry committed, e;
+    uint64_t lid, start;
+    char text[32];
+    int i, m;
+
+    for (m = 0; m < 4; m++) {
+        setUp();
+        create(&p);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_alloc(&p, &lid));
+        start = p.append_point;
+        for (i = 0; i < 200; i++) {
+            snprintf(text, sizeof text, "first %d", i);
+            write_text(&p, lid, text);
+        }
+        TEST_ASSERT_EQUAL_UINT64(start + 1u, p.append_point); /* one page, not 200 */
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&p));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_lookup(&p, lid, &committed));
+
+        write_text(&p, lid, "second 0");
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_lookup(&p, lid, &e));
+        TEST_ASSERT_TRUE_MESSAGE(e.phys != committed.phys, "a committed page was overwritten");
+        for (i = 1; i < 50; i++) {
+            uint64_t phys = e.phys;
+            snprintf(text, sizeof text, "second %d", i);
+            write_text(&p, lid, text);
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_lookup(&p, lid, &e));
+            TEST_ASSERT_EQUAL_UINT64(phys, e.phys);
+        }
+        expect_text(&p, lid, "second 49");
+        cdb_faultdev_crash_now(&dev, modes[m], m == 1 ? 1 : 0, m == 2 ? 100 : 0);
+        cdb_faultdev_reboot(&dev);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_open(&p, &st, &cfg));
+        expect_text(&p, lid, "first 199");
+
+        /* After reopening, earlier pages are older than the mark too. */
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_lookup(&p, lid, &committed));
+        write_text(&p, lid, "third");
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_lookup(&p, lid, &e));
+        TEST_ASSERT_TRUE(e.phys != committed.phys);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&p));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_open(&p, &st, &cfg));
+        expect_text(&p, lid, "third");
+    }
+}
+
 static void test_free_list_merges(void)
 {
     cdb_pager p;
@@ -651,6 +704,7 @@ int main(void)
     RUN_TEST(test_tree_grows_to_three_levels);
     RUN_TEST(test_growth_across_commits);
     RUN_TEST(test_rewrite_frees_old_page);
+    RUN_TEST(test_rewrites_between_commits_stay_in_place);
     RUN_TEST(test_free_and_ids_not_reused);
     RUN_TEST(test_mirror_repairs_damaged_anchor_page);
     RUN_TEST(test_damaged_data_page_is_reported);
