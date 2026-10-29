@@ -19,7 +19,7 @@ static cdb_fault_record env_records[CDB_FAULTENV_MAX_FILES * 4096u];
 static cdb_faultenv fe;
 static cdb_env env;
 
-static uint8_t arena[NODES * 2u * PAGE + PAGE];
+static uint8_t arena[NODES * 2u * PAGE + 2u * PAGE];
 static cdb_pager_node nodes[NODES];
 static cdb_free_extent free_list[8192];
 static uint8_t record_buf[1024];
@@ -264,6 +264,46 @@ static void test_damaged_journal_is_set_aside(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+static void test_compaction_through_db(void)
+{
+    cdb_faultdev *arch;
+    uint64_t moved, reclaimed, before, after;
+    char text[32];
+    unsigned i;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db(&env, "t"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+    for (i = 1; i <= 120; i++) {
+        snprintf(text, sizeof text, "row-%u", i);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, put(i, text));
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+    for (i = 1; i <= 120; i++)
+        if (i % 6 != 0)
+            TEST_ASSERT_EQUAL_INT(CDB_OK, del(i));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db)); /* nothing new: no-op */
+
+    arch = cdb_faultenv_device(&fe, "t.cdbarch");
+    TEST_ASSERT_NOT_NULL(arch);
+    before = arch->current_size;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_compact(&db, 1000, &moved, &reclaimed));
+    after = arch->current_size;
+    TEST_ASSERT_TRUE_MESSAGE(after < before, "the archive did not shrink");
+    for (i = 1; i <= 120; i++) {
+        snprintf(text, sizeof text, "row-%u", i);
+        expect(i, i % 6 == 0 ? text : NULL);
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db(&env, "t"));
+    expect(6, "row-6");
+    expect(7, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 /* ------------------------------------------------------- crash sweep */
 
 /* Committed states, in order. Entries 1..3; NULL = absent. */
@@ -418,6 +458,7 @@ int main(void)
     RUN_TEST(test_reconcile_then_reopen);
     RUN_TEST(test_missing_journal_is_reported);
     RUN_TEST(test_damaged_journal_is_set_aside);
+    RUN_TEST(test_compaction_through_db);
     RUN_TEST(test_crash_sweep);
     RUN_TEST(test_host_filesystem);
     return UNITY_END();

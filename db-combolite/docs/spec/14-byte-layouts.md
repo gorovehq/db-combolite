@@ -490,6 +490,10 @@ The free-space list is a sorted list of freed physical **extents** that are wait
 
 An extent is reclaimed only after the lock state that covers it has been reconciled.
 
+- **Ordering.** The list is kept sorted by start.
+- **Merging.** Touching extents merge only if the same commit freed them.
+- **The value 0.** A freed sequence of `0` means *reusable now*. Every extent whose freeing commit is older than the latest commit is normalized to 0, and touching extents marked 0 then merge.
+
 ### 14.7.5 Where the roots are recorded
 
 - The anchor map's root is at header offset 56.
@@ -541,9 +545,15 @@ At every commit, the whole list is written as a new chain. The pages of the prev
 - **Mirror of the free-space list.** The list is mirrored as a second chain.
 - **Commit order.** A commit follows Section 3.2:
   1. barrier;
-  2. the new free-space chains, then the changed anchor-map nodes from the leaves up, with the root last;
-  3. barrier;
-  4. the header commit.
+  2. the changed anchor-map nodes below the root, from the leaves up;
+  3. the root's two pages are reserved;
+  4. the pages for both free-space chains are allocated, and the chains are written;
+  5. the root is written;
+  6. barrier;
+  7. the header commit.
+
+  Every commit rewrites the root, because the root records the roots of the free-space chains. All chain pages are allocated before any of them is written. Allocating can only shorten the list, so the chains then hold exactly the final list. Spare chain pages are written as empty links.
+- **Chain length.** A free-space chain uses at most 128 pages. A longer list needs compaction.
 - **Sequence reservation.** Page sequence numbers are reserved in blocks of 1024 (Section 12.1).
 
 ## 14.8 Ordered index

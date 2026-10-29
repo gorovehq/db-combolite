@@ -107,6 +107,20 @@ static cdb_status hf_size(void *ctx, uint64_t *out)
     return CDB_OK;
 }
 
+static cdb_status hf_truncate(void *ctx, uint64_t size)
+{
+    const cdb_hostfile *hf = (const cdb_hostfile *)ctx;
+    if (hf->flags & CDB_HOSTFILE_READONLY)
+        return CDB_E_READ_ONLY;
+    if (!hf_offset_ok(size, 0))
+        return CDB_E_INVALID_ARG;
+    while (ftruncate(hf->fd, (off_t)size) != 0) {
+        if (errno != EINTR)
+            return CDB_E_IO;
+    }
+    return CDB_OK;
+}
+
 static void hf_close(void *ctx)
 {
     cdb_hostfile *hf = (cdb_hostfile *)ctx;
@@ -117,7 +131,7 @@ static void hf_close(void *ctx)
 }
 
 static const cdb_storage_ops hostfile_ops = {
-    hf_read, hf_program, hf_erase, hf_sync, hf_geometry, hf_size, hf_close
+    hf_read, hf_program, hf_erase, hf_sync, hf_geometry, hf_size, hf_close, hf_truncate
 };
 
 cdb_status cdb_hostfile_open(cdb_hostfile *hf, const char *path, unsigned flags, cdb_storage *out)

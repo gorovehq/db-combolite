@@ -97,4 +97,8 @@ cdb_status cdb_tx_abort(cdb_db *db);
 /* Folds every applied change into the archive (spec 3.2) and starts a new journal. */
 cdb_status cdb_db_reconcile(cdb_db *db);
 
+/* Maintenance (spec 3.4, 3.7): reconciles, moves up to max_moves live pages
+ * down into reusable space, and releases the free tail of the archive. */
+cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed);
+
 #endif

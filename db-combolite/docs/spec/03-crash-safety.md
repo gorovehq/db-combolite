@@ -49,6 +49,17 @@ Every delta record carries its own checksum, or its own authentication tag if it
 3. Commit by writing the header, as in step 4 of 3.2. **Barrier.**
 4. Only now release the old space.
 
+**Space reuse and the compaction procedure (implementation, M6).**
+
+- **When space can be reused.** A freed page is reused only once the commit that freed it is older than the latest commit: its freed sequence must be below the committed sequence. Until the next commit, the other header slot may still hold the previous state (Section 1.9), and that state can reference pages the latest commit freed.
+- **Allocation order.** New writes always take the lowest reusable page. The file grows only when no reusable page exists.
+- **Procedure.** Compaction runs in this order:
+  1. **Fence commit.** If any freed space is not reusable yet, a commit is made first, so that it becomes reusable.
+  2. **Target.** The target end of the file is the current end minus all reusable pages.
+  3. **Move.** Live data pages, and anchor-map nodes, that sit at or beyond the target are rewritten into reusable holes below it. Pages already below the target stay where they are, so compacting a file that is already compact moves nothing.
+  4. **Two commits.** The second makes the vacated pages reusable.
+  5. **Release the tail** (3.7).
+
 ### 3.5 Damage that was not caused by a crash
 
 Bit rot, failing flash cells and similar damage are detected when a page is read, because the page's checksum or authentication tag no longer verifies. The response escalates in three tiers:
@@ -87,6 +98,8 @@ A crash before commit can leave pages that were written but never committed. The
 
 - **by default**, during the next maintenance window;
 - **on demand**, through a **reclaim-now** operation that the operator can run at any time.
+
+**Releasing the free tail.** Reusable free extents that reach the end of the file are removed from the free-space list. The append point is lowered, and that change is committed. The storage is then truncated and synced. The same operation trims pages that a crash left past the append point. Neither header slot's state references anything past the append point. On media that cannot shrink, such as raw flash, the truncation step is skipped.
 
 ## Open questions (do not specify until answered)
 

@@ -455,6 +455,16 @@ cdb_status cdb_db_reconcile(cdb_db *db)
     return env_sync_dir(db, db->workdir);
 }
 
+cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed)
+{
+    cdb_status s;
+    if (usable(db) != CDB_OK || db->in_tx)
+        return CDB_E_STATE;
+    if ((s = cdb_db_reconcile(db)) != CDB_OK)
+        return s;
+    return cdb_pager_compact(&db->pager, max_moves, moved, reclaimed);
+}
+
 cdb_status cdb_db_close(cdb_db *db)
 {
     cdb_status s;
