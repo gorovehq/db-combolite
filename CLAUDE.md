@@ -44,9 +44,12 @@ cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release   # optimised build, sanitize
   | `test_` | test-only changes |
   | `docs_` | spec and documentation changes |
   | `merge_` | integration branches that bring other branches together |
+  | `refactor_` | restructuring that does not change behaviour |
+  | `build_` | build system, CMake, CI and toolchain changes |
 
 - **Branch names** take the form `<prefix><short-kebab-description>`.
 - **Commit and merge only when the user asks.** Merging into `main` is the user's decision.
+- **Merges into `main` use `--no-ff`,** so every branch shows up in the history as a single unit.
 
 ## Code rules
 
