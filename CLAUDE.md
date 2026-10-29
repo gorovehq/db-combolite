@@ -50,6 +50,7 @@ cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release   # optimised build, sanitize
 - **Branch names** take the form `<prefix><short-kebab-description>`.
 - **Commit and merge only when the user asks.** Merging into `main` is the user's decision.
 - **Merges into `main` use `--no-ff`,** so every branch shows up in the history as a single unit.
+- **No AI attribution in commits.** Don't add `Co-Authored-By: Claude` trailers or similar lines to commit messages or PR descriptions. Attribution lives only in `ATTRIBUTIONS.md` at the repo root. Add each new third-party dependency to the table there.
 
 ## Code rules
 
