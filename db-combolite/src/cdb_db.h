@@ -145,6 +145,7 @@ typedef struct cdb_db {
         cdb_index sources;       /* (source store, source entry, entry) -> nothing */
         uint64_t next_entry;
         uint64_t touched_tx;     /* the open transaction changed this collection */
+        uint64_t free_from;      /* blocks below this ID have no free slot: a hint, kept in memory */
     } vecs[CDB_DB_MAX_POOLS];
     /* The schema held in the schema buffer (cdb_doc.h). */
     uint64_t schema_store;
