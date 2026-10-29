@@ -395,13 +395,73 @@ static void test_field_order_enforced(void)
 
 static void test_validator_rejects_unsorted_directory(void)
 {
-    /* object, 2 fields: dir {5:0, 2:1}, values null, null */
-    const uint8_t unsorted[] = { CDB_TAG_OBJECT, 7, 2, 5, 0, 2, 1, CDB_TAG_NULL, CDB_TAG_NULL };
-    const uint8_t gap[] = { CDB_TAG_OBJECT, 8, 2, 1, 0, 2, 2, CDB_TAG_NULL, CDB_TAG_NULL, CDB_TAG_NULL };
+    /* object, 2 fields, 1-byte widths: dir {5:0, 2:1}, values null, null */
+    const uint8_t unsorted[] = { CDB_TAG_OBJECT, 8, 2, 0x00, 5, 0, 2, 1, CDB_TAG_NULL, CDB_TAG_NULL };
+    const uint8_t gap[] = { CDB_TAG_OBJECT, 9, 2, 0x00, 1, 0, 2, 2, CDB_TAG_NULL, CDB_TAG_NULL, CDB_TAG_NULL };
     TEST_ASSERT_EQUAL_INT(CDB_E_NOT_CANONICAL, cdb_value_validate(unsorted, sizeof unsorted, CDB_ORDER_LITTLE,
                                                                   CDB_DECIMAL_UNBOUNDED, 0));
     TEST_ASSERT_EQUAL_INT(CDB_E_NOT_CANONICAL, cdb_value_validate(gap, sizeof gap, CDB_ORDER_LITTLE,
                                                                   CDB_DECIMAL_UNBOUNDED, 0));
+}
+
+static void test_validator_rejects_wide_directory(void)
+{
+    /* One field (ID 2) stored with a 2-byte ID width: valid shape, not canonical. */
+    const uint8_t wide[] = { CDB_TAG_OBJECT, 6, 1, 0x01, 0x02, 0x00, 0, CDB_TAG_NULL };
+    const uint8_t bad_bits[] = { CDB_TAG_OBJECT, 5, 1, 0x04, 2, 0, CDB_TAG_NULL };
+    const uint8_t empty_wide[] = { CDB_TAG_OBJECT, 2, 0, 0x11 };
+    cdb_value v;
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_CANONICAL, cdb_value_validate(wide, sizeof wide, CDB_ORDER_LITTLE,
+                                                                  CDB_DECIMAL_UNBOUNDED, 0));
+    TEST_ASSERT_EQUAL_INT(CDB_E_MALFORMED, cdb_value_read(bad_bits, sizeof bad_bits, CDB_ORDER_LITTLE, &v));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_CANONICAL, cdb_value_validate(empty_wide, sizeof empty_wide,
+                                                                  CDB_ORDER_LITTLE, CDB_DECIMAL_UNBOUNDED, 0));
+}
+
+static void test_empty_object(void)
+{
+    cdb_value v;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_begin_object(&w));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_end_object(&w));
+    assert_valid(CDB_ORDER_LITTLE);
+    TEST_ASSERT_EQUAL_size_t(4, cdb_value_writer_len(&w)); /* tag, length, count, width byte */
+    v = read_root(CDB_ORDER_LITTLE);
+    TEST_ASSERT_EQUAL_UINT64(0, v.as.object.count);
+}
+
+/* Many fields with wide IDs: exercises 2-byte widths and the binary search. */
+static void test_binary_search_large_object(void)
+{
+    static uint8_t big[16384];
+    cdb_byte_order orders[2] = { CDB_ORDER_LITTLE, CDB_ORDER_BIG };
+    int o;
+    for (o = 0; o < 2; o++) {
+        cdb_value root, field;
+        uint64_t id;
+        int found;
+        cdb_value_writer_init(&w, big, sizeof big, orders[o], CDB_DECIMAL_UNBOUNDED);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_begin_object(&w));
+        for (id = 0; id < 400; id++) {
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_field(&w, id * 7 + 3));
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_write_int(&w, (int64_t)id));
+        }
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_end_object(&w));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_validate(big, cdb_value_writer_len(&w), orders[o],
+                                                         CDB_DECIMAL_UNBOUNDED, 0));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_read(big, cdb_value_writer_len(&w), orders[o], &root));
+        TEST_ASSERT_EQUAL_UINT8(2, root.as.object.id_width);  /* max ID 2796 */
+        TEST_ASSERT_EQUAL_UINT8(2, root.as.object.off_width); /* offsets reach several hundred */
+        for (id = 0; id < 400; id++) {
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_object_get(&root, orders[o], id * 7 + 3, &field, &found));
+            TEST_ASSERT_TRUE(found);
+            TEST_ASSERT_EQUAL_INT64((int64_t)id, field.as.i64);
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_object_get(&root, orders[o], id * 7 + 4, &field, &found));
+            TEST_ASSERT_FALSE(found);
+        }
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_object_get(&root, orders[o], 0, &field, &found));
+        TEST_ASSERT_FALSE(found);
+    }
+    setUp();
 }
 
 static void test_writer_state_errors(void)
@@ -503,6 +563,9 @@ int main(void)
     RUN_TEST(test_identical_values_encode_identically);
     RUN_TEST(test_field_order_enforced);
     RUN_TEST(test_validator_rejects_unsorted_directory);
+    RUN_TEST(test_validator_rejects_wide_directory);
+    RUN_TEST(test_empty_object);
+    RUN_TEST(test_binary_search_large_object);
     RUN_TEST(test_writer_state_errors);
     RUN_TEST(test_depth_limit);
     RUN_TEST(test_buffer_too_small);

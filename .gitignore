@@ -2,3 +2,4 @@ build/
 db-combolite/build/
 *.o
 *.a
+.claude/

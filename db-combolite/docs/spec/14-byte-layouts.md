@@ -355,7 +355,7 @@ This is the single binary encoding for every value in every data model: document
 | `0x41` | binary | varint length, then bytes |
 | `0x42` | exact decimal | varint length, then the scale (varint) and the unscaled integer (two's complement, big-endian) |
 | `0x43` | array | varint byte length, varint element count, then the elements |
-| `0x44` | object | varint byte length, varint field count, then the field directory (14.6.3), then the values |
+| `0x44` | object | varint byte length, varint field count, width byte, then the fixed-width field directory (14.6.3), then the values |
 | `0x45` | vector | varint byte length, element type, dimension count, then the raw elements (Section 7.1) |
 
 - **Integers, lengths and IDs** use LEB128 varints.
@@ -374,7 +374,18 @@ A reader that meets an unknown variable-size tag reads the length and skips that
 
 - **Field dictionaries.** Every document pool and every table keeps a **field dictionary** in the catalog, mapping field names to small numeric field IDs. For an enclave, the dictionary is stored inside the enclave (Section 4.4).
 - **Field IDs, not names.** Objects store field IDs. Field names are never repeated inside records.
-- **The field directory.** An object's field directory is a list of *(field ID varint, value offset varint)* pairs, sorted strictly by field ID. To read one field, a reader binary-searches the directory and jumps straight to the value, without parsing any other field (Section 8.1).
+- **The field directory.** An object's field directory lists *(field ID, value offset)* pairs. It is sorted strictly by field ID.
+- **Fixed-width entries.** Directory entries are fixed width, so a reader can binary-search the directory and jump straight to the value it wants, without parsing any other field (Section 8.1).
+  - **The width byte.** A width byte comes before the directory:
+    - bits 0–1 hold the field-ID width code;
+    - bits 4–5 hold the offset width code;
+    - all other bits are zero.
+  - **Width codes:** 0 = 1 byte, 1 = 2 bytes, 2 = 4 bytes, 3 = 8 bytes.
+  - **Byte order.** Entries are stored in the file's byte order.
+- **Value offsets.** Each offset is measured from the start of the values area. Values are stored contiguously and in directory order, with no gaps.
+- **Canonical form:**
+  - each width is the **smallest** that fits the largest field ID, or the largest offset, in that object;
+  - an empty object has the width byte `0x00`.
 
 ### 14.6.4 Exact decimals: unbounded or compact
 
@@ -396,6 +407,20 @@ Content-hash deduplication (Section 6.3) needs every value to have exactly one v
 - strings stored exactly as supplied.
 
 Strings are **not** Unicode-normalized, because that would require shipping Unicode tables, which is too heavy for microcontrollers. As a consequence, a precomposed "é" and an "e" followed by a combining accent are different values.
+
+### 14.6.6 Encoding details
+
+| Item | Rule |
+|---|---|
+| Timestamp precision codes | 0 = seconds · 1 = milliseconds · 2 = microseconds · 3 = nanoseconds |
+| Vector element codes | 0 = f32 · 1 = f16 · 2 = bf16 · 3 = int8 · 4 = binary |
+| Binary vectors | Bit *i* is bit *(i mod 8)* of byte *i / 8*, least significant bit first. Unused bits in the last byte must be zero. |
+| Vector dimensions | A vector has at least one dimension. Its data length must equal the length implied by its element type and dimension count. |
+| Floats in vectors | f32, f16 and bf16 elements follow the same canonical rules as scalar floats: one canonical NaN, and −0 stored as +0. |
+| Byte order of fixed fields | float64, float32, timestamp ticks, vector elements and object directory entries all use the file's byte order. Decimals are always big-endian (14.6.1). |
+| Decimal zero | Stored as a single byte, `0x00`. |
+| Decimal scale | Not normalized. `1.0` (scale 1) and `1.00` (scale 2) are different values, because the scale records the precision the writer supplied. |
+| Unassigned fixed-shape tags | Tags `0x08`–`0x3F` that have not been assigned are **malformed**. They have no length prefix, so a reader cannot skip them. |
 
 ## 14.7 Anchor map and free-space list
 

@@ -173,6 +173,43 @@ static size_t vector_data_len(cdb_vector_elem elem, uint64_t dims)
     return (size_t)dims * (bits / 8u);
 }
 
+/* Fixed-width directory entries (spec 14.6.3). Width codes 0..3 = 1, 2, 4, 8 bytes. */
+static unsigned width_for(uint64_t v)
+{
+    if (v <= UINT8_MAX)
+        return 1;
+    if (v <= UINT16_MAX)
+        return 2;
+    if (v <= UINT32_MAX)
+        return 4;
+    return 8;
+}
+
+static uint8_t width_code(unsigned width)
+{
+    return (uint8_t)(width == 1 ? 0 : width == 2 ? 1 : width == 4 ? 2 : 3);
+}
+
+static void store_width(uint8_t *p, uint64_t v, unsigned width, cdb_byte_order order)
+{
+    switch (width) {
+    case 1: p[0] = (uint8_t)v; break;
+    case 2: cdb_store_u16(p, (uint16_t)v, order); break;
+    case 4: cdb_store_u32(p, (uint32_t)v, order); break;
+    default: cdb_store_u64(p, v, order); break;
+    }
+}
+
+static uint64_t load_width(const uint8_t *p, unsigned width, cdb_byte_order order)
+{
+    switch (width) {
+    case 1: return p[0];
+    case 2: return cdb_load_u16(p, order);
+    case 4: return cdb_load_u32(p, order);
+    default: return cdb_load_u64(p, order);
+    }
+}
+
 /* ------------------------------------------------------------- writer */
 
 static cdb_status w_fail(cdb_value_writer *w, cdb_status status)
@@ -564,33 +601,42 @@ cdb_status cdb_value_field(cdb_value_writer *w, uint64_t field_id)
 cdb_status cdb_value_end_object(cdb_value_writer *w)
 {
     cdb_value_frame *f;
-    size_t body, dir = 0, header, total;
-    uint64_t i;
+    size_t body, dir, header, total;
+    uint64_t i, max_id = 0, max_off = 0;
+    unsigned id_w, off_w;
+    uint8_t *out;
     if (w->error != CDB_OK)
         return w->error;
     if ((f = w_top(w, CDB_TAG_OBJECT)) == NULL || f->expect_value)
         return w_fail(w, CDB_E_STATE);
-    for (i = 0; i < f->count; i++) {
-        uint64_t id, off;
-        scratch_entry(w, f, i, &id, &off);
-        dir += cdb_varint_size(id) + cdb_varint_size(off);
-    }
+    /* Entries are staged in increasing field and offset order, so the last
+     * one holds both maxima. */
+    if (f->count > 0)
+        scratch_entry(w, f, f->count - 1, &max_id, &max_off);
+    id_w = width_for(max_id);
+    off_w = width_for(max_off);
+    if (f->count > (uint64_t)(SIZE_MAX / 16u))
+        return w_fail(w, CDB_E_OVERFLOW);
+    dir = (size_t)f->count * (id_w + off_w);
     body = w->len - (f->start + 1);
-    total = cdb_varint_size(f->count) + dir + body;
-    header = cdb_varint_size(total) + cdb_varint_size(f->count) + dir;
+    total = cdb_varint_size(f->count) + 1 + dir + body;
+    header = cdb_varint_size(total) + cdb_varint_size(f->count) + 1 + dir;
     if (w_room(w, header) != CDB_OK)
         return w->error;
     memmove(w->buf + f->start + 1 + header, w->buf + f->start + 1, body);
     w->len = f->start + 1;
     w_put_varint(w, total);
     w_put_varint(w, f->count);
+    w_put_byte(w, (uint8_t)(width_code(id_w) | (unsigned)width_code(off_w) << 4));
+    out = w->buf + w->len;
     for (i = 0; i < f->count; i++) {
         uint64_t id, off;
         scratch_entry(w, f, i, &id, &off);
-        w_put_varint(w, id);
-        w_put_varint(w, off);
+        store_width(out, id, id_w, w->order);
+        store_width(out + id_w, off, off_w, w->order);
+        out += id_w + off_w;
     }
-    w->len += body;
+    w->len += dir + body;
     w->scratch_top = f->scratch_base;
     w->depth--;
     w_end_value(w);
@@ -719,21 +765,27 @@ cdb_status cdb_value_read(const uint8_t *buf, size_t len, cdb_byte_order order, 
         out->as.array.items_len = (size_t)(pend - p);
         return CDB_OK;
     case CDB_TAG_OBJECT: {
-        uint64_t i;
-        const uint8_t *dir;
-        if ((s = read_varint(&p, pend, &out->as.object.count)) != CDB_OK)
+        uint8_t widths;
+        unsigned entry;
+        uint64_t count;
+        if ((s = read_varint(&p, pend, &count)) != CDB_OK)
             return s == CDB_E_TRUNCATED ? CDB_E_MALFORMED : s;
-        dir = p;
-        for (i = 0; i < out->as.object.count; i++) {
-            uint64_t id, off;
-            if ((s = read_varint(&p, pend, &id)) != CDB_OK || (s = read_varint(&p, pend, &off)) != CDB_OK)
-                return s == CDB_E_TRUNCATED ? CDB_E_MALFORMED : s;
-        }
+        if (p == pend)
+            return CDB_E_MALFORMED;
+        widths = *p++;
+        if (widths & 0xCCu)
+            return CDB_E_MALFORMED;
+        out->as.object.id_width = (uint8_t)(1u << (widths & 0x03u));
+        out->as.object.off_width = (uint8_t)(1u << ((widths >> 4) & 0x03u));
+        entry = (unsigned)out->as.object.id_width + out->as.object.off_width;
+        if (count > (uint64_t)(pend - p) / entry)
+            return CDB_E_MALFORMED;
         out->type = CDB_TYPE_OBJECT;
-        out->as.object.directory = dir;
-        out->as.object.directory_len = (size_t)(p - dir);
-        out->as.object.values = p;
-        out->as.object.values_len = (size_t)(pend - p);
+        out->as.object.count = count;
+        out->as.object.directory = p;
+        out->as.object.directory_len = (size_t)count * entry;
+        out->as.object.values = p + out->as.object.directory_len;
+        out->as.object.values_len = (size_t)(pend - out->as.object.values);
         return CDB_OK;
     }
     case CDB_TAG_VECTOR: {
@@ -791,6 +843,8 @@ cdb_status cdb_value_object_iter(const cdb_value *object, cdb_byte_order order, 
     memset(it, 0, sizeof *it);
     it->dir_pos = object->as.object.directory;
     it->dir_end = object->as.object.directory + object->as.object.directory_len;
+    it->id_width = object->as.object.id_width;
+    it->off_width = object->as.object.off_width;
     it->pos = object->as.object.values;
     it->end = object->as.object.values + object->as.object.values_len;
     it->order = order;
@@ -808,42 +862,43 @@ static cdb_status object_value_at(const cdb_value_iter *it, uint64_t offset, cdb
 cdb_status cdb_value_object_next(cdb_value_iter *it, uint64_t *field_id, cdb_value *value, int *done)
 {
     uint64_t offset;
-    cdb_status s;
     if (it->dir_pos == it->dir_end) {
         *done = 1;
         return CDB_OK;
     }
     *done = 0;
-    if ((s = read_varint(&it->dir_pos, it->dir_end, field_id)) != CDB_OK)
-        return s;
-    if ((s = read_varint(&it->dir_pos, it->dir_end, &offset)) != CDB_OK)
-        return s;
+    *field_id = load_width(it->dir_pos, it->id_width, it->order);
+    offset = load_width(it->dir_pos + it->id_width, it->off_width, it->order);
+    it->dir_pos += it->id_width + it->off_width;
     return object_value_at(it, offset, value);
 }
 
-/* The directory holds varints, so lookup is a linear scan of the directory.
- * It never decodes the values it passes over. */
+/* Binary search over the fixed-width directory (spec 14.6.3). */
 cdb_status cdb_value_object_get(const cdb_value *object, cdb_byte_order order,
                                 uint64_t field_id, cdb_value *value, int *found)
 {
     cdb_value_iter it;
+    uint64_t lo = 0, hi;
+    unsigned entry;
     cdb_status s;
 
     *found = 0;
     if ((s = cdb_value_object_iter(object, order, &it)) != CDB_OK)
         return s;
-    while (it.dir_pos != it.dir_end) {
-        uint64_t id, offset;
-        if ((s = read_varint(&it.dir_pos, it.dir_end, &id)) != CDB_OK)
-            return s;
-        if ((s = read_varint(&it.dir_pos, it.dir_end, &offset)) != CDB_OK)
-            return s;
+    entry = (unsigned)it.id_width + it.off_width;
+    hi = object->as.object.count;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        const uint8_t *e = it.dir_pos + (size_t)mid * entry;
+        uint64_t id = load_width(e, it.id_width, order);
         if (id == field_id) {
             *found = 1;
-            return object_value_at(&it, offset, value);
+            return object_value_at(&it, load_width(e + it.id_width, it.off_width, order), value);
         }
-        if (id > field_id)
-            break;
+        if (id < field_id)
+            lo = mid + 1;
+        else
+            hi = mid;
     }
     return CDB_OK;
 }
@@ -926,23 +981,25 @@ static cdb_status validate_array(const validate_ctx *c, const cdb_value *v, unsi
 static cdb_status validate_object(const validate_ctx *c, const cdb_value *v, unsigned depth)
 {
     const uint8_t *dp = v->as.object.directory;
-    const uint8_t *dend = dp + v->as.object.directory_len;
+    unsigned id_w = v->as.object.id_width;
+    unsigned off_w = v->as.object.off_width;
     size_t expected = 0;
-    uint64_t prev = 0;
+    uint64_t prev = 0, last_off = 0;
     uint64_t i;
 
     for (i = 0; i < v->as.object.count; i++) {
-        uint64_t id, off;
+        uint64_t id = load_width(dp, id_w, c->order);
+        uint64_t off = load_width(dp + id_w, off_w, c->order);
         size_t used;
         cdb_status s;
-        if ((s = read_varint(&dp, dend, &id)) != CDB_OK || (s = read_varint(&dp, dend, &off)) != CDB_OK)
-            return s;
+        dp += id_w + off_w;
         if (i > 0 && id <= prev)
             return CDB_E_NOT_CANONICAL; /* unsorted or duplicate field */
         prev = id;
         /* Values are contiguous and in directory order: no gaps, no overlap. */
         if (off != (uint64_t)expected)
             return CDB_E_NOT_CANONICAL;
+        last_off = off;
         if (expected >= v->as.object.values_len)
             return CDB_E_MALFORMED;
         s = validate_at(c, v->as.object.values + expected, v->as.object.values_len - expected,
@@ -951,6 +1008,9 @@ static cdb_status validate_object(const validate_ctx *c, const cdb_value *v, uns
             return s;
         expected += used;
     }
+    /* Widths must be the smallest that fit (an empty object uses 1 and 1). */
+    if (id_w != width_for(prev) || off_w != width_for(last_off))
+        return CDB_E_NOT_CANONICAL;
     return expected == v->as.object.values_len ? CDB_OK : CDB_E_MALFORMED;
 }
 

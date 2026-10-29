@@ -151,6 +151,8 @@ typedef struct cdb_value {
         struct { uint64_t count; const uint8_t *items; size_t items_len; } array;
         struct {
             uint64_t count;
+            uint8_t id_width;  /* bytes per directory field ID: 1, 2, 4 or 8 */
+            uint8_t off_width; /* bytes per directory value offset */
             const uint8_t *directory; size_t directory_len;
             const uint8_t *values; size_t values_len;
         } object;
@@ -169,6 +171,8 @@ typedef struct cdb_value_iter {
     /* objects only */
     const uint8_t *dir_pos;
     const uint8_t *dir_end;
+    uint8_t id_width;
+    uint8_t off_width;
 } cdb_value_iter;
 
 cdb_status cdb_value_array_iter(const cdb_value *array, cdb_byte_order order, cdb_value_iter *it);
@@ -177,7 +181,7 @@ cdb_status cdb_value_array_next(cdb_value_iter *it, cdb_value *item, int *done);
 
 cdb_status cdb_value_object_iter(const cdb_value *object, cdb_byte_order order, cdb_value_iter *it);
 cdb_status cdb_value_object_next(cdb_value_iter *it, uint64_t *field_id, cdb_value *value, int *done);
-/* Finds a field through the directory without decoding other values.
+/* Binary-searches the fixed-width directory; never decodes other values.
  * *found is 0 when the field is absent. */
 cdb_status cdb_value_object_get(const cdb_value *object, cdb_byte_order order,
                                 uint64_t field_id, cdb_value *value, int *found);
