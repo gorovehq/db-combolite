@@ -52,6 +52,9 @@ typedef struct cdb_index {
 size_t cdb_index_work_size(size_t page_size);
 size_t cdb_index_entries_needed(size_t page_size);
 
+/* The longest value an index over this pager's pages can hold. */
+size_t cdb_index_max_value(const cdb_pager *p);
+
 /* Creates an empty index: allocates and writes its root leaf. */
 cdb_status cdb_index_create(cdb_index *ix, cdb_pager *p, uint64_t store_id, unsigned flags,
                             const cdb_index_work *w);

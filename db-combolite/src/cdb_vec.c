@@ -20,8 +20,23 @@
 /* Payload flag: a source follows. */
 #define PAYLOAD_SOURCE 0x01u
 
+/* Neighbour graph: record header, bytes per neighbour, live-count record,
+ * most entry points. Entry points are reverse rows under neighbour 0. */
+#define REC_HDR 12u
+#define NB_SIZE 12u
+#define MEASURE_VERSION 1u
+#define META_LEN 8u
+#define MAX_EP 1024u
+#define MIN_EP 8u   /* entry points the smallest vec_work holds */
+#define EP_SPREAD 1u  /* entry point rows: chosen to spread over the collection */
+#define EP_REACH 2u   /* added because a walk could not reach the entry */
+#define DEFAULT_BUDGET 256u
+#define DEFAULT_EF 64u
+#define DEFAULT_EXACT_BELOW 10000u /* bench_graph: exact was faster up to 8000 (spec 7.7) */
+
 /* Settings fields (spec 14.12.3), kept in store record field 16. */
-enum { S_ELEM = 1, S_DIMS, S_MEASURE, S_MODEL, S_VERSION, S_ENTRIES, S_BLOCKS, S_SOURCES, S_NORMS };
+enum { S_ELEM = 1, S_DIMS, S_MEASURE, S_MODEL, S_VERSION, S_ENTRIES, S_BLOCKS, S_SOURCES, S_NORMS,
+       S_K, S_GRAPH, S_REVERSE, S_PENDING /* optional: the neighbour graph */ };
 
 typedef struct cdb_vec_coll coll;
 
@@ -104,6 +119,16 @@ static cdb_status encode_settings(const cdb_db *db, const cdb_vec_config *cfg, c
     cdb_value_write_int(&w, (int64_t)c->sources.root);
     cdb_value_field(&w, S_NORMS);
     cdb_value_write_bool(&w, c->norms != 0);
+    if (c->graph_on) {
+        cdb_value_field(&w, S_K);
+        cdb_value_write_int(&w, (int64_t)c->k);
+        cdb_value_field(&w, S_GRAPH);
+        cdb_value_write_int(&w, (int64_t)c->graph.root);
+        cdb_value_field(&w, S_REVERSE);
+        cdb_value_write_int(&w, (int64_t)c->reverse.root);
+        cdb_value_field(&w, S_PENDING);
+        cdb_value_write_int(&w, (int64_t)c->pending.root);
+    }
     cdb_value_end_object(&w);
     *len = cdb_value_writer_len(&w);
     return w.error;
@@ -133,9 +158,10 @@ static cdb_status get_text(const cdb_value *obj, cdb_byte_order o, uint64_t f, c
     return CDB_OK;
 }
 
-/* Decodes settings into c (roots in *roots) and, optionally, cfg with its
- * model strings copied to model and version. */
-static cdb_status decode_settings(const cdb_db *db, const uint8_t *in, size_t len, coll *c, uint64_t roots[3],
+/* Decodes settings into c (index roots in roots: entries, blocks, sources,
+ * then graph, reverse, pending when c->graph_on) and, optionally, cfg with
+ * its model strings copied to model and version. */
+static cdb_status decode_settings(const cdb_db *db, const uint8_t *in, size_t len, coll *c, uint64_t roots[6],
                                   cdb_vec_config *cfg, char *model, char *version)
 {
     cdb_byte_order o = db->pager.order;
@@ -166,6 +192,21 @@ static cdb_status decode_settings(const cdb_db *db, const uint8_t *in, size_t le
     c->vec_bytes = vector_bytes(c->elem, c->dims);
     for (i = 0; i < 3; i++)
         roots[i] = (uint64_t)r[i];
+    c->graph_on = 0;
+    if (cdb_value_object_get(&obj, o, S_K, &v, &found) != CDB_OK)
+        return CDB_E_CORRUPT;
+    if (found) {
+        int64_t kk, g;
+        if (get_int(&obj, o, S_K, 1, CDB_VEC_MAX_K, &kk) != CDB_OK)
+            return CDB_E_CORRUPT;
+        for (i = 0; i < 3; i++) {
+            if (get_int(&obj, o, (uint64_t)S_GRAPH + (uint64_t)i, 1, INT64_MAX, &g) != CDB_OK)
+                return CDB_E_CORRUPT;
+            roots[3 + i] = (uint64_t)g;
+        }
+        c->graph_on = 1;
+        c->k = (uint32_t)kk;
+    }
     if (cfg) {
         memset(cfg, 0, sizeof *cfg);
         cfg->elem = (cdb_vector_elem)elem;
@@ -196,7 +237,7 @@ static cdb_status coll_get(cdb_db *db, uint64_t store, coll **out)
 {
     coll *free_slot = NULL;
     cdb_store_info info;
-    uint64_t roots[3];
+    uint64_t roots[6];
     cdb_status s;
     int i;
 
@@ -236,16 +277,36 @@ static cdb_status coll_get(cdb_db *db, uint64_t store, coll **out)
         || (s = cdb_index_open(&free_slot->blocks, &db->pager, roots[1], &db->cfg.catalog_work)) != CDB_OK
         || (s = cdb_index_open(&free_slot->sources, &db->pager, roots[2], &db->cfg.catalog_work)) != CDB_OK)
         return s;
+    if (free_slot->graph_on) {
+        if (db->cfg.vec_work == NULL
+            || db->cfg.vec_work_size < cdb_vec_work_size((cdb_vector_elem)free_slot->elem, free_slot->dims, free_slot->k))
+            return CDB_E_UNSUPPORTED; /* the graph could not be kept up to date */
+        if ((s = cdb_index_open(&free_slot->graph, &db->pager, roots[3], &db->cfg.catalog_work)) != CDB_OK
+            || (s = cdb_index_open(&free_slot->reverse, &db->pager, roots[4], &db->cfg.catalog_work)) != CDB_OK
+            || (s = cdb_index_open(&free_slot->pending, &db->pager, roots[5], &db->cfg.catalog_work)) != CDB_OK)
+            return s;
+    }
     free_slot->in_use = 1;
     *out = free_slot;
     return CDB_OK;
 }
 
+static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *processed);
+
+/* At reconciliation: refresh up to the budget of each graph (spec 6.8),
+ * then record next entry IDs. */
 cdb_status cdb_vec_flush(cdb_db *db)
 {
     int i;
     for (i = 0; i < CDB_DB_MAX_POOLS; i++) {
         coll *c = &db->vecs[i];
+        if (c->in_use && c->graph_on) {
+            size_t done;
+            cdb_status s = refresh_coll(db, c, db->cfg.vec_refresh_budget ? db->cfg.vec_refresh_budget : DEFAULT_BUDGET,
+                                        &done);
+            if (s != CDB_OK)
+                return s;
+        }
         if (c->in_use && c->dirty) {
             cdb_status s = cdb_catalog_stage_next_entry(&db->catalog, c->store_id, c->next_entry);
             if (s != CDB_OK)
@@ -310,7 +371,7 @@ cdb_status cdb_vec_create(cdb_db *db, const char *name, size_t len, const cdb_ve
 cdb_status cdb_vec_describe(cdb_db *db, uint64_t store, cdb_vec_config *cfg, char *model, char *model_version)
 {
     cdb_store_info info;
-    uint64_t roots[3];
+    uint64_t roots[6];
     coll *c, tmp;
     cdb_status s;
     if ((s = coll_get(db, store, &c)) != CDB_OK)
@@ -677,6 +738,883 @@ static cdb_status unplace(cdb_db *db, coll *c, uint64_t entry, const entry_rec *
     return blocks_put(c, r->block, used - 1u, count);
 }
 
+/* -------------------------------------------------------- neighbour graph
+ *
+ * Record (spec 14.12.2, 14.12.4): entry ID (8), count (2), flags (1), measure
+ * version (1), then per neighbour its entry ID (8) and distance (f32, 4),
+ * nearest first; equal distances: lower entry ID first. Key 0 of the graph
+ * index holds the live vector count (8), the entry-point count (2) and the
+ * entry points (8 each). Index values are big-endian. */
+
+typedef struct nb {
+    uint64_t entry;
+    float dist;
+} nb;
+
+typedef struct grec {
+    uint32_t count;
+    nb n[CDB_VEC_MAX_K];
+} grec;
+
+/* One pending entry being refreshed, in vec_work; its vector follows. */
+typedef struct bitem {
+    uint64_t entry;
+    double norm;     /* cached norm, as its block holds it (cosine), else -1 */
+    int live;
+    float d;         /* distance to the vector being scanned */
+    grec rec;
+} bitem;
+
+typedef struct cand {
+    uint64_t entry;
+    double dist;
+} cand;
+
+static int nb_less(float d1, uint64_t e1, float d2, uint64_t e2)
+{
+    return d1 < d2 || (d1 == d2 && e1 < e2);
+}
+
+/* Offers (e, d) to a list of at most k: kept in order, without duplicates.
+ * Returns 1 when it went in; *dropped is the entry it pushed out, or 0. */
+static int rec_offer(grec *r, uint32_t k, uint64_t e, float d, uint64_t *dropped)
+{
+    uint32_t i, pos;
+    *dropped = 0;
+    for (i = 0; i < r->count; i++)
+        if (r->n[i].entry == e)
+            return 0;
+    if (r->count == k) {
+        if (!nb_less(d, e, r->n[k - 1].dist, r->n[k - 1].entry))
+            return 0;
+        *dropped = r->n[k - 1].entry;
+        r->count--;
+    }
+    for (pos = r->count; pos > 0 && nb_less(d, e, r->n[pos - 1].dist, r->n[pos - 1].entry); pos--)
+        r->n[pos] = r->n[pos - 1];
+    r->n[pos].entry = e;
+    r->n[pos].dist = d;
+    r->count++;
+    return 1;
+}
+
+static int rec_remove(grec *r, uint64_t e)
+{
+    uint32_t i;
+    for (i = 0; i < r->count; i++) {
+        if (r->n[i].entry == e) {
+            memmove(&r->n[i], &r->n[i + 1], (r->count - i - 1u) * sizeof r->n[0]);
+            r->count--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static cdb_status rec_get(coll *c, uint64_t entry, grec *r, int *found)
+{
+    uint8_t k[8], v[REC_HDR + NB_SIZE * CDB_VEC_MAX_K];
+    size_t vlen;
+    uint32_t i;
+    cdb_status s = cdb_index_get(&c->graph, k, k_u64(k, entry), v, sizeof v, &vlen, found);
+    if (s != CDB_OK || !*found)
+        return s;
+    if (vlen < REC_HDR || cdb_load_u64(v, CDB_ORDER_BIG) != entry)
+        return CDB_E_CORRUPT;
+    r->count = cdb_load_u16(v + 8, CDB_ORDER_BIG);
+    if (r->count > c->k || vlen != REC_HDR + (size_t)r->count * NB_SIZE)
+        return CDB_E_CORRUPT;
+    for (i = 0; i < r->count; i++) {
+        uint32_t bits = cdb_load_u32(v + REC_HDR + i * NB_SIZE + 8u, CDB_ORDER_BIG);
+        r->n[i].entry = cdb_load_u64(v + REC_HDR + i * NB_SIZE, CDB_ORDER_BIG);
+        memcpy(&r->n[i].dist, &bits, sizeof bits);
+    }
+    return CDB_OK;
+}
+
+static cdb_status rec_put(coll *c, uint64_t entry, const grec *r)
+{
+    uint8_t k[8], v[REC_HDR + NB_SIZE * CDB_VEC_MAX_K];
+    uint32_t i;
+    memset(v, 0, REC_HDR);
+    cdb_store_u64(v, entry, CDB_ORDER_BIG);
+    cdb_store_u16(v + 8, (uint16_t)r->count, CDB_ORDER_BIG);
+    v[11] = MEASURE_VERSION;
+    for (i = 0; i < r->count; i++) {
+        uint32_t bits;
+        memcpy(&bits, &r->n[i].dist, sizeof bits);
+        cdb_store_u64(v + REC_HDR + i * NB_SIZE, r->n[i].entry, CDB_ORDER_BIG);
+        cdb_store_u32(v + REC_HDR + i * NB_SIZE + 8u, bits, CDB_ORDER_BIG);
+    }
+    return cdb_index_put(&c->graph, k, k_u64(k, entry), v, REC_HDR + (size_t)r->count * NB_SIZE);
+}
+
+static size_t k_pair(uint8_t *k, uint64_t a, uint64_t b)
+{
+    cdb_store_u64(k, a, CDB_ORDER_BIG);
+    cdb_store_u64(k + 8, b, CDB_ORDER_BIG);
+    return 16;
+}
+
+/* entry lists neighbour. */
+static cdb_status rev_put(coll *c, uint64_t neighbour, uint64_t entry)
+{
+    uint8_t k[16];
+    return cdb_index_put(&c->reverse, k, k_pair(k, neighbour, entry), k, 0);
+}
+
+static cdb_status rev_del(coll *c, uint64_t neighbour, uint64_t entry)
+{
+    uint8_t k[16];
+    int found;
+    return cdb_index_delete(&c->reverse, k, k_pair(k, neighbour, entry), &found);
+}
+
+static cdb_status pending_put(coll *c, uint64_t entry)
+{
+    uint8_t k[8];
+    return cdb_index_put(&c->pending, k, k_u64(k, entry), k, 0);
+}
+
+static cdb_status pending_del(coll *c, uint64_t entry)
+{
+    uint8_t k[8];
+    int found;
+    return cdb_index_delete(&c->pending, k, k_u64(k, entry), &found);
+}
+
+static cdb_status pending_has(coll *c, uint64_t entry, int *found)
+{
+    uint8_t k[8], v[1];
+    size_t vlen;
+    return cdb_index_get(&c->pending, k, k_u64(k, entry), v, sizeof v, &vlen, found);
+}
+
+static cdb_status meta_get(coll *c, uint64_t *live)
+{
+    uint8_t k[8], v[META_LEN];
+    size_t vlen;
+    int found;
+    cdb_status s = cdb_index_get(&c->graph, k, k_u64(k, 0), v, sizeof v, &vlen, &found);
+    *live = 0;
+    if (s != CDB_OK || !found)
+        return s;
+    if (vlen != META_LEN)
+        return CDB_E_CORRUPT;
+    *live = cdb_load_u64(v, CDB_ORDER_BIG);
+    return CDB_OK;
+}
+
+static cdb_status meta_put(coll *c, uint64_t live)
+{
+    uint8_t k[8], v[META_LEN];
+    cdb_store_u64(v, live, CDB_ORDER_BIG);
+    return cdb_index_put(&c->graph, k, k_u64(k, 0), v, META_LEN);
+}
+
+static cdb_status meta_live(coll *c, int delta)
+{
+    uint64_t live;
+    cdb_status s = meta_get(c, &live);
+    if (s != CDB_OK)
+        return s;
+    if (delta < 0 && live == 0)
+        return CDB_E_CORRUPT;
+    return meta_put(c, delta < 0 ? live - 1u : live + 1u);
+}
+
+/* The entry point at or after from (reverse rows under neighbour 0) and
+ * its kind; 0 when there are no more. */
+static cdb_status ep_next(cdb_db *db, coll *c, uint64_t from, uint64_t *e, unsigned *kind)
+{
+    cdb_index_cursor cur;
+    uint8_t k[16], got[16], v[2];
+    size_t klen, vlen;
+    int done;
+    cdb_status s;
+    *e = 0;
+    if ((s = cdb_index_seek(&cur, &c->reverse, vbuf(db, V_CURSOR), k, k_pair(k, 0, from))) != CDB_OK
+        || (s = cdb_index_next(&cur, got, sizeof got, &klen, v, sizeof v, &vlen, &done)) != CDB_OK)
+        return s;
+    if (done || klen != 16 || cdb_load_u64(got, CDB_ORDER_BIG) != 0)
+        return CDB_OK;
+    *e = cdb_load_u64(got + 8, CDB_ORDER_BIG);
+    *kind = vlen == 1 ? v[0] : 0u;
+    return *e == 0 || (*kind != EP_SPREAD && *kind != EP_REACH) ? CDB_E_CORRUPT : CDB_OK;
+}
+
+/* An entry's entry point kind; 0 when it is not one. */
+static cdb_status ep_get(coll *c, uint64_t e, unsigned *kind)
+{
+    uint8_t k[16], v[2];
+    size_t vlen;
+    int found;
+    cdb_status s = cdb_index_get(&c->reverse, k, k_pair(k, 0, e), v, sizeof v, &vlen, &found);
+    *kind = 0;
+    if (s != CDB_OK || !found)
+        return s;
+    if (vlen != 1 || (v[0] != EP_SPREAD && v[0] != EP_REACH))
+        return CDB_E_CORRUPT;
+    *kind = v[0];
+    return CDB_OK;
+}
+
+static cdb_status ep_put(coll *c, uint64_t e, unsigned kind)
+{
+    uint8_t k[16], v[1];
+    v[0] = (uint8_t)kind;
+    return cdb_index_put(&c->reverse, k, k_pair(k, 0, e), v, 1);
+}
+
+/* Takes an entry out of the graph: its record and the reverse rows of its
+ * list, and itself from every list that holds it. Those entries become
+ * pending, so their lists are filled again at the next refresh. */
+static cdb_status graph_detach(cdb_db *db, coll *c, uint64_t entry)
+{
+    grec r;
+    uint32_t i;
+    int found;
+    cdb_status s;
+    if ((s = rec_get(c, entry, &r, &found)) != CDB_OK)
+        return s;
+    if (found) {
+        uint8_t k[8];
+        for (i = 0; i < r.count; i++)
+            if ((s = rev_del(c, r.n[i].entry, entry)) != CDB_OK)
+                return s;
+        if ((s = cdb_index_delete(&c->graph, k, k_u64(k, entry), &found)) != CDB_OK)
+            return s;
+    }
+    for (;;) {
+        cdb_index_cursor cur;
+        uint8_t k[16], got[16], none[1];
+        size_t klen, vlen;
+        uint64_t lister;
+        int done;
+        grec lr;
+        if ((s = cdb_index_seek(&cur, &c->reverse, vbuf(db, V_CURSOR), k, k_pair(k, entry, 0))) != CDB_OK
+            || (s = cdb_index_next(&cur, got, sizeof got, &klen, none, sizeof none, &vlen, &done)) != CDB_OK)
+            return s;
+        if (done || klen != 16 || memcmp(got, k, 8) != 0)
+            return CDB_OK;
+        lister = cdb_load_u64(got + 8, CDB_ORDER_BIG);
+        if ((s = rev_del(c, entry, lister)) != CDB_OK || (s = rec_get(c, lister, &lr, &found)) != CDB_OK)
+            return s;
+        if (found && rec_remove(&lr, entry) && (s = rec_put(c, lister, &lr)) != CDB_OK)
+            return s;
+        if ((s = pending_put(c, lister)) != CDB_OK)
+            return s;
+    }
+}
+
+/* vec_work, aligned for the structures placed in it. */
+static uint8_t *work_base(const cdb_db *db, size_t *avail)
+{
+    uintptr_t p = (uintptr_t)db->cfg.vec_work, a = (p + 7u) & ~(uintptr_t)7u;
+    size_t skip = (size_t)(a - p);
+    *avail = db->cfg.vec_work_size > skip ? db->cfg.vec_work_size - skip : 0;
+    return db->cfg.vec_work + skip;
+}
+
+static size_t item_stride(size_t vec_bytes)
+{
+    return (sizeof(bitem) + vec_bytes + 7u) & ~(size_t)7u;
+}
+
+/* One chosen entry point in vec_work: its ID, then its vector. */
+static size_t ep_stride(size_t vec_bytes)
+{
+    return (8u + vec_bytes + 7u) & ~(size_t)7u;
+}
+
+size_t cdb_vec_work_size(cdb_vector_elem elem, uint32_t dims, uint32_t k)
+{
+    size_t vb = vector_bytes(elem, dims), need = item_stride(vb) + 8u, ep = (MIN_EP + 1u) * ep_stride(vb) + 8u;
+    size_t search = 2u * DEFAULT_EF * sizeof(cand) + 512u * 8u + 8u;
+    (void)k; /* records are sized for CDB_VEC_MAX_K */
+    if (ep > need)
+        need = ep;
+    if (search > need)
+        need = search;
+    return need + need / 7u + 64u; /* an eighth more lists the entries to check */
+}
+
+/* Copies an entry's vector into out; *norm gets its cached norm or -1. */
+static cdb_status fetch_vector(cdb_db *db, coll *c, uint64_t entry, uint8_t *out, double *norm, int *found)
+{
+    entry_rec r;
+    block b;
+    cdb_status s;
+    if ((s = entry_get(c, entry, &r, found)) != CDB_OK || !*found)
+        return s;
+    if ((s = block_read(db, c, r.block, &b)) != CDB_OK)
+        return s;
+    if (r.slot >= b.count || slot_entry(db, &b, r.slot) != entry)
+        return CDB_E_CORRUPT;
+    memcpy(out, slot_data(db, c, &b, r.slot), c->vec_bytes);
+    if (norm)
+        *norm = slot_norm(db, c, &b, r.slot);
+    return CDB_OK;
+}
+
+static uint64_t ep_id(const uint8_t *w, size_t stride, size_t i)
+{
+    uint64_t e;
+    memcpy(&e, w + i * stride, sizeof e);
+    return e;
+}
+
+/* Raises r to the distance of the closest pair of the chosen, then keeps,
+ * in order, each chosen point farther than r from those already kept. The
+ * closest points go first, so the rest stay spread out. */
+static size_t ep_thin(const coll *c, unsigned spread, uint8_t *w, size_t stride, size_t n, double *r,
+                      cdb_byte_order o)
+{
+    size_t i, j, kept = 0;
+    double m = -1.0;
+    for (i = 0; i < n; i++)
+        for (j = i + 1u; j < n; j++) {
+            double d = distance(c, spread, w + i * stride + 8u, 0.0, w + j * stride + 8u, -1.0, o);
+            if (m < 0.0 || d < m)
+                m = d;
+        }
+    *r = m;
+    for (i = 0; i < n; i++) {
+        for (j = 0; j < kept; j++)
+            if (distance(c, spread, w + j * stride + 8u, 0.0, w + i * stride + 8u, -1.0, o) <= *r)
+                break;
+        if (j < kept)
+            continue;
+        if (kept != i)
+            memmove(w + kept * stride, w + i * stride, stride);
+        kept++;
+    }
+    return kept;
+}
+
+/* Chooses entry points that cover the collection (spec 7.4): about the
+ * square root of the live count (at least MIN_EP, at most MAX_EP and what
+ * vec_work holds). One pass over the blocks keeps each vector farther than
+ * r from those chosen (Euclidean, or Hamming for binary vectors); when too
+ * many are chosen, r grows to their closest pair and they are thinned. The
+ * rows under neighbour 0 are then made to match. */
+static cdb_status choose_entry_points(cdb_db *db, coll *c, uint8_t *w, size_t avail)
+{
+    unsigned spread = c->elem == CDB_VEC_BINARY ? CDB_VEC_HAMMING : CDB_VEC_EUCLIDEAN, kind;
+    cdb_byte_order o = db->pager.order;
+    size_t stride = ep_stride(c->vec_bytes), want, n = 0, i;
+    uint64_t live, e, from;
+    double r = 0.0;
+    cdb_index_cursor cur;
+    uint8_t key[8], val[BLOCKS_VAL];
+    size_t klen, vlen;
+    int done;
+    cdb_status s;
+
+    if ((s = meta_get(c, &live)) != CDB_OK)
+        return s;
+    want = (size_t)ceil(sqrt((double)live));
+    if (want < MIN_EP)
+        want = MIN_EP;
+    if (want > MAX_EP)
+        want = MAX_EP;
+    if (avail / stride < want + 1u)
+        want = avail / stride > 1u ? avail / stride - 1u : 0;
+    if (want == 0)
+        return CDB_E_UNSUPPORTED;
+    if ((s = cdb_index_seek(&cur, &c->blocks, vbuf(db, V_CURSOR), NULL, 0)) != CDB_OK)
+        return s;
+    for (;;) {
+        block b;
+        uint32_t t;
+        if ((s = cdb_index_next(&cur, key, sizeof key, &klen, val, sizeof val, &vlen, &done)) != CDB_OK)
+            return s;
+        if (done)
+            break;
+        if ((s = block_read(db, c, cdb_load_u64(key, CDB_ORDER_BIG), &b)) != CDB_OK)
+            return s;
+        for (t = 0; t < b.count; t++) {
+            const uint8_t *v = slot_data(db, c, &b, t);
+            e = slot_entry(db, &b, t);
+            if (e == 0)
+                continue;
+            for (i = 0; i < n; i++)
+                if (distance(c, spread, w + i * stride + 8u, 0.0, v, -1.0, o) <= r)
+                    break;
+            if (i < n)
+                continue;
+            memcpy(w + n * stride, &e, sizeof e);
+            memcpy(w + n * stride + 8u, v, c->vec_bytes);
+            n++;
+            while (n > want)
+                n = ep_thin(c, spread, w, stride, n, &r, o);
+        }
+    }
+    for (from = 1;; from = e + 1u) {
+        if ((s = ep_next(db, c, from, &e, &kind)) != CDB_OK)
+            return s;
+        if (e == 0)
+            break;
+        if (kind != EP_SPREAD)
+            continue;
+        for (i = 0; i < n && ep_id(w, stride, i) != e; i++)
+            ;
+        if (i == n && (s = rev_del(c, 0, e)) != CDB_OK)
+            return s;
+    }
+    for (i = 0; i < n; i++) {
+        if ((s = ep_get(c, ep_id(w, stride, i), &kind)) != CDB_OK)
+            return s;
+        if (kind != EP_SPREAD && (s = ep_put(c, ep_id(w, stride, i), EP_SPREAD)) != CDB_OK)
+            return s;
+    }
+    return CDB_OK;
+}
+
+/* Working state of the approximate path, in vec_work: the candidates still
+ * to expand, the best found so far (sorted), and the visited set. */
+typedef struct walk {
+    cand *cands;
+    size_t ncand;
+    cand *best;
+    size_t nbest;
+    size_t ef;
+    uint64_t *seen;
+    size_t seen_cap;
+    size_t seen_n;
+} walk;
+
+/* Marks e visited; 0 if it already was. When the set is full, nothing is
+ * marked and 1 is returned: the walk then stops expanding (see full). */
+static int visit(walk *w, uint64_t e)
+{
+    size_t h = (size_t)((e * 0x9E3779B97F4A7C15ull) % w->seen_cap);
+    while (w->seen[h] != 0) {
+        if (w->seen[h] == e)
+            return 0;
+        h = (h + 1u) % w->seen_cap;
+    }
+    if (w->seen_n + 1u >= w->seen_cap)
+        return 1;
+    w->seen[h] = e;
+    w->seen_n++;
+    return 1;
+}
+
+static int full(const walk *w)
+{
+    return w->seen_n + 1u >= w->seen_cap;
+}
+
+/* Offers a found vector to the best list and the candidates. */
+static void consider(walk *w, uint64_t e, double d, int expand)
+{
+    size_t i, pos;
+    for (i = 0; i < w->nbest; i++)
+        if (w->best[i].entry == e)
+            return;
+    if (w->nbest == w->ef && !(d < w->best[w->ef - 1].dist || (d == w->best[w->ef - 1].dist && e < w->best[w->ef - 1].entry)))
+        return;
+    if (w->nbest == w->ef)
+        w->nbest--;
+    for (pos = w->nbest; pos > 0 && (w->best[pos - 1].dist > d || (w->best[pos - 1].dist == d && w->best[pos - 1].entry > e)); pos--)
+        w->best[pos] = w->best[pos - 1];
+    w->best[pos].entry = e;
+    w->best[pos].dist = d;
+    w->nbest++;
+    if (!expand)
+        return;
+    if (w->ncand < w->ef) {
+        w->cands[w->ncand].entry = e;
+        w->cands[w->ncand++].dist = d;
+    } else {
+        size_t worst = 0;
+        for (i = 1; i < w->ncand; i++)
+            if (w->cands[i].dist > w->cands[worst].dist)
+                worst = i;
+        if (d < w->cands[worst].dist) {
+            w->cands[worst].entry = e;
+            w->cands[worst].dist = d;
+        }
+    }
+}
+
+/* Measures a vector by entry and offers it. */
+static cdb_status reach(cdb_db *db, coll *c, walk *w, const uint8_t *q, double qn, uint64_t e, int expand)
+{
+    entry_rec r;
+    block b;
+    int found;
+    cdb_status s;
+    if ((s = entry_get(c, e, &r, &found)) != CDB_OK || !found)
+        return s;
+    if ((s = block_read(db, c, r.block, &b)) != CDB_OK)
+        return s;
+    if (r.slot >= b.count || slot_entry(db, &b, r.slot) != e)
+        return CDB_E_CORRUPT;
+    consider(w, e,
+             distance(c, c->measure, q, qn, slot_data(db, c, &b, r.slot),
+                      c->measure == CDB_VEC_COSINE ? slot_norm(db, c, &b, r.slot) : -1.0, db->pager.order),
+             expand);
+    return CDB_OK;
+}
+
+static int seen_has(const walk *w, uint64_t e)
+{
+    size_t h = (size_t)((e * 0x9E3779B97F4A7C15ull) % w->seen_cap);
+    while (w->seen[h] != 0) {
+        if (w->seen[h] == e)
+            return 1;
+        h = (h + 1u) % w->seen_cap;
+    }
+    return 0;
+}
+
+/* Lays a walk out in mem: ef candidates and best (at least k), then the
+ * visited set. 0 when there is too little room. */
+static int walk_setup(walk *w, uint8_t *mem, size_t avail, size_t ef, size_t k)
+{
+    memset(w, 0, sizeof *w);
+    w->ef = ef < k ? k : ef;
+    if (avail < 2u * k * sizeof(cand) + 64u * sizeof(uint64_t))
+        return 0;
+    if (avail < 2u * w->ef * sizeof(cand) + 64u * sizeof(uint64_t))
+        w->ef = (avail - 64u * sizeof(uint64_t)) / (2u * sizeof(cand)); /* what fits */
+    w->cands = (cand *)(void *)mem;
+    w->best = w->cands + w->ef;
+    w->seen = (uint64_t *)(void *)(w->best + w->ef);
+    w->seen_cap = (avail - 2u * w->ef * sizeof(cand)) / sizeof(uint64_t);
+    memset(w->seen, 0, w->seen_cap * sizeof(uint64_t));
+    return 1;
+}
+
+/* A best-first walk over the graph under the base measure, from every entry
+ * point but skip; the nearest ef of them start it. A walk with a skip is a
+ * reachability check: it stops as soon as a list leads to skip. */
+static cdb_status walk_run(cdb_db *db, coll *c, walk *w, const uint8_t *q, double qn, uint64_t skip)
+{
+    uint64_t e, from;
+    unsigned kind;
+    cdb_status s;
+    for (from = 1;; from = e + 1u) {
+        if ((s = ep_next(db, c, from, &e, &kind)) != CDB_OK)
+            return s;
+        if (e == 0)
+            break;
+        if (e != skip && visit(w, e) && (s = reach(db, c, w, q, qn, e, 1)) != CDB_OK)
+            return s;
+    }
+    while (w->ncand > 0 && !full(w)) {
+        size_t m = 0, j;
+        cand next;
+        grec r;
+        int found;
+        for (j = 1; j < w->ncand; j++)
+            if (w->cands[j].dist < w->cands[m].dist)
+                m = j;
+        next = w->cands[m];
+        w->cands[m] = w->cands[--w->ncand];
+        if (w->nbest == w->ef && next.dist > w->best[w->ef - 1].dist)
+            break; /* nothing left can improve the best list */
+        if ((s = rec_get(c, next.entry, &r, &found)) != CDB_OK)
+            return s;
+        for (j = 0; found && j < r.count && !full(w); j++) {
+            if (skip && r.n[j].entry == skip) {
+                (void)visit(w, skip);
+                return CDB_OK;
+            }
+            if (visit(w, r.n[j].entry) && (s = reach(db, c, w, q, qn, r.n[j].entry, 1)) != CDB_OK)
+                return s;
+        }
+    }
+    return CDB_OK;
+}
+
+/* Entries whose reachability is checked after a refresh, in vec_work. */
+typedef struct checks {
+    uint64_t *ids;
+    size_t n, cap;
+    int overflow;    /* too many: every listed entry is checked */
+} checks;
+
+static void sift_down(uint64_t *a, size_t i, size_t n)
+{
+    for (;;) {
+        size_t c = 2u * i + 1u;
+        uint64_t t;
+        if (c >= n)
+            return;
+        if (c + 1u < n && a[c + 1u] > a[c])
+            c++;
+        if (a[i] >= a[c])
+            return;
+        t = a[i];
+        a[i] = a[c];
+        a[c] = t;
+        i = c;
+    }
+}
+
+/* Heapsort: in place, and no allocation (the core has none). */
+static void sort_ids(uint64_t *a, size_t n)
+{
+    size_t i;
+    for (i = n / 2u; i > 0; i--)
+        sift_down(a, i - 1u, n);
+    for (i = n; i > 1; i--) {
+        uint64_t t = a[0];
+        a[0] = a[i - 1u];
+        a[i - 1u] = t;
+        sift_down(a, 0, i - 1u);
+    }
+}
+
+static size_t unique_ids(uint64_t *a, size_t n)
+{
+    size_t i, m = 0;
+    sort_ids(a, n);
+    for (i = 0; i < n; i++)
+        if (m == 0 || a[m - 1] != a[i])
+            a[m++] = a[i];
+    return m;
+}
+
+static void check_add(checks *k, uint64_t e)
+{
+    if (k->overflow || e == 0)
+        return;
+    if (k->n == k->cap) {
+        k->n = unique_ids(k->ids, k->n);
+        if (k->n * 2u > k->cap) {
+            k->overflow = 1;
+            return;
+        }
+    }
+    k->ids[k->n++] = e;
+}
+
+/* Checks that a walk from the other entry points reaches e, with e's own
+ * vector as the query. An entry it can't reach becomes an entry point; one
+ * added that way stops being one once it is reached. */
+static cdb_status check_entry(cdb_db *db, coll *c, uint64_t e, uint8_t *mem, size_t avail)
+{
+    uint8_t *v = vbuf(db, V_BUILD);
+    unsigned kind;
+    int found, pend;
+    walk w;
+    cdb_status s;
+    if ((s = pending_has(c, e, &pend)) != CDB_OK || pend)
+        return s; /* searches measure pending vectors directly */
+    if ((s = ep_get(c, e, &kind)) != CDB_OK || kind == EP_SPREAD)
+        return s;
+    if ((s = fetch_vector(db, c, e, v, NULL, &found)) != CDB_OK || !found)
+        return s;
+    if (!walk_setup(&w, mem, avail, db->cfg.vec_ef ? db->cfg.vec_ef : DEFAULT_EF, 1))
+        return CDB_E_UNSUPPORTED;
+    if ((s = walk_run(db, c, &w, v, c->measure == CDB_VEC_COSINE ? norm_of(c, v, db->pager.order) : 0.0, e))
+        != CDB_OK)
+        return s;
+    if (seen_has(&w, e))
+        return kind == EP_REACH ? rev_del(c, 0, e) : CDB_OK;
+    return kind == 0 ? ep_put(c, e, EP_REACH) : CDB_OK;
+}
+
+/* After a refresh: entry points are chosen again, then the entries it
+ * touched, and those added as entry points before, are checked. */
+static cdb_status check_coverage(cdb_db *db, coll *c, checks *k, uint8_t *mem, size_t avail)
+{
+    uint64_t e, from;
+    unsigned kind;
+    size_t i;
+    cdb_status s;
+    if ((s = choose_entry_points(db, c, mem, avail)) != CDB_OK)
+        return s;
+    for (from = 1; !k->overflow; from = e + 1u) {
+        if ((s = ep_next(db, c, from, &e, &kind)) != CDB_OK)
+            return s;
+        if (e == 0)
+            break;
+        if (kind == EP_REACH)
+            check_add(k, e);
+    }
+    if (!k->overflow) {
+        k->n = unique_ids(k->ids, k->n);
+        for (i = 0; i < k->n; i++)
+            if ((s = check_entry(db, c, k->ids[i], mem, avail)) != CDB_OK)
+                return s;
+        return CDB_OK;
+    }
+    /* Too many to list: every entry with a list, and every entry point. */
+    for (from = 1;; from = e + 1u) {
+        cdb_index_cursor cur;
+        uint8_t key[8], got[8], rec[REC_HDR + NB_SIZE * CDB_VEC_MAX_K];
+        size_t klen, vlen;
+        int done;
+        if ((s = cdb_index_seek(&cur, &c->graph, vbuf(db, V_CURSOR), key, k_u64(key, from))) != CDB_OK
+            || (s = cdb_index_next(&cur, got, sizeof got, &klen, rec, sizeof rec, &vlen, &done)) != CDB_OK)
+            return s;
+        if (done)
+            break;
+        e = cdb_load_u64(got, CDB_ORDER_BIG);
+        if ((s = check_entry(db, c, e, mem, avail)) != CDB_OK)
+            return s;
+    }
+    for (from = 1;; from = e + 1u) {
+        if ((s = ep_next(db, c, from, &e, &kind)) != CDB_OK)
+            return s;
+        if (e == 0)
+            break;
+        if ((s = check_entry(db, c, e, mem, avail)) != CDB_OK)
+            return s;
+    }
+    return CDB_OK;
+}
+
+static int in_batch(const uint8_t *items, size_t stride, size_t n, uint64_t e)
+{
+    size_t i;
+    for (i = 0; i < n; i++)
+        if (((const bitem *)(const void *)(items + i * stride))->entry == e)
+            return 1;
+    return 0;
+}
+
+/* Refreshes pending entries, at most budget of them (0: all), in batches
+ * that fit vec_work. Each batch reads every vector once: it builds the
+ * batch's lists and offers the batch's vectors to the fresh lists of the
+ * others. Changes only pager pages; the caller commits. */
+static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *processed)
+{
+    cdb_byte_order o = db->pager.order;
+    size_t avail, stride = item_stride(c->vec_bytes), cap, n, i;
+    uint8_t *items = work_base(db, &avail);
+    checks chk;
+    cdb_status s;
+
+    /* The last eighth of vec_work lists the entries to check. */
+    chk.cap = avail / 8u / sizeof(uint64_t);
+    chk.n = 0;
+    chk.overflow = 0;
+    avail -= chk.cap * sizeof(uint64_t);
+    chk.ids = (uint64_t *)(void *)(items + avail);
+    *processed = 0;
+    cap = avail / stride;
+    if (cap == 0)
+        return CDB_E_UNSUPPORTED;
+    for (;;) {
+        cdb_index_cursor cur;
+        uint8_t key[8], val[BLOCKS_VAL];
+        size_t klen, vlen;
+        int done, any = 0;
+
+        /* The next batch of pending entries. */
+        n = cap;
+        if (budget && budget - *processed < n)
+            n = budget - *processed;
+        if (n == 0)
+            break;
+        if ((s = cdb_index_seek(&cur, &c->pending, vbuf(db, V_CURSOR), NULL, 0)) != CDB_OK)
+            return s;
+        for (i = 0; i < n; i++) {
+            bitem *it = (bitem *)(void *)(items + i * stride);
+            if ((s = cdb_index_next(&cur, key, sizeof key, &klen, val, sizeof val, &vlen, &done)) != CDB_OK)
+                return s;
+            if (done)
+                break;
+            memset(it, 0, sizeof *it);
+            it->entry = cdb_load_u64(key, CDB_ORDER_BIG);
+        }
+        n = i;
+        if (n == 0)
+            break;
+        for (i = 0; i < n; i++) {
+            bitem *it = (bitem *)(void *)(items + i * stride);
+            if ((s = fetch_vector(db, c, it->entry, (uint8_t *)(it + 1), &it->norm, &it->live)) != CDB_OK)
+                return s;
+            any |= it->live;
+        }
+
+        /* One pass over every vector. */
+        if (any && (s = cdb_index_seek(&cur, &c->blocks, vbuf(db, V_CURSOR), NULL, 0)) != CDB_OK)
+            return s;
+        while (any) {
+            block b;
+            uint32_t j;
+            if ((s = cdb_index_next(&cur, key, sizeof key, &klen, val, sizeof val, &vlen, &done)) != CDB_OK)
+                return s;
+            if (done)
+                break;
+            if ((s = block_read(db, c, cdb_load_u64(key, CDB_ORDER_BIG), &b)) != CDB_OK)
+                return s;
+            for (j = 0; j < b.count; j++) {
+                uint64_t u = slot_entry(db, &b, j), dropped;
+                const uint8_t *ud = slot_data(db, c, &b, j);
+                double un = slot_norm(db, c, &b, j);
+                int pend, found, changed = 0;
+                grec ur;
+                if (u == 0)
+                    continue;
+                for (i = 0; i < n; i++) {
+                    bitem *it = (bitem *)(void *)(items + i * stride);
+                    if (!it->live || it->entry == u)
+                        continue;
+                    it->d = (float)distance(c, c->measure, (const uint8_t *)(it + 1), it->norm, ud, un, o);
+                    (void)rec_offer(&it->rec, c->k, u, it->d, &dropped);
+                }
+                if (in_batch(items, stride, n, u))
+                    continue;
+                /* A fresh list takes the batch's vectors that are nearer. */
+                if ((s = pending_has(c, u, &pend)) != CDB_OK)
+                    return s;
+                if (pend)
+                    continue;
+                if ((s = rec_get(c, u, &ur, &found)) != CDB_OK)
+                    return s;
+                if (!found)
+                    continue;
+                for (i = 0; i < n; i++) {
+                    bitem *it = (bitem *)(void *)(items + i * stride);
+                    if (!it->live || !rec_offer(&ur, c->k, it->entry, it->d, &dropped))
+                        continue;
+                    changed = 1;
+                    if ((s = rev_put(c, it->entry, u)) != CDB_OK || (dropped && (s = rev_del(c, dropped, u)) != CDB_OK))
+                        return s;
+                    check_add(&chk, dropped); /* it lost a way in */
+                }
+                if (changed && (s = rec_put(c, u, &ur)) != CDB_OK)
+                    return s;
+            }
+        }
+
+        /* Store the batch's lists. */
+        for (i = 0; i < n; i++) {
+            bitem *it = (bitem *)(void *)(items + i * stride);
+            if (it->live) {
+                grec old;
+                uint32_t j;
+                int found;
+                if ((s = rec_get(c, it->entry, &old, &found)) != CDB_OK)
+                    return s;
+                for (j = 0; found && j < old.count; j++) {
+                    if ((s = rev_del(c, old.n[j].entry, it->entry)) != CDB_OK)
+                        return s;
+                    check_add(&chk, old.n[j].entry);
+                }
+                check_add(&chk, it->entry);
+                if ((s = rec_put(c, it->entry, &it->rec)) != CDB_OK)
+                    return s;
+                for (j = 0; j < it->rec.count; j++)
+                    if ((s = rev_put(c, it->rec.n[j].entry, it->entry)) != CDB_OK)
+                        return s;
+            }
+            if ((s = pending_del(c, it->entry)) != CDB_OK)
+                return s;
+        }
+        *processed += n;
+    }
+    return *processed ? check_coverage(db, c, &chk, items, avail) : CDB_OK;
+}
+
 /* -------------------------------------------------------- apply */
 
 static cdb_status parse_payload(const cdb_db *db, const coll *c, const cdb_delta *d, int *has_source,
@@ -762,7 +1700,11 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
             if (r.source_store
                 && (s = cdb_index_put(&c->sources, k, k_source(k, ss, se, d->entry_id), k, 0)) != CDB_OK)
                 return s;
-            return entry_put(c, d->entry_id, &r);
+            if ((s = entry_put(c, d->entry_id, &r)) != CDB_OK)
+                return s;
+            if (c->graph_on && ((s = pending_put(c, d->entry_id)) != CDB_OK || (s = meta_live(c, +1)) != CDB_OK))
+                return s;
+            return CDB_OK;
         } else {
             uint32_t used, count;
             block b;
@@ -771,6 +1713,10 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
             if (r.slot >= b.count || slot_entry(db, &b, r.slot) != d->entry_id)
                 return CDB_E_CORRUPT;
             if ((s = block_write(db, c, r.block, &b, b.count, r.slot, d->entry_id, data)) != CDB_OK)
+                return s;
+            /* A new vector: its place in the graph is worked out again. */
+            if (c->graph_on && ((s = graph_detach(db, c, d->entry_id)) != CDB_OK
+                                || (s = pending_put(c, d->entry_id)) != CDB_OK))
                 return s;
             if (r.source_store == 0)
                 return CDB_OK;
@@ -783,6 +1729,10 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
     case CDB_OP_DELETE:
         if (!found)
             return CDB_OK;
+        if (c->graph_on && ((s = graph_detach(db, c, d->entry_id)) != CDB_OK
+                            || (s = pending_del(c, d->entry_id)) != CDB_OK || (s = rev_del(c, 0, d->entry_id)) != CDB_OK
+                            || (s = meta_live(c, -1)) != CDB_OK))
+            return s;
         if ((s = unplace(db, c, d->entry_id, &r)) != CDB_OK)
             return s;
         if (r.source_store
@@ -1019,32 +1969,18 @@ static cdb_status source_states(cdb_db *db, coll *c, cdb_vec_hit *hits, size_t n
     return CDB_OK;
 }
 
-cdb_status cdb_vec_search(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
-                          cdb_vec_hit *hits, size_t k, size_t *n)
+/* The exact path: every vector is compared with the query. */
+static cdb_status search_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned measure, cdb_vec_hit *hits,
+                               size_t k, size_t *n)
 {
     cdb_byte_order o = db->pager.order;
     cdb_index_cursor cur;
-    const uint8_t *q;
     uint8_t key[8], val[BLOCKS_VAL];
     size_t klen, vlen;
-    double qn = 0.0;
-    coll *c;
+    double qn = measure == CDB_VEC_COSINE ? norm_of(c, q, o) : 0.0;
     int done;
     cdb_status s;
 
-    *n = 0;
-    if ((s = coll_get(db, store, &c)) != CDB_OK)
-        return s;
-    if (measure == CDB_VEC_BASE)
-        measure = c->measure;
-    if (!measure_fits(c->elem, measure) || (hits == NULL && k))
-        return CDB_E_INVALID_ARG;
-    if ((s = vector_of(db, c, (const uint8_t *)query, len, 1, &q)) != CDB_OK)
-        return s;
-    if (k == 0)
-        return CDB_OK;
-    if (measure == CDB_VEC_COSINE)
-        qn = norm_of(c, q, o);
     if ((s = cdb_index_seek(&cur, &c->blocks, vbuf(db, V_CURSOR), NULL, 0)) != CDB_OK)
         return s;
     for (;;) {
@@ -1053,7 +1989,7 @@ cdb_status cdb_vec_search(cdb_db *db, uint64_t store, const void *query, size_t 
         if ((s = cdb_index_next(&cur, key, sizeof key, &klen, val, sizeof val, &vlen, &done)) != CDB_OK)
             return s;
         if (done)
-            return source_states(db, c, hits, *n);
+            return CDB_OK;
         if (klen != 8)
             return CDB_E_CORRUPT;
         if ((s = block_read(db, c, cdb_load_u64(key, CDB_ORDER_BIG), &b)) != CDB_OK)
@@ -1067,4 +2003,232 @@ cdb_status cdb_vec_search(cdb_db *db, uint64_t store, const void *query, size_t 
                              measure == CDB_VEC_COSINE ? slot_norm(db, c, &b, i) : -1.0, o));
         }
     }
+}
+
+/* The approximate path (spec 7.4, 7.7): a best-first walk over the graph
+ * from its entry points under the base measure, plus every pending vector
+ * measured directly; what it found is ranked with the requested measure. */
+static cdb_status search_approx(cdb_db *db, coll *c, const uint8_t *q, unsigned measure, cdb_vec_hit *hits,
+                                size_t k, size_t *n)
+{
+    cdb_byte_order o = db->pager.order;
+    double qn = c->measure == CDB_VEC_COSINE ? norm_of(c, q, o) : 0.0;
+    size_t avail, i;
+    uint8_t *base = work_base(db, &avail);
+    walk w;
+    cdb_status s;
+
+    if (!walk_setup(&w, base, avail, db->cfg.vec_ef ? db->cfg.vec_ef : DEFAULT_EF, k))
+        return search_exact(db, c, q, measure, hits, k, n); /* too little room to walk */
+    if ((s = walk_run(db, c, &w, q, qn, 0)) != CDB_OK)
+        return s;
+    /* Pending vectors are not in the graph yet: measure each directly. */
+    {
+        cdb_index_cursor cur;
+        uint8_t key[8], none[1];
+        size_t klen, vlen;
+        int done;
+        if ((s = cdb_index_seek(&cur, &c->pending, vbuf(db, V_CURSOR), NULL, 0)) != CDB_OK)
+            return s;
+        for (;;) {
+            if ((s = cdb_index_next(&cur, key, sizeof key, &klen, none, sizeof none, &vlen, &done)) != CDB_OK)
+                return s;
+            if (done)
+                break;
+            if ((s = reach(db, c, &w, q, qn, cdb_load_u64(key, CDB_ORDER_BIG), 0)) != CDB_OK)
+                return s;
+        }
+    }
+    /* Rank what was found with the requested measure. */
+    for (i = 0; i < w.nbest; i++) {
+        double d = w.best[i].dist;
+        if (measure != c->measure) {
+            uint8_t *tmp = vbuf(db, V_BUILD);
+            double vn;
+            int found;
+            if ((s = fetch_vector(db, c, w.best[i].entry, tmp, &vn, &found)) != CDB_OK)
+                return s;
+            if (!found)
+                continue;
+            d = distance(c, measure, q, measure == CDB_VEC_COSINE ? norm_of(c, q, o) : 0.0, tmp,
+                         c->norms ? vn : -1.0, o);
+        }
+        add_hit(hits, k, n, w.best[i].entry, d);
+    }
+    return CDB_OK;
+}
+
+cdb_status cdb_vec_search_mode(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
+                               unsigned mode, cdb_vec_hit *hits, size_t k, size_t *n)
+{
+    const uint8_t *q;
+    coll *c;
+    int approx = 0;
+    cdb_status s;
+
+    *n = 0;
+    if ((s = coll_get(db, store, &c)) != CDB_OK)
+        return s;
+    if (measure == CDB_VEC_BASE)
+        measure = c->measure;
+    if (!measure_fits(c->elem, measure) || (hits == NULL && k) || mode > CDB_VEC_APPROX)
+        return CDB_E_INVALID_ARG;
+    if ((s = vector_of(db, c, (const uint8_t *)query, len, 1, &q)) != CDB_OK)
+        return s;
+    if (k == 0)
+        return CDB_OK;
+    if (mode == CDB_VEC_AUTO)
+        mode = db->cfg.vec_mode;
+    if (c->graph_on && mode == CDB_VEC_APPROX) {
+        approx = 1;
+    } else if (c->graph_on && mode == CDB_VEC_AUTO && measure == c->measure) {
+        uint64_t live;
+        if ((s = meta_get(c, &live)) != CDB_OK)
+            return s;
+        approx = live >= (db->cfg.vec_exact_below ? db->cfg.vec_exact_below : DEFAULT_EXACT_BELOW);
+    }
+    s = approx ? search_approx(db, c, q, measure, hits, k, n) : search_exact(db, c, q, measure, hits, k, n);
+    return s == CDB_OK ? source_states(db, c, hits, *n) : s;
+}
+
+cdb_status cdb_vec_search(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
+                          cdb_vec_hit *hits, size_t k, size_t *n)
+{
+    return cdb_vec_search_mode(db, store, query, len, measure, CDB_VEC_AUTO, hits, k, n);
+}
+
+/* -------------------------------------------------------- graph upkeep */
+
+cdb_status cdb_vec_create_graph(cdb_db *db, uint64_t store, uint32_t k)
+{
+    char model[CDB_VEC_MODEL_MAX], version[CDB_VEC_MODEL_MAX];
+    uint8_t settings[CDB_CATALOG_SETTINGS_MAX];
+    cdb_store_info info;
+    cdb_vec_config cfg;
+    uint64_t roots[6], live = 0;
+    size_t slen;
+    coll *c, tmp;
+    cdb_status s;
+
+    if (db->in_tx || db->failed)
+        return CDB_E_STATE;
+    if ((s = coll_get(db, store, &c)) != CDB_OK)
+        return s;
+    if (c->graph_on)
+        return CDB_E_EXISTS;
+    if (k == 0)
+        k = CDB_VEC_DEFAULT_K;
+    if (k > CDB_VEC_MAX_K)
+        return CDB_E_INVALID_ARG;
+    if (REC_HDR + (size_t)k * NB_SIZE > cdb_index_max_value(&db->pager))
+        return CDB_E_OVERFLOW; /* a record of k neighbours does not fit an index value */
+    if (db->cfg.vec_work == NULL || db->cfg.vec_work_size < cdb_vec_work_size((cdb_vector_elem)c->elem, c->dims, k))
+        return CDB_E_UNSUPPORTED;
+    if ((s = cdb_db_catalog_begin(db)) != CDB_OK)
+        return s;
+    s = cdb_index_create(&c->graph, &db->pager, store, CDB_INDEX_FLAG_UNIQUE, &db->cfg.catalog_work);
+    if (s == CDB_OK)
+        s = cdb_index_create(&c->reverse, &db->pager, store, CDB_INDEX_FLAG_UNIQUE | CDB_INDEX_FLAG_PREFIX,
+                             &db->cfg.catalog_work);
+    if (s == CDB_OK)
+        s = cdb_index_create(&c->pending, &db->pager, store, CDB_INDEX_FLAG_UNIQUE, &db->cfg.catalog_work);
+    if (s == CDB_OK) {
+        /* Every vector already there is queued. */
+        cdb_index_cursor cur;
+        uint8_t key[8], val[ENTRY_VAL];
+        size_t klen, vlen;
+        int done;
+        s = cdb_index_seek(&cur, &c->entries, vbuf(db, V_CURSOR), NULL, 0);
+        while (s == CDB_OK) {
+            if ((s = cdb_index_next(&cur, key, sizeof key, &klen, val, sizeof val, &vlen, &done)) != CDB_OK || done)
+                break;
+            if ((s = pending_put(c, cdb_load_u64(key, CDB_ORDER_BIG))) == CDB_OK)
+                live++;
+        }
+    }
+    c->graph_on = 1;
+    c->k = k;
+    if (s == CDB_OK)
+        s = meta_put(c, live);
+    if (s == CDB_OK)
+        s = cdb_catalog_get_store(&db->catalog, store, &info);
+    if (s == CDB_OK)
+        s = decode_settings(db, info.vector, info.vector_len, &tmp, roots, &cfg, model, version);
+    if (s == CDB_OK)
+        s = encode_settings(db, &cfg, c, settings, sizeof settings, &slen);
+    if (s == CDB_OK)
+        s = cdb_catalog_set_vector(&db->catalog, store, settings, slen);
+    if (s != CDB_OK)
+        c->graph_on = 0; /* the pages written so far are unreferenced: space, not damage */
+    return cdb_db_catalog_end(db, s);
+}
+
+static cdb_status count_pending(cdb_db *db, coll *c, size_t *n)
+{
+    cdb_index_cursor cur;
+    uint8_t key[8], none[1];
+    size_t klen, vlen;
+    int done;
+    cdb_status s;
+    *n = 0;
+    if ((s = cdb_index_seek(&cur, &c->pending, vbuf(db, V_CURSOR), NULL, 0)) != CDB_OK)
+        return s;
+    for (;;) {
+        if ((s = cdb_index_next(&cur, key, sizeof key, &klen, none, sizeof none, &vlen, &done)) != CDB_OK || done)
+            return s;
+        (*n)++;
+    }
+}
+
+cdb_status cdb_vec_refresh(cdb_db *db, uint64_t store, size_t budget, size_t *remaining)
+{
+    size_t done;
+    coll *c;
+    cdb_status s;
+    if (db->in_tx || db->failed)
+        return CDB_E_STATE;
+    if ((s = coll_get(db, store, &c)) != CDB_OK)
+        return s;
+    if (!c->graph_on)
+        return CDB_E_STATE;
+    if ((s = cdb_db_catalog_begin(db)) != CDB_OK)
+        return s;
+    s = refresh_coll(db, c, budget, &done);
+    if (s == CDB_OK && db->pager.dirty)
+        s = cdb_pager_commit(&db->pager);
+    if ((s = cdb_db_catalog_end(db, s)) != CDB_OK)
+        return s;
+    return remaining ? count_pending(db, c, remaining) : CDB_OK;
+}
+
+cdb_status cdb_vec_neighbours(cdb_db *db, uint64_t store, uint64_t entry, cdb_vec_hit *hits, size_t max,
+                              size_t *n, int *fresh)
+{
+    entry_rec er;
+    grec r;
+    uint32_t i;
+    coll *c;
+    int found, pend;
+    cdb_status s;
+    *n = 0;
+    *fresh = 0;
+    if ((s = coll_get(db, store, &c)) != CDB_OK)
+        return s;
+    if (!c->graph_on)
+        return CDB_E_STATE;
+    if (hits == NULL && max)
+        return CDB_E_INVALID_ARG;
+    if ((s = entry_get(c, entry, &er, &found)) != CDB_OK)
+        return s;
+    if (!found)
+        return CDB_E_NOT_FOUND;
+    if ((s = pending_has(c, entry, &pend)) != CDB_OK || (s = rec_get(c, entry, &r, &found)) != CDB_OK)
+        return s;
+    *fresh = !pend;
+    for (i = 0; found && i < r.count && *n < max; i++) {
+        hits[*n].entry = r.n[i].entry;
+        hits[*n].distance = r.n[i].dist;
+        (*n)++;
+    }
+    return source_states(db, c, hits, *n);
 }

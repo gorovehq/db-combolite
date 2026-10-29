@@ -42,3 +42,14 @@ cdb_add_test(test_doc)
 cdb_add_test(test_schema)
 cdb_add_test(test_fts)
 cdb_add_test(test_vec)
+cdb_add_test(test_graph)
+
+# Benchmarks: built with the tests, run by hand (not part of ctest).
+function(cdb_add_bench name)
+  add_executable(${name} ${name}.c)
+  target_link_libraries(${name} PRIVATE combolite)
+  target_include_directories(${name} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  target_compile_options(${name} PRIVATE ${CDB_WARNINGS})
+endfunction()
+
+cdb_add_bench(bench_graph)

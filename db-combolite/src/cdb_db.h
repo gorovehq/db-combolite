@@ -84,6 +84,12 @@ typedef struct cdb_db_config {
     size_t doc_stage_size;
     uint8_t *fts_buffers;         /* full-text: 3 * page_size bytes (cdb_fts.h) */
     uint8_t *vec_buffers;         /* vectors: 3 * page_size bytes (cdb_vec.h) */
+    uint8_t *vec_work;            /* vectors with a neighbour graph: working memory (cdb_vec.h) */
+    size_t vec_work_size;
+    unsigned vec_refresh_budget;  /* graph entries refreshed per reconciliation; 0 means 256 */
+    unsigned vec_ef;              /* approximate search: candidates kept; 0 means 64 */
+    uint64_t vec_exact_below;     /* automatic path: exact below this many vectors; 0 means 10000 */
+    unsigned vec_mode;            /* operator's search path: CDB_VEC_AUTO, _EXACT or _APPROX */
     cdb_fts_token *fts_tokens;    /* full-text: words of two document versions */
     size_t fts_tokens_cap;
 } cdb_db_config;
@@ -146,6 +152,11 @@ typedef struct cdb_db {
         uint64_t next_entry;
         uint64_t touched_tx;     /* the open transaction changed this collection */
         uint64_t free_from;      /* blocks below this ID have no free slot: a hint, kept in memory */
+        int graph_on;            /* it has a neighbour graph (spec 6.4, 7.4) */
+        uint32_t k;              /* neighbours per entry */
+        cdb_index graph;         /* entry -> neighbour record; 0 -> live count */
+        cdb_index reverse;       /* (neighbour, entry): entry lists neighbour; (0, entry): an entry point */
+        cdb_index pending;       /* entries whose list needs work */
     } vecs[CDB_DB_MAX_POOLS];
     /* The schema held in the schema buffer (cdb_doc.h). */
     uint64_t schema_store;
