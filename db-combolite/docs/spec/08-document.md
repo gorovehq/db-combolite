@@ -27,6 +27,10 @@ Every document has space set aside for a short **summary**. Searches that use th
 
 A pool can have a schema in the catalog. The schema is versioned (Section 4.3), and documents written to the pool are validated against it. A pool without a schema accepts any document.
 
+- **What is checked.** Every new revision is checked against the pool's **current** schema and records that version (14.9.1). Existing documents are not re-checked when the schema changes, but a change to an older document must produce a document that is valid under the current schema.
+- **When.** The check happens when the change is made, inside the transaction. An invalid change is refused and nothing is journaled; applying a committed change never fails for schema reasons.
+- **Within one transaction.** A change is checked against the document as the transaction sees it, including the transaction's own earlier changes. The schema format is in 14.9.4.
+
 ### 8.4 Attachments and size limits are configured by the operator
 
 - **Attachments** (PDFs, images and so on) are stored in one of two ways, chosen by the operator:

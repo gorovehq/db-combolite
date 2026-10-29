@@ -56,8 +56,10 @@ typedef struct cdb_db_config {
     unsigned flags;
     cdb_index_work catalog_work;  /* optional: the catalog is available when set */
     uint8_t *catalog_page;        /* page_size bytes, with catalog_work */
-    uint8_t *doc_buffers;         /* documents: 5 * page_size bytes (cdb_doc.h) */
+    uint8_t *doc_buffers;         /* documents: 6 * page_size bytes (cdb_doc.h) */
     unsigned checkpoint_every;    /* documents: full revision every N; 0 means 16 */
+    uint8_t *doc_stage;           /* documents: per-transaction staging (cdb_doc.h) */
+    size_t doc_stage_size;
 } cdb_db_config;
 
 typedef struct cdb_db {
@@ -94,7 +96,15 @@ typedef struct cdb_db {
         cdb_index revs;
         int have_indexes;
         uint64_t next_entry;
+        uint32_t schema_version; /* current; 0 = no schema */
     } pools[CDB_DB_MAX_POOLS];
+    /* The schema held in the schema buffer (cdb_doc.h). */
+    uint64_t schema_store;
+    uint32_t schema_version;
+    size_t schema_len;
+    int schema_trivial;   /* it accepts every document */
+    size_t stage_used;    /* bytes of doc_stage in use by the open transaction */
+    int stage_overflow;   /* a change could not be staged: consult the journal */
     int set_aside;        /* recovery set a companion aside (spec 1.12.2) */
 } cdb_db;
 
@@ -121,6 +131,7 @@ cdb_status cdb_db_reconcile(cdb_db *db);
 cdb_status cdb_db_create_store(cdb_db *db, const char *name, size_t len, uint32_t model, uint64_t *id);
 cdb_status cdb_db_find_store(cdb_db *db, const char *name, size_t len, uint64_t *id, int *found);
 cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id);
+cdb_status cdb_db_add_schema(cdb_db *db, uint64_t store_id, const void *schema, size_t len, uint32_t *version);
 
 /* Maintenance (spec 3.4, 3.7): reconciles, moves up to max_moves live pages
  * down into reusable space, and releases the free tail of the archive. */

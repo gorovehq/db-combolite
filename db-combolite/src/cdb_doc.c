@@ -5,6 +5,7 @@
 #include "cdb_doc.h"
 #include "cdb_endian.h"
 #include "cdb_key.h"
+#include "cdb_schema.h"
 #include "cdb_varint.h"
 
 /* Record envelope (spec 14.9.1): entry, revision, parent, commit, principal
@@ -35,7 +36,7 @@ static uint8_t *buf(cdb_db *db, unsigned i)
     return db->cfg.doc_buffers + (size_t)i * db->pager.page_size;
 }
 
-enum { B_DOC0 = 0, B_DOC1 = 1, B_PAGE = 2, B_WORK = 3, B_SUMMARY = 4 };
+enum { B_DOC0 = 0, B_DOC1 = 1, B_PAGE = 2, B_WORK = 3, B_SUMMARY = 4, B_SCHEMA = 5 };
 
 static unsigned checkpoint_every(const cdb_db *db)
 {
@@ -73,6 +74,7 @@ static cdb_status pool_get(cdb_db *db, uint64_t store, struct cdb_doc_pool **out
     memset(free_slot, 0, sizeof *free_slot);
     free_slot->store_id = store;
     free_slot->next_entry = info.next_entry_id ? info.next_entry_id : 1;
+    free_slot->schema_version = info.schema_version;
     if (info.head_root && info.rev_root) {
         if ((s = cdb_index_open(&free_slot->head, &db->pager, info.head_root, &db->cfg.catalog_work)) != CDB_OK)
             return s;
@@ -633,6 +635,7 @@ cdb_status cdb_doc_get(cdb_db *db, uint64_t store, uint64_t entry, uint64_t rev,
         info->kind = m.target.kind;
         info->commit_number = m.target.commit;
         info->principal = m.target.principal;
+        info->schema_version = m.target.schema;
     }
     return CDB_OK;
 }
@@ -717,6 +720,9 @@ cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
     e.rev = found ? head.rev + 1 : 1;
     e.parent = found ? head.rev : 0;
     e.commit = d->commit_number;
+    /* Schema changes reconcile first and start a new journal, so the
+     * current version is the one the change was validated under. */
+    e.schema = pool->schema_version;
 
     switch (d->op) {
     case CDB_OP_INSERT:
@@ -794,23 +800,244 @@ cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
     }
 }
 
+/* -------------------------------------------------------- schemas */
+
+/* Loads the pool's current schema into the schema buffer. *active is 0
+ * when the pool has no schema or one that accepts every document. */
+static cdb_status schema_load(cdb_db *db, struct cdb_doc_pool *pool, int *active)
+{
+    cdb_status s;
+    *active = 0;
+    if (pool->schema_version == 0)
+        return CDB_OK;
+    if (db->schema_version != pool->schema_version || db->schema_store != pool->store_id) {
+        db->schema_version = 0;
+        if ((s = cdb_catalog_get_schema(&db->catalog, pool->store_id, pool->schema_version, buf(db, B_SCHEMA),
+                                        db->pager.page_size, &db->schema_len)) != CDB_OK)
+            return s == CDB_E_NOT_FOUND ? CDB_E_CORRUPT : s;
+        s = cdb_schema_check(buf(db, B_SCHEMA), db->schema_len, db->pager.order, &db->schema_trivial);
+        if (s != CDB_OK)
+            return s == CDB_E_UNSUPPORTED ? s : CDB_E_CORRUPT; /* unknown rules: a newer build wrote it */
+        db->schema_store = pool->store_id;
+        db->schema_version = pool->schema_version;
+    }
+    *active = !db->schema_trivial;
+    return CDB_OK;
+}
+
+static cdb_status schema_validate(cdb_db *db, const uint8_t *doc, size_t len)
+{
+    return cdb_schema_validate(buf(db, B_SCHEMA), db->schema_len, doc, len, db->pager.order);
+}
+
+cdb_status cdb_doc_set_schema(cdb_db *db, uint64_t store, const void *schema, size_t len, uint32_t *version)
+{
+    struct cdb_doc_pool *pool;
+    int trivial;
+    cdb_status s;
+    if (db->in_tx || db->failed)
+        return CDB_E_STATE;
+    if ((s = pool_get(db, store, &pool)) != CDB_OK)
+        return s;
+    if ((s = cdb_schema_check((const uint8_t *)schema, len, db->pager.order, &trivial)) != CDB_OK)
+        return s;
+    if ((s = cdb_db_add_schema(db, store, schema, len, version)) != CDB_OK)
+        return s;
+    pool->schema_version = *version;
+    return CDB_OK;
+}
+
+cdb_status cdb_doc_get_schema(cdb_db *db, uint64_t store, uint32_t version, void *schema, size_t cap,
+                              size_t *len, uint32_t *current)
+{
+    struct cdb_doc_pool *pool;
+    cdb_status s;
+    if ((s = pool_get(db, store, &pool)) != CDB_OK)
+        return s;
+    if (current)
+        *current = pool->schema_version;
+    if (version == 0)
+        version = pool->schema_version;
+    if (version == 0 || version > pool->schema_version)
+        return CDB_E_NOT_FOUND;
+    return cdb_catalog_get_schema(&db->catalog, store, version, schema, cap, len);
+}
+
+/* -------------------------------------------------------- staging
+ *
+ * In a pool with a schema, each change is validated against the document as
+ * the open transaction sees it, which the pages do not show until commit.
+ * doc_stage is a cache of those states: each record is store ID (8), entry
+ * ID (8), state length (4), flags (1), reserved (3), then the state. When a
+ * state does not fit, the document's record is dropped and the transaction
+ * is marked as overflowed; from then on a document without a record is
+ * rebuilt from its committed state and the transaction's own journal
+ * records. Without doc_stage every such lookup reads the journal. */
+
+#define STAGE_HDR 24u
+#define STAGE_DELETED 0x1u
+
+typedef struct staged {
+    int found;
+    size_t off;      /* of the record in doc_stage */
+    size_t len;      /* state length */
+    uint8_t flags;
+} staged;
+
+static void stage_find(const cdb_db *db, uint64_t store, uint64_t entry, staged *st)
+{
+    const uint8_t *p = db->cfg.doc_stage;
+    size_t off = 0;
+    memset(st, 0, sizeof *st);
+    while (off < db->stage_used) {
+        const uint8_t *r = p + off;
+        size_t len = cdb_load_u32(r + 16, CDB_ORDER_BIG);
+        if (cdb_load_u64(r, CDB_ORDER_BIG) == store && cdb_load_u64(r + 8, CDB_ORDER_BIG) == entry) {
+            st->found = 1;
+            st->off = off;
+            st->len = len;
+            st->flags = r[20];
+            return;
+        }
+        off += STAGE_HDR + len;
+    }
+}
+
+/* Records the document's new state, replacing its old record. state is
+ * never inside doc_stage. */
+static void stage_put(cdb_db *db, uint64_t store, uint64_t entry, const staged *old,
+                      const uint8_t *state, size_t len, int deleted)
+{
+    uint8_t *p = db->cfg.doc_stage, *r;
+    size_t avail;
+    if (old->found) {
+        size_t size = STAGE_HDR + old->len;
+        memmove(p + old->off, p + old->off + size, db->stage_used - old->off - size);
+        db->stage_used -= size;
+    }
+    avail = p ? db->cfg.doc_stage_size - db->stage_used : 0u;
+    if (avail < STAGE_HDR || len > avail - STAGE_HDR) {
+        db->stage_overflow = 1;
+        return;
+    }
+    r = p + db->stage_used;
+    memset(r, 0, STAGE_HDR);
+    cdb_store_u64(r, store, CDB_ORDER_BIG);
+    cdb_store_u64(r + 8, entry, CDB_ORDER_BIG);
+    cdb_store_u32(r + 16, (uint32_t)len, CDB_ORDER_BIG);
+    r[20] = deleted ? (uint8_t)STAGE_DELETED : 0u;
+    if (len)
+        memcpy(r + STAGE_HDR, state, len);
+    db->stage_used += STAGE_HDR + len;
+}
+
+/* The committed document with the open transaction's journaled changes to
+ * it applied in order, as the document apply will apply them. With
+ * need_state, a live document's body ends up in document buffer *b. */
+static cdb_status replay_tx(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry, int need_state,
+                            int *live, unsigned *b, size_t *len)
+{
+    uint64_t off;
+    cdb_status s;
+
+    if (need_state) {
+        materialized m;
+        s = materialize(db, pool, entry, 0, &m);
+        if (s != CDB_OK && s != CDB_E_NOT_FOUND)
+            return s;
+        *live = s == CDB_OK;
+        *b = m.buffer;
+        *len = m.len;
+    } else {
+        head_rec h;
+        int found;
+        if ((s = head_get(pool, entry, &h, &found)) != CDB_OK)
+            return s;
+        *live = found && h.kind != CDB_REV_TOMBSTONE;
+    }
+    if (!db->stage_overflow)
+        return CDB_OK; /* every change of this transaction is staged */
+    for (off = db->tx_start; off < db->journal.end;) {
+        cdb_record r;
+        cdb_delta d;
+        uint64_t next;
+        if ((s = cdb_journal_read(&db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next)) != CDB_OK)
+            return s;
+        off = next;
+        if (r.kind != CDB_RECORD_DATA || r.tx_id != db->tx_id || r.store_id != pool->store_id
+            || r.entry_id != entry || r.payload_len < 1)
+            continue;
+        memset(&d, 0, sizeof d);
+        d.op = r.payload[0];
+        d.data = r.payload + 1;
+        d.len = r.payload_len - 1u;
+        switch (d.op) {
+        case CDB_OP_INSERT:
+        case CDB_OP_REPLACE:
+            if (!*live && d.op == CDB_OP_REPLACE)
+                break;
+            *live = 1;
+            if (need_state) {
+                const uint8_t *summary, *body;
+                size_t slen, blen;
+                if (split_payload(&d, &summary, &slen, &body, &blen) != CDB_OK)
+                    return CDB_E_CORRUPT;
+                memcpy(buf(db, B_DOC0), body, blen);
+                *b = B_DOC0;
+                *len = blen;
+            }
+            break;
+        case CDB_OP_PATCH:
+            if (*live && need_state && (s = apply_patch(db, b, len, d.data, d.len)) != CDB_OK)
+                return s;
+            break;
+        case CDB_OP_DELETE:
+            *live = 0;
+            break;
+        default:
+            break;
+        }
+    }
+    return CDB_OK;
+}
+
+/* The document as the open transaction sees it. */
+static cdb_status tx_doc(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry, const staged *st,
+                         int need_state, int *live, unsigned *b, size_t *len)
+{
+    if (!st->found)
+        return replay_tx(db, pool, entry, need_state, live, b, len);
+    *live = !(st->flags & STAGE_DELETED);
+    if (*live && need_state) {
+        memcpy(buf(db, B_DOC0), db->cfg.doc_stage + st->off + STAGE_HDR, st->len);
+        *b = B_DOC0;
+        *len = st->len;
+    }
+    return CDB_OK;
+}
+
 /* -------------------------------------------------------- transactions */
 
-static cdb_status tx_pool(cdb_db *db, uint64_t store, struct cdb_doc_pool **pool)
+static cdb_status tx_pool(cdb_db *db, uint64_t store, struct cdb_doc_pool **pool, int *guarded)
 {
+    cdb_status s;
     if (!db->in_tx || db->failed)
         return CDB_E_STATE;
     if (db->cfg.apply != cdb_doc_apply)
         return CDB_E_UNSUPPORTED;
-    return pool_get(db, store, pool);
+    if ((s = pool_get(db, store, pool)) != CDB_OK)
+        return s;
+    return schema_load(db, *pool, guarded);
 }
 
-static cdb_status put_body(cdb_db *db, uint64_t store, uint64_t entry, uint8_t op, const char *summary,
-                           size_t summary_len, const void *body, size_t body_len)
+static cdb_status put_body(cdb_db *db, struct cdb_doc_pool *pool, int guarded, uint64_t entry, uint8_t op,
+                           const char *summary, size_t summary_len, const void *body, size_t body_len)
 {
     uint8_t *p = buf(db, B_WORK);
     size_t cap = capacity(db), len = 0, summary_value;
     cdb_value v;
+    staged st;
+    cdb_status s;
 
     if (body == NULL || cdb_value_validate((const uint8_t *)body, body_len, db->pager.order, CDB_DECIMAL_COMPACT, 0) != CDB_OK
         || cdb_value_read((const uint8_t *)body, body_len, db->pager.order, &v) != CDB_OK || v.type != CDB_TYPE_OBJECT)
@@ -821,6 +1048,20 @@ static cdb_status put_body(cdb_db *db, uint64_t store, uint64_t entry, uint8_t o
     summary_value = summary ? 1u + cdb_varint_size(summary_len) + summary_len : 0;
     if (summary_len > cap || body_len > cap || ENV_SIZE + summary_value + body_len > cap)
         return CDB_E_OVERFLOW;
+    if (guarded) {
+        stage_find(db, pool->store_id, entry, &st);
+        if (op == CDB_OP_REPLACE) {
+            unsigned b;
+            size_t n;
+            int live;
+            if ((s = tx_doc(db, pool, entry, &st, 0, &live, &b, &n)) != CDB_OK)
+                return s;
+            if (!live)
+                return CDB_E_NOT_FOUND;
+        }
+        if ((s = schema_validate(db, (const uint8_t *)body, body_len)) != CDB_OK)
+            return s;
+    }
     p[len++] = summary ? (uint8_t)PAYLOAD_SUMMARY : 0u;
     if (summary) {
         cdb_value_writer w;
@@ -833,17 +1074,23 @@ static cdb_status put_body(cdb_db *db, uint64_t store, uint64_t entry, uint8_t o
     }
     memcpy(p + len, body, body_len);
     len += body_len;
-    return cdb_tx_put(db, store, entry, op, p, len);
+    if ((s = cdb_tx_put(db, pool->store_id, entry, op, p, len)) != CDB_OK)
+        return s;
+    if (guarded)
+        stage_put(db, pool->store_id, entry, &st, (const uint8_t *)body, body_len, 0);
+    return CDB_OK;
 }
 
 cdb_status cdb_doc_insert(cdb_db *db, uint64_t store, const char *summary, size_t summary_len,
                           const void *body, size_t body_len, uint64_t *entry)
 {
     struct cdb_doc_pool *pool;
+    int guarded;
     cdb_status s;
-    if ((s = tx_pool(db, store, &pool)) != CDB_OK)
+    if ((s = tx_pool(db, store, &pool, &guarded)) != CDB_OK)
         return s;
-    if ((s = put_body(db, store, pool->next_entry, CDB_OP_INSERT, summary, summary_len, body, body_len)) != CDB_OK)
+    if ((s = put_body(db, pool, guarded, pool->next_entry, CDB_OP_INSERT, summary, summary_len, body,
+                      body_len)) != CDB_OK)
         return s;
     *entry = pool->next_entry++;
     pool->dirty = 1;
@@ -854,19 +1101,24 @@ cdb_status cdb_doc_replace(cdb_db *db, uint64_t store, uint64_t entry, const cha
                            size_t summary_len, const void *body, size_t body_len)
 {
     struct cdb_doc_pool *pool;
+    int guarded;
     cdb_status s;
-    if ((s = tx_pool(db, store, &pool)) != CDB_OK)
+    if ((s = tx_pool(db, store, &pool, &guarded)) != CDB_OK)
         return s;
     if (entry == 0 || entry >= pool->next_entry)
         return CDB_E_NOT_FOUND;
-    return put_body(db, store, entry, CDB_OP_REPLACE, summary, summary_len, body, body_len);
+    return put_body(db, pool, guarded, entry, CDB_OP_REPLACE, summary, summary_len, body, body_len);
 }
 
 cdb_status cdb_doc_patch(cdb_db *db, uint64_t store, uint64_t entry, const void *patch, size_t patch_len)
 {
     struct cdb_doc_pool *pool;
+    staged st;
+    unsigned b = B_DOC0;
+    size_t len = 0;
+    int guarded, live;
     cdb_status s;
-    if ((s = tx_pool(db, store, &pool)) != CDB_OK)
+    if ((s = tx_pool(db, store, &pool, &guarded)) != CDB_OK)
         return s;
     if (entry == 0 || entry >= pool->next_entry)
         return CDB_E_NOT_FOUND;
@@ -874,16 +1126,46 @@ cdb_status cdb_doc_patch(cdb_db *db, uint64_t store, uint64_t entry, const void 
         return CDB_E_INVALID_ARG;
     if (ENV_SIZE + patch_len > capacity(db))
         return CDB_E_OVERFLOW;
-    return cdb_tx_put(db, store, entry, CDB_OP_PATCH, patch, patch_len);
+    if (guarded) {
+        stage_find(db, store, entry, &st);
+        if ((s = tx_doc(db, pool, entry, &st, 1, &live, &b, &len)) != CDB_OK)
+            return s;
+        if (!live)
+            return CDB_E_NOT_FOUND;
+        if ((s = apply_patch(db, &b, &len, (const uint8_t *)patch, patch_len)) != CDB_OK)
+            return s;
+        if ((s = schema_validate(db, buf(db, b), len)) != CDB_OK)
+            return s;
+    }
+    if ((s = cdb_tx_put(db, store, entry, CDB_OP_PATCH, patch, patch_len)) != CDB_OK)
+        return s;
+    if (guarded)
+        stage_put(db, store, entry, &st, buf(db, b), len, 0);
+    return CDB_OK;
 }
 
 cdb_status cdb_doc_delete(cdb_db *db, uint64_t store, uint64_t entry)
 {
     struct cdb_doc_pool *pool;
+    staged st;
+    unsigned b;
+    size_t len;
+    int guarded, live;
     cdb_status s;
-    if ((s = tx_pool(db, store, &pool)) != CDB_OK)
+    if ((s = tx_pool(db, store, &pool, &guarded)) != CDB_OK)
         return s;
     if (entry == 0 || entry >= pool->next_entry)
         return CDB_E_NOT_FOUND;
-    return cdb_tx_put(db, store, entry, CDB_OP_DELETE, NULL, 0);
+    if (guarded) {
+        stage_find(db, store, entry, &st);
+        if ((s = tx_doc(db, pool, entry, &st, 0, &live, &b, &len)) != CDB_OK)
+            return s;
+        if (!live)
+            return CDB_E_NOT_FOUND;
+    }
+    if ((s = cdb_tx_put(db, store, entry, CDB_OP_DELETE, NULL, 0)) != CDB_OK)
+        return s;
+    if (guarded)
+        stage_put(db, store, entry, &st, NULL, 0, 1);
+    return CDB_OK;
 }

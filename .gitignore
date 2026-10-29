@@ -3,3 +3,4 @@ db-combolite/build/
 *.o
 *.a
 .claude/
+db-combolite/build-rel/

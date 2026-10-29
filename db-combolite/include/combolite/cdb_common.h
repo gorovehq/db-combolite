@@ -21,7 +21,8 @@ typedef enum cdb_status {
     CDB_E_NOT_FOUND = -11,       /* the named file or object does not exist */
     CDB_E_READ_ONLY = -12,       /* write attempted on read-only storage */
     CDB_E_CORRUPT = -13,         /* a checksum or integrity check failed */
-    CDB_E_EXISTS = -14           /* the name or key is already in use */
+    CDB_E_EXISTS = -14,          /* the name or key is already in use */
+    CDB_E_SCHEMA = -15           /* a document does not satisfy its pool's schema */
 } cdb_status;
 
 const char *cdb_status_str(cdb_status status);

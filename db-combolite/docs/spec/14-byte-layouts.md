@@ -744,6 +744,33 @@ The data-change payloads (14.4.5) for document pools, keyed by store and entry:
 
 **Applying never fails for logical reasons.** The built-in document apply runs again during recovery, so a change to a missing or deleted document, or to a dropped or non-document store, does nothing instead of failing. A failure there would recur on every reopen. Input is validated when the change is made, inside the transaction.
 
+### 14.9.4 Document schemas (Section 8.3)
+
+A schema is an object value (14.6), stored as a schema version in the catalog (14.3.3, key `03`).
+
+| Field | Name | Value |
+|---|---|---|
+| 1 | open | bool: fields the schema does not list are allowed. Default true |
+| 2 | fields | array of rules, in strictly ascending field-ID order |
+
+Each rule is an object:
+
+| Field | Name | Value |
+|---|---|---|
+| 1 | field | int: the field ID the rule constrains. Required |
+| 2 | types | int: allowed types, one bit per type (below); 0 = any |
+| 3 | required | bool. Default false |
+| 4 | max length | int: bytes of a string or binary value, elements of an array |
+| 5 | object schema | a schema, applied when the value is an object |
+| 6 | element types | int: allowed types of array elements; 0 = any |
+| 7 | element schema | a schema, applied to array elements that are objects |
+
+- **Type bits:** 0 null · 1 bool · 2 int · 3 f64 · 4 f32 · 5 timestamp · 6 reference · 7 string · 8 binary · 9 decimal · 10 array · 11 object · 12 vector.
+- **Unknown fields** in a schema or rule are refused. A build that does not know a rule never enforces less than the schema says: writes to that pool are refused as unsupported.
+- **Clearing a schema** is done by adding the empty schema `{}`, which accepts every document. History is kept (Section 4.11).
+- **Not yet defined:** enumerations, numeric ranges, patterns and cross-field rules. They will be new rule fields.
+- **Transactions.** A change is validated against the document as the open transaction sees it. The library keeps those states in a working area the application supplies. When the area is full, it reads the transaction's own journal records back instead, so the area never limits a transaction's size.
+
 ---
 
 ## 14.10 Table pages

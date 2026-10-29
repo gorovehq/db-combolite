@@ -11,12 +11,22 @@
  *   head:  entry ID              -> head revision (ID, page, chain length, kind)
  *   revs:  (entry ID, revision)  -> revision page
  *
- * Buffers: cdb_db_config.doc_buffers holds five page_size buffers, and
- * cdb_db_config.catalog_work is shared with the pool indexes. */
+ * Schemas (spec 8.3): a pool may have a schema (cdb_schema.h). Every change
+ * is validated when it is made, against the document as the open transaction
+ * sees it; a violation is CDB_E_SCHEMA and nothing is journaled. Existing
+ * documents are not re-validated when the schema changes (spec 4.3).
+ *
+ * Buffers: cdb_db_config.doc_buffers holds six page_size buffers, and
+ * cdb_db_config.catalog_work is shared with the pool indexes. For pools with
+ * a schema, the optional cdb_db_config.doc_stage caches the state of each
+ * document the open transaction changed (24 bytes plus the document). It
+ * never limits a transaction: once it is full, a change to a document it
+ * does not hold reads that document's changes back from the journal. */
 #ifndef CDB_DOC_H
 #define CDB_DOC_H
 
 #include "cdb_db.h"
+#include "cdb_schema.h"
 
 /* Revision kinds (spec 14.9.1). */
 #define CDB_REV_ORIGINAL 0u
@@ -35,6 +45,7 @@ typedef struct cdb_doc_info {
     uint8_t kind;
     uint64_t commit_number;
     uint64_t principal;
+    uint32_t schema_version; /* the schema it was written under; 0 = none */
 } cdb_doc_info;
 
 /* Inside a transaction. The body is an encoded object (spec 14.6); summary
@@ -52,6 +63,16 @@ cdb_status cdb_doc_delete(cdb_db *db, uint64_t store, uint64_t entry);
 cdb_status cdb_doc_get(cdb_db *db, uint64_t store, uint64_t entry, uint64_t rev,
                        void *body, size_t cap, size_t *body_len,
                        char *summary, size_t summary_cap, size_t *summary_len, cdb_doc_info *info);
+
+/* Adds a schema version and makes it current; commits immediately, like other
+ * catalog changes, so not inside a transaction. An empty object ({}) accepts
+ * every document, which is how a schema is cleared. */
+cdb_status cdb_doc_set_schema(cdb_db *db, uint64_t store, const void *schema, size_t len, uint32_t *version);
+
+/* Copies schema version (0 = current) and reports the current version.
+ * CDB_E_NOT_FOUND if the pool has no such version. */
+cdb_status cdb_doc_get_schema(cdb_db *db, uint64_t store, uint32_t version, void *schema, size_t cap,
+                              size_t *len, uint32_t *current);
 
 /* Engine hooks used by cdb_db. */
 cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d);
