@@ -173,6 +173,21 @@ AES-GCM and ChaCha20-Poly1305 both take a 12-byte nonce:
 - **Delta records.** The track ID is the coordinator slot number (2 bytes) followed by the companion type (2 bytes), and the sequence number is the delta sequence number. Delta sequences are reserved durably in the slot (Section 12.1), so numbering continues correctly when a later process reuses the slot.
 - **Associated data.** The page header, or the delta record header, is passed as AEAD associated data. It is authenticated, but not encrypted.
 
+### 14.2.6 Identifiers and numbering
+
+- **Checksum algorithm IDs** (file header offset 76): `1` = CRC32C. `0` is invalid. Further algorithms are assigned IDs when they are added.
+- **Page type IDs** (page header offset 2):
+
+  | ID | Page type |
+  |---|---|
+  | `0x0001` | anchor map |
+  | `0x0002` | free space |
+  | `0x7F00` | reserved for tests |
+
+  Further page types are assigned IDs when they are built.
+- **Zero means "none".** Logical page ID `0` and physical page `0` both mean "no page".
+- **Physical page numbers** count from the start of the file, in units of the file's page size. The **data area** starts after the two header slots (1,024 bytes) and the location-0 area (1,024 bytes), rounded up to a page boundary. System pages that are addressed physically, such as anchor-map and free-space pages, carry logical ID `0`, store `0` and domain `0`.
+
 ## 14.3 Catalog root slot (location 0)
 
 ### 14.3.1 Placement
@@ -464,6 +479,56 @@ An extent is reclaimed only after the lock state that covers it has been reconci
 - The anchor map's root is at header offset 56.
 - The anchor map's mirror root is at header offset 472.
 - The free-space list's root and the free-space list's mirror root are kept in a small fixed area at the start of the anchor map's root page.
+
+### 14.7.6 Anchor-map page payload
+
+Every anchor-map page payload starts with an 8-byte node header:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | Level: 0 for a leaf; the root is at level depth − 1 |
+| 1 | 1 | Flags: bit 0 is set on the root |
+| 2 | 6 | Reserved, zero |
+
+The **root** page has a 32-byte area directly after the node header:
+
+| Offset | Size | Field |
+|---|---|---|
+| 8 | 8 | Next logical ID: the allocation counter; IDs are never reused (Section 4.12) |
+| 16 | 8 | Free-space list: root of the primary chain |
+| 24 | 8 | Free-space list: root of the mirror chain |
+| 32 | 8 | Reserved, zero |
+
+The entries follow: leaf entries (14.7.2) or interior entries (14.7.3).
+
+- **Depth.** The tree's depth is the root's level plus one.
+- **Fan-out.** The number of entries per page follows from the page capacity. The root holds fewer entries than other pages, because of its 32-byte area.
+- **Adding a level.** When the next logical ID would exceed what the tree can address, a new root is added. The old root becomes child 0 of the new root.
+
+### 14.7.7 Free-space page payload
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | Number of extents on this page |
+| 4 | 4 | Reserved, zero |
+| 8 | 8 | Next page in the chain (physical); 0 at the end |
+| 16 | … | Extents (14.7.4) |
+
+At every commit, the whole list is written as a new chain. The pages of the previous chain are freed by that commit.
+
+### 14.7.8 Mirroring and commit order
+
+- **Mirror of the anchor map.** The mirror is a complete second tree.
+  - Leaf pages in the mirror hold the same entries as the primary leaves.
+  - Interior pages point into their own tree.
+  - When one copy of a node fails verification, the other copy is used in its place (Section 3.5).
+- **Mirror of the free-space list.** The list is mirrored as a second chain.
+- **Commit order.** A commit follows Section 3.2:
+  1. barrier;
+  2. the new free-space chains, then the changed anchor-map nodes from the leaves up, with the root last;
+  3. barrier;
+  4. the header commit.
+- **Sequence reservation.** Page sequence numbers are reserved in blocks of 1024 (Section 12.1).
 
 ## 14.8 Ordered index
 

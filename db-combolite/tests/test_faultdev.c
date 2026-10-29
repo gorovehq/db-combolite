@@ -112,6 +112,23 @@ static void test_torn_write(void)
     read_expect(0, "BBBAAAAA", 8);
 }
 
+static void test_reorder_keeps_only_latest(void)
+{
+    uint8_t out[3];
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_storage_program(&st, 0, "one", 3));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_storage_program(&st, 3, "two", 3));
+    cdb_faultdev_crash_now(&dev, CDB_CRASH_REORDER, 0, 0);
+    cdb_faultdev_reboot(&dev);
+    read_expect(3, "two", 3);
+    {
+        uint64_t size;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_storage_size(&st, &size));
+        TEST_ASSERT_EQUAL_UINT64(6, size);
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_storage_read(&st, 0, out, 3));
+    TEST_ASSERT_EQUAL_HEX8(0xFF, out[0]); /* the earlier write never landed */
+}
+
 static void test_flash_rules(void)
 {
     const uint8_t zero = 0x00, ff = 0xFF;
@@ -153,6 +170,7 @@ int main(void)
     RUN_TEST(test_crash_during_sync_loses_unsynced);
     RUN_TEST(test_keep_prefix);
     RUN_TEST(test_torn_write);
+    RUN_TEST(test_reorder_keeps_only_latest);
     RUN_TEST(test_flash_rules);
     RUN_TEST(test_bit_flip);
     RUN_TEST(test_counts_ops_for_crash_enumeration);

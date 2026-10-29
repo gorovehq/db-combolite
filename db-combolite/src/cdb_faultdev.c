@@ -187,10 +187,14 @@ void cdb_faultdev_reboot(cdb_faultdev *dev)
         memcpy(dev->cfg.durable, dev->cfg.current, dev->cfg.capacity);
         dev->durable_size = dev->current_size;
     } else {
-        if (dev->mode != CDB_CRASH_DROP_UNSYNCED)
+        if (dev->mode == CDB_CRASH_KEEP_PREFIX || dev->mode == CDB_CRASH_TORN)
             keep = dev->keep_writes < dev->log_len ? dev->keep_writes : dev->log_len;
         for (i = 0; i < keep; i++)
             apply_record(dev, &dev->cfg.log[i], dev->cfg.log[i].len);
+        if (dev->mode == CDB_CRASH_REORDER && dev->log_len > 0) {
+            const cdb_fault_record *r = &dev->cfg.log[dev->log_len - 1];
+            apply_record(dev, r, r->len);
+        }
         if (dev->mode == CDB_CRASH_TORN && keep < dev->log_len) {
             const cdb_fault_record *r = &dev->cfg.log[keep];
             apply_record(dev, r, dev->torn_bytes < r->len ? dev->torn_bytes : r->len);
