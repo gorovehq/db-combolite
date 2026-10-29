@@ -607,7 +607,8 @@ static cdb_status place(cdb_db *db, coll *c, uint64_t entry, const uint8_t *data
     int done;
     cdb_status s;
 
-    if ((s = cdb_index_seek(&cur, &c->blocks, vbuf(db, V_CURSOR), NULL, 0)) != CDB_OK)
+    /* The scan starts at the hint, so appends don't read every block. */
+    if ((s = cdb_index_seek(&cur, &c->blocks, vbuf(db, V_CURSOR), k, k_u64(k, c->free_from))) != CDB_OK)
         return s;
     for (;;) {
         uint32_t used, count, slot;
@@ -620,9 +621,12 @@ static cdb_status place(cdb_db *db, coll *c, uint64_t entry, const uint8_t *data
             return CDB_E_CORRUPT;
         used = cdb_load_u32(v, CDB_ORDER_BIG);
         count = cdb_load_u32(v + 4, CDB_ORDER_BIG);
-        if (used >= c->slots)
-            continue;
         r->block = cdb_load_u64(k, CDB_ORDER_BIG);
+        if (used >= c->slots) {
+            c->free_from = r->block + 1u;
+            continue;
+        }
+        c->free_from = r->block;
         if ((s = block_read(db, c, r->block, &b)) != CDB_OK)
             return s;
         if (b.count != count)
@@ -662,6 +666,8 @@ static cdb_status unplace(cdb_db *db, coll *c, uint64_t entry, const entry_rec *
             return cdb_index_delete(&c->blocks, k, k_u64(k, r->block), &found);
         }
     }
+    if (r->block < c->free_from)
+        c->free_from = r->block;
     /* Trailing empty slots are dropped, so blocks stay dense. */
     count = b.count;
     while (count > 0 && (count - 1u == r->slot || slot_entry(db, &b, count - 1u) == 0))
