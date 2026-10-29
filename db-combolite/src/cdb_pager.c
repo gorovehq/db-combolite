@@ -591,6 +591,7 @@ static cdb_status setup(cdb_pager *p, const cdb_storage *st, const cdb_pager_con
 
     /* Header slots, then location 0 (the catalog root slots), then data. */
     loc0 = round_up(CDB_HEADER_SLOTS * CDB_HEADER_SLOT_SIZE, p->page_size);
+    p->loc0 = loc0;
     p->data_start = round_up(loc0 + LOCATION0_SLOTS_BYTES, p->page_size) / p->page_size;
 
     per_node = 2u * p->page_size;
@@ -612,6 +613,84 @@ static cdb_status setup(cdb_pager *p, const cdb_storage *st, const cdb_pager_con
     }
     p->scratch = cfg->arena + p->node_count * per_node;
     p->page2 = p->scratch + p->page_size;
+    return CDB_OK;
+}
+
+/* Chooses the catalog root (spec 14.3.1): the newest valid slot whose commit
+ * sequence is not above the header's. A slot written by a commit that never
+ * completed is ignored (C-R4). */
+static cdb_status load_catroot(cdb_pager *p)
+{
+    uint64_t committed = p->hs.record.committed_seq;
+    uint64_t newest_counter = 0;
+    unsigned i, newest = 1, corrupt = 0;
+    int have = 0;
+
+    for (i = 0; i < 2; i++) {
+        uint8_t img[CDB_CATROOT_SLOT_SIZE];
+        cdb_catroot r;
+        cdb_status s = cdb_storage_read(&p->st, p->loc0 + i * CDB_CATROOT_SLOT_SIZE, img, sizeof img);
+        if (s == CDB_E_TRUNCATED)
+            continue;
+        if (s != CDB_OK)
+            return s;
+        s = cdb_catroot_decode(img, &r, p->order);
+        if (s == CDB_E_NOT_FOUND)
+            continue;
+        if (s != CDB_OK) {
+            corrupt++;
+            continue;
+        }
+        if (r.write_counter >= newest_counter) {
+            newest_counter = r.write_counter;
+            newest = i;
+        }
+        if (r.commit_seq > committed)
+            continue;
+        if (!have || r.commit_seq > p->catroot.commit_seq
+            || (r.commit_seq == p->catroot.commit_seq && r.write_counter > p->catroot.write_counter)) {
+            p->catroot = r;
+            have = 1;
+        }
+    }
+    /* Both slots damaged: the catalog is lost (spec 3.5). One damaged slot
+     * with nothing else written is a first catalog commit cut short. */
+    if (!have && corrupt == 2)
+        return CDB_E_CORRUPT;
+    p->cat_exists = have;
+    if (!have)
+        memset(&p->catroot, 0, sizeof p->catroot);
+    p->cat_next_slot = (newest + 1u) % 2u;
+    if (newest_counter > p->catroot.write_counter)
+        p->catroot.write_counter = newest_counter;
+    return CDB_OK;
+}
+
+void cdb_pager_set_catroot(cdb_pager *p, const cdb_catroot *r)
+{
+    uint64_t counter = p->catroot.write_counter;
+    p->catroot = *r;
+    p->catroot.write_counter = counter;
+    p->cat_dirty = 1;
+    p->dirty = 1;
+}
+
+static cdb_status write_catroot(cdb_pager *p)
+{
+    uint8_t img[CDB_CATROOT_SLOT_SIZE];
+    unsigned copies = p->cat_exists ? 1u : 2u, i;
+    cdb_status s;
+
+    p->catroot.commit_seq = p->hs.record.committed_seq + 1;
+    for (i = 0; i < copies; i++) {
+        p->catroot.write_counter++;
+        p->catroot.slot_index = (uint8_t)p->cat_next_slot;
+        cdb_catroot_encode(&p->catroot, img, p->order);
+        if ((s = cdb_storage_program(&p->st, p->loc0 + p->cat_next_slot * CDB_CATROOT_SLOT_SIZE,
+                                     img, sizeof img)) != CDB_OK)
+            return s;
+        p->cat_next_slot = (p->cat_next_slot + 1u) % 2u;
+    }
     return CDB_OK;
 }
 
@@ -666,7 +745,7 @@ cdb_status cdb_pager_open(cdb_pager *p, const cdb_storage *st, const cdb_pager_c
         if ((s = load_free_chain(p, p->free_mirror)) != CDB_OK)
             return s;
     }
-    return CDB_OK;
+    return load_catroot(p);
 }
 
 cdb_status cdb_pager_create(cdb_pager *p, const cdb_storage *st, const cdb_pager_config *cfg,
@@ -911,6 +990,14 @@ cdb_status cdb_pager_commit(cdb_pager *p)
     if ((s = cdb_storage_sync(&p->st)) != CDB_OK)
         return s;
 
+    /* Step 3: the catalog root slot, when the catalog changed. */
+    if (p->cat_dirty) {
+        if ((s = write_catroot(p)) != CDB_OK)
+            return s;
+        if ((s = cdb_storage_sync(&p->st)) != CDB_OK)
+            return s;
+    }
+
     /* Step 4: the header commit. */
     rec = p->hs.record;
     rec.anchor_root = p->root_primary;
@@ -920,6 +1007,10 @@ cdb_status cdb_pager_commit(cdb_pager *p)
     if ((s = cdb_header_commit(&p->st, &p->hs, &rec)) != CDB_OK)
         return s;
     p->dirty = 0;
+    if (p->cat_dirty) {
+        p->cat_dirty = 0;
+        p->cat_exists = 1;
+    }
     return CDB_OK;
 }
 

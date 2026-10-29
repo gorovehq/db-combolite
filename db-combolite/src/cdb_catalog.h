@@ -1,0 +1,82 @@
+/* Catalog: the database's description of itself (spec 4, 14.3).
+ *
+ * The body is one B+tree, kept twice (primary and mirror, spec 3.5), whose
+ * keys start with a kind byte:
+ *   01 + ID                      -> object record
+ *   02 + kind + name             -> ID (lookup by name)
+ *   03 + store ID + version      -> schema version record
+ *   04 + store ID + field name   -> field ID (field dictionary, spec 14.6.3)
+ *   05 + store ID + field ID     -> field name
+ * Records live in their own pages, written twice; index values name both.
+ *
+ * Catalog changes commit immediately: each call that changes the catalog
+ * ends with a pager commit, which writes a new root slot (spec 3.2 step 3). */
+#ifndef CDB_CATALOG_H
+#define CDB_CATALOG_H
+
+#include "cdb_index.h"
+#include "cdb_pager.h"
+
+/* Object kinds. */
+#define CDB_OBJ_STORE 1u
+
+/* Data models (spec 6-10). */
+#define CDB_MODEL_RELATIONAL 1u
+#define CDB_MODEL_DOCUMENT 2u
+#define CDB_MODEL_VECTOR 3u
+#define CDB_MODEL_TIME_SERIES 4u
+
+/* Store flags. */
+#define CDB_STORE_DROPPED 0x1u
+
+#define CDB_CATALOG_NAME_MAX 64u
+
+typedef struct cdb_store_info {
+    uint64_t id;
+    char name[CDB_CATALOG_NAME_MAX + 1];
+    size_t name_len;
+    uint32_t model;
+    uint64_t domain_id;       /* 0 = public, until enclaves exist */
+    uint32_t page_log2;
+    uint32_t compression;
+    uint32_t schema_version;  /* current version; 0 = no schema */
+    uint64_t next_field_id;
+    uint64_t created_commit;
+    uint32_t flags;
+} cdb_store_info;
+
+typedef struct cdb_catalog {
+    cdb_pager *pager;
+    cdb_index body;
+    cdb_index mirror;
+    cdb_index_work work;
+    uint8_t *page;            /* one page buffer */
+    int open;                 /* body and mirror exist */
+} cdb_catalog;
+
+/* Binds the catalog to an open pager. page is a page_size buffer; work is
+ * index working memory (shared by the body and its mirror). */
+cdb_status cdb_catalog_open(cdb_catalog *cat, cdb_pager *p, const cdb_index_work *work, uint8_t *page);
+
+cdb_status cdb_catalog_create_store(cdb_catalog *cat, const char *name, size_t len, uint32_t model,
+                                    uint64_t *id);
+/* *found is 0 when no live store has that name. */
+cdb_status cdb_catalog_find_store(cdb_catalog *cat, const char *name, size_t len, uint64_t *id, int *found);
+/* Dropped stores are still found by ID (their IDs are never reused). */
+cdb_status cdb_catalog_get_store(cdb_catalog *cat, uint64_t id, cdb_store_info *info);
+cdb_status cdb_catalog_rename_store(cdb_catalog *cat, uint64_t id, const char *name, size_t len);
+cdb_status cdb_catalog_drop_store(cdb_catalog *cat, uint64_t id);
+
+/* Schema history (spec 4.3, 4.11): adds a version and makes it current. */
+cdb_status cdb_catalog_add_schema(cdb_catalog *cat, uint64_t store_id, const void *schema, size_t len,
+                                  uint32_t *version);
+cdb_status cdb_catalog_get_schema(cdb_catalog *cat, uint64_t store_id, uint32_t version,
+                                  void *buf, size_t cap, size_t *len);
+
+/* Field dictionary (spec 14.6.3): returns the field's ID, adding the name if new. */
+cdb_status cdb_catalog_field_id(cdb_catalog *cat, uint64_t store_id, const char *name, size_t len,
+                                uint64_t *field_id);
+cdb_status cdb_catalog_field_name(cdb_catalog *cat, uint64_t store_id, uint64_t field_id,
+                                  char *name, size_t cap, size_t *len);
+
+#endif

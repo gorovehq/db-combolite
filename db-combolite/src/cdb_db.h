@@ -12,6 +12,7 @@
 #define CDB_DB_H
 
 #include "combolite/cdb_env.h"
+#include "cdb_catalog.h"
 #include "cdb_journal.h"
 #include "cdb_pager.h"
 
@@ -51,6 +52,8 @@ typedef struct cdb_db_config {
     cdb_durability durability;    /* default level; DEFAULT means NORMAL (spec 3.1) */
     unsigned normal_sync_every;   /* 0 means 32 */
     unsigned flags;
+    cdb_index_work catalog_work;  /* optional: the catalog is available when set */
+    uint8_t *catalog_page;        /* page_size bytes, with catalog_work */
 } cdb_db_config;
 
 typedef struct cdb_db {
@@ -76,6 +79,8 @@ typedef struct cdb_db {
     cdb_durability tx_durability;
     unsigned unsynced;
     int failed;           /* an apply failed: the database must be reopened */
+    cdb_catalog catalog;
+    int has_catalog;
     int set_aside;        /* recovery set a companion aside (spec 1.12.2) */
 } cdb_db;
 
@@ -96,6 +101,12 @@ cdb_status cdb_tx_abort(cdb_db *db);
 
 /* Folds every applied change into the archive (spec 3.2) and starts a new journal. */
 cdb_status cdb_db_reconcile(cdb_db *db);
+
+/* Catalog changes (spec 4). Each reconciles first, then commits the change
+ * immediately. Need catalog_work and catalog_page in the configuration. */
+cdb_status cdb_db_create_store(cdb_db *db, const char *name, size_t len, uint32_t model, uint64_t *id);
+cdb_status cdb_db_find_store(cdb_db *db, const char *name, size_t len, uint64_t *id, int *found);
+cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id);
 
 /* Maintenance (spec 3.4, 3.7): reconciles, moves up to max_moves live pages
  * down into reusable space, and releases the free tail of the archive. */

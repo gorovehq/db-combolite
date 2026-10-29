@@ -24,6 +24,7 @@ typedef enum cdb_page_format {
 #define CDB_PAGE_TYPE_ANCHOR_MAP 0x0001u
 #define CDB_PAGE_TYPE_FREE_SPACE 0x0002u
 #define CDB_PAGE_TYPE_INDEX_NODE 0x0003u
+#define CDB_PAGE_TYPE_CATALOG_RECORD 0x0004u
 #define CDB_PAGE_TYPE_DATA_TEST 0x7F00u /* reserved for tests */
 
 typedef struct cdb_page_header {

@@ -17,6 +17,7 @@ const char *cdb_status_str(cdb_status status)
     case CDB_E_NOT_FOUND: return "not found";
     case CDB_E_READ_ONLY: return "read-only storage";
     case CDB_E_CORRUPT: return "checksum mismatch";
+    case CDB_E_EXISTS: return "already exists";
     }
     return "unknown status";
 }
