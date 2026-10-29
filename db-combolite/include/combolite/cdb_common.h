@@ -20,7 +20,8 @@ typedef enum cdb_status {
     CDB_E_IO = -10,              /* the storage device reported an error */
     CDB_E_NOT_FOUND = -11,       /* the named file or object does not exist */
     CDB_E_READ_ONLY = -12,       /* write attempted on read-only storage */
-    CDB_E_CORRUPT = -13          /* a checksum or integrity check failed */
+    CDB_E_CORRUPT = -13,         /* a checksum or integrity check failed */
+    CDB_E_EXISTS = -14           /* the name or key is already in use */
 } cdb_status;
 
 const char *cdb_status_str(cdb_status status);

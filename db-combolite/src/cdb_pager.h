@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include "combolite/cdb_storage.h"
+#include "cdb_catroot.h"
 #include "cdb_header.h"
 #include "cdb_page.h"
 
@@ -95,6 +96,12 @@ typedef struct cdb_pager {
     uint64_t lru_clock;
     int read_only;
     int dirty;            /* anything to commit */
+    /* Catalog root slots at location 0 (spec 14.3). */
+    uint64_t loc0;        /* byte offset of location 0 */
+    cdb_catroot catroot;  /* the root in force; zero if no catalog yet */
+    int cat_exists;       /* a catalog root has been committed */
+    int cat_dirty;
+    unsigned cat_next_slot;
 } cdb_pager;
 
 /* Creates a new database on empty storage. h supplies the file settings:
@@ -122,7 +129,10 @@ cdb_status cdb_pager_free(cdb_pager *p, uint64_t lid);
 
 cdb_status cdb_pager_lookup(cdb_pager *p, uint64_t lid, cdb_anchor_entry *e);
 
-/* Commits every change since the last commit (spec 3.2 steps 1, 2 and 4). */
+/* Replaces the catalog root; written by the next commit (spec 3.2 step 3). */
+void cdb_pager_set_catroot(cdb_pager *p, const cdb_catroot *r);
+
+/* Commits every change since the last commit (spec 3.2 steps 1 to 4). */
 cdb_status cdb_pager_commit(cdb_pager *p);
 
 /* Space reuse and compaction (spec 1.3, 3.4, 3.7).

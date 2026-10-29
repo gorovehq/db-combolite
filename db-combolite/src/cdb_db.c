@@ -299,7 +299,14 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
     if (db->next_commit <= db->applied)
         db->next_commit = db->applied + 1;
     db->next_tx = 1;
-    return start_session(db);
+    if ((s = start_session(db)) != CDB_OK)
+        return s;
+    if (cfg->catalog_page != NULL) {
+        if ((s = cdb_catalog_open(&db->catalog, &db->pager, &cfg->catalog_work, cfg->catalog_page)) != CDB_OK)
+            return s;
+        db->has_catalog = 1;
+    }
+    return CDB_OK;
 }
 
 /* -------------------------------------------------------- transactions */
@@ -453,6 +460,34 @@ cdb_status cdb_db_reconcile(cdb_db *db)
         return s;
     db->unsynced = 0;
     return env_sync_dir(db, db->workdir);
+}
+
+static cdb_status catalog_ready(cdb_db *db)
+{
+    if (usable(db) != CDB_OK || db->in_tx)
+        return CDB_E_STATE;
+    if (!db->has_catalog)
+        return CDB_E_UNSUPPORTED;
+    return cdb_db_reconcile(db);
+}
+
+cdb_status cdb_db_create_store(cdb_db *db, const char *name, size_t len, uint32_t model, uint64_t *id)
+{
+    cdb_status s = catalog_ready(db);
+    return s != CDB_OK ? s : cdb_catalog_create_store(&db->catalog, name, len, model, id);
+}
+
+cdb_status cdb_db_find_store(cdb_db *db, const char *name, size_t len, uint64_t *id, int *found)
+{
+    if (!db->has_catalog)
+        return CDB_E_UNSUPPORTED;
+    return cdb_catalog_find_store(&db->catalog, name, len, id, found);
+}
+
+cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
+{
+    cdb_status s = catalog_ready(db);
+    return s != CDB_OK ? s : cdb_catalog_drop_store(&db->catalog, id);
 }
 
 cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed)

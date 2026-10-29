@@ -23,6 +23,9 @@ static uint8_t arena[NODES * 2u * PAGE + 2u * PAGE];
 static cdb_pager_node nodes[NODES];
 static cdb_free_extent free_list[8192];
 static uint8_t record_buf[1024];
+static uint8_t cat_work[16384];
+static cdb_index_entry cat_entries[512];
+static uint8_t cat_page[PAGE];
 static uint8_t page[PAGE];
 static cdb_db_config cfg;
 static cdb_db db;
@@ -83,6 +86,11 @@ void setUp(void)
     cfg.record_buf = record_buf;
     cfg.record_buf_size = sizeof record_buf;
     cfg.apply = kv_apply;
+    cfg.catalog_work.bytes = cat_work;
+    cfg.catalog_work.bytes_size = sizeof cat_work;
+    cfg.catalog_work.entries = cat_entries;
+    cfg.catalog_work.entries_cap = 512;
+    cfg.catalog_page = cat_page;
     cfg.durability = CDB_DURABILITY_FULL;
 }
 
@@ -304,6 +312,27 @@ static void test_compaction_through_db(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+static void test_catalog_through_db(void)
+{
+    uint64_t id, found_id;
+    int found;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db(&env, "t"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put(1, "pending"));
+    TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_db_create_store(&db, "adr", 3, CDB_MODEL_DOCUMENT, &id));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_store(&db, "adr", 3, CDB_MODEL_DOCUMENT, &id));
+    cdb_faultenv_crash_now(&fe, CDB_CRASH_DROP_UNSYNCED, 0, 0); /* no close */
+    cdb_faultenv_reboot(&fe);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db(&env, "t"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_find_store(&db, "adr", 3, &found_id, &found));
+    TEST_ASSERT_TRUE(found);
+    TEST_ASSERT_EQUAL_UINT64(id, found_id);
+    expect(1, "pending"); /* reconciled before the catalog change */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_drop_store(&db, id));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 /* ------------------------------------------------------- crash sweep */
 
 /* Committed states, in order. Entries 1..3; NULL = absent. */
@@ -459,6 +488,7 @@ int main(void)
     RUN_TEST(test_missing_journal_is_reported);
     RUN_TEST(test_damaged_journal_is_set_aside);
     RUN_TEST(test_compaction_through_db);
+    RUN_TEST(test_catalog_through_db);
     RUN_TEST(test_crash_sweep);
     RUN_TEST(test_host_filesystem);
     return UNITY_END();

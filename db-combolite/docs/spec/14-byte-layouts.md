@@ -225,6 +225,39 @@ Logical IDs in this structure are always 8 bytes, even in 32-bit files, so the s
 
 Each store's entry-ID counter is held in that store's catalog entry, not in the root.
 
+### 14.3.3 Catalog body and records
+
+- **One tree, mirrored.** The catalog body is a single B+tree (14.8), written twice: primary and mirror (Section 3.5). Every key starts with a kind byte:
+
+  | Prefix | Key | Value |
+  |---|---|---|
+  | `01` | object ID (8 bytes, big-endian) | record reference |
+  | `02` | object kind (key int) + name (key string) | object ID |
+  | `03` | store ID + schema version | record reference |
+  | `04` | store ID + field name | field ID |
+  | `05` | store ID + field ID | field name |
+  | `06` | none | next object ID: a copy of the root slot's counter |
+
+- **Record pages.** Records live in pages of type `0x0004`. Each record is written twice, and a **record reference** is the two logical page IDs, 16 bytes.
+- **Store records** use the shared value encoding (14.6), with these field IDs:
+
+  | ID | Field | ID | Field |
+  |---|---|---|---|
+  | 1 | kind | 7 | compression |
+  | 2 | ID | 8 | schema version |
+  | 3 | name | 9 | next field ID |
+  | 4 | data model | 10 | creating commit |
+  | 5 | encryption domain | 11 | flags; bit 0 = dropped |
+  | 6 | page-size code (log₂) | | |
+
+- **Writing the root slots.** The first catalog commit writes both root slots. Later commits alternate between them.
+- **Choosing a slot on open.**
+  - If both slots are damaged, the catalog is lost: **corrupt**.
+  - If one slot is damaged and the other was never written, a first catalog commit was cut short, so the file has no catalog yet.
+- **The ID counter.** The next object ID is the larger of the root slot's value and the body's `06` value. A fallback to an older slot therefore never reuses an ID.
+- **Catalog changes commit immediately.** At the database level they reconcile first, and they are refused while a transaction is open.
+- **Names.** Names are 1–64 bytes of valid UTF-8. A name's key must fit within the index key limit. Field names must also fit within the index value limit.
+
 ## 14.4 Companion files, delta records and commit records
 
 ### 14.4.1 Companion file header (64 bytes)
