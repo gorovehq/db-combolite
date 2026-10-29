@@ -7,6 +7,7 @@
 #include "cdb_fts.h"
 #include "cdb_key.h"
 #include "cdb_schema.h"
+#include "cdb_vec.h"
 #include "cdb_varint.h"
 
 /* Record envelope (spec 14.9.1): entry, revision, parent, commit, principal
@@ -130,7 +131,7 @@ cdb_status cdb_doc_flush_pools(cdb_db *db)
             p->dirty = 0;
         }
     }
-    return CDB_OK;
+    return cdb_vec_flush(db);
 }
 
 /* -------------------------------------------------------- index records */
@@ -873,9 +874,20 @@ cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
     cdb_status s;
     (void)pager;
 
+    /* The built-in apply serves every data model it knows. */
+    if (cdb_vec_is_open(db, d->store_id)) {
+        int handled;
+        return cdb_vec_apply(db, d, &handled);
+    }
     s = pool_get(db, d->store_id, &pool);
+    if (s == CDB_E_INVALID_ARG || s == CDB_E_UNSUPPORTED) {
+        int handled;
+        cdb_status vs = cdb_vec_apply(db, d, &handled);
+        if (handled)
+            return vs;
+    }
     if (s == CDB_E_NOT_FOUND || s == CDB_E_INVALID_ARG)
-        return CDB_OK; /* no such document pool: nothing to change */
+        return CDB_OK; /* no such pool or collection: nothing to change */
     if (s != CDB_OK)
         return s;
     if (!pool->fts_on || d->entry_id == 0)
@@ -892,6 +904,25 @@ cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
     if ((s = fts_capture(db, pool, d->entry_id, &after, 0)) != CDB_OK)
         return s;
     return cdb_fts_update(db, pool, d->entry_id, &before, &after);
+}
+
+/* The head revision of a document, for other models that refer to it.
+ * CDB_E_INVALID_ARG: the store is not a document pool. */
+cdb_status cdb_doc_head(cdb_db *db, uint64_t store, uint64_t entry, uint64_t *rev, int *live)
+{
+    struct cdb_doc_pool *pool;
+    head_rec h;
+    int found;
+    cdb_status s;
+    *rev = 0;
+    *live = 0;
+    if ((s = pool_get(db, store, &pool)) != CDB_OK)
+        return s;
+    if ((s = head_get(pool, entry, &h, &found)) != CDB_OK || !found)
+        return s;
+    *rev = h.rev;
+    *live = h.kind != CDB_REV_TOMBSTONE;
+    return CDB_OK;
 }
 
 /* -------------------------------------------------------- full text */

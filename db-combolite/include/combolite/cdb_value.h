@@ -125,6 +125,11 @@ cdb_status cdb_value_write_decimal_i64(cdb_value_writer *w, uint64_t scale, int6
 cdb_status cdb_value_write_vector(cdb_value_writer *w, cdb_vector_elem elem,
                                   uint64_t dims, const void *elems);
 
+/* data: the elements already in the writer's byte order and canonical form,
+ * as found in an encoded vector (cdb_value.as.vector.data). */
+cdb_status cdb_value_write_vector_raw(cdb_value_writer *w, cdb_vector_elem elem, uint64_t dims,
+                                      const void *data, size_t len);
+
 /* Copies one value that is already encoded (for example, read from another
  * document). It is validated against the writer's decimal mode first. */
 cdb_status cdb_value_write_encoded(cdb_value_writer *w, const void *value, size_t len);

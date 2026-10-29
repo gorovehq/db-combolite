@@ -86,6 +86,10 @@ cdb_status cdb_doc_create_full_text(cdb_db *db, uint64_t store, const cdb_fts_co
 cdb_status cdb_doc_search(cdb_db *db, uint64_t store, const char *query, size_t len, int mode,
                           cdb_fts_hit *hits, size_t max, size_t *n);
 
+/* The head revision of a document (0 and *live 0 when there is none), for
+ * other models that refer to documents. CDB_E_INVALID_ARG: not a pool. */
+cdb_status cdb_doc_head(cdb_db *db, uint64_t store, uint64_t entry, uint64_t *rev, int *live);
+
 /* Engine hooks used by cdb_db. */
 cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d);
 cdb_status cdb_doc_flush_pools(cdb_db *db);

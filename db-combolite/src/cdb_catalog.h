@@ -31,6 +31,7 @@
 
 #define CDB_CATALOG_NAME_MAX 64u
 #define CDB_CATALOG_FULL_TEXT_MAX 512u
+#define CDB_CATALOG_SETTINGS_MAX 512u
 
 typedef struct cdb_store_info {
     uint64_t id;
@@ -50,6 +51,8 @@ typedef struct cdb_store_info {
     uint64_t next_entry_id;   /* entry IDs are never reused (spec 6.1) */
     uint8_t full_text[CDB_CATALOG_FULL_TEXT_MAX]; /* encoded settings (14.14); empty = none */
     size_t full_text_len;
+    uint8_t vector[CDB_CATALOG_SETTINGS_MAX]; /* encoded collection settings (14.12.3); empty = none */
+    size_t vector_len;
 } cdb_store_info;
 
 typedef struct cdb_catalog {
@@ -67,6 +70,15 @@ cdb_status cdb_catalog_open(cdb_catalog *cat, cdb_pager *p, const cdb_index_work
 
 cdb_status cdb_catalog_create_store(cdb_catalog *cat, const char *name, size_t len, uint32_t model,
                                     uint64_t *id);
+/* As create_store, with a vector collection's settings (an encoded object)
+ * in the same record and commit. */
+cdb_status cdb_catalog_create_store_ex(cdb_catalog *cat, const char *name, size_t len, uint32_t model,
+                                       const void *vector, size_t vector_len, uint64_t *id);
+/* The ID the next created store will get, for pages written before it. */
+uint64_t cdb_catalog_next_store_id(const cdb_catalog *cat);
+/* Records a store's next entry ID without committing (like stage_pool). */
+cdb_status cdb_catalog_stage_next_entry(cdb_catalog *cat, uint64_t store_id, uint64_t next_entry_id);
+
 /* *found is 0 when no live store has that name. */
 cdb_status cdb_catalog_find_store(cdb_catalog *cat, const char *name, size_t len, uint64_t *id, int *found);
 /* Dropped stores are still found by ID (their IDs are never reused). */

@@ -83,6 +83,7 @@ typedef struct cdb_db_config {
     uint8_t *doc_stage;           /* documents: per-transaction staging (cdb_doc.h) */
     size_t doc_stage_size;
     uint8_t *fts_buffers;         /* full-text: 3 * page_size bytes (cdb_fts.h) */
+    uint8_t *vec_buffers;         /* vectors: 3 * page_size bytes (cdb_vec.h) */
     cdb_fts_token *fts_tokens;    /* full-text: words of two document versions */
     size_t fts_tokens_cap;
 } cdb_db_config;
@@ -128,6 +129,23 @@ typedef struct cdb_db {
         cdb_index fts_postings;  /* (term, entry) -> term frequency */
         cdb_index fts_lengths;   /* entry -> words indexed; 0 -> pool totals */
     } pools[CDB_DB_MAX_POOLS];
+    /* Open vector collections (cdb_vec.h). */
+    struct cdb_vec_coll {
+        int in_use;
+        int dirty;               /* next_entry changed since the catalog has it */
+        uint64_t store_id;
+        uint8_t elem;            /* cdb_vector_elem */
+        uint8_t measure;         /* base measure, CDB_VEC_* */
+        uint8_t norms;           /* blocks cache each vector's norm */
+        uint32_t dims;
+        size_t vec_bytes;        /* bytes per vector */
+        uint32_t slots;          /* vectors per block */
+        cdb_index entries;       /* entry -> block, slot, source */
+        cdb_index blocks;        /* block -> slots in use, slots */
+        cdb_index sources;       /* (source store, source entry, entry) -> nothing */
+        uint64_t next_entry;
+        uint64_t touched_tx;     /* the open transaction changed this collection */
+    } vecs[CDB_DB_MAX_POOLS];
     /* The schema held in the schema buffer (cdb_doc.h). */
     uint64_t schema_store;
     uint32_t schema_version;
