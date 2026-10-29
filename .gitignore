@@ -4,3 +4,7 @@ db-combolite/build/
 *.a
 .claude/
 db-combolite/build-rel/
+# Test data pools: fetched, not committed (Project Gutenberg index and books).
+db-combolite/datastore/gutenberg/
+# Sub-agent activity log, tailed by the user.
+db-combolite/workspace/agents.log
