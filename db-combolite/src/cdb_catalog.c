@@ -513,6 +513,10 @@ cdb_status cdb_catalog_rename_store(cdb_catalog *cat, uint64_t id, const char *n
         return s;
     if (info.flags & CDB_STORE_DROPPED)
         return CDB_E_NOT_FOUND;
+    /* Names starting with '$' are the engine's own, as is the link store
+     * (found by its name), so neither can be renamed into or out of. */
+    if (info.model == CDB_MODEL_LINK || (len > 0 && name[0] == '$'))
+        return CDB_E_INVALID_ARG;
     if ((s = cdb_catalog_find_store(cat, name, len, &other, &found)) != CDB_OK)
         return s;
     if (found)

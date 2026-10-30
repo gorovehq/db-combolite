@@ -153,6 +153,19 @@ static void test_rename_keeps_id(void)
     TEST_ASSERT_TRUE(find("gamma", &id));
 }
 
+/* '$' names stay the engine's: no store takes one, and the link store
+ * keeps its own. */
+static void test_rename_keeps_reserved_names(void)
+{
+    uint64_t a = create("alpha", CDB_MODEL_DOCUMENT), links = create("$links", CDB_MODEL_LINK), id;
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_catalog_rename_store(&cat, a, "$mine", 5));
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_catalog_rename_store(&cat, links, "plain", 5));
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_catalog_rename_store(&cat, links, "$other", 6));
+    TEST_ASSERT_TRUE(find("alpha", &id));
+    TEST_ASSERT_TRUE(find("$links", &id));
+    TEST_ASSERT_EQUAL_UINT64(links, id);
+}
+
 static void test_drop_frees_name_but_not_id(void)
 {
     cdb_store_info info;
@@ -360,6 +373,7 @@ int main(void)
     RUN_TEST(test_create_find_get_and_reopen);
     RUN_TEST(test_rejects_bad_input);
     RUN_TEST(test_rename_keeps_id);
+    RUN_TEST(test_rename_keeps_reserved_names);
     RUN_TEST(test_drop_frees_name_but_not_id);
     RUN_TEST(test_schema_history);
     RUN_TEST(test_field_dictionary);
