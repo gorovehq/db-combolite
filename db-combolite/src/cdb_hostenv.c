@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "combolite/cdb_env.h"
@@ -100,8 +101,18 @@ static cdb_status he_sync_dir(void *ctx, const char *path)
     return s;
 }
 
+static cdb_status he_now(void *ctx, int64_t *ns)
+{
+    struct timespec ts;
+    (void)ctx;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+        return CDB_E_UNSUPPORTED;
+    *ns = (int64_t)ts.tv_sec * 1000000000 + (int64_t)ts.tv_nsec;
+    return CDB_OK;
+}
+
 static const cdb_env_ops hostenv_ops = {
-    he_open, he_remove, he_rename, he_mkdir, he_rmdir, he_exists, he_sync_dir
+    he_open, he_remove, he_rename, he_mkdir, he_rmdir, he_exists, he_sync_dir, he_now
 };
 
 void cdb_hostenv_init(cdb_hostenv *he, cdb_env *out)

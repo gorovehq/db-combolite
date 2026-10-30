@@ -23,3 +23,6 @@ Features and follow-ups that were agreed and deferred. Each one becomes a milest
 - **ARM CRC-32C path.** It is only compiled when targeting little-endian ARMv8 with CRC, and it has never been built or run. Test it on ARM hardware or under an emulator.
 - **Mutation checks on M13's reachability check.** The other M13 mutation checks ran; this new code hasn't had any yet.
 - **Search-path threshold (spec 7.7).** The provisional 10,000 should be revisited with real embeddings and larger collections.
+- **Open-store limit, to decide before the relational milestone.** `cdb_db` holds at most 8 open document pools and 8 vector collections (`CDB_DB_MAX_POOLS`); a 9th gives "buffer too small". The link store has a fixed place of its own. Relational tables need more indexes each, and the Gutenberg layout uses many stores. Options: raise the fixed limit, or have callers supply the slots.
+- **Links: cost of checks in large transactions.** Checks read the open transaction's own LINK and UNLINK records back from the journal. That is linear in the transaction's size, so a bulk import should commit often. A staging cache, like the one documents use, would fix it.
+- **Links to other models.** Link ends can be documents and vectors so far. Rows, time-series points (a different reference shape) and enclave pointers (spec 6.11) come with those milestones.

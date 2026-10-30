@@ -160,6 +160,14 @@ typedef struct cdb_db {
         cdb_index reverse;       /* (neighbour, entry): entry lists neighbour; (0, entry): an entry point */
         cdb_index pending;       /* entries whose list needs work */
     } vecs[CDB_DB_MAX_POOLS];
+    /* The one link store (cdb_link.h), looked up on first use. */
+    struct cdb_link_store {
+        int looked;              /* the catalog was asked for it */
+        uint64_t store_id;       /* 0: there is none yet */
+        int open;                /* its indexes are open */
+        cdb_index fwd;           /* (source, type, target) -> weight, time, flags */
+        cdb_index rev;           /* (target, type, source) -> nothing */
+    } links;
     /* The schema held in the schema buffer (cdb_doc.h). */
     uint64_t schema_store;
     uint32_t schema_version;
@@ -187,6 +195,10 @@ cdb_status cdb_tx_abort(cdb_db *db);
 
 /* Folds every applied change into the archive (spec 3.2) and starts a new journal. */
 cdb_status cdb_db_reconcile(cdb_db *db);
+
+/* The environment's clock, in nanoseconds since the Unix epoch. *have is 0
+ * (and *ns 0) when the environment has none. Commit records carry it. */
+cdb_status cdb_db_now(cdb_db *db, int64_t *ns, int *have);
 
 /* Catalog changes (spec 4). Each reconciles first, then commits the change
  * immediately. Need catalog_work and catalog_page in the configuration. */

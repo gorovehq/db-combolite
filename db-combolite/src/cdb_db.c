@@ -4,6 +4,7 @@
 
 #include "cdb_db.h"
 #include "cdb_doc.h"
+#include "cdb_link.h"
 
 #define JOURNAL_SLOT 0u
 #define DEFAULT_SYNC_EVERY 32u
@@ -376,6 +377,23 @@ static cdb_status reserve_commit(cdb_db *db, uint64_t *number)
     return CDB_OK;
 }
 
+cdb_status cdb_db_now(cdb_db *db, int64_t *ns, int *have)
+{
+    cdb_status s;
+    *ns = 0;
+    *have = 0;
+    if (db->env.ops->now == NULL)
+        return CDB_OK;
+    s = db->env.ops->now(db->env.ctx, ns);
+    if (s == CDB_E_UNSUPPORTED) {
+        *ns = 0;
+        return CDB_OK;
+    }
+    if (s == CDB_OK)
+        *have = 1;
+    return s;
+}
+
 cdb_status cdb_tx_commit(cdb_db *db)
 {
     uint8_t info[CDB_COMMIT_PAYLOAD_SIZE];
@@ -393,6 +411,13 @@ cdb_status cdb_tx_commit(cdb_db *db)
     memset(&ci, 0, sizeof ci);
     if ((s = reserve_commit(db, &ci.commit_number)) != CDB_OK)
         return s;
+    {
+        int64_t now;
+        int have;
+        if ((s = cdb_db_now(db, &now, &have)) != CDB_OK)
+            return s;
+        ci.timestamp = have ? (uint64_t)now : 0u; /* spec 14.4: ns since the epoch; 0 = no clock */
+    }
     ci.delta_count = db->tx_deltas;
     ci.track_mask = 1u << CDB_COMPANION_MAIN_JOURNAL;
     cdb_commit_encode(&ci, info, db->pager.order);
@@ -511,6 +536,11 @@ cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
 {
     cdb_status s = catalog_ready(db);
     int i;
+    if (s == CDB_OK && cdb_link_is_store(db, id))
+        s = CDB_E_INVALID_ARG; /* the link store is the engine's own */
+    /* Its entries' links are tombstoned; the drop's commit carries that. */
+    if (s == CDB_OK)
+        s = cdb_link_on_drop(db, id);
     if (s == CDB_OK)
         s = cdb_catalog_drop_store(&db->catalog, id);
     if (s != CDB_OK)

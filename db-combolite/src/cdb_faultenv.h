@@ -43,7 +43,13 @@ typedef struct cdb_faultenv {
     cdb_fault_clock clock;
     cdb_faultenv_file files[CDB_FAULTENV_MAX_FILES];
     cdb_faultenv_dir dirs[CDB_FAULTENV_MAX_DIRS];
+    int has_time;     /* the clock: off after init */
+    int64_t time_ns;
 } cdb_faultenv;
+
+/* Sets the environment's clock: on, and the time it reports (ns since the
+ * Unix epoch); off, the environment has no clock. Survives reboots. */
+void cdb_faultenv_set_time(cdb_faultenv *fe, int on, int64_t ns);
 
 cdb_status cdb_faultenv_init(cdb_faultenv *fe, const cdb_faultenv_config *cfg, cdb_env *out);
 

@@ -1,0 +1,691 @@
+/* Links between entries (spec 6, 14.13). */
+#include <string.h>
+
+#include "cdb_doc.h"
+#include "cdb_endian.h"
+#include "cdb_link.h"
+#include "cdb_vec.h"
+
+#define KEY_LEN 40u        /* reference (16), type (8), reference (16) */
+#define VAL_LEN 13u        /* weight (f32 bits, 4), time (8), flags (1) */
+#define LINK_PAYLOAD 53u   /* mode (1), type, source, target, weight, time */
+#define UNLINK_PAYLOAD 40u /* type, source, target */
+#define MODE_CREATE 1u
+#define MODE_REINFORCE 2u
+
+/* -------------------------------------------------------- the store */
+
+int cdb_link_is_store(cdb_db *db, uint64_t store)
+{
+    struct cdb_link_store *ls = &db->links;
+    if (!ls->store_id && !ls->looked && db->has_catalog) {
+        uint64_t id;
+        int found;
+        if (cdb_catalog_find_store(&db->catalog, CDB_LINK_STORE_NAME, sizeof CDB_LINK_STORE_NAME - 1u, &id, &found)
+                == CDB_OK) {
+            ls->looked = 1;
+            if (found)
+                ls->store_id = id;
+        }
+    }
+    return store != 0 && store == ls->store_id;
+}
+
+/* Opens the link store's indexes. CDB_E_NOT_FOUND when there are no links
+ * yet. With create (inside a catalog change), makes what is missing: the
+ * store commits at once; its index roots are staged for the next commit. */
+static cdb_status open_store(cdb_db *db, int create)
+{
+    struct cdb_link_store *ls = &db->links;
+    cdb_store_info info;
+    cdb_status s;
+    if (ls->open)
+        return CDB_OK;
+    if (!db->has_catalog)
+        return CDB_E_UNSUPPORTED;
+    (void)cdb_link_is_store(db, 0);
+    if (!ls->store_id) {
+        if (!create)
+            return CDB_E_NOT_FOUND;
+        if ((s = cdb_catalog_create_store(&db->catalog, CDB_LINK_STORE_NAME, sizeof CDB_LINK_STORE_NAME - 1u,
+                                          CDB_MODEL_LINK, &ls->store_id)) != CDB_OK)
+            return s;
+        ls->looked = 1;
+    }
+    if ((s = cdb_catalog_get_store(&db->catalog, ls->store_id, &info)) != CDB_OK)
+        return s;
+    if (info.head_root && info.rev_root) {
+        if ((s = cdb_index_open(&ls->fwd, &db->pager, info.head_root, &db->cfg.catalog_work)) != CDB_OK
+            || (s = cdb_index_open(&ls->rev, &db->pager, info.rev_root, &db->cfg.catalog_work)) != CDB_OK)
+            return s;
+    } else {
+        /* A crash between the store's commit and its first type's. */
+        if (!create)
+            return CDB_E_NOT_FOUND;
+        if ((s = cdb_index_create(&ls->fwd, &db->pager, ls->store_id, CDB_INDEX_FLAG_UNIQUE | CDB_INDEX_FLAG_PREFIX,
+                                  &db->cfg.catalog_work)) != CDB_OK
+            || (s = cdb_index_create(&ls->rev, &db->pager, ls->store_id, CDB_INDEX_FLAG_UNIQUE | CDB_INDEX_FLAG_PREFIX,
+                                     &db->cfg.catalog_work)) != CDB_OK
+            || (s = cdb_catalog_stage_pool(&db->catalog, ls->store_id, ls->fwd.root, ls->rev.root, 0)) != CDB_OK)
+            return s;
+    }
+    ls->open = 1;
+    return CDB_OK;
+}
+
+static cdb_status type_of(cdb_db *db, uint64_t type, cdb_link_type_info *t)
+{
+    if (t->id == type && type != 0)
+        return CDB_OK; /* the one looked up last */
+    return cdb_catalog_get_link_type(&db->catalog, type, t);
+}
+
+/* -------------------------------------------------------- rows */
+
+static void put_ref(uint8_t *p, cdb_ref r)
+{
+    cdb_store_u64(p, r.store, CDB_ORDER_BIG);
+    cdb_store_u64(p + 8, r.entry, CDB_ORDER_BIG);
+}
+
+static cdb_ref get_ref(const uint8_t *p)
+{
+    cdb_ref r;
+    r.store = cdb_load_u64(p, CDB_ORDER_BIG);
+    r.entry = cdb_load_u64(p + 8, CDB_ORDER_BIG);
+    return r;
+}
+
+static void k_fwd(uint8_t *k, uint64_t type, cdb_ref s, cdb_ref t)
+{
+    put_ref(k, s);
+    cdb_store_u64(k + 16, type, CDB_ORDER_BIG);
+    put_ref(k + 24, t);
+}
+
+static void k_rev(uint8_t *k, uint64_t type, cdb_ref s, cdb_ref t)
+{
+    put_ref(k, t);
+    cdb_store_u64(k + 16, type, CDB_ORDER_BIG);
+    put_ref(k + 24, s);
+}
+
+static void encode_val(uint8_t *v, const cdb_link *l)
+{
+    uint32_t bits;
+    memcpy(&bits, &l->weight, sizeof bits);
+    cdb_store_u32(v, bits, CDB_ORDER_BIG);
+    cdb_store_u64(v + 4, (uint64_t)l->time, CDB_ORDER_BIG);
+    v[12] = l->flags;
+}
+
+static void decode_val(const uint8_t *v, cdb_link *l)
+{
+    uint32_t bits = cdb_load_u32(v, CDB_ORDER_BIG);
+    memcpy(&l->weight, &bits, sizeof bits);
+    l->time = (int64_t)cdb_load_u64(v + 4, CDB_ORDER_BIG);
+    l->flags = v[12];
+}
+
+static cdb_status row_get(struct cdb_link_store *ls, uint64_t type, cdb_ref s, cdb_ref t, cdb_link *l, int *found)
+{
+    uint8_t k[KEY_LEN], v[VAL_LEN];
+    size_t vlen;
+    cdb_status st;
+    k_fwd(k, type, s, t);
+    if ((st = cdb_index_get(&ls->fwd, k, KEY_LEN, v, sizeof v, &vlen, found)) != CDB_OK || !*found)
+        return st;
+    if (vlen != VAL_LEN)
+        return CDB_E_CORRUPT;
+    l->type = type;
+    l->source = s;
+    l->target = t;
+    decode_val(v, l);
+    return CDB_OK;
+}
+
+static cdb_status row_put(struct cdb_link_store *ls, const cdb_link *l)
+{
+    uint8_t k[KEY_LEN], v[VAL_LEN];
+    k_fwd(k, l->type, l->source, l->target);
+    encode_val(v, l);
+    return cdb_index_put(&ls->fwd, k, KEY_LEN, v, VAL_LEN);
+}
+
+static cdb_status row_insert(struct cdb_link_store *ls, const cdb_link *l)
+{
+    uint8_t k[KEY_LEN];
+    cdb_status s;
+    if ((s = row_put(ls, l)) != CDB_OK)
+        return s;
+    k_rev(k, l->type, l->source, l->target);
+    return cdb_index_put(&ls->rev, k, KEY_LEN, k, 0);
+}
+
+static cdb_status row_erase(struct cdb_link_store *ls, const cdb_link *l)
+{
+    uint8_t k[KEY_LEN];
+    int found;
+    cdb_status s;
+    k_fwd(k, l->type, l->source, l->target);
+    if ((s = cdb_index_delete(&ls->fwd, k, KEY_LEN, &found)) != CDB_OK)
+        return s;
+    k_rev(k, l->type, l->source, l->target);
+    return cdb_index_delete(&ls->rev, k, KEY_LEN, &found);
+}
+
+/* The next key at or after pos (KEY_LEN bytes) that starts with prefix;
+ * *done when there is none. Seeks afresh each time, so the index may
+ * change between calls. The cursor uses the catalog page. */
+static cdb_status scan_at(cdb_db *db, cdb_index *ix, const uint8_t *prefix, size_t plen, uint8_t *pos, int *done)
+{
+    cdb_index_cursor c;
+    uint8_t k[KEY_LEN], v[VAL_LEN];
+    size_t klen, vlen;
+    cdb_status s;
+    if ((s = cdb_index_seek(&c, ix, db->cfg.catalog_page, pos, KEY_LEN)) != CDB_OK
+        || (s = cdb_index_next(&c, k, sizeof k, &klen, v, sizeof v, &vlen, done)) != CDB_OK)
+        return s == CDB_E_BUFFER_TOO_SMALL ? CDB_E_CORRUPT : s;
+    if (*done || klen != KEY_LEN || memcmp(k, prefix, plen) != 0) {
+        *done = 1;
+        return CDB_OK;
+    }
+    memcpy(pos, k, KEY_LEN);
+    return CDB_OK;
+}
+
+/* The key right after k, as a big-endian number; 0 at the very end. */
+static int key_succ(uint8_t *k)
+{
+    size_t i = KEY_LEN;
+    while (i-- > 0)
+        if (++k[i] != 0)
+            return 1;
+    return 0;
+}
+
+/* A row of either index as the link it names (the reverse one is read
+ * from the forward index). */
+static cdb_status row_at(struct cdb_link_store *ls, int reverse, const uint8_t *k, cdb_link *l, int *found)
+{
+    cdb_ref a = get_ref(k), b = get_ref(k + 24);
+    uint64_t type = cdb_load_u64(k + 16, CDB_ORDER_BIG);
+    return reverse ? row_get(ls, type, b, a, l, found) : row_get(ls, type, a, b, l, found);
+}
+
+/* -------------------------------------------------------- the open transaction */
+
+typedef struct txrec {
+    uint8_t op, mode;
+    uint64_t type;
+    cdb_ref source, target;
+    float weight;
+    int64_t time;
+} txrec;
+
+static int parse(const uint8_t op, const uint8_t *p, size_t len, txrec *r)
+{
+    memset(r, 0, sizeof *r);
+    r->op = op;
+    if (op == CDB_OP_LINK && len == LINK_PAYLOAD && (p[0] == MODE_CREATE || p[0] == MODE_REINFORCE)) {
+        uint32_t bits;
+        r->mode = p[0];
+        p++;
+        r->type = cdb_load_u64(p, CDB_ORDER_BIG);
+        r->source = get_ref(p + 8);
+        r->target = get_ref(p + 24);
+        bits = cdb_load_u32(p + 40, CDB_ORDER_BIG);
+        memcpy(&r->weight, &bits, sizeof bits);
+        r->time = (int64_t)cdb_load_u64(p + 44, CDB_ORDER_BIG);
+        return 1;
+    }
+    if (op == CDB_OP_UNLINK && len == UNLINK_PAYLOAD) {
+        r->type = cdb_load_u64(p, CDB_ORDER_BIG);
+        r->source = get_ref(p + 8);
+        r->target = get_ref(p + 24);
+        return 1;
+    }
+    return 0;
+}
+
+/* The open transaction's link record at or after *off; *done at the end. */
+static cdb_status tx_next(cdb_db *db, uint64_t *off, txrec *r, int *done)
+{
+    *done = 0;
+    while (*off < db->journal.end) {
+        cdb_record rec;
+        uint64_t next;
+        cdb_status s = cdb_journal_read(&db->journal, *off, db->cfg.record_buf, db->cfg.record_buf_size, &rec, &next);
+        if (s != CDB_OK)
+            return s;
+        *off = next;
+        if (rec.kind == CDB_RECORD_DATA && rec.tx_id == db->tx_id && rec.store_id == db->links.store_id
+            && rec.payload_len >= 1 && parse(rec.payload[0], rec.payload + 1, rec.payload_len - 1u, r))
+            return CDB_OK;
+    }
+    *done = 1;
+    return CDB_OK;
+}
+
+static int same_pair(const txrec *r, uint64_t type, cdb_ref s, cdb_ref t)
+{
+    return r->type == type && r->source.store == s.store && r->source.entry == s.entry && r->target.store == t.store
+           && r->target.entry == t.entry;
+}
+
+enum { NONE = 0, LIVE = 1, TOMB = 2 };
+
+/* A link as the open transaction sees it: the committed row, then the
+ * transaction's own records for the pair, in order. */
+static cdb_status tx_state(cdb_db *db, uint64_t type, cdb_ref s, cdb_ref t, int *state)
+{
+    cdb_link l;
+    uint64_t off = db->tx_start;
+    txrec r;
+    int found, done;
+    cdb_status st;
+    if ((st = row_get(&db->links, type, s, t, &l, &found)) != CDB_OK)
+        return st;
+    *state = !found ? NONE : (l.flags & CDB_LINK_TOMBSTONE) ? TOMB : LIVE;
+    for (;;) {
+        if ((st = tx_next(db, &off, &r, &done)) != CDB_OK || done)
+            return st;
+        if (!same_pair(&r, type, s, t))
+            continue;
+        if (r.op == CDB_OP_LINK && r.mode == MODE_CREATE && *state == NONE)
+            *state = LIVE;
+        else if (r.op == CDB_OP_UNLINK && *state == LIVE)
+            *state = TOMB;
+    }
+}
+
+/* Whether an entry has a live link of the type in one direction, as the
+ * open transaction sees it; with refuse_only, of any refuse type (type 0). */
+static cdb_status any_live(cdb_db *db, int direction, cdb_ref e, uint64_t type, int refuse_only, int *any)
+{
+    struct cdb_link_store *ls = &db->links;
+    cdb_index *ix = direction == CDB_LINK_IN ? &ls->rev : &ls->fwd;
+    cdb_link_type_info ti;
+    uint8_t prefix[24], pos[KEY_LEN];
+    size_t plen = type ? 24u : 16u;
+    uint64_t off = db->tx_start;
+    txrec r;
+    int done, found, state;
+    cdb_status s;
+
+    *any = 0;
+    memset(&ti, 0, sizeof ti);
+    put_ref(prefix, e);
+    cdb_store_u64(prefix + 16, type, CDB_ORDER_BIG);
+    memset(pos, 0, sizeof pos);
+    memcpy(pos, prefix, plen);
+    for (;;) {
+        cdb_link l;
+        if ((s = scan_at(db, ix, prefix, plen, pos, &done)) != CDB_OK || done)
+            break;
+        if ((s = row_at(ls, direction == CDB_LINK_IN, pos, &l, &found)) != CDB_OK)
+            return s;
+        if (found && !(l.flags & CDB_LINK_TOMBSTONE)) {
+            int counts = 1;
+            if (refuse_only) {
+                if ((s = type_of(db, l.type, &ti)) != CDB_OK)
+                    return s;
+                counts = ti.on_delete == CDB_LINK_ON_DELETE_REFUSE;
+            }
+            if (counts && (s = tx_state(db, l.type, l.source, l.target, &state)) != CDB_OK)
+                return s;
+            if (counts && state == LIVE) {
+                *any = 1;
+                return CDB_OK;
+            }
+        }
+        if (!key_succ(pos))
+            break;
+    }
+    if (s != CDB_OK)
+        return s;
+    /* Links this transaction made. */
+    for (;;) {
+        cdb_ref end;
+        if ((s = tx_next(db, &off, &r, &done)) != CDB_OK || done)
+            return s;
+        end = direction == CDB_LINK_IN ? r.target : r.source;
+        if (r.op != CDB_OP_LINK || r.mode != MODE_CREATE || end.store != e.store || end.entry != e.entry
+            || (type && r.type != type))
+            continue;
+        if (refuse_only) {
+            if ((s = type_of(db, r.type, &ti)) != CDB_OK)
+                return s;
+            if (ti.on_delete != CDB_LINK_ON_DELETE_REFUSE)
+                continue;
+        }
+        if ((s = tx_state(db, r.type, r.source, r.target, &state)) != CDB_OK)
+            return s;
+        if (state == LIVE) {
+            *any = 1;
+            return CDB_OK;
+        }
+    }
+}
+
+/* Whether an entry exists as the open transaction sees it. */
+static cdb_status ref_live(cdb_db *db, cdb_ref r, int *live)
+{
+    cdb_status s = cdb_doc_live_in_tx(db, r.store, r.entry, live);
+    if (s == CDB_E_INVALID_ARG)
+        s = cdb_vec_live_in_tx(db, r.store, r.entry, live);
+    if (s == CDB_E_NOT_FOUND || s == CDB_E_INVALID_ARG) {
+        *live = 0; /* no such store, or a model links do not reach yet */
+        return CDB_OK;
+    }
+    return s;
+}
+
+/* -------------------------------------------------------- types */
+
+cdb_status cdb_link_define_type(cdb_db *db, const char *name, size_t len, unsigned cardinality, int enforced,
+                                unsigned on_delete, uint64_t *type)
+{
+    cdb_link_type_info info;
+    cdb_status s;
+    if (cardinality < CDB_CARD_1_1 || cardinality > CDB_CARD_N_M || on_delete > CDB_LINK_ON_DELETE_REFUSE
+        || (enforced != 0 && enforced != 1) || name == NULL || len == 0 || len > CDB_CATALOG_NAME_MAX)
+        return CDB_E_INVALID_ARG;
+    memset(&info, 0, sizeof info);
+    memcpy(info.name, name, len);
+    info.name_len = len;
+    info.cardinality = (uint8_t)cardinality;
+    info.enforced = (uint8_t)enforced;
+    info.on_delete = (uint8_t)on_delete;
+    if ((s = cdb_db_catalog_begin(db)) != CDB_OK)
+        return s;
+    s = open_store(db, 1);
+    if (s == CDB_OK)
+        s = cdb_catalog_create_link_type(&db->catalog, &info, type);
+    return cdb_db_catalog_end(db, s);
+}
+
+cdb_status cdb_link_find_type(cdb_db *db, const char *name, size_t len, uint64_t *type, int *found)
+{
+    if (!db->has_catalog)
+        return CDB_E_UNSUPPORTED;
+    return cdb_catalog_find_link_type(&db->catalog, name, len, type, found);
+}
+
+/* -------------------------------------------------------- changes */
+
+static cdb_status tx_ready(cdb_db *db, uint64_t type, cdb_link_type_info *ti)
+{
+    cdb_status s;
+    if (!db->in_tx || db->failed)
+        return CDB_E_STATE;
+    if ((s = open_store(db, 0)) != CDB_OK)
+        return s; /* no link store: no link types either */
+    memset(ti, 0, sizeof *ti);
+    return type_of(db, type, ti);
+}
+
+static cdb_status put_link(cdb_db *db, uint8_t mode, uint64_t type, cdb_ref source, cdb_ref target, float weight,
+                           int64_t time)
+{
+    uint8_t p[LINK_PAYLOAD];
+    uint32_t bits;
+    int64_t now;
+    int have;
+    cdb_status s;
+    if ((s = cdb_db_now(db, &now, &have)) != CDB_OK)
+        return s;
+    p[0] = mode;
+    cdb_store_u64(p + 1, type, CDB_ORDER_BIG);
+    put_ref(p + 9, source);
+    put_ref(p + 25, target);
+    memcpy(&bits, &weight, sizeof bits);
+    cdb_store_u32(p + 41, bits, CDB_ORDER_BIG);
+    cdb_store_u64(p + 45, (uint64_t)(have ? now : time), CDB_ORDER_BIG);
+    return cdb_tx_put(db, db->links.store_id, 0, CDB_OP_LINK, p, sizeof p);
+}
+
+cdb_status cdb_link_add(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, float weight, int64_t time)
+{
+    cdb_link_type_info ti;
+    int live, state, any;
+    cdb_status s;
+    if ((s = tx_ready(db, type, &ti)) != CDB_OK)
+        return s;
+    if (weight != weight)
+        return CDB_E_INVALID_ARG; /* NaN */
+    if ((s = ref_live(db, source, &live)) != CDB_OK)
+        return s;
+    if (!live)
+        return CDB_E_NOT_FOUND;
+    if ((s = ref_live(db, target, &live)) != CDB_OK)
+        return s;
+    if (!live)
+        return CDB_E_NOT_FOUND;
+    if ((s = tx_state(db, type, source, target, &state)) != CDB_OK)
+        return s;
+    if (state != NONE)
+        return CDB_E_EXISTS; /* a pair is linked under a type once */
+    if (ti.enforced && ti.cardinality != CDB_CARD_N_M) {
+        if ((s = any_live(db, CDB_LINK_IN, target, type, 0, &any)) != CDB_OK)
+            return s;
+        if (any)
+            return CDB_E_STATE; /* the target has its one source */
+        if (ti.cardinality == CDB_CARD_1_1) {
+            if ((s = any_live(db, CDB_LINK_OUT, source, type, 0, &any)) != CDB_OK)
+                return s;
+            if (any)
+                return CDB_E_STATE; /* the source has its one target */
+        }
+    }
+    return put_link(db, MODE_CREATE, type, source, target, weight, time);
+}
+
+cdb_status cdb_link_reinforce(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, float weight,
+                              int64_t time)
+{
+    cdb_link_type_info ti;
+    int state;
+    cdb_status s;
+    if ((s = tx_ready(db, type, &ti)) != CDB_OK)
+        return s;
+    if (weight != weight)
+        return CDB_E_INVALID_ARG;
+    if ((s = tx_state(db, type, source, target, &state)) != CDB_OK)
+        return s;
+    if (state != LIVE)
+        return CDB_E_NOT_FOUND;
+    return put_link(db, MODE_REINFORCE, type, source, target, weight, time);
+}
+
+cdb_status cdb_link_remove(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target)
+{
+    cdb_link_type_info ti;
+    uint8_t p[UNLINK_PAYLOAD];
+    int state;
+    cdb_status s;
+    if ((s = tx_ready(db, type, &ti)) != CDB_OK)
+        return s;
+    if ((s = tx_state(db, type, source, target, &state)) != CDB_OK)
+        return s;
+    if (state != LIVE)
+        return CDB_E_NOT_FOUND;
+    cdb_store_u64(p, type, CDB_ORDER_BIG);
+    put_ref(p + 8, source);
+    put_ref(p + 24, target);
+    return cdb_tx_put(db, db->links.store_id, 0, CDB_OP_UNLINK, p, sizeof p);
+}
+
+cdb_status cdb_link_check_delete(cdb_db *db, uint64_t store, uint64_t entry)
+{
+    cdb_ref e;
+    int any;
+    cdb_status s = open_store(db, 0);
+    if (s == CDB_E_NOT_FOUND || s == CDB_E_UNSUPPORTED)
+        return CDB_OK; /* no links at all */
+    if (s != CDB_OK)
+        return s;
+    e.store = store;
+    e.entry = entry;
+    if ((s = any_live(db, CDB_LINK_IN, e, 0, 1, &any)) != CDB_OK)
+        return s;
+    return any ? CDB_E_STATE : CDB_OK;
+}
+
+/* -------------------------------------------------------- apply */
+
+/* Never fails for logical reasons: it runs again during recovery. */
+cdb_status cdb_link_apply(cdb_db *db, const cdb_delta *d)
+{
+    struct cdb_link_store *ls = &db->links;
+    cdb_link l;
+    txrec r;
+    int found;
+    cdb_status s = open_store(db, 0);
+    if (s == CDB_E_NOT_FOUND)
+        return CDB_OK;
+    if (s != CDB_OK)
+        return s;
+    if (!parse(d->op, d->data, d->len, &r))
+        return CDB_OK;
+    if ((s = row_get(ls, r.type, r.source, r.target, &l, &found)) != CDB_OK)
+        return s;
+    if (r.op == CDB_OP_LINK && r.mode == MODE_CREATE) {
+        if (found)
+            return CDB_OK;
+        l.type = r.type;
+        l.source = r.source;
+        l.target = r.target;
+        l.weight = r.weight;
+        l.time = r.time;
+        l.flags = 0;
+        return row_insert(ls, &l);
+    }
+    if (!found || (l.flags & CDB_LINK_TOMBSTONE))
+        return CDB_OK;
+    if (r.op == CDB_OP_LINK) { /* reinforce */
+        l.weight = r.weight;
+        l.time = r.time;
+    } else {
+        l.flags |= CDB_LINK_TOMBSTONE;
+    }
+    return row_put(ls, &l);
+}
+
+/* Applies "this end is gone" to every link with an end matching prefix:
+ * tombstone (with the gone flag), or erase for a cascade type unless
+ * at_drop. Both indexes are walked: one for each end. */
+static cdb_status ends_gone(cdb_db *db, const uint8_t *prefix, size_t plen, int at_drop)
+{
+    struct cdb_link_store *ls = &db->links;
+    cdb_link_type_info ti;
+    int reverse;
+    cdb_status s = open_store(db, 0);
+    if (s == CDB_E_NOT_FOUND || s == CDB_E_UNSUPPORTED)
+        return CDB_OK;
+    if (s != CDB_OK)
+        return s;
+    memset(&ti, 0, sizeof ti);
+    for (reverse = 0; reverse < 2; reverse++) {
+        uint8_t pos[KEY_LEN];
+        memset(pos, 0, sizeof pos);
+        memcpy(pos, prefix, plen);
+        for (;;) {
+            cdb_link l;
+            int done, found;
+            if ((s = scan_at(db, reverse ? &ls->rev : &ls->fwd, prefix, plen, pos, &done)) != CDB_OK)
+                return s;
+            if (done)
+                break;
+            if ((s = row_at(ls, reverse, pos, &l, &found)) != CDB_OK)
+                return s;
+            if (!found)
+                return CDB_E_CORRUPT; /* a reverse row without its link */
+            if (!at_drop && (s = type_of(db, l.type, &ti)) != CDB_OK && s != CDB_E_NOT_FOUND)
+                return s;
+            if (!at_drop && s == CDB_OK && ti.on_delete == CDB_LINK_ON_DELETE_CASCADE) {
+                if ((s = row_erase(ls, &l)) != CDB_OK)
+                    return s;
+                continue; /* the row is gone: pos now names the next one */
+            }
+            l.flags |= (uint8_t)(CDB_LINK_TOMBSTONE | (reverse ? CDB_LINK_TARGET_GONE : CDB_LINK_SOURCE_GONE));
+            if ((s = row_put(ls, &l)) != CDB_OK)
+                return s;
+            if (!key_succ(pos))
+                break;
+        }
+    }
+    return CDB_OK;
+}
+
+cdb_status cdb_link_on_delete(cdb_db *db, uint64_t store, uint64_t entry)
+{
+    uint8_t prefix[16];
+    cdb_ref e;
+    e.store = store;
+    e.entry = entry;
+    put_ref(prefix, e);
+    return ends_gone(db, prefix, sizeof prefix, 0);
+}
+
+cdb_status cdb_link_on_drop(cdb_db *db, uint64_t store)
+{
+    uint8_t prefix[8];
+    cdb_store_u64(prefix, store, CDB_ORDER_BIG);
+    return ends_gone(db, prefix, sizeof prefix, 1);
+}
+
+/* -------------------------------------------------------- reading */
+
+cdb_status cdb_link_get(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, cdb_link *out, int *found)
+{
+    cdb_status s = open_store(db, 0);
+    *found = 0;
+    if (s == CDB_E_NOT_FOUND)
+        return CDB_OK;
+    if (s != CDB_OK)
+        return s;
+    return row_get(&db->links, type, source, target, out, found);
+}
+
+cdb_status cdb_link_list(cdb_db *db, cdb_ref entry, int direction, uint64_t type, const cdb_link *after,
+                         cdb_link *out, size_t max, size_t *n)
+{
+    struct cdb_link_store *ls = &db->links;
+    int reverse = direction == CDB_LINK_IN;
+    uint8_t prefix[24], pos[KEY_LEN];
+    size_t plen = type ? 24u : 16u;
+    cdb_status s = open_store(db, 0);
+    *n = 0;
+    if (s == CDB_E_NOT_FOUND)
+        return CDB_OK;
+    if (s != CDB_OK)
+        return s;
+    if (direction != CDB_LINK_OUT && direction != CDB_LINK_IN)
+        return CDB_E_INVALID_ARG;
+    put_ref(prefix, entry);
+    cdb_store_u64(prefix + 16, type, CDB_ORDER_BIG);
+    memset(pos, 0, sizeof pos);
+    memcpy(pos, prefix, plen);
+    if (after) {
+        if (reverse)
+            k_rev(pos, after->type, after->source, after->target);
+        else
+            k_fwd(pos, after->type, after->source, after->target);
+        if (!key_succ(pos))
+            return CDB_OK;
+    }
+    while (*n < max) {
+        int done, found;
+        if ((s = scan_at(db, reverse ? &ls->rev : &ls->fwd, prefix, plen, pos, &done)) != CDB_OK || done)
+            return s;
+        if ((s = row_at(ls, reverse, pos, &out[*n], &found)) != CDB_OK)
+            return s;
+        if (!found)
+            return CDB_E_CORRUPT;
+        (*n)++;
+        if (!key_succ(pos))
+            break;
+    }
+    return CDB_OK;
+}

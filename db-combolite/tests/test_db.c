@@ -184,6 +184,51 @@ static void test_abort_and_empty_transactions(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+/* The commit timestamps in the open journal, in order. */
+static size_t commit_times(uint64_t *out, size_t cap)
+{
+    static uint8_t rb[4096];
+    uint64_t off = CDB_JOURNAL_HEADER_SIZE, next;
+    size_t n = 0;
+    while (off < db.journal.end) {
+        cdb_record r;
+        cdb_commit_info ci;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_journal_read(&db.journal, off, rb, sizeof rb, &r, &next));
+        if (r.kind == CDB_RECORD_COMMIT && n < cap) {
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_commit_decode(&r, &ci, db.pager.order));
+            out[n++] = ci.timestamp;
+        }
+        off = next;
+    }
+    return n;
+}
+
+/* Commit records carry the environment's clock, or 0 without one. */
+static void test_commit_timestamp(void)
+{
+    const int64_t t = INT64_C(1761768000123456789);
+    uint64_t times[4];
+    int64_t now;
+    int have;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db(&env, "t"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_now(&db, &now, &have));
+    TEST_ASSERT_EQUAL_INT(0, have);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put(1, "no clock"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    cdb_faultenv_set_time(&fe, 1, t);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_now(&db, &now, &have));
+    TEST_ASSERT_EQUAL_INT(1, have);
+    TEST_ASSERT_EQUAL_INT64(t, now);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put(2, "clock"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_size_t(2, commit_times(times, 4));
+    TEST_ASSERT_EQUAL_UINT64(0, times[0]);
+    TEST_ASSERT_EQUAL_UINT64((uint64_t)t, times[1]);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 static void test_full_commit_replayed_after_crash(void)
 {
     TEST_ASSERT_EQUAL_INT(CDB_OK, open_db(&env, "t"));
@@ -483,6 +528,14 @@ static void test_host_filesystem(void)
     cdb_hostenv_init(&he, &host);
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, open_db(&host, base));
+    {
+        /* The host clock reads the real time: after 2025-01-01. */
+        int64_t now;
+        int have;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_now(&db, &now, &have));
+        TEST_ASSERT_EQUAL_INT(1, have);
+        TEST_ASSERT_TRUE(now > INT64_C(1735689600000000000));
+    }
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
     TEST_ASSERT_EQUAL_INT(CDB_OK, put(1, "on disk"));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
@@ -504,6 +557,7 @@ int main(void)
     RUN_TEST(test_roundtrip_and_close_leaves_one_file);
     RUN_TEST(test_open_missing_without_create);
     RUN_TEST(test_abort_and_empty_transactions);
+    RUN_TEST(test_commit_timestamp);
     RUN_TEST(test_full_commit_replayed_after_crash);
     RUN_TEST(test_uncommitted_tail_discarded);
     RUN_TEST(test_reconcile_then_reopen);

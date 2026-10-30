@@ -19,12 +19,14 @@
 
 /* Object kinds. */
 #define CDB_OBJ_STORE 1u
+#define CDB_OBJ_LINK_TYPE 2u
 
 /* Data models (spec 6-10). */
 #define CDB_MODEL_RELATIONAL 1u
 #define CDB_MODEL_DOCUMENT 2u
 #define CDB_MODEL_VECTOR 3u
 #define CDB_MODEL_TIME_SERIES 4u
+#define CDB_MODEL_LINK 5u /* the one link store (cdb_link.h): a reserved name, starting with '$' */
 
 /* Store flags. */
 #define CDB_STORE_DROPPED 0x1u
@@ -54,6 +56,16 @@ typedef struct cdb_store_info {
     uint8_t vector[CDB_CATALOG_SETTINGS_MAX]; /* encoded collection settings (14.12.3); empty = none */
     size_t vector_len;
 } cdb_store_info;
+
+/* A link type (spec 6.7, 6.9, 14.13): a catalog object of its own kind. */
+typedef struct cdb_link_type_info {
+    uint64_t id;
+    char name[CDB_CATALOG_NAME_MAX + 1];
+    size_t name_len;
+    uint8_t cardinality; /* CDB_CARD_* (cdb_link.h) */
+    uint8_t enforced;    /* 1: checked on every write; 0: recorded only */
+    uint8_t on_delete;   /* CDB_LINK_ON_DELETE_* (cdb_link.h) */
+} cdb_link_type_info;
 
 typedef struct cdb_catalog {
     cdb_pager *pager;
@@ -87,6 +99,13 @@ cdb_status cdb_catalog_find_store(cdb_catalog *cat, const char *name, size_t len
 cdb_status cdb_catalog_get_store(cdb_catalog *cat, uint64_t id, cdb_store_info *info);
 cdb_status cdb_catalog_rename_store(cdb_catalog *cat, uint64_t id, const char *name, size_t len);
 cdb_status cdb_catalog_drop_store(cdb_catalog *cat, uint64_t id);
+
+/* Link types. create assigns the next object ID and commits; the name is
+ * unique among link types. get gives CDB_E_NOT_FOUND for an ID that is not
+ * a link type. */
+cdb_status cdb_catalog_create_link_type(cdb_catalog *cat, const cdb_link_type_info *in, uint64_t *id);
+cdb_status cdb_catalog_find_link_type(cdb_catalog *cat, const char *name, size_t len, uint64_t *id, int *found);
+cdb_status cdb_catalog_get_link_type(cdb_catalog *cat, uint64_t id, cdb_link_type_info *out);
 
 /* Records a pool's index roots and entry counter without committing: the
  * caller's next pager commit (reconciliation) makes it durable. */

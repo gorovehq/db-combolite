@@ -254,11 +254,13 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
   | 3 | name | 9 | next field ID |
   | 4 | data model | 10 | creating commit |
   | 5 | encryption domain | 11 | flags; bit 0 = dropped |
-  | 6 | page-size code (log₂) | 12 | document pools: head index root (optional) |
-  | 13 | document pools: revisions index root (optional) | 14 | document pools: next entry ID (optional) |
+  | 6 | page-size code (log₂) | 12 | document pools: head index root; link store: forward index root (optional) |
+  | 13 | document pools: revisions index root; link store: reverse index root (optional) | 14 | document pools: next entry ID (optional) |
   | 15 | document pools: full-text settings, an object (14.14.1; optional) | 16 | vector collections: settings, an object (14.12.3) |
 
   Optional fields that are absent read as zero.
+
+- **Object kinds** (field 1, and the kind in key `02`): 1 store · 2 link type (14.13.1). Reading an object as the wrong kind finds nothing. **Data models** (field 4): 1 relational · 2 document · 3 vector · 4 time series · 5 the link store.
 
 - **Writing the root slots.** The first catalog commit writes both root slots. Later commits alternate between them.
 - **Choosing a slot on open.**
@@ -326,7 +328,7 @@ Commit record payload:
 | Size | Field |
 |---|---|
 | 8 | Global commit number (14.1.8) |
-| 8 | Commit timestamp from the primary coordinator's clock |
+| 8 | Commit timestamp from the primary coordinator's clock: ns since the Unix epoch. Until the coordinator exists, the environment's clock; 0 when the platform has none |
 | 8 | Principal identity ID (Section 5.1) |
 | 4 | Number of deltas in the transaction |
 | 4 | Bitmask of the companion types the transaction touched |
@@ -936,12 +938,29 @@ Links, foreign keys and neuron mapping all use this layout.
 |---|---|
 | var | Source reference (store ID, entry ID), or an opaque pointer in a joined store |
 | var | Target reference |
-| 4 | Link-type ID. The link type, its cardinality and its delete behaviour are defined in the catalog (Sections 6.7 and 6.9). |
+| 8 | Link-type ID, a catalog object ID like any other (Section 4.12). The link type, its cardinality and its delete behaviour are defined in the catalog (Sections 6.7 and 6.9). |
 | 4 | Weight (f32). Used by neuron mapping; 1.0 for plain links. |
 | 8 | Time the link was last reinforced (Section 6.10) |
 | 1 | Flags: tombstone |
 
 Every link is stored in **two** ordered indexes: one keyed by *(source, link type, target)* and one keyed by *(target, link type, source)*. Links can then be followed efficiently in both directions.
+
+### 14.13.1 Current layout
+
+- **Link types** are catalog objects of kind 2 (14.3.3), named in key `02` like stores, with a record of: 1 kind · 2 ID · 3 name · 4 cardinality (1 = 1:1, 2 = 1:N, 3 = N:M) · 5 enforced (1: checked on every write; 0: recorded only, Section 6.9) · 6 on delete (0 tombstone, 1 cascade, 2 refuse).
+- **The link store.** Every link lives in one store of model 5, named `$links` (names starting with `$` are the engine's own). It is created with the first link type. Its record holds the forward index root in field 12 and the reverse index root in field 13.
+- **Indexes.** A reference is store ID and entry ID, 8 bytes each; keys are big-endian.
+
+  | Index | Key | Value |
+  |---|---|---|
+  | forward | source (16) · type (8) · target (16) | weight (f32 bits, 4) · time (8, ns since the Unix epoch) · flags (1) |
+  | reverse | target (16) · type (8) · source (16) | empty |
+
+  Flags: bit 0 tombstone · bit 1 the source is gone · bit 2 the target is gone.
+- **Change payloads** (14.4.5), keyed by the link store with entry 0, all big-endian. LINK: mode (1: 1 create, 2 reinforce) · type · source · target · weight (f32 bits) · time. UNLINK: type · source · target. The time is the environment's clock when there is one, else the caller's.
+- **Checks when a change is made**, as the open transaction sees things (its own records included): both ends exist (documents and vectors so far); the pair has never been linked under the type, live or tombstoned; an enforced 1:N type allows each target one live source, and 1:1 also each source one live target. Reinforce and remove need a live link. A delete is refused while a live refuse-type link points at the entry.
+- **Applying.** Create adds both rows unless the pair has a row. Reinforce sets the weight and time of a live link; remove (UNLINK) tombstones it. Applying never fails for logical reasons.
+- **Deletes and drops.** After an entry's delete is applied, each of its links, in either direction, is tombstoned and flagged with the end that is gone; a cascade type erases the link instead, and a refuse-type link found then is tombstoned. Dropping a store tombstones every link with an end in it, whatever the type, in the drop's own commit.
 
 ---
 
