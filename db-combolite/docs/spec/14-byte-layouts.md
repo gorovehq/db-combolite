@@ -953,13 +953,13 @@ Every link is stored in **two** ordered indexes: one keyed by *(source, link typ
 
   | Index | Key | Value |
   |---|---|---|
-  | forward | source (16) · type (8) · target (16) | weight (f32 bits, 4) · time (8, ns since the Unix epoch) · flags (1) |
+  | forward | source (16) · type (8) · target (16) | weight (f32 bits, 4) · time (8, ns since the Unix epoch) · flags (1) · removed count (4) |
   | reverse | target (16) · type (8) · source (16) | empty |
 
   Flags: bit 0 tombstone · bit 1 the source is gone · bit 2 the target is gone.
 - **Change payloads** (14.4.5), keyed by the link store with entry 0, all big-endian. LINK: mode (1: 1 create, 2 reinforce) · type · source · target · weight (f32 bits) · time. UNLINK: type · source · target. The time is the environment's clock when there is one, else the caller's.
-- **Checks when a change is made**, as the open transaction sees things (its own records included): both ends exist (documents and vectors so far); the pair has never been linked under the type, live or tombstoned; an enforced 1:N type allows each target one live source, and 1:1 also each source one live target. Reinforce and remove need a live link. A delete is refused while a live refuse-type link points at the entry.
-- **Applying.** Create adds both rows unless the pair has a row. Reinforce sets the weight and time of a live link; remove (UNLINK) tombstones it. Applying never fails for logical reasons.
+- **Checks when a change is made**, as the open transaction sees things (its own records included): both ends exist (documents and vectors so far); the pair is not linked under the type, and its link was not tombstoned with an end gone (a removed one may be revived); an enforced 1:N type allows each target one live source, and 1:1 also each source one live target. Reinforce and remove need a live link. A delete is refused while a live refuse-type link points at the entry.
+- **Applying.** Create adds both rows when the pair has none; a link removed on purpose (tombstone flag, neither end-gone flag) is revived instead: flags cleared, weight and time set, removed count up by one. Reinforce sets the weight and time of a live link; remove (UNLINK) tombstones it. Applying never fails for logical reasons.
 - **Deletes and drops.** After an entry's delete is applied, each of its links, in either direction, is tombstoned and flagged with the end that is gone; a cascade type erases the link instead, and a refuse-type link found then is tombstoned. Dropping a store tombstones every link with an end in it, whatever the type, in the drop's own commit.
 
 ---

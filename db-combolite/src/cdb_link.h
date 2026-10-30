@@ -13,9 +13,10 @@
  * Changes go through transactions: add, reinforce and remove journal LINK
  * and UNLINK records, applied at commit by the built-in apply, which never
  * fails for logical reasons. They are checked when they are made, as the
- * open transaction sees things: both ends must exist; the link must not
- * exist yet (live or tombstoned: a pair is never linked twice); an enforced
- * cardinality must hold. Removing tombstones the link and keeps its history.
+ * open transaction sees things: both ends must exist; the pair must not be
+ * linked already; an enforced cardinality must hold. Removing tombstones the
+ * link and keeps its history; adding it again revives it, counting the
+ * removal. A link tombstoned because an end went never comes back.
  *
  * When an entry is deleted, its links in both directions are tombstoned,
  * flagged with the end that is gone; a cascade type erases them instead. A
@@ -60,8 +61,9 @@ typedef struct cdb_link {
     cdb_ref source;
     cdb_ref target;
     float weight;
-    int64_t time;   /* created or last reinforced */
-    uint8_t flags;  /* CDB_LINK_* */
+    int64_t time;     /* created, revived or last reinforced */
+    uint8_t flags;    /* CDB_LINK_* */
+    uint32_t removed; /* times it was removed and then added again */
 } cdb_link;
 
 /* Defines a link type; commits immediately, like other catalog changes, so
@@ -72,9 +74,9 @@ cdb_status cdb_link_find_type(cdb_db *db, const char *name, size_t len, uint64_t
 
 /* Inside a transaction. time is used only when the environment has no clock.
  * add: CDB_E_NOT_FOUND if an end or the type does not exist, CDB_E_EXISTS if
- * the pair is already linked under the type (or was), CDB_E_STATE if an
- * enforced cardinality would break. reinforce and remove: CDB_E_NOT_FOUND
- * unless the link is live. */
+ * the pair is linked under the type (a removed link is revived instead),
+ * CDB_E_STATE if an enforced cardinality would break. reinforce and remove:
+ * CDB_E_NOT_FOUND unless the link is live. */
 cdb_status cdb_link_add(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, float weight, int64_t time);
 cdb_status cdb_link_reinforce(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, float weight,
                               int64_t time);
