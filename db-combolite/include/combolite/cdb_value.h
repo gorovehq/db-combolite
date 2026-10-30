@@ -242,4 +242,23 @@ cdb_status cdb_value_validate(const uint8_t *buf, size_t len, cdb_byte_order ord
  * points past U+10FFFF): the check strings get (14.6). */
 int cdb_value_utf8_valid(const uint8_t *s, size_t len);
 
+/* The per-type canonical checks cdb_value_validate applies to a decimal's
+ * unscaled integer and to a vector's float elements (spec 14.6.5), exposed
+ * for callers that hold a value's pieces without its tag byte (such as a
+ * column chunk's decoder, cdb_colenc.c) and so cannot call
+ * cdb_value_validate itself.
+ *
+ * unscaled_be: the shortest big-endian two's complement form, as passed to
+ * cdb_value_write_decimal. cdb_value_decimal_fits_compact assumes
+ * unscaled_be is already canonical, same as the writer. */
+int cdb_value_decimal_is_canonical(const uint8_t *unscaled_be, size_t len);
+int cdb_value_decimal_fits_compact(const uint8_t *unscaled_be, size_t len);
+
+/* The canonical form of a float bit pattern: every NaN becomes the one
+ * quiet NaN, and -0 becomes +0. A pattern is canonical exactly when it
+ * equals what this returns. cdb_value_half_canonical covers both F16 and
+ * BF16 vector elements (elem says which). */
+uint32_t cdb_value_f32_canonical(uint32_t bits);
+uint16_t cdb_value_half_canonical(uint16_t bits, cdb_vector_elem elem);
+
 #endif

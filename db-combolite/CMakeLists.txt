@@ -21,6 +21,27 @@ else()
 endif()
 option(CDB_SANITIZE "Build with AddressSanitizer and UBSan" ${CDB_SANITIZE_DEFAULT})
 
+# LZMA2 compression through the vendored liblzma (spec 15.7,
+# third-party/xz/VENDORED.md). Without it, compression defaults are off and
+# files that use compression are refused.
+option(CDB_WITH_XZ "Build the xz (LZMA2) codec" ON)
+if(CDB_WITH_XZ)
+  # Only what spec 15 uses; forced, so xz's own defaults never apply.
+  set(XZ_NLS OFF CACHE BOOL "" FORCE)
+  set(XZ_THREADS no CACHE STRING "" FORCE)
+  set(XZ_DOC OFF CACHE BOOL "" FORCE)
+  set(XZ_SANDBOX no CACHE STRING "" FORCE)
+  set(XZ_ENCODERS "lzma1;lzma2" CACHE STRING "" FORCE)
+  set(XZ_DECODERS "lzma1;lzma2" CACHE STRING "" FORCE)
+  set(XZ_MATCH_FINDERS "hc3;hc4;bt4" CACHE STRING "" FORCE)
+  set(XZ_CHECKS "crc32" CACHE STRING "" FORCE)
+  foreach(off XZ_MICROLZMA_ENCODER XZ_MICROLZMA_DECODER XZ_LZIP_DECODER XZ_TOOL_XZ XZ_TOOL_XZDEC
+              XZ_TOOL_LZMADEC XZ_TOOL_LZMAINFO XZ_TOOL_SCRIPTS XZ_TOOL_SYMLINKS XZ_TOOL_SYMLINKS_LZMA)
+    set(${off} OFF CACHE BOOL "" FORCE)
+  endforeach()
+  add_subdirectory(third-party/xz EXCLUDE_FROM_ALL)
+endif()
+
 set(CDB_WARNINGS
   -Wall -Wextra -Wpedantic
   -Wshadow -Wconversion -Wsign-conversion
@@ -47,6 +68,8 @@ add_library(combolite
   src/cdb_db.c
   src/cdb_slots.c
   src/cdb_nib.c
+  src/cdb_codec.c
+  src/cdb_colenc.c
   src/cdb_table.c
   src/cdb_key.c
   src/cdb_index.c
@@ -66,6 +89,11 @@ target_include_directories(combolite
 target_compile_options(combolite PRIVATE ${CDB_WARNINGS})
 if(UNIX)
   target_link_libraries(combolite PUBLIC m) # log() for BM25 ranking
+endif()
+if(CDB_WITH_XZ)
+  target_link_libraries(combolite PRIVATE liblzma)
+  target_include_directories(combolite SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third-party/xz/src/liblzma/api)
+  target_compile_definitions(combolite PUBLIC CDB_WITH_XZ=1)
 endif()
 if(CDB_SANITIZE)
   target_compile_options(combolite PUBLIC ${CDB_SANITIZER_FLAGS})

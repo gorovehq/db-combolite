@@ -30,7 +30,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M15 | Links: link types, the link store, delete and drop rules; the environment clock (spec 6, 14.4, 14.13) | done |
 | M16 | Time series: series, bit-level column blocks, late modes incl. hold-and-forward, collisions (spec 10, 14.11) | done |
 | M17 | Row-oriented tables on document pools, and nibblets (small records packed in shared pages) for document and table revisions and sparse time-series blocks: column schemas and schema changes, not-null/unique/primary keys, secondary indexes, history on or last-N (spec 9, 14.10.1, 16, 14.18) | done |
-| M18 | Column-oriented tables and compression: row groups (small column chunks as nibblets), automatic column encodings, pending rows folded at reconciliation; xz (LZMA2) for column chunks, large document bodies, journal records and in-page compression (spec 9.12, 14.10.2, 15) | planned |
+| M18 | Column-oriented tables and compression: row groups (small column chunks as nibblets), automatic column encodings, pending rows folded at reconciliation; xz (LZMA2) for column chunks, large document bodies, journal records and in-page compression (spec 9.12, 14.10.2, 15) | in progress |
+| M19 | Coordinator: the in-process coordinator, primary/subordinate election, heartbeats, the append/settle/choose baton protocol for reconciliation and compaction, per-process delta tracks and single-writer coordinator slots, multi-process recovery; completes M5 beyond the single-process case (spec 5, 14.4, 14.5) | planned |
+| M20 | Structured query core: operator-tree execution (Scan/Filter/Project/Join/Sort/Limit/Union/Aggregate/Traverse/TextSearch/VectorSearch/HybridRank), the expression grammar, the binary wire form, and the stored-procedure bytecode engine (spec 11.1, 11.2, 11.7, 11.10) | planned |
+| M21 | Text query language: db-combolite's own human-readable language, compiling into the M20 structured core, including the dotted-field-path question left open in spec 11.10 | planned |
+| M22 | Cross-store atomic transactions and collision handling, triggers and trigger safety, scheduled and maintenance-window procedure runs (spec 11.3, 11.6, 11.9) | planned |
 
 ## Commands
 

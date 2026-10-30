@@ -832,6 +832,38 @@ A row-oriented table is a B+tree clustered by **entry ID**, with the same struct
 - **Changes.** Changes arrive through the delta tracks. At reconciliation, each affected row group is rewritten copy-on-write.
 - **History.** Columnar tables that have history turned on (Section 9.6) keep that history in a **row-format side store**, using the same envelope as 14.9. Analytic scans stay fast, and the revision trail remains complete.
 
+### 14.10.2.1 Column chunk encodings (current layout)
+
+A column chunk's **values** part (14.10.2) holds the chunk's present (non-null) values, all of the column's type. The null bitmap, the encoding ID and the compression codec (Section 2.5, 14.10.2) sit outside this part and are known to the caller; so are the value count *n* (from the null bitmap) and the column's type tag, so neither is stored in the encoded bytes.
+
+**Items.** Within a chunk, a value is stored as an **item**: the canonical encoding of 14.6 with the tag dropped, since every value in a chunk shares the column's tag.
+
+| Column type | Item bytes |
+|---|---|
+| int | zigzag varint (14.6, no tag) |
+| f64 / f32 | 8 / 4 bytes, file byte order |
+| timestamp | precision byte, then 8 bytes, file byte order |
+| ref | two varints |
+| bool | one byte, 0 = false, 1 = true (the two bool tags share one column type) |
+| tag ≥ 0x40 (string, binary, decimal, array, object, vector) | length varint, then that many payload bytes |
+
+Item bytes are equal if and only if the values are equal, since values are canonical. A null value and the reserved fixed tags 0x08–0x3F never appear in a column.
+
+**Encoding IDs** (stored by the caller in the chunk header):
+
+| ID | Name | Bytes |
+|---|---|---|
+| 0 | plain | the *n* items, one after another |
+| 1 | dictionary | varint *k* (distinct items, 1 ≤ *k* ≤ *n*), the *k* items in order of first use, then *n* indexes, each in `bitlen(k − 1)` bits (0 bits when *k* = 1), as one bitstream |
+| 2 | run-length | pairs of (varint run length ≥ 1, item) until *n* values are covered; adjacent runs never hold the same item |
+| 3 | bit-packed | integer-like columns only (int, timestamp, bool): for timestamp, a precision byte shared by every value; then a zigzag varint of the minimum *m*, a byte *w* (0–64), then the *n* values (*v* − *m*, computed in `uint64`) in *w* bits each. *w* is the bit length of the largest *v* − *m*, so some value equals *m* and some value needs all *w* bits. A timestamp column whose values do not share one precision cannot be bit-packed |
+
+A bitstream is most-significant-bit first (Section 10.3's bit codecs); the bits after the last one are zero, and the stream ends exactly there. None of these forms has a fixed-width offset or length field — every count, run length and the dictionary's *k* is a varint, so a chunk's own byte form never caps it at 4 GiB.
+
+**Choice** (Section 9.12): the chunk is encoded every way that applies, and the smallest result is kept; a tie goes to the lowest ID. An empty chunk (*n* = 0) is plain and zero bytes; any other encoding with *n* = 0 is rejected as not canonical.
+
+**Canonical form** (14.6.5): every set of values has exactly one encoded form per encoding ID. Rejected as not canonical: dictionary entries repeated, out of first-use order, or unused; adjacent runs of the same item; a bit width wider than needed; a minimum no value reaches; non-zero padding bits; trailing bytes. Rejected as corrupt: a run length of 0, a run-length total that disagrees with *n*, an out-of-range index or count, a width over 64, bit-packing on a type that does not support it, a value that wraps below the minimum. An item is checked as deeply as a tag-less item allows: fixed-shape scalars and strings get the same canonical check as a tagged value; array and object elements are themselves full tagged values and are validated recursively, including the container's own canonical rules (ascending field IDs, contiguous offsets, smallest directory widths); binary has no canonical rule beyond its bytes; decimal and vector items get the same canonical bit-pattern checks as a tagged value (shortest two's-complement form and the compact-mode limit for decimal; canonical float bits for vector elements).
+
 ---
 
 ## 14.11 Time-series blocks

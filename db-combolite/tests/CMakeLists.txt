@@ -60,6 +60,8 @@ cdb_add_bench(bench_graph)
 cdb_add_test(test_ts)
 cdb_add_test(test_nib)
 cdb_add_test(test_table)
+cdb_add_test(test_codec)
+cdb_add_test(test_colenc)
 
 # The suites that use several stores again, with one open store of each
 # model at a time, so a store closed while still in use shows up here.
