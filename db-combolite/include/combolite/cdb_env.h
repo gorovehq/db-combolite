@@ -19,6 +19,8 @@ typedef struct cdb_env_ops {
     cdb_status (*remove)(void *ctx, const char *path);
     cdb_status (*rename)(void *ctx, const char *from, const char *to);
     cdb_status (*mkdir)(void *ctx, const char *path);
+    /* CDB_E_STATE: the directory is not empty, for example because a
+     * companion was set aside in it (spec 1.12.2). */
     cdb_status (*rmdir)(void *ctx, const char *path);
     cdb_status (*exists)(void *ctx, const char *path, int *exists);
     /* Makes every create, remove and rename inside the directory durable. */

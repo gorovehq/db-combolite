@@ -63,7 +63,11 @@ static cdb_status he_mkdir(void *ctx, const char *path)
 static cdb_status he_rmdir(void *ctx, const char *path)
 {
     (void)ctx;
-    return rmdir(path) == 0 ? CDB_OK : errno_status();
+    if (rmdir(path) == 0)
+        return CDB_OK;
+    if (errno == ENOTEMPTY || errno == EEXIST)
+        return CDB_E_STATE; /* POSIX allows either for a directory that is not empty */
+    return errno_status();
 }
 
 static cdb_status he_exists(void *ctx, const char *path, int *exists)
