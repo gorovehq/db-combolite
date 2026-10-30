@@ -88,4 +88,4 @@ A procedure can run in two ways:
 ## Open questions (do not specify until answered)
 
 - How the text language lets a user write a field name containing a literal dot, and how it compiles a dotted path into 0x1F-joined segments.
-- The exact binary layout of each node kind (field order, lengths), to be written into Section 14 once implementation (M19) begins.
+- The exact binary layout of each node kind (field order, lengths), to be written into Section 14 once implementation (M20) begins.
