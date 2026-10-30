@@ -133,6 +133,7 @@ def main():
             path = a.index
         else:
             url = a.mirror.rstrip("/") + "/cache/epub/feeds/pg_catalog.csv"
+            os.makedirs(DATA, exist_ok=True)
             path = os.path.join(DATA, "pg_catalog.csv")
         data = fetch(url)
         with open(path + ".part", "wb") as f:
