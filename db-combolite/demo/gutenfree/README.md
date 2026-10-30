@@ -30,35 +30,26 @@ cmake -S . -B build-demo-rel -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCDB_BUILD_DEMO=
 cmake --build build-demo-rel -j --target gutenfree
 ```
 
-`-DCDB_BUILD_DEMO=ON` is required: the engine's default build never needs ncurses or llama.cpp. A Debug build (`-B build-demo`, without a build type) turns on AddressSanitizer and UBSan. That is good for finding bugs, but every timing it shows is about 9 times slower. The screens show which build is running.
+The binary goes into this folder, next to its scripts, as `./gutenfree`. `-DCDB_BUILD_DEMO=ON` is required: the engine's default build never needs ncurses or llama.cpp. A Debug build (`-B build-demo`, without a build type) turns on AddressSanitizer and UBSan. That is good for finding bugs, but every timing it shows is about 9 times slower. The screens show which build is running, and the build made last is the one in this folder.
 
-## Get the data
+## Get the data and run
 
-The scripts fetch only from Gutenberg mirrors, never from www.gutenberg.org. Everything lands in `datastore/gutenberg/`, which git ignores.
-
-```sh
-# 1. The catalog index, GUTINDEX.ALL (about 9 MB).
-python3 demo/gutenfree/tools/gf_fetch.py --mirror https://gutenberg.pglaf.org/ --gutindex
-# 2. Bibliographic data: genres (bookshelves), subjects, dates, LoCC classes.
-python3 demo/gutenfree/tools/gf_fetch.py --mirror https://gutenberg.pglaf.org/ --catalog
-# 3. The embedding model: bge-small-en-v1.5, Q8_0 GGUF, about 37 MB, SHA-256 checked.
-python3 demo/gutenfree/tools/gf_model.py
-# 4. Optional: a seeded random sample of 25 English books.
-#    You can also add books one by one, or in batches, from the catalog screen.
-python3 demo/gutenfree/tools/gf_fetch.py --mirror https://gutenberg.pglaf.org/ --count 25
-```
-
-## Build a database and run
+Everything runs from this folder, and everything it downloads or builds lands in `data/`, which git ignores. The scripts fetch only from a Gutenberg mirror, never from www.gutenberg.org. The default is Project Gutenberg's own pglaf.org mirror; `--mirror URL` picks another one from MIRRORS.ALL.
 
 ```sh
-G=./build-demo-rel/demo/gutenfree/gutenfree
-$G ingest-index     # catalog: GUTINDEX, then pg_catalog.csv merged in (about 30 s)
-$G ingest-books     # store the fetched books as passages, with full-text indexing
-$G embed            # vectors, similar_to links, neighbour graph
-$G                  # the e-reader
+cd demo/gutenfree
+python3 gf_fetch.py --gutindex    # the catalog index, GUTINDEX.ALL (about 9 MB)
+python3 gf_fetch.py --catalog     # genres, subjects, dates, LoCC classes (about 21 MB)
+python3 gf_model.py               # embedding model bge-small-en-v1.5, about 37 MB, SHA-256 checked
+python3 gf_fetch.py --count 25    # optional: 25 random English books (or add them in the app)
+
+./gutenfree ingest-index          # catalog: GUTINDEX, then pg_catalog.csv merged in (about 30 s)
+./gutenfree ingest-books          # store the fetched books as passages, with full-text indexing
+./gutenfree embed                 # vectors, similar_to links, neighbour graph
+./gutenfree                       # the e-reader
 ```
 
-The database is `datastore/gutenberg/gutenfree.cdbarch` by default. Set `GUTENFREE_DB=/some/path` (no extension) to use another one. To start over, delete `<path>.cdbarch` and `<path>.cdbwork`.
+The database is `data/gutenfree.cdbarch`. Set `GUTENFREE_DB=/some/path` (no extension) to use another one. To start over, delete `data/gutenfree.cdbarch` and `data/gutenfree.cdbwork`.
 
 **Only one process may open a database at a time.** Multi-process access is milestone M19, and until then nothing stops a second process from opening the file and corrupting it. Quit the e-reader before running a command against the same database.
 
@@ -66,7 +57,9 @@ The database is `datastore/gutenberg/gutenfree.cdbarch` by default. Set `GUTENFR
 
 | Key | Screen |
 |---|---|
-| `c` | Card catalog. `/` filter, `o` change the sort order, Space queue a book, `A` queue every match, `F` fetch the queue, `a` add one book, Enter details, `g` go to an ebook number |
+| `c` | Card catalog. `/` filter, `o` change the sort order, Space queue a book, `A` queue every match, `f` the download queue (runs in the background), Enter details, `g` go to an ebook number |
+| `f` | Download queue: start it, then use the app while it runs; the status bar shows progress |
+| F2 or Ctrl-D | Diagnostics, from any screen |
 | `r` | Shelf, the books with text, opening in the reader |
 | `s` | Full-text search |
 | `v` | Semantic search: exact, neighbour-graph and 1-bit results compared |
@@ -77,10 +70,10 @@ The database is `datastore/gutenberg/gutenfree.cdbarch` by default. Set `GUTENFR
 ## Other commands
 
 ```sh
-$G filter genre="science fiction" type=Text author=verne   # the catalog filter, from the shell
-$G probe 15                                                # 15 s of probe load
-$G metrics                                                 # what every gauge holds
-$G --help
+./gutenfree filter genre="science fiction" type=Text author=verne   # the catalog filter, from the shell
+./gutenfree probe 15                                                # 15 s of probe load
+./gutenfree metrics                                                 # what every gauge holds
+./gutenfree --help
 ```
 
 ## Licences and sources

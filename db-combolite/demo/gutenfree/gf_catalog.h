@@ -140,7 +140,7 @@ void gf_utf8_clean(char *s);
 /* Merges pg_catalog.csv: fills the bibliographic columns of every row it
  * names, and inserts the ebooks GUTINDEX does not list, committing every
  * GF_INGEST_BATCH rows. */
-#define GF_DEFAULT_PGCSV "datastore/gutenberg/pg_catalog.csv"
+#define GF_DEFAULT_PGCSV "data/pg_catalog.csv"
 cdb_status gf_catalog_merge_csv(gf_db *g, const gf_catalog *c, const char *path, gf_ingest_stats *st,
                                 gf_progress_fn progress, void *ctx);
 

@@ -16,7 +16,7 @@
 #include <curses.h>
 
 #define QUEUE_MAX 8192u
-#define FETCH_SCRIPT "demo/gutenfree/tools/gf_fetch.py"
+#define FETCH_SCRIPT "gf_fetch.py"
 #define PAUSE_MS 2000.0  /* between books, for the mirror */
 #define GRAPH_BUDGET 64u /* neighbour-graph entries refreshed per slice */
 

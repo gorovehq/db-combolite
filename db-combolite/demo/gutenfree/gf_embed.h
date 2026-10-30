@@ -7,7 +7,7 @@
 #include <stddef.h>
 
 #define GF_EMBED_DIMS 384
-#define GF_EMBED_DEFAULT_MODEL "datastore/gutenberg/models/bge-small-en-v1.5-q8_0.gguf"
+#define GF_EMBED_DEFAULT_MODEL "data/models/bge-small-en-v1.5-q8_0.gguf"
 /* bge wants this before a search query, and nothing before a passage. */
 #define GF_EMBED_QUERY_PREFIX "Represent this sentence for searching relevant passages: "
 
