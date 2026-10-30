@@ -89,21 +89,33 @@ static unsigned checkpoint_every(const cdb_db *db)
 
 /* -------------------------------------------------------- pools */
 
+/* Records a pool's roots and entry counter, staged for reconciliation. */
+static cdb_status save_pool(cdb_db *db, void *slot)
+{
+    struct cdb_doc_pool *p = (struct cdb_doc_pool *)slot;
+    cdb_status s;
+    if (!p->dirty)
+        return CDB_OK;
+    if ((s = cdb_catalog_stage_pool(&db->catalog, p->slot.store_id, p->head.root, p->revs.root, p->next_entry))
+        != CDB_OK)
+        return s;
+    p->dirty = 0;
+    return CDB_OK;
+}
+
+const cdb_slot_ops cdb_doc_slot_ops = { NULL, save_pool };
+
 static cdb_status pool_get(cdb_db *db, uint64_t store, struct cdb_doc_pool **out)
 {
-    struct cdb_doc_pool *free_slot = NULL;
+    struct cdb_doc_pool *free_slot = (struct cdb_doc_pool *)cdb_slots_find(&db->pool_slots, store);
     cdb_store_info info;
     cdb_status s;
-    int i;
+    void *v;
 
-    for (i = 0; i < CDB_DB_MAX_POOLS; i++) {
-        struct cdb_doc_pool *p = &db->pools[i];
-        if (p->in_use && p->store_id == store) {
-            *out = p;
-            return CDB_OK;
-        }
-        if (!p->in_use && free_slot == NULL)
-            free_slot = p;
+    if (free_slot != NULL) {
+        cdb_slots_touch(db, &db->pool_slots, free_slot);
+        *out = free_slot;
+        return CDB_OK;
     }
     if (!db->has_catalog || db->cfg.doc_buffers == NULL)
         return CDB_E_UNSUPPORTED;
@@ -113,10 +125,10 @@ static cdb_status pool_get(cdb_db *db, uint64_t store, struct cdb_doc_pool **out
         return CDB_E_INVALID_ARG;
     if (info.flags & CDB_STORE_DROPPED)
         return CDB_E_NOT_FOUND;
-    if (free_slot == NULL)
-        return CDB_E_BUFFER_TOO_SMALL;
-    memset(free_slot, 0, sizeof *free_slot);
-    free_slot->store_id = store;
+    if ((s = cdb_slots_claim(db, &db->pool_slots, &v)) != CDB_OK)
+        return s;
+    free_slot = (struct cdb_doc_pool *)v;
+    free_slot->slot.store_id = store;
     free_slot->next_entry = info.next_entry_id ? info.next_entry_id : 1;
     free_slot->schema_version = info.schema_version;
     if (info.head_root && info.rev_root) {
@@ -140,7 +152,8 @@ static cdb_status pool_get(cdb_db *db, uint64_t store, struct cdb_doc_pool **out
             return s;
         free_slot->fts_on = 1;
     }
-    free_slot->in_use = 1;
+    free_slot->slot.in_use = 1;
+    cdb_slots_touch(db, &db->pool_slots, free_slot);
     *out = free_slot;
     return CDB_OK;
 }
@@ -150,10 +163,10 @@ static cdb_status pool_indexes(cdb_db *db, struct cdb_doc_pool *p)
     cdb_status s;
     if (p->have_indexes)
         return CDB_OK;
-    if ((s = cdb_index_create(&p->head, &db->pager, p->store_id, CDB_INDEX_FLAG_UNIQUE,
+    if ((s = cdb_index_create(&p->head, &db->pager, p->slot.store_id, CDB_INDEX_FLAG_UNIQUE,
                               &db->cfg.catalog_work)) != CDB_OK)
         return s;
-    if ((s = cdb_index_create(&p->revs, &db->pager, p->store_id, CDB_INDEX_FLAG_UNIQUE | CDB_INDEX_FLAG_PREFIX,
+    if ((s = cdb_index_create(&p->revs, &db->pager, p->slot.store_id, CDB_INDEX_FLAG_UNIQUE | CDB_INDEX_FLAG_PREFIX,
                               &db->cfg.catalog_work)) != CDB_OK)
         return s;
     p->have_indexes = 1;
@@ -163,16 +176,12 @@ static cdb_status pool_indexes(cdb_db *db, struct cdb_doc_pool *p)
 
 cdb_status cdb_doc_flush_pools(cdb_db *db)
 {
-    int i;
-    for (i = 0; i < CDB_DB_MAX_POOLS; i++) {
-        struct cdb_doc_pool *p = &db->pools[i];
-        if (p->in_use && p->dirty) {
-            cdb_status s = cdb_catalog_stage_pool(&db->catalog, p->store_id, p->head.root, p->revs.root,
-                                                  p->next_entry);
-            if (s != CDB_OK)
-                return s;
-            p->dirty = 0;
-        }
+    cdb_slot_iter it;
+    void *p;
+    for (p = cdb_slots_first(&db->pool_slots, &it); p != NULL; p = cdb_slots_next(&it)) {
+        cdb_status s = save_pool(db, p);
+        if (s != CDB_OK)
+            return s;
     }
     {
         cdb_status s = cdb_vec_flush(db);
@@ -370,7 +379,7 @@ static cdb_status write_revision(cdb_db *db, struct cdb_doc_pool *pool, const en
         if (!revision_fits(db, e->summary != NULL, e->summary_len, e->body_len))
             return CDB_E_OVERFLOW;
         inline_len = cap - head - 8u - db->pager.addr_width;
-        if ((s = cdb_overflow_write(&db->pager, pool->store_id, e->body + inline_len, e->body_len - inline_len, pl,
+        if ((s = cdb_overflow_write(&db->pager, pool->slot.store_id, e->body + inline_len, e->body_len - inline_len, pl,
                                     &first)) != CDB_OK)
             return s;
     }
@@ -404,7 +413,7 @@ static cdb_status write_revision(cdb_db *db, struct cdb_doc_pool *pool, const en
         return s;
     memset(&t, 0, sizeof t);
     t.type = CDB_PAGE_TYPE_DOCUMENT;
-    t.store_id = pool->store_id;
+    t.store_id = pool->slot.store_id;
     return cdb_pager_write(&db->pager, *lid, &t, pl, len);
 }
 
@@ -1121,15 +1130,15 @@ static cdb_status schema_load(cdb_db *db, struct cdb_doc_pool *pool, int *active
     *active = 0;
     if (pool->schema_version == 0)
         return CDB_OK;
-    if (db->schema_version != pool->schema_version || db->schema_store != pool->store_id) {
+    if (db->schema_version != pool->schema_version || db->schema_store != pool->slot.store_id) {
         db->schema_version = 0;
-        if ((s = cdb_catalog_get_schema(&db->catalog, pool->store_id, pool->schema_version, buf(db, B_SCHEMA),
+        if ((s = cdb_catalog_get_schema(&db->catalog, pool->slot.store_id, pool->schema_version, buf(db, B_SCHEMA),
                                         db->pager.page_size, &db->schema_len)) != CDB_OK)
             return s == CDB_E_NOT_FOUND ? CDB_E_CORRUPT : s;
         s = cdb_schema_check(buf(db, B_SCHEMA), db->schema_len, db->pager.order, &db->schema_trivial);
         if (s != CDB_OK)
             return s == CDB_E_UNSUPPORTED ? s : CDB_E_CORRUPT; /* unknown rules: a newer build wrote it */
-        db->schema_store = pool->store_id;
+        db->schema_store = pool->slot.store_id;
         db->schema_version = pool->schema_version;
     }
     *active = !db->schema_trivial;
@@ -1293,7 +1302,7 @@ static cdb_status replay_tx(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entr
         if ((s = cdb_journal_read(&db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next)) != CDB_OK)
             return s;
         off = next;
-        if (r.kind != CDB_RECORD_DATA || r.tx_id != db->tx_id || r.store_id != pool->store_id
+        if (r.kind != CDB_RECORD_DATA || r.tx_id != db->tx_id || r.store_id != pool->slot.store_id
             || r.entry_id != entry || r.payload_len < 1)
             continue;
         memset(&d, 0, sizeof d);
@@ -1385,7 +1394,7 @@ static cdb_status put_body(cdb_db *db, struct cdb_doc_pool *pool, int guarded, u
         return CDB_E_INVALID_ARG;
     if (summary_len > cap || body_len > body_max(db))
         return CDB_E_OVERFLOW;
-    stage_find(db, pool->store_id, entry, &st);
+    stage_find(db, pool->slot.store_id, entry, &st);
     memset(&now, 0, sizeof now);
     if (op == CDB_OP_REPLACE) {
         if ((s = tx_doc(db, pool, entry, &st, 1, &now)) != CDB_OK)
@@ -1416,9 +1425,9 @@ static cdb_status put_body(cdb_db *db, struct cdb_doc_pool *pool, int guarded, u
     }
     memcpy(p + len, body, body_len);
     len += body_len;
-    if ((s = cdb_tx_put(db, pool->store_id, entry, op, p, len)) != CDB_OK)
+    if ((s = cdb_tx_put(db, pool->slot.store_id, entry, op, p, len)) != CDB_OK)
         return s;
-    stage_put(db, pool->store_id, entry, &st, &now, (const uint8_t *)body);
+    stage_put(db, pool->slot.store_id, entry, &st, &now, (const uint8_t *)body);
     return CDB_OK;
 }
 

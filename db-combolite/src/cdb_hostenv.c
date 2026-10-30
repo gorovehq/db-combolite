@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -111,8 +112,20 @@ static cdb_status he_now(void *ctx, int64_t *ns)
     return CDB_OK;
 }
 
+static void *he_alloc(void *ctx, size_t size)
+{
+    (void)ctx;
+    return malloc(size);
+}
+
+static void he_free(void *ctx, void *p)
+{
+    (void)ctx;
+    free(p);
+}
+
 static const cdb_env_ops hostenv_ops = {
-    he_open, he_remove, he_rename, he_mkdir, he_rmdir, he_exists, he_sync_dir, he_now
+    he_open, he_remove, he_rename, he_mkdir, he_rmdir, he_exists, he_sync_dir, he_now, he_alloc, he_free
 };
 
 void cdb_hostenv_init(cdb_hostenv *he, cdb_env *out)

@@ -15,9 +15,9 @@
 #include "cdb_catalog.h"
 #include "cdb_journal.h"
 #include "cdb_pager.h"
+#include "cdb_slots.h"
 
 #define CDB_DB_PATH_MAX 200
-#define CDB_DB_MAX_POOLS 8
 #define CDB_COMMIT_RESERVE_BLOCK 1024u
 
 /* Durability levels (spec 3.1). */
@@ -101,7 +101,79 @@ typedef struct cdb_db_config {
      * (spec 10.6), at apply, so again on recovery. Optional. */
     void (*ts_collision)(void *ctx, uint64_t store, uint64_t series, int64_t ts);
     void *ts_collision_ctx;
+    /* Open stores (cdb_slots.h): the most document pools, vector
+     * collections and time-series stores, each, open at once; 0: no cap.
+     * Slots grow with use, in chunks of 4, from slot_mem first and then
+     * the environment's allocator; past the cap the store used longest ago
+     * is closed. A slot of each kind together is about 1.9 KB on a 64-bit
+     * host (cdb_db_slot_mem_size). Recommended caps (estimates until the
+     * host benchmarking tool in the backlog measures them):
+     *   micro-controller    4, all in slot_mem (no allocator)
+     *   single-board (SBC)  8
+     *   budget PC           16
+     *   workstation         0 (no cap), or 32 to bound memory
+     *   server              0 (no cap) */
+    unsigned max_open;
+    cdb_slot_align *slot_mem;     /* optional caller memory for slots */
+    size_t slot_mem_size;         /* in bytes */
 } cdb_db_config;
+
+/* An open document pool (cdb_doc.h). */
+struct cdb_doc_pool {
+    cdb_slot slot;           /* first: in_use, store_id, use (cdb_slots.h) */
+    int dirty;
+    cdb_index head;
+    cdb_index revs;
+    int have_indexes;
+    uint64_t next_entry;
+    uint32_t schema_version; /* current; 0 = no schema */
+    int fts_on;              /* the pool has a full-text index */
+    cdb_fts_config fts;
+    cdb_index fts_terms;     /* term -> document frequency */
+    cdb_index fts_postings;  /* (term, entry) -> term frequency */
+    cdb_index fts_lengths;   /* entry -> words indexed; 0 -> pool totals */
+};
+
+/* An open vector collection (cdb_vec.h). */
+struct cdb_vec_coll {
+    cdb_slot slot;           /* first: in_use, store_id, use (cdb_slots.h) */
+    int dirty;               /* next_entry changed since the catalog has it */
+    uint8_t elem;            /* cdb_vector_elem */
+    uint8_t measure;         /* base measure, CDB_VEC_* */
+    uint8_t norms;           /* blocks cache each vector's norm */
+    uint32_t dims;
+    size_t vec_bytes;        /* bytes per vector */
+    uint32_t slots;          /* vectors per block */
+    cdb_index entries;       /* entry -> block, slot, source */
+    cdb_index blocks;        /* block -> slots in use, slots */
+    cdb_index sources;       /* (source store, source entry, entry) -> nothing */
+    uint64_t next_entry;
+    uint64_t touched_tx;     /* the open transaction changed this collection */
+    uint64_t free_from;      /* blocks below this ID have no free slot: a hint, kept in memory */
+    int graph_on;            /* it has a neighbour graph (spec 6.4, 7.4) */
+    uint32_t k;              /* neighbours per entry */
+    cdb_index graph;         /* entry -> neighbour record; 0 -> live count */
+    cdb_index reverse;       /* (neighbour, entry): entry lists neighbour; (0, entry): an entry point */
+    cdb_index pending;       /* entries whose list needs work */
+};
+
+/* An open time-series store (cdb_ts.h). */
+struct cdb_ts_store {
+    cdb_slot slot;           /* first: in_use, store_id, use (cdb_slots.h) */
+    int dirty;               /* next_entry changed since the catalog has it */
+    int held_any;            /* late points may be held, to fold in at reconciliation */
+    uint64_t next_entry;     /* the next series ID */
+    uint8_t late_mode;       /* CDB_TS_LATE_* */
+    int64_t lateness;        /* ns, for CDB_TS_LATE_WITHIN */
+    cdb_index keys;          /* series key -> series ID */
+    cdb_index series;        /* series ID -> series record */
+    cdb_index blocks;        /* (series, first timestamp) -> block page, count, last timestamp */
+    cdb_index held;          /* (series, timestamp) -> a late point held until reconciliation */
+    uint64_t touched_tx;     /* the open transaction changed this store */
+};
+
+/* Caller memory for n open stores of each kind, without an allocator. */
+size_t cdb_db_slot_mem_size(unsigned n);
 
 typedef struct cdb_db {
     cdb_env env;
@@ -128,59 +200,12 @@ typedef struct cdb_db {
     int failed;           /* an apply failed: the database must be reopened */
     cdb_catalog catalog;
     int has_catalog;
-    /* Open document pools (cdb_doc.h). */
-    struct cdb_doc_pool {
-        int in_use;
-        int dirty;
-        uint64_t store_id;
-        cdb_index head;
-        cdb_index revs;
-        int have_indexes;
-        uint64_t next_entry;
-        uint32_t schema_version; /* current; 0 = no schema */
-        int fts_on;              /* the pool has a full-text index */
-        cdb_fts_config fts;
-        cdb_index fts_terms;     /* term -> document frequency */
-        cdb_index fts_postings;  /* (term, entry) -> term frequency */
-        cdb_index fts_lengths;   /* entry -> words indexed; 0 -> pool totals */
-    } pools[CDB_DB_MAX_POOLS];
-    /* Open vector collections (cdb_vec.h). */
-    struct cdb_vec_coll {
-        int in_use;
-        int dirty;               /* next_entry changed since the catalog has it */
-        uint64_t store_id;
-        uint8_t elem;            /* cdb_vector_elem */
-        uint8_t measure;         /* base measure, CDB_VEC_* */
-        uint8_t norms;           /* blocks cache each vector's norm */
-        uint32_t dims;
-        size_t vec_bytes;        /* bytes per vector */
-        uint32_t slots;          /* vectors per block */
-        cdb_index entries;       /* entry -> block, slot, source */
-        cdb_index blocks;        /* block -> slots in use, slots */
-        cdb_index sources;       /* (source store, source entry, entry) -> nothing */
-        uint64_t next_entry;
-        uint64_t touched_tx;     /* the open transaction changed this collection */
-        uint64_t free_from;      /* blocks below this ID have no free slot: a hint, kept in memory */
-        int graph_on;            /* it has a neighbour graph (spec 6.4, 7.4) */
-        uint32_t k;              /* neighbours per entry */
-        cdb_index graph;         /* entry -> neighbour record; 0 -> live count */
-        cdb_index reverse;       /* (neighbour, entry): entry lists neighbour; (0, entry): an entry point */
-        cdb_index pending;       /* entries whose list needs work */
-    } vecs[CDB_DB_MAX_POOLS];
-    /* Open time-series stores (cdb_ts.h). */
-    struct cdb_ts_store {
-        int in_use;
-        int dirty;               /* next_entry changed since the catalog has it */
-        uint64_t store_id;
-        uint64_t next_entry;     /* the next series ID */
-        uint8_t late_mode;       /* CDB_TS_LATE_* */
-        int64_t lateness;        /* ns, for CDB_TS_LATE_WITHIN */
-        cdb_index keys;          /* series key -> series ID */
-        cdb_index series;        /* series ID -> series record */
-        cdb_index blocks;        /* (series, first timestamp) -> block page, count, last timestamp */
-        cdb_index held;          /* (series, timestamp) -> a late point held until reconciliation */
-        uint64_t touched_tx;     /* the open transaction changed this store */
-    } tss[CDB_DB_MAX_POOLS];
+    /* Open stores, one set per model (cdb_slots.h): struct cdb_doc_pool,
+     * struct cdb_vec_coll and struct cdb_ts_store. */
+    cdb_slots pool_slots;
+    cdb_slots vec_slots;
+    cdb_slots ts_slots;
+    size_t slot_mem_used;    /* bytes of cfg.slot_mem carved into chunks */
     /* The one link store (cdb_link.h), looked up on first use. */
     struct cdb_link_store {
         int looked;              /* the catalog was asked for it */

@@ -225,31 +225,38 @@ static cdb_status decode_settings(const cdb_db *db, const uint8_t *in, size_t le
 
 int cdb_vec_is_open(const cdb_db *db, uint64_t store)
 {
-    int i;
-    for (i = 0; i < CDB_DB_MAX_POOLS; i++)
-        if (db->vecs[i].in_use && db->vecs[i].store_id == store)
-            return 1;
-    return 0;
+    return cdb_slots_find(&db->vec_slots, store) != NULL;
 }
+
+/* Records the entry counter, staged for reconciliation. */
+static cdb_status save_coll(cdb_db *db, void *slot)
+{
+    coll *c = (coll *)slot;
+    cdb_status s;
+    if (!c->dirty)
+        return CDB_OK;
+    if ((s = cdb_catalog_stage_next_entry(&db->catalog, c->slot.store_id, c->next_entry)) != CDB_OK)
+        return s;
+    c->dirty = 0;
+    return CDB_OK;
+}
+
+const cdb_slot_ops cdb_vec_slot_ops = { NULL, save_coll };
 
 /* CDB_E_INVALID_ARG: not a vector collection; CDB_E_NOT_FOUND: no such
  * store, or it was dropped. */
 static cdb_status coll_get(cdb_db *db, uint64_t store, coll **out)
 {
-    coll *free_slot = NULL;
+    coll *free_slot = (coll *)cdb_slots_find(&db->vec_slots, store);
     cdb_store_info info;
     uint64_t roots[6];
     cdb_status s;
-    int i;
+    void *v;
 
-    for (i = 0; i < CDB_DB_MAX_POOLS; i++) {
-        coll *c = &db->vecs[i];
-        if (c->in_use && c->store_id == store) {
-            *out = c;
-            return CDB_OK;
-        }
-        if (!c->in_use && free_slot == NULL)
-            free_slot = c;
+    if (free_slot != NULL) {
+        cdb_slots_touch(db, &db->vec_slots, free_slot);
+        *out = free_slot;
+        return CDB_OK;
     }
     if (!db->has_catalog)
         return CDB_E_UNSUPPORTED;
@@ -263,12 +270,12 @@ static cdb_status coll_get(cdb_db *db, uint64_t store, coll **out)
         return CDB_E_UNSUPPORTED;
     if (info.vector_len == 0)
         return CDB_E_CORRUPT;
-    if (free_slot == NULL)
-        return CDB_E_BUFFER_TOO_SMALL;
-    memset(free_slot, 0, sizeof *free_slot);
+    if ((s = cdb_slots_claim(db, &db->vec_slots, &v)) != CDB_OK)
+        return s;
+    free_slot = (coll *)v;
     if ((s = decode_settings(db, info.vector, info.vector_len, free_slot, roots, NULL, NULL, NULL)) != CDB_OK)
         return s;
-    free_slot->store_id = store;
+    free_slot->slot.store_id = store;
     free_slot->slots = block_slots(db, free_slot);
     if (free_slot->slots == 0)
         return CDB_E_CORRUPT;
@@ -287,7 +294,8 @@ static cdb_status coll_get(cdb_db *db, uint64_t store, coll **out)
             || (s = cdb_index_open(&free_slot->pending, &db->pager, roots[5], &db->cfg.catalog_work)) != CDB_OK)
             return s;
     }
-    free_slot->in_use = 1;
+    free_slot->slot.in_use = 1;
+    cdb_slots_touch(db, &db->vec_slots, free_slot);
     *out = free_slot;
     return CDB_OK;
 }
@@ -298,22 +306,18 @@ static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *proce
  * then record next entry IDs. */
 cdb_status cdb_vec_flush(cdb_db *db)
 {
-    int i;
-    for (i = 0; i < CDB_DB_MAX_POOLS; i++) {
-        coll *c = &db->vecs[i];
-        if (c->in_use && c->graph_on) {
+    cdb_slot_iter it;
+    coll *c;
+    for (c = (coll *)cdb_slots_first(&db->vec_slots, &it); c != NULL; c = (coll *)cdb_slots_next(&it)) {
+        cdb_status s;
+        if (c->graph_on) {
             size_t done;
-            cdb_status s = refresh_coll(db, c, db->cfg.vec_refresh_budget ? db->cfg.vec_refresh_budget : DEFAULT_BUDGET,
-                                        &done);
+            s = refresh_coll(db, c, db->cfg.vec_refresh_budget ? db->cfg.vec_refresh_budget : DEFAULT_BUDGET, &done);
             if (s != CDB_OK)
                 return s;
         }
-        if (c->in_use && c->dirty) {
-            cdb_status s = cdb_catalog_stage_next_entry(&db->catalog, c->store_id, c->next_entry);
-            if (s != CDB_OK)
-                return s;
-            c->dirty = 0;
-        }
+        if ((s = save_coll(db, c)) != CDB_OK)
+            return s;
     }
     return CDB_OK;
 }
@@ -589,7 +593,7 @@ static cdb_status block_read(cdb_db *db, const coll *c, uint64_t lid, block *b)
     if (h.type != CDB_PAGE_TYPE_VECTOR || h.payload_len < BLOCK_HDR)
         return CDB_E_CORRUPT;
     b->count = cdb_load_u32(b->p + 8, db->pager.order);
-    if (cdb_load_u64(b->p, db->pager.order) != c->store_id || b->p[12] != c->elem
+    if (cdb_load_u64(b->p, db->pager.order) != c->slot.store_id || b->p[12] != c->elem
         || cdb_load_u16(b->p + 14, db->pager.order) != (uint16_t)c->dims || b->count > c->slots
         || h.payload_len != block_len(db, c, b->count))
         return CDB_E_CORRUPT;
@@ -629,7 +633,7 @@ static cdb_status block_write(cdb_db *db, const coll *c, uint64_t lid, const blo
     uint32_t i;
 
     memset(nb, 0, len);
-    cdb_store_u64(nb, c->store_id, o);
+    cdb_store_u64(nb, c->slot.store_id, o);
     cdb_store_u32(nb + 8, count, o);
     nb[12] = c->elem;
     nb[13] = c->norms ? (uint8_t)BLOCK_NORMS : 0u;
@@ -656,7 +660,7 @@ static cdb_status block_write(cdb_db *db, const coll *c, uint64_t lid, const blo
     }
     memset(&t, 0, sizeof t);
     t.type = CDB_PAGE_TYPE_VECTOR;
-    t.store_id = c->store_id;
+    t.store_id = c->slot.store_id;
     return cdb_pager_write(&db->pager, lid, &t, nb, len);
 }
 
@@ -1774,7 +1778,7 @@ static cdb_status live_in_tx(cdb_db *db, coll *c, uint64_t entry, int *live)
         if ((s = cdb_journal_read(&db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &rec, &next)) != CDB_OK)
             return s;
         off = next;
-        if (rec.kind != CDB_RECORD_DATA || rec.tx_id != db->tx_id || rec.store_id != c->store_id
+        if (rec.kind != CDB_RECORD_DATA || rec.tx_id != db->tx_id || rec.store_id != c->slot.store_id
             || rec.entry_id != entry || rec.payload_len < 1)
             continue;
         if (rec.payload[0] == CDB_OP_INSERT)
@@ -1803,7 +1807,7 @@ static cdb_status put_vector(cdb_db *db, coll *c, uint64_t entry, uint8_t op, co
     }
     memcpy(p + n, vec, len);
     n += len;
-    if ((s = cdb_tx_put(db, c->store_id, entry, op, p, n)) != CDB_OK)
+    if ((s = cdb_tx_put(db, c->slot.store_id, entry, op, p, n)) != CDB_OK)
         return s;
     c->touched_tx = db->tx_id;
     return CDB_OK;

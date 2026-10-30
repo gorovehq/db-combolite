@@ -69,7 +69,7 @@ These were agreed with the user:
 
 - **C99 only.** `CMAKE_C_EXTENSIONS` is off.
 - **Warnings are errors.** The flags include `-Wconversion`, `-Wsign-conversion` and `-Wvla`, so write explicit casts and never use VLAs.
-- **No heap allocation in the core.** Memory comes from the caller, through buffers now and an allocator interface later, so microcontroller builds can use static pools. Readers return views into caller-owned buffers.
+- **No heap allocation in the core.** Memory comes from the caller: buffers, and the environment's optional `alloc`/`free` hooks (`cdb_env.h`), which only the host environment backs with malloc. Anything that grows must also work from caller memory alone, so microcontroller builds can use static pools. Readers return views into caller-owned buffers.
 - **Fallible functions return `cdb_status`**, defined in `include/combolite/cdb_common.h`. The value writer's errors are sticky.
 - **Explicit byte order.** Every multi-byte on-disk field goes through `src/cdb_endian.h`, using the file's declared byte order. Never cast raw bytes to integers.
 - **Canonical encoding.** Writers produce the one canonical form, and validators reject anything else (spec 14.6.5).
@@ -99,6 +99,12 @@ These were agreed with the user:
     - `cdb_ts`: the store, with keys, series, blocks and held indexes. It handles series by key, batched appends, late modes (hold parks points in the held index, and `cdb_ts_flush` folds them in at reconciliation), collisions, `drop_before` and range reads.
   - `cdb_schema`: checks schemas and validates documents against them. Validation happens in `cdb_doc` when a change is made, against the document as the open transaction sees it: from the staging cache (`doc_stage`), or, after the cache overflows, from the transaction's own journal records.
   - `cdb_journal` and `cdb_db`: transactions, reconciliation and recovery. Changes reach pages only through the `cdb_apply_fn` hook, and the data models will plug in there.
+  - `cdb_slots`: the open stores of each model (document pools, vector collections, time-series stores).
+    - **Growth:** slots grow in chunks of 4, from `cfg.slot_mem` and then the environment's allocator, up to `cfg.max_open` (0: no cap).
+    - **At the cap:** the least recently used store is closed. Its state is staged to the catalog first. A store the open transaction has used is never closed, nor a time-series store with held points.
+    - **Shrinking:** reconciliation frees chunks idle since the previous reconciliation.
+    - **Pointer lifetime:** a slot pointer is valid until the next open of the same model outside a transaction. Each model's slot struct starts with `cdb_slot`, so its store is `p->slot.store_id`.
+    - **Tests:** the fault environment's allocator frees everything at reboot, as a crash would. `cdb_faultenv_live_allocs()` counts what is live.
 - `src/cdb_faultenv.*`: several fault devices on one shared crash clock, plus directory entries that are lost on crash unless their directory was synced. Test-only.
 - `src/cdb_faultdev.*`: an in-memory device that simulates power loss: unsynced writes are dropped, kept in part or torn. It is built only into the `combolite_testing` library, never into the production library.
   - **Crash modes:** drop every unsynced write, keep an in-order prefix of them, tear a write partway, or reorder (only the latest write survives, the way a real disk can land writes out of order).

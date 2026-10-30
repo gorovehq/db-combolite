@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <string.h>
 
 #include "cdb_faultenv.h"
@@ -237,14 +238,53 @@ static cdb_status fe_now(void *ctx, int64_t *ns)
     return CDB_OK;
 }
 
+static void *fe_alloc(void *ctx, size_t size)
+{
+    cdb_faultenv *fe = (cdb_faultenv *)ctx;
+    void *p;
+    if (fe->no_alloc || fe->live == CDB_FAULTENV_MAX_ALLOCS || (p = malloc(size)) == NULL)
+        return NULL;
+    fe->allocs[fe->live++] = p;
+    return p;
+}
+
+static void fe_free(void *ctx, void *p)
+{
+    cdb_faultenv *fe = (cdb_faultenv *)ctx;
+    unsigned i;
+    for (i = 0; i < fe->live; i++)
+        if (fe->allocs[i] == p) {
+            fe->allocs[i] = fe->allocs[--fe->live];
+            free(p);
+            return;
+        }
+}
+
+/* A crash or shutdown ends the process, and its memory with it. */
+static void free_all(cdb_faultenv *fe)
+{
+    while (fe->live)
+        free(fe->allocs[--fe->live]);
+}
+
 static const cdb_env_ops faultenv_ops = {
-    fe_open, fe_remove, fe_rename, fe_mkdir, fe_rmdir, fe_exists, fe_sync_dir, fe_now
+    fe_open, fe_remove, fe_rename, fe_mkdir, fe_rmdir, fe_exists, fe_sync_dir, fe_now, fe_alloc, fe_free
 };
 
 void cdb_faultenv_set_time(cdb_faultenv *fe, int on, int64_t ns)
 {
     fe->has_time = on;
     fe->time_ns = ns;
+}
+
+void cdb_faultenv_set_alloc(cdb_faultenv *fe, int on)
+{
+    fe->no_alloc = !on;
+}
+
+unsigned cdb_faultenv_live_allocs(const cdb_faultenv *fe)
+{
+    return fe->live;
 }
 
 cdb_status cdb_faultenv_init(cdb_faultenv *fe, const cdb_faultenv_config *cfg, cdb_env *out)
@@ -282,6 +322,7 @@ void cdb_faultenv_reboot(cdb_faultenv *fe)
     int crashed = fe->clock.crashed;
     int i;
 
+    free_all(fe);
     for (i = 0; i < CDB_FAULTENV_MAX_DIRS; i++) {
         cdb_faultenv_dir *d = &fe->dirs[i];
         if (!crashed)

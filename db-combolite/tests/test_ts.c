@@ -385,6 +385,43 @@ static void test_late_points(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+/* With room for one open store, a store holding a late point stays open
+ * until reconciliation folds the point in; then stores take turns. */
+static void test_held_store_stays_open(void)
+{
+    uint64_t h, a, sh, sa, s;
+    pt p1 = nth(1000, 1), p2 = nth(2000, 2), late = nth(1500, 3);
+    cdb_ts_def d = def4(0);
+    int created;
+    cfg.max_open = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_create(&db, "h", 1, CDB_TS_LATE_HOLD, 0, &h));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_create(&db, "a", 1, CDB_TS_LATE_ACCEPT, 0, &a));
+    begin();
+    sh = series_of(h, "s", 0);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, append1(h, sh, &p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, append1(h, sh, &p2));
+    commit();
+    begin();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, append1(h, sh, &late)); /* held */
+    commit();
+    begin();
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUFFER_TOO_SMALL, cdb_ts_series(&db, a, "s", 1, NULL, 0, &d, &s, &created));
+    commit();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db)); /* folds it in */
+    begin();
+    sa = series_of(a, "s", 0); /* now h may be closed */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, append1(a, sa, &p1));
+    commit();
+    model_n = 0;
+    model_put(&p1);
+    model_put(&late);
+    model_put(&p2);
+    expect_range(h, sh, INT64_MIN, INT64_MAX, 100); /* reopens h, closing a */
+    TEST_ASSERT_NULL(cdb_slots_find(&db.ts_slots, a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 static void test_change_of_value_and_drop(void)
 {
     uint64_t store, s, h, hs;
@@ -605,6 +642,7 @@ int main(void)
     RUN_TEST(test_series);
     RUN_TEST(test_append_and_range);
     RUN_TEST(test_late_points);
+    RUN_TEST(test_held_store_stays_open);
     RUN_TEST(test_change_of_value_and_drop);
     RUN_TEST(test_clock);
     RUN_TEST(test_crash_sweep);

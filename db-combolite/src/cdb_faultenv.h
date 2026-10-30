@@ -6,7 +6,9 @@
  * creation was never made durable vanish with it. Directory operations count
  * as mutating operations, so they are crash points as well.
  *
- * All memory comes from the caller. Not part of the production library. */
+ * Its own memory comes from the caller. The allocator it offers the engine
+ * uses malloc, keeps track of every block, and frees them all at a reboot,
+ * as a real crash would. Not part of the production library. */
 #ifndef CDB_FAULTENV_H
 #define CDB_FAULTENV_H
 
@@ -16,6 +18,7 @@
 #define CDB_FAULTENV_MAX_FILES 6
 #define CDB_FAULTENV_MAX_DIRS 4
 #define CDB_FAULTENV_NAME 160
+#define CDB_FAULTENV_MAX_ALLOCS 256
 
 typedef struct cdb_faultenv_file {
     char name[CDB_FAULTENV_NAME];
@@ -45,11 +48,22 @@ typedef struct cdb_faultenv {
     cdb_faultenv_dir dirs[CDB_FAULTENV_MAX_DIRS];
     int has_time;     /* the clock: off after init */
     int64_t time_ns;
+    int no_alloc;     /* the allocator refuses: on after init is off */
+    void *allocs[CDB_FAULTENV_MAX_ALLOCS]; /* live blocks */
+    unsigned live;    /* how many */
 } cdb_faultenv;
 
 /* Sets the environment's clock: on, and the time it reports (ns since the
  * Unix epoch); off, the environment has no clock. Survives reboots. */
 void cdb_faultenv_set_time(cdb_faultenv *fe, int on, int64_t ns);
+
+/* Turns the allocator on (the default) or off: off, it returns NULL, as a
+ * host with no allocator would, so the engine uses caller memory only.
+ * Survives reboots. */
+void cdb_faultenv_set_alloc(cdb_faultenv *fe, int on);
+
+/* Blocks the engine has allocated and not yet freed. */
+unsigned cdb_faultenv_live_allocs(const cdb_faultenv *fe);
 
 cdb_status cdb_faultenv_init(cdb_faultenv *fe, const cdb_faultenv_config *cfg, cdb_env *out);
 

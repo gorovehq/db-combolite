@@ -72,24 +72,43 @@ static cdb_status get_int(const cdb_value *obj, cdb_byte_order o, uint64_t f, in
     return CDB_OK;
 }
 
+/* Records the series counter, staged for reconciliation. */
+static cdb_status save_store(cdb_db *db, void *slot)
+{
+    ts_store *t = (ts_store *)slot;
+    cdb_status s;
+    if (!t->dirty)
+        return CDB_OK;
+    if ((s = cdb_catalog_stage_next_entry(&db->catalog, t->slot.store_id, t->next_entry)) != CDB_OK)
+        return s;
+    t->dirty = 0;
+    return CDB_OK;
+}
+
+/* Held points stay unseen until reconciliation folds them in, which only
+ * reaches open stores. */
+static int store_pinned(const void *slot)
+{
+    return ((const ts_store *)slot)->held_any;
+}
+
+const cdb_slot_ops cdb_ts_slot_ops = { store_pinned, save_store };
+
 static cdb_status ts_get(cdb_db *db, uint64_t store, ts_store **out)
 {
-    ts_store *free_slot = NULL;
+    ts_store *free_slot = (ts_store *)cdb_slots_find(&db->ts_slots, store);
     cdb_store_info info;
     cdb_value obj;
     int64_t v[6];
     cdb_byte_order o = db->pager.order;
     unsigned i;
     cdb_status s;
+    void *slot;
 
-    for (i = 0; i < CDB_DB_MAX_POOLS; i++) {
-        ts_store *t = &db->tss[i];
-        if (t->in_use && t->store_id == store) {
-            *out = t;
-            return CDB_OK;
-        }
-        if (!t->in_use && free_slot == NULL)
-            free_slot = t;
+    if (free_slot != NULL) {
+        cdb_slots_touch(db, &db->ts_slots, free_slot);
+        *out = free_slot;
+        return CDB_OK;
     }
     if (!db->has_catalog || db->cfg.ts_buffers == NULL || db->cfg.ts_work == NULL
         || db->cfg.ts_work_size < cdb_ts_work_size())
@@ -100,16 +119,16 @@ static cdb_status ts_get(cdb_db *db, uint64_t store, ts_store **out)
         return CDB_E_INVALID_ARG;
     if (info.flags & CDB_STORE_DROPPED)
         return CDB_E_NOT_FOUND;
-    if (free_slot == NULL)
-        return CDB_E_BUFFER_TOO_SMALL;
     if (cdb_value_read(info.vector, info.vector_len, o, &obj) != CDB_OK || obj.type != CDB_TYPE_OBJECT)
         return CDB_E_CORRUPT;
     for (i = 0; i < 6; i++)
         if ((s = get_int(&obj, o, i + 1u, i == 0 ? 0 : i == 1 ? 0 : 1, i == 0 ? CDB_TS_LATE_HOLD : INT64_MAX, &v[i]))
             != CDB_OK)
             return s;
-    memset(free_slot, 0, sizeof *free_slot);
-    free_slot->store_id = store;
+    if ((s = cdb_slots_claim(db, &db->ts_slots, &slot)) != CDB_OK)
+        return s;
+    free_slot = (ts_store *)slot;
+    free_slot->slot.store_id = store;
     free_slot->next_entry = info.next_entry_id ? info.next_entry_id : 1;
     free_slot->late_mode = (uint8_t)v[0];
     free_slot->lateness = v[1];
@@ -118,18 +137,31 @@ static cdb_status ts_get(cdb_db *db, uint64_t store, ts_store **out)
         || (s = cdb_index_open(&free_slot->blocks, &db->pager, (uint64_t)v[4], &db->cfg.catalog_work)) != CDB_OK
         || (s = cdb_index_open(&free_slot->held, &db->pager, (uint64_t)v[5], &db->cfg.catalog_work)) != CDB_OK)
         return s;
-    free_slot->in_use = 1;
+    {
+        /* Whether late points wait to be folded in; a value too large for
+         * no buffer at all is one. */
+        cdb_index_cursor c;
+        uint8_t k[16];
+        size_t klen, vlen;
+        int done = 1;
+        s = cdb_index_seek(&c, &free_slot->held, tbuf(db, B_CURSOR), NULL, 0);
+        if (s == CDB_OK)
+            s = cdb_index_next(&c, k, sizeof k, &klen, NULL, 0, &vlen, &done);
+        if (s == CDB_E_BUFFER_TOO_SMALL)
+            done = 0;
+        else if (s != CDB_OK)
+            return s;
+        free_slot->held_any = !done;
+    }
+    free_slot->slot.in_use = 1;
+    cdb_slots_touch(db, &db->ts_slots, free_slot);
     *out = free_slot;
     return CDB_OK;
 }
 
 int cdb_ts_is_open(cdb_db *db, uint64_t store)
 {
-    unsigned i;
-    for (i = 0; i < CDB_DB_MAX_POOLS; i++)
-        if (db->tss[i].in_use && db->tss[i].store_id == store)
-            return 1;
-    return 0;
+    return cdb_slots_find(&db->ts_slots, store) != NULL;
 }
 
 cdb_status cdb_ts_create(cdb_db *db, const char *name, size_t len, unsigned late_mode, int64_t lateness,
@@ -517,7 +549,8 @@ static cdb_status tx_next(cdb_db *db, ts_store *t, uint64_t *off, txrec *r, int 
         if (s != CDB_OK)
             return s;
         *off = next;
-        if (rec.kind == CDB_RECORD_DATA && rec.tx_id == db->tx_id && rec.store_id == t->store_id && rec.payload_len >= 1) {
+        if (rec.kind == CDB_RECORD_DATA && rec.tx_id == db->tx_id && rec.store_id == t->slot.store_id
+            && rec.payload_len >= 1) {
             r->op = rec.payload[0];
             r->series = rec.entry_id;
             r->data = rec.payload + 1;
@@ -846,7 +879,7 @@ static cdb_status blk_read(cdb_db *db, const ts_store *t, const blk *b, const ui
     cdb_status s = cdb_pager_read(&db->pager, b->lid, tbuf(db, B_READ), &h);
     if (s != CDB_OK)
         return s == CDB_E_NOT_FOUND ? CDB_E_CORRUPT : s;
-    if (h.type != CDB_PAGE_TYPE_TS_BLOCK || h.store_id != t->store_id)
+    if (h.type != CDB_PAGE_TYPE_TS_BLOCK || h.store_id != t->slot.store_id)
         return CDB_E_CORRUPT;
     *pl = tbuf(db, B_READ) + cdb_page_header_size(db->pager.fmt);
     *len = h.payload_len;
@@ -858,7 +891,7 @@ static cdb_status blk_write(cdb_db *db, const ts_store *t, uint64_t lid, const u
     cdb_page_header h;
     memset(&h, 0, sizeof h);
     h.type = CDB_PAGE_TYPE_TS_BLOCK;
-    h.store_id = t->store_id;
+    h.store_id = t->slot.store_id;
     return cdb_pager_write(&db->pager, lid, &h, pl, len);
 }
 
@@ -932,7 +965,7 @@ static cdb_status blk_for(cdb_db *db, ts_store *t, const srec *r, uint64_t serie
 static void collided(cdb_db *db, const ts_store *t, uint64_t series, int64_t ts)
 {
     if (db->cfg.ts_collision)
-        db->cfg.ts_collision(db->cfg.ts_collision_ctx, t->store_id, series, ts);
+        db->cfg.ts_collision(db->cfg.ts_collision_ctx, t->slot.store_id, series, ts);
 }
 
 /* Merges point p into the block it belongs to: a new point, a duplicate (no
@@ -1056,6 +1089,7 @@ static cdb_status apply_point(cdb_db *db, ts_store *t, srec *r, uint64_t series,
 static cdb_status hold(ts_store *t, uint64_t series, int64_t ts, const uint8_t *obj, size_t len)
 {
     uint8_t k[16];
+    t->held_any = 1;
     return cdb_index_put(&t->held, k, k_series_ts(k, series, ts), obj, len);
 }
 
@@ -1194,12 +1228,10 @@ cdb_status cdb_ts_apply(cdb_db *db, const cdb_delta *d, int *handled)
  * first; entry counters reach the catalog. */
 cdb_status cdb_ts_flush(cdb_db *db)
 {
-    unsigned i;
-    for (i = 0; i < CDB_DB_MAX_POOLS; i++) {
-        ts_store *t = &db->tss[i];
+    cdb_slot_iter it;
+    ts_store *t;
+    for (t = (ts_store *)cdb_slots_first(&db->ts_slots, &it); t != NULL; t = (ts_store *)cdb_slots_next(&it)) {
         cdb_status s;
-        if (!t->in_use)
-            continue;
         for (;;) {
             /* The held point's values go in record_buf: reconciliation is
              * not reading the journal while it flushes. */
@@ -1226,11 +1258,9 @@ cdb_status cdb_ts_flush(cdb_db *db)
             if ((s = merge_point(db, t, &r, series, &p)) != CDB_OK || (s = rec_put(t, series, &r)) != CDB_OK)
                 return s;
         }
-        if (t->dirty) {
-            if ((s = cdb_catalog_stage_next_entry(&db->catalog, t->store_id, t->next_entry)) != CDB_OK)
-                return s;
-            t->dirty = 0;
-        }
+        t->held_any = 0;
+        if ((s = save_store(db, t)) != CDB_OK)
+            return s;
     }
     return CDB_OK;
 }
