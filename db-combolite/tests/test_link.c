@@ -221,15 +221,24 @@ static void test_add_follow_remove(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_get(&db, t, D(a), D(b), &l, &found));
     TEST_ASSERT_EQUAL_FLOAT(2.5f, l.weight);
     TEST_ASSERT_EQUAL_INT64(t0, l.time);
-    /* Removing tombstones; the pair can't be linked again. */
+    /* Removing tombstones; a removed link can be added again (revived). */
     begin();
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_remove(&db, t, D(a), D(c)));
     commit();
     TEST_ASSERT_EQUAL_INT(CDB_LINK_TOMBSTONE, flags_of(t, D(a), D(c)));
     begin();
-    TEST_ASSERT_EQUAL_INT(CDB_E_EXISTS, cdb_link_add(&db, t, D(a), D(c), 1.0f, 0));
     TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_link_reinforce(&db, t, D(a), D(c), 1.0f, 0));
     TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_link_remove(&db, t, D(a), D(c)));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_add(&db, t, D(a), D(c), 0.5f, 0));
+    TEST_ASSERT_EQUAL_INT(CDB_E_EXISTS, cdb_link_add(&db, t, D(a), D(c), 1.0f, 0));
+    commit();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_get(&db, t, D(a), D(c), &l, &found));
+    TEST_ASSERT_TRUE(found);
+    TEST_ASSERT_EQUAL_UINT8(0, l.flags);
+    TEST_ASSERT_EQUAL_FLOAT(0.5f, l.weight);
+    TEST_ASSERT_EQUAL_UINT32(1, l.removed);
+    begin();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_remove(&db, t, D(a), D(c)));
     commit();
     TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_link_add(&db, t, D(b), D(c), 1.0f, 0)); /* not in a transaction */
     /* It all survives reopening. */
@@ -254,7 +263,8 @@ static void test_transaction_view(void)
     add(t, D(a), D(b)); /* both made in this transaction */
     TEST_ASSERT_EQUAL_INT(CDB_E_EXISTS, cdb_link_add(&db, t, D(a), D(b), 1.0f, 0));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_remove(&db, t, D(a), D(b)));
-    TEST_ASSERT_EQUAL_INT(CDB_E_EXISTS, cdb_link_add(&db, t, D(a), D(b), 1.0f, 0));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_add(&db, t, D(a), D(b), 1.0f, 0)); /* revived within the transaction */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_remove(&db, t, D(a), D(b)));
     d = new_doc();
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_delete(&db, pool, d));
     TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_link_add(&db, t, D(a), D(d), 1.0f, 0));

@@ -7,7 +7,7 @@
 #include "cdb_vec.h"
 
 #define KEY_LEN 40u        /* reference (16), type (8), reference (16) */
-#define VAL_LEN 13u        /* weight (f32 bits, 4), time (8), flags (1) */
+#define VAL_LEN 17u        /* weight (f32 bits, 4), time (8), flags (1), removed count (4) */
 #define LINK_PAYLOAD 53u   /* mode (1), type, source, target, weight, time */
 #define UNLINK_PAYLOAD 40u /* type, source, target */
 #define MODE_CREATE 1u
@@ -117,6 +117,7 @@ static void encode_val(uint8_t *v, const cdb_link *l)
     cdb_store_u32(v, bits, CDB_ORDER_BIG);
     cdb_store_u64(v + 4, (uint64_t)l->time, CDB_ORDER_BIG);
     v[12] = l->flags;
+    cdb_store_u32(v + 13, l->removed, CDB_ORDER_BIG);
 }
 
 static void decode_val(const uint8_t *v, cdb_link *l)
@@ -125,6 +126,7 @@ static void decode_val(const uint8_t *v, cdb_link *l)
     memcpy(&l->weight, &bits, sizeof bits);
     l->time = (int64_t)cdb_load_u64(v + 4, CDB_ORDER_BIG);
     l->flags = v[12];
+    l->removed = cdb_load_u32(v + 13, CDB_ORDER_BIG);
 }
 
 static cdb_status row_get(struct cdb_link_store *ls, uint64_t type, cdb_ref s, cdb_ref t, cdb_link *l, int *found)
@@ -273,7 +275,16 @@ static int same_pair(const txrec *r, uint64_t type, cdb_ref s, cdb_ref t)
            && r->target.entry == t.entry;
 }
 
-enum { NONE = 0, LIVE = 1, TOMB = 2 };
+/* NONE: never linked. REMOVED: removed on purpose, may be revived. TOMB:
+ * tombstoned because an end went, for good. */
+enum { NONE = 0, LIVE = 1, TOMB = 2, REMOVED = 3 };
+
+static int state_of(const cdb_link *l)
+{
+    if (!(l->flags & CDB_LINK_TOMBSTONE))
+        return LIVE;
+    return (l->flags & (CDB_LINK_SOURCE_GONE | CDB_LINK_TARGET_GONE)) ? TOMB : REMOVED;
+}
 
 /* A link as the open transaction sees it: the committed row, then the
  * transaction's own records for the pair, in order. */
@@ -286,16 +297,16 @@ static cdb_status tx_state(cdb_db *db, uint64_t type, cdb_ref s, cdb_ref t, int 
     cdb_status st;
     if ((st = row_get(&db->links, type, s, t, &l, &found)) != CDB_OK)
         return st;
-    *state = !found ? NONE : (l.flags & CDB_LINK_TOMBSTONE) ? TOMB : LIVE;
+    *state = found ? state_of(&l) : NONE;
     for (;;) {
         if ((st = tx_next(db, &off, &r, &done)) != CDB_OK || done)
             return st;
         if (!same_pair(&r, type, s, t))
             continue;
-        if (r.op == CDB_OP_LINK && r.mode == MODE_CREATE && *state == NONE)
+        if (r.op == CDB_OP_LINK && r.mode == MODE_CREATE && (*state == NONE || *state == REMOVED))
             *state = LIVE;
         else if (r.op == CDB_OP_UNLINK && *state == LIVE)
-            *state = TOMB;
+            *state = REMOVED;
     }
 }
 
@@ -464,8 +475,8 @@ cdb_status cdb_link_add(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref targe
         return CDB_E_NOT_FOUND;
     if ((s = tx_state(db, type, source, target, &state)) != CDB_OK)
         return s;
-    if (state != NONE)
-        return CDB_E_EXISTS; /* a pair is linked under a type once */
+    if (state == LIVE || state == TOMB)
+        return CDB_E_EXISTS; /* linked, or tombstoned with an end gone; a removed link is revived */
     if (ti.enforced && ti.cardinality != CDB_CARD_N_M) {
         if ((s = any_live(db, CDB_LINK_IN, target, type, 0, &any)) != CDB_OK)
             return s;
@@ -551,14 +562,22 @@ cdb_status cdb_link_apply(cdb_db *db, const cdb_delta *d)
     if ((s = row_get(ls, r.type, r.source, r.target, &l, &found)) != CDB_OK)
         return s;
     if (r.op == CDB_OP_LINK && r.mode == MODE_CREATE) {
-        if (found)
-            return CDB_OK;
+        if (found) {
+            if (state_of(&l) != REMOVED)
+                return CDB_OK;
+            l.weight = r.weight; /* revived: live again, the removal counted */
+            l.time = r.time;
+            l.flags = 0;
+            l.removed++;
+            return row_put(ls, &l);
+        }
         l.type = r.type;
         l.source = r.source;
         l.target = r.target;
         l.weight = r.weight;
         l.time = r.time;
         l.flags = 0;
+        l.removed = 0;
         return row_insert(ls, &l);
     }
     if (!found || (l.flags & CDB_LINK_TOMBSTONE))

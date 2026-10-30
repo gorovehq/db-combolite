@@ -50,7 +50,7 @@ The mapping is a **stored structure** that is kept up to date. Rankings are comp
 *Cardinality*, as in "matrix ordinality, cardinality", means **relationship cardinality**: one-to-one, one-to-many and many-to-many.
 
 - **One-to-many** means each target has at most one live source of that link type, like a parent. One-to-one also gives each source at most one live target.
-- **A pair is linked once.** Two entries can be linked under a type only once: a link that was removed or tombstoned is never revived, so its history stays.
+- **Removed links can come back.** Removing a link tombstones it. Adding the same pair under the same type again revives that link, live, with a new weight and time, and counts the removal, so the history stays. A link tombstoned because one of its ends was deleted or dropped never comes back: entry IDs are never reused.
 
 ### 6.6 Neuron mapping
 
