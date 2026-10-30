@@ -549,6 +549,21 @@ static void test_host_filesystem(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
     snprintf(path, sizeof path, "%s.cdbarch", base);
     unlink(path);
+
+    {
+        /* A directory that still holds a file is reported as CDB_E_STATE,
+         * which close relies on to keep a set-aside companion's directory. */
+        char dir[300], file[320];
+        cdb_storage st;
+        snprintf(dir, sizeof dir, "%s.dir", base);
+        snprintf(file, sizeof file, "%s/kept", dir);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, host.ops->mkdir(host.ctx, dir));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, host.ops->open(host.ctx, file, CDB_ENV_CREATE, &st));
+        cdb_storage_close(&st);
+        TEST_ASSERT_EQUAL_INT(CDB_E_STATE, host.ops->rmdir(host.ctx, dir));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, host.ops->remove(host.ctx, file));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, host.ops->rmdir(host.ctx, dir));
+    }
 }
 
 int main(void)
