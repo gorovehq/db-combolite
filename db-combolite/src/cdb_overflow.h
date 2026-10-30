@@ -22,12 +22,14 @@ size_t cdb_overflow_room(const cdb_pager *p);
 uint64_t cdb_overflow_pages(const cdb_pager *p, size_t len);
 
 /* Writes len bytes (len > 0) as a new chain owned by store; *first gets
- * its first page. scratch holds one page payload (cdb_page_capacity bytes). */
+ * its first page. scratch holds one page payload (cdb_page_capacity bytes).
+ * The data is copied; it must not lie inside scratch. */
 cdb_status cdb_overflow_write(cdb_pager *p, uint64_t store, const void *data, size_t len, uint8_t *scratch,
                               uint64_t *first);
 
 /* Reads the chain at first, which must hold exactly len bytes owned by
- * store, into out. page is a page_size buffer. */
+ * store, into out. page is a page_size buffer. out must have room for len
+ * bytes. CDB_E_CORRUPT if any page does not match what the chain needs. */
 cdb_status cdb_overflow_read(cdb_pager *p, uint64_t first, uint64_t store, void *out, size_t len, uint8_t *page);
 
 /* Releases every page of the chain at first, which holds len bytes owned by

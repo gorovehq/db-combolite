@@ -1,4 +1,9 @@
-/* Common page header and trailer (spec 13, 14.2). */
+/* Common page header and trailer (spec 13, 14.2).
+ *
+ * Every page starts with the marker C0 DB and a header whose shape depends
+ * on the file's format, and ends with a trailer whose first 4 bytes are a
+ * CRC32C over everything before the trailer; the rest of the trailer is
+ * zero (room for an AEAD tag later, spec 14.2.4). */
 #include <string.h>
 
 #include "cdb_crc32c.h"
@@ -7,8 +12,9 @@
 
 #define MARKER_0 0xC0u
 #define MARKER_1 0xDBu
-#define COMPACT_MAX_PAGE 1024u
+#define COMPACT_MAX_PAGE 1024u /* the compact header is for pages of at most 1 KiB */
 
+/* Header bytes for each format (spec 14.2.1-14.2.3); 0 for an unknown one. */
 size_t cdb_page_header_size(cdb_page_format fmt)
 {
     switch (fmt) {
@@ -25,6 +31,8 @@ size_t cdb_page_trailer_size(cdb_page_format fmt)
     return fmt == CDB_PAGE_FMT_COMPACT ? 8 : 16;
 }
 
+/* 0 means the combination is impossible (page too small for its header and
+ * trailer, or a compact page over 1 KiB); callers treat that as invalid. */
 size_t cdb_page_capacity(cdb_page_format fmt, size_t page_size)
 {
     size_t overhead = cdb_page_header_size(fmt) + cdb_page_trailer_size(fmt);
@@ -35,6 +43,7 @@ size_t cdb_page_capacity(cdb_page_format fmt, size_t page_size)
     return page_size - overhead;
 }
 
+/* Whether v fits in an unsigned field of `bytes` bytes. */
 static int fits(uint64_t v, unsigned bytes)
 {
     return bytes >= 8 || v < (UINT64_C(1) << (bytes * 8u));
@@ -52,6 +61,7 @@ static cdb_status check_args(size_t page_size, cdb_page_format fmt, cdb_byte_ord
     return CDB_OK;
 }
 
+/* An ID field of 8, 4 or 2 bytes (full 64-bit, full 32-bit, compact). */
 static void store_id(uint8_t *p, uint64_t v, unsigned width, cdb_byte_order o)
 {
     if (width == 8)
@@ -84,6 +94,9 @@ cdb_status cdb_page_seal(uint8_t *page, size_t page_size, cdb_page_format fmt,
     if (h->payload_len > cdb_page_capacity(fmt, page_size))
         return CDB_E_OVERFLOW;
 
+    /* Header: marker, type, version, flags, compression, then the
+     * format-specific fields. Every field is checked to fit its width
+     * before anything is written for it. */
     memset(page, 0, hsize);
     page[0] = MARKER_0;
     page[1] = MARKER_1;
@@ -118,6 +131,8 @@ cdb_status cdb_page_seal(uint8_t *page, size_t page_size, cdb_page_format fmt,
         cdb_store_u16(page + ids + 3 * w, h->extent_pos, order);
     }
 
+    /* Trailer last: the CRC covers header, payload and any unused bytes
+     * between them. */
     trailer = page + page_size - tsize;
     memset(trailer, 0, tsize);
     cdb_store_u32(trailer, cdb_crc32c(page, page_size - tsize), order);
@@ -134,6 +149,8 @@ cdb_status cdb_page_open(const uint8_t *page, size_t page_size, cdb_page_format 
 
     if (s != CDB_OK)
         return s;
+    /* Integrity first (marker and CRC: CDB_E_CORRUPT), then form (zero
+     * padding and reserved bytes, payload length: CDB_E_MALFORMED). */
     trailer = page + page_size - tsize;
     if (page[0] != MARKER_0 || page[1] != MARKER_1)
         return CDB_E_CORRUPT;

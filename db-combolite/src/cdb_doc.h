@@ -49,16 +49,28 @@
 #define CDB_PATCH_SET 1
 #define CDB_PATCH_REMOVE 2
 
+/* Facts about the revision cdb_doc_get returned. */
 typedef struct cdb_doc_info {
-    uint64_t revision;
-    uint8_t kind;
-    uint64_t commit_number;
-    uint64_t principal;
+    uint64_t revision;       /* revision ID; revisions count up from 1 per document */
+    uint8_t kind;            /* CDB_REV_* */
+    uint64_t commit_number;  /* global commit that wrote it */
+    uint64_t principal;      /* who wrote it (0 until identities exist) */
     uint32_t schema_version; /* the schema it was written under; 0 = none */
 } cdb_doc_info;
 
 /* Inside a transaction. The body is an encoded object (spec 14.6); summary
- * may be NULL. insert allocates the entry ID. */
+ * may be NULL. insert allocates the entry ID.
+ * Each call checks the change against the document as this transaction sees
+ * it and journals it; the pages change at commit. All input buffers are
+ * copied. Errors (nothing is journaled on any of them):
+ *   CDB_E_STATE        no open transaction
+ *   CDB_E_INVALID_ARG  not a document pool, or the body/patch is malformed
+ *   CDB_E_NOT_FOUND    replace/patch/delete of a document that does not exist
+ *                      (or is deleted) as the transaction sees it
+ *   CDB_E_OVERFLOW     the resulting revision would be too large
+ *   CDB_E_SCHEMA       the result breaks the pool's schema
+ * A summary given to replace becomes the new summary; without one, the old
+ * summary is kept. */
 cdb_status cdb_doc_insert(cdb_db *db, uint64_t store, const char *summary, size_t summary_len,
                           const void *body, size_t body_len, uint64_t *entry);
 cdb_status cdb_doc_replace(cdb_db *db, uint64_t store, uint64_t entry, const char *summary,
@@ -68,7 +80,11 @@ cdb_status cdb_doc_delete(cdb_db *db, uint64_t store, uint64_t entry);
 
 /* Reads a document as of revision rev (0 = current). Copies the body and, if
  * summary is not NULL, the summary. CDB_E_NOT_FOUND for unknown or deleted
- * documents (a tombstone revision read by number is also not found). */
+ * documents (a tombstone revision read by number is also not found).
+ * Reads see committed changes only, not the open transaction's.
+ * CDB_E_BUFFER_TOO_SMALL when body or summary does not fit; *body_len and
+ * *summary_len are set first, so the call can be retried. summary_len and
+ * info may be NULL. The summary is not zero-terminated. */
 cdb_status cdb_doc_get(cdb_db *db, uint64_t store, uint64_t entry, uint64_t rev,
                        void *body, size_t cap, size_t *body_len,
                        char *summary, size_t summary_cap, size_t *summary_len, cdb_doc_info *info);

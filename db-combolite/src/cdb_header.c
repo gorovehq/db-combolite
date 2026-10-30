@@ -1,12 +1,20 @@
-/* File header, epoch 1 (spec 1.9, 14.1). */
+/* File header, epoch 1 (spec 1.9, 14.1).
+ *
+ * The header is two 512-byte slots at the start of the file. Every header
+ * write goes to the slot not written most recently and is followed by a
+ * barrier, so whatever a crash does to that write, the other slot still
+ * holds a complete, earlier header. Each slot carries a write counter that
+ * only grows, so a reader can tell which slot is newer. */
 #include <string.h>
 
 #include "cdb_crc32c.h"
 #include "cdb_endian.h"
 #include "cdb_header.h"
 
+/* "\x89CDB\r\n\x1A\n" (spec 14.1.3). */
 static const uint8_t header_magic[8] = { 0x89, 0x43, 0x44, 0x42, 0x0D, 0x0A, 0x1A, 0x0A };
 
+/* Stored in the file's byte order; reading it back confirms the order flag. */
 #define BYTE_ORDER_CHECK UINT32_C(0x01020304)
 
 /* Field offsets (spec 14.1.4). */
@@ -27,8 +35,9 @@ enum {
 #define ANCHOR_SIZE 16u
 #define RESERVED_A_LEN 4u
 #define RESERVED_B_LEN 11u
-#define MAX_PAGE_LOG2 30u
+#define MAX_PAGE_LOG2 30u /* largest page-size code a header may declare */
 
+/* Whether len bytes are all zero (reserved areas must be). */
 static int all_zero(const uint8_t *p, size_t len)
 {
     size_t i;
@@ -96,6 +105,8 @@ cdb_status cdb_header_encode(const cdb_header *h, uint8_t out[CDB_HEADER_SLOT_SI
     return CDB_OK;
 }
 
+/* The key reference is zero-padded text: after its first zero byte every
+ * byte must be zero. */
 static int key_ref_padding_ok(const uint8_t *k)
 {
     size_t i;
@@ -110,6 +121,8 @@ cdb_status cdb_header_decode(const uint8_t in[CDB_HEADER_SLOT_SIZE], cdb_header 
     cdb_byte_order o;
     unsigned i;
 
+    /* Magic and byte order first (the CRC is stored in that order), then
+     * the CRC, then the order check and the epoch; only then the fields. */
     if (memcmp(in + OFF_MAGIC, header_magic, sizeof header_magic) != 0)
         return CDB_E_MALFORMED;
     if (in[OFF_ORDER] != (uint8_t)CDB_ORDER_LITTLE && in[OFF_ORDER] != (uint8_t)CDB_ORDER_BIG)
@@ -174,6 +187,8 @@ cdb_status cdb_header_decode(const uint8_t in[CDB_HEADER_SLOT_SIZE], cdb_header 
     h->content_hash_alg = in[OFF_CONTENT_HASH_ALG];
     memcpy(h->tamper_tag, in + OFF_TAMPER_TAG, sizeof h->tamper_tag);
 
+    /* Semantic checks: known role and layout flags, zero reserved bytes,
+     * a committed sequence of at least 1, page sizes in order. */
     if (h->role > CDB_ROLE_COMMITTED || (h->layout_flags & ~CDB_LAYOUT_KNOWN))
         return CDB_E_MALFORMED;
     if (!all_zero(in + OFF_RESERVED_A, RESERVED_A_LEN) || !all_zero(in + OFF_RESERVED_B, RESERVED_B_LEN))
@@ -203,6 +218,7 @@ static uint64_t slot_offset(unsigned slot)
     return (uint64_t)slot * CDB_HEADER_SLOT_SIZE;
 }
 
+/* Encodes h into slot and syncs: every header write is its own barrier. */
 static cdb_status write_slot(const cdb_storage *st, unsigned slot, const cdb_header *h)
 {
     uint8_t img[CDB_HEADER_SLOT_SIZE];
@@ -251,6 +267,11 @@ static int record_better(const cdb_header *a, const cdb_header *b)
     return a->write_counter > b->write_counter;
 }
 
+/* Reads both slots, picks the best valid one as the record in force, and
+ * the slot after the most recently written one as the next to write.
+ * Errors: CDB_E_NOT_FOUND when both slots are past the end of the storage
+ * (no file yet); CDB_E_UNSUPPORTED when no slot is usable and at least one
+ * is a newer epoch; CDB_E_CORRUPT when no slot is usable otherwise. */
 cdb_status cdb_header_open(const cdb_storage *st, cdb_header_state *hs)
 {
     cdb_header slots[CDB_HEADER_SLOTS];
@@ -311,6 +332,9 @@ cdb_status cdb_header_open(const cdb_storage *st, cdb_header_state *hs)
     return cdb_header_check_features(&hs->record, &hs->read_only);
 }
 
+/* Writes rec to the working slot with the next write counter, never
+ * letting a reservation mark go down, and then makes the other slot the
+ * working one. */
 static cdb_status write_next(const cdb_storage *st, cdb_header_state *hs, cdb_header *rec)
 {
     cdb_status s;
@@ -348,6 +372,9 @@ cdb_status cdb_header_commit(const cdb_storage *st, cdb_header_state *hs, const 
     return CDB_OK;
 }
 
+/* A copy of the committed record, marked working, with new marks. Since it
+ * holds the same committed state, overwriting either slot with it is safe:
+ * whichever slot survives a crash describes the same commit. */
 cdb_status cdb_header_checkpoint(const cdb_storage *st, cdb_header_state *hs,
                                  uint64_t page_seq_hwm, uint64_t commit_hwm)
 {

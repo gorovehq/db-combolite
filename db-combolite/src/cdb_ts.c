@@ -1,4 +1,16 @@
-/* Time series (spec 10, 14.11). */
+/* Time series (spec 10, 14.11).
+ *
+ * The same two-sided pattern as documents and vectors: the public calls
+ * check a change inside the open transaction (series exists, values have
+ * the declared types, late points are allowed by the store's mode) and
+ * journal it; cdb_ts_apply writes blocks at commit and on recovery, and
+ * never fails for logical reasons.
+ *
+ * Each series record keeps the encoder state after the newest block's last
+ * point, so the common case (a point newer than every stored one, in the
+ * newest block's window) appends to that block without decoding it
+ * (cdb_tsblock_append). Older points are merged into the block of their
+ * window, which is decoded, edited and rebuilt. */
 #include <string.h>
 
 #include "combolite/cdb_value.h"
@@ -21,6 +33,8 @@ typedef struct cdb_ts_store ts_store;
 
 /* -------------------------------------------------------- buffers */
 
+/* The three page buffers of cfg.ts_buffers: a block page read, a block
+ * payload being built, and an index cursor's page. */
 enum { B_READ = 0, B_OUT = 1, B_CURSOR = 2 };
 
 static uint8_t *tbuf(cdb_db *db, unsigned i)
@@ -33,6 +47,8 @@ static size_t capacity(const cdb_db *db)
     return cdb_page_capacity(db->pager.fmt, db->pager.page_size);
 }
 
+/* ts_work holds the decoded points of one full block plus one more (the
+ * point being merged in). */
 size_t cdb_ts_work_size(void)
 {
     return (CDB_TS_BLOCK_MAX_POINTS + 1u) * sizeof(cdb_ts_point);
@@ -45,6 +61,8 @@ static cdb_ts_point *work(cdb_db *db)
 
 /* -------------------------------------------------------- settings and stores */
 
+/* The store's settings object (spec 14.11.1), kept in store record field
+ * 16 (the field the catalog calls `vector`). */
 static cdb_status encode_settings(cdb_db *db, const ts_store *t, uint8_t *out, size_t cap, size_t *len)
 {
     cdb_value_writer w;
@@ -94,6 +112,11 @@ static int store_pinned(const void *slot)
 
 const cdb_slot_ops cdb_ts_slot_ops = { store_pinned, save_store };
 
+/* Finds an open store or opens it from its catalog record into a slot:
+ * decodes the settings (late mode 0..3, lateness >= 0, index roots >= 1),
+ * opens the four indexes, and notes whether any held points wait.
+ * CDB_E_INVALID_ARG: not a time-series store; CDB_E_NOT_FOUND: unknown or
+ * dropped; CDB_E_UNSUPPORTED without the time-series buffers. */
 static cdb_status ts_get(cdb_db *db, uint64_t store, ts_store **out)
 {
     ts_store *free_slot = (ts_store *)cdb_slots_find(&db->ts_slots, store);
@@ -164,6 +187,8 @@ int cdb_ts_is_open(cdb_db *db, uint64_t store)
     return cdb_slots_find(&db->ts_slots, store) != NULL;
 }
 
+/* A catalog change: the four indexes are created for the ID the store will
+ * get, then the store record naming them, all in one commit. */
 cdb_status cdb_ts_create(cdb_db *db, const char *name, size_t len, unsigned late_mode, int64_t lateness,
                          uint64_t *store)
 {
@@ -218,7 +243,9 @@ static size_t k_u64(uint8_t *k, uint64_t v)
     return 8;
 }
 
-/* (series, timestamp): the timestamp big-endian with its sign bit flipped. */
+/* (series, timestamp): the timestamp big-endian with its sign bit flipped,
+ * so negative timestamps sort before positive ones under memcmp. Used by
+ * the blocks and held indexes. */
 static size_t k_series_ts(uint8_t *k, uint64_t series, int64_t ts)
 {
     cdb_store_u64(k, series, CDB_ORDER_BIG);
@@ -232,7 +259,9 @@ static int64_t key_ts(const uint8_t *k)
 }
 
 /* The series key: the name, then each tag's key and value, tags sorted by
- * key (a key may appear once). */
+ * key (a key may appear once). Sorting makes the key independent of the
+ * order the caller lists the tags in. Each part is an order-preserving key
+ * string. CDB_E_OVERFLOW when the key does not fit max bytes. */
 static cdb_status series_key(const char *name, size_t len, const cdb_ts_tag *tags, size_t ntags, size_t max,
                              uint8_t *out, size_t *klen)
 {
@@ -279,6 +308,9 @@ typedef struct srec {
     cdb_tsblock_state st;  /* after that block's last point */
 } srec;
 
+/* Bytes of encoder state a field of this type keeps in the series record
+ * (spec 14.11.1): int previous value; float previous bits and a started
+ * flag; string dictionary size; nothing for the others. */
 static size_t state_bytes(uint8_t type)
 {
     switch (type) {
@@ -290,6 +322,10 @@ static size_t state_bytes(uint8_t type)
     }
 }
 
+/* Encodes and decodes the series record, big-endian (layout in spec
+ * 14.11.1): a 48-byte header, then per field its ID, type and state.
+ * rec_get checks every length and range and that the record ends exactly
+ * after the last field. */
 static cdb_status rec_put(ts_store *t, uint64_t series, const srec *r)
 {
     uint8_t k[8], v[REC_MAX];
@@ -377,11 +413,13 @@ static int64_t window_of(int64_t ts, int64_t w)
     return q * w;
 }
 
+/* start + w, clamped at INT64_MAX instead of overflowing. */
 static int64_t window_end(int64_t start, int64_t w)
 {
     return start > INT64_MAX - w ? INT64_MAX : start + w;
 }
 
+/* The block layout for the window holding ts. */
 static void layout_of(const srec *r, uint64_t series, int64_t ts, cdb_ts_layout *L)
 {
     memset(L, 0, sizeof *L);
@@ -395,7 +433,8 @@ static void layout_of(const srec *r, uint64_t series, int64_t ts, cdb_ts_layout 
 }
 
 /* A point's values: an object of field ID -> value, each of its field's type.
- * The point refers to bytes in obj. */
+ * The point refers to bytes in obj. Both lists are in ascending field-ID
+ * order, so one merge-style pass matches each value to its field. */
 static cdb_status point_of(const cdb_ts_def *def, int64_t ts, const uint8_t *obj, size_t len, cdb_byte_order o,
                            cdb_ts_point *p)
 {
@@ -444,6 +483,8 @@ static cdb_status point_of(const cdb_ts_def *def, int64_t ts, const uint8_t *obj
     }
 }
 
+/* Whether two points carry the same fields with the same bits or bytes
+ * (floats compare by bit pattern, so NaN equals the same NaN). */
 static int same_values(const cdb_ts_def *def, const cdb_ts_point *a, const cdb_ts_point *b)
 {
     unsigned i;
@@ -467,6 +508,9 @@ static int same_values(const cdb_ts_def *def, const cdb_ts_point *a, const cdb_t
  * object's length (varint) and bytes. DELETE (drop before): a timestamp (8).
  * Big-endian. */
 
+/* Encodes and decodes the create payload. decode_create returns 0 for
+ * anything malformed, including a length that does not end exactly after
+ * the key. */
 static size_t encode_create(const cdb_ts_def *def, const uint8_t *key, size_t klen, uint8_t *out)
 {
     size_t n = 0, i;
@@ -524,8 +568,13 @@ static int next_point(const uint8_t *p, size_t len, size_t *at, int64_t *ts, con
     return 1;
 }
 
-/* -------------------------------------------------------- the open transaction */
+/* -------------------------------------------------------- the open transaction
+ *
+ * Time series keep no staging cache: what the open transaction did is read
+ * back from its journal records. touched_tx skips that read entirely when
+ * this transaction has not changed the store. */
 
+/* One of this transaction's records for the store: op, series, payload. */
 typedef struct txrec {
     uint8_t op;
     uint64_t series;
@@ -603,6 +652,8 @@ static cdb_status tx_series(cdb_db *db, ts_store *t, uint64_t series, srec *r, i
     }
 }
 
+/* Common checks for every change: an open, healthy transaction and the
+ * built-in apply. */
 static cdb_status tx_store(cdb_db *db, uint64_t store, ts_store **t)
 {
     if (!db->in_tx || db->failed)
@@ -648,6 +699,9 @@ static cdb_status find_series(cdb_db *db, ts_store *t, const uint8_t *key, size_
 
 /* -------------------------------------------------------- the API */
 
+/* A valid definition: a known precision, a window that is not negative
+ * (0 means the default), at most CDB_TS_MAX_FIELDS fields of known types
+ * with strictly increasing IDs. */
 static cdb_status check_def(const cdb_ts_def *def)
 {
     unsigned i;
@@ -693,6 +747,7 @@ cdb_status cdb_ts_series(cdb_db *db, uint64_t store, const char *name, size_t le
         return CDB_E_NOT_FOUND;
     if ((s = check_def(def)) != CDB_OK)
         return s;
+    /* A new series: journal its create record under the next series ID. */
     d = *def;
     if (d.window == 0)
         d.window = default_window(d.precision);
@@ -731,6 +786,8 @@ static int64_t ticks_of(int64_t ns, unsigned precision)
     return ns;
 }
 
+/* Ticks back to nanoseconds, saturating instead of overflowing. Used to
+ * compare lateness, which the store gives in nanoseconds. */
 static int64_t ticks_to_ns(int64_t ticks, unsigned precision)
 {
     unsigned p;
@@ -782,6 +839,9 @@ cdb_status cdb_ts_append(cdb_db *db, uint64_t store, uint64_t series, const cdb_
         }
         if ((s = point_of(&r.def, ts, (const uint8_t *)points[i].values, points[i].len, db->pager.order, &pt)) != CDB_OK)
             return s;
+        /* Late: older than the newest point so far, counting the points
+         * earlier in this call and in this transaction. Hold and accept
+         * modes take it; the apply decides what to do with it. */
         if (r.has_points && ts < r.last_ts) {
             int64_t late_ns = ticks_to_ns(r.last_ts, r.def.precision) - ticks_to_ns(ts, r.def.precision);
             if (t->late_mode == CDB_TS_LATE_REJECT || (t->late_mode == CDB_TS_LATE_WITHIN && late_ns > t->lateness))
@@ -804,6 +864,7 @@ cdb_status cdb_ts_append(cdb_db *db, uint64_t store, uint64_t series, const cdb_
     return CDB_OK;
 }
 
+/* Only checks the series exists; the apply does the removal. */
 cdb_status cdb_ts_drop_before(cdb_db *db, uint64_t store, uint64_t series, int64_t ts)
 {
     uint8_t p[8];
@@ -826,6 +887,8 @@ cdb_status cdb_ts_drop_before(cdb_db *db, uint64_t store, uint64_t series, int64
 
 /* -------------------------------------------------------- blocks */
 
+/* A blocks-index row: the block's page, point count, and first and last
+ * timestamps (first is the key). */
 typedef struct blk {
     uint64_t lid;
     uint32_t count;
@@ -886,6 +949,7 @@ static cdb_status blk_read(cdb_db *db, const ts_store *t, const blk *b, const ui
     return CDB_OK;
 }
 
+/* Writes a block payload to logical page lid, tagged with the store. */
 static cdb_status blk_write(cdb_db *db, const ts_store *t, uint64_t lid, const uint8_t *pl, size_t len)
 {
     cdb_page_header h;
@@ -897,7 +961,11 @@ static cdb_status blk_write(cdb_db *db, const ts_store *t, uint64_t lid, const u
 
 /* Writes points [0, n) of the work array (or the one point p) as new
  * blocks, splitting while they don't fit; *last gets the last block's key
- * and state when st is given. reuse: a page to write the first block to. */
+ * and state when st is given. reuse: a page to write the first block to.
+ * The points must all lie in one window (callers pass the points of one
+ * block, or one point). Each block takes up to MAX_POINTS points; if they
+ * don't fit a page, the count is halved until they do. late sets the block
+ * flag that says late points were folded in. */
 static cdb_status write_points(cdb_db *db, ts_store *t, const srec *r, uint64_t series, const cdb_ts_point *pts,
                                size_t n, int late, uint64_t reuse, int64_t *last_key, cdb_tsblock_state *st)
 {
@@ -962,6 +1030,8 @@ static cdb_status blk_for(cdb_db *db, ts_store *t, const srec *r, uint64_t serie
 
 /* -------------------------------------------------------- applying points */
 
+/* Tells the application about a collision (spec 10.6). Called from the
+ * apply, so it is called again for the same point on recovery. */
 static void collided(cdb_db *db, const ts_store *t, uint64_t series, int64_t ts)
 {
     if (db->cfg.ts_collision)
@@ -969,7 +1039,10 @@ static void collided(cdb_db *db, const ts_store *t, uint64_t series, int64_t ts)
 }
 
 /* Merges point p into the block it belongs to: a new point, a duplicate (no
- * change) or a collision (its fields replace the stored ones). */
+ * change) or a collision (its fields replace the stored ones).
+ * The block is decoded into the work array, edited there, and rewritten
+ * (to its own page first). If it was the series' newest block, the record's
+ * newest-block key and encoder state follow the rewrite. */
 static cdb_status merge_point(cdb_db *db, ts_store *t, srec *r, uint64_t series, const cdb_ts_point *p)
 {
     cdb_ts_point *pts = work(db);
@@ -1036,7 +1109,11 @@ static cdb_status last_point(cdb_db *db, ts_store *t, const srec *r, uint64_t se
     return CDB_OK;
 }
 
-/* Applies one point. Never fails for logical reasons. */
+/* Applies one point. Never fails for logical reasons.
+ * Three cases: the series' first point (a new block); a point newer than
+ * every stored one (append to the newest block if it is in the same window
+ * and fits, else start a new block; with change-of-value, skip it when it
+ * equals the last point); an older or equal point (merged, unless held). */
 static cdb_status apply_point(cdb_db *db, ts_store *t, srec *r, uint64_t series, const cdb_ts_point *p)
 {
     cdb_status s;
@@ -1093,7 +1170,9 @@ static cdb_status hold(ts_store *t, uint64_t series, int64_t ts, const uint8_t *
     return cdb_index_put(&t->held, k, k_series_ts(k, series, ts), obj, len);
 }
 
-/* Removes every point older than ts. */
+/* Removes every point older than ts. Blocks are taken oldest first: a
+ * block wholly before ts is freed; the block that straddles ts is
+ * rewritten with its remaining points, and the walk stops there. */
 static cdb_status drop_before(cdb_db *db, ts_store *t, srec *r, uint64_t series, int64_t ts)
 {
     for (;;) {
@@ -1153,6 +1232,11 @@ static cdb_status drop_before(cdb_db *db, ts_store *t, srec *r, uint64_t series,
 
 /* -------------------------------------------------------- apply */
 
+/* The time-series apply. *handled is 0 when the store is not a time-series
+ * store. Records that no longer make sense (a create of an existing series,
+ * an append to a missing one, a malformed payload) are skipped. The series
+ * record is written back after every change, since it carries the encoder
+ * state. */
 cdb_status cdb_ts_apply(cdb_db *db, const cdb_delta *d, int *handled)
 {
     ts_store *t;
@@ -1203,6 +1287,8 @@ cdb_status cdb_ts_apply(cdb_db *db, const cdb_delta *d, int *handled)
                 break;
             if (point_of(&r.def, ts, obj, olen, db->pager.order, &p) != CDB_OK)
                 continue; /* checked when made: only a damaged record lands here */
+            /* Hold mode: late points wait in the held index, unseen by
+             * reads, until reconciliation folds them in. */
             if (r.has_points && ts < r.last_ts && t->late_mode == CDB_TS_LATE_HOLD) {
                 if ((s = hold(t, d->entry_id, ts, obj, olen)) != CDB_OK)
                     return s;
@@ -1243,6 +1329,8 @@ cdb_status cdb_ts_flush(cdb_db *db)
             uint64_t series;
             cdb_ts_point p;
             srec r;
+            /* Take the first held row (in series, then time order), delete
+             * it, and merge the point into its block. */
             if ((s = cdb_index_seek(&c, &t->held, tbuf(db, B_CURSOR), NULL, 0)) != CDB_OK
                 || (s = cdb_index_next(&c, k, sizeof k, &klen, obj, db->cfg.record_buf_size, &vlen, &done)) != CDB_OK)
                 return s;
@@ -1267,6 +1355,8 @@ cdb_status cdb_ts_flush(cdb_db *db)
 
 /* -------------------------------------------------------- reading */
 
+/* Encodes a point's present fields as an object into out (the form
+ * cdb_ts_range returns). */
 static cdb_status write_row(const srec *r, const cdb_ts_point *p, cdb_byte_order o, uint8_t *out, size_t cap,
                             size_t *len)
 {
@@ -1323,6 +1413,11 @@ cdb_status cdb_ts_range(cdb_db *db, uint64_t store, uint64_t series, int64_t fro
         return CDB_E_NOT_FOUND;
     if (!r.has_points || from >= to)
         return CDB_OK;
+    /* Blocks never cross a window, so the first block that can hold `from`
+     * starts at or after its window's start. Walk the blocks in key order,
+     * decoding those that overlap [from, to). Held points are not seen.
+     * When rows or buf run out, *next is the first point not returned (and
+     * CDB_E_BUFFER_TOO_SMALL if not even one row fit). */
     at = window_of(from, r.def.window);
     for (;;) {
         cdb_ts_point *pts = work(db);

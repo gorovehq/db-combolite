@@ -1,8 +1,13 @@
-/* Document schemas (spec 8.3, 14.9.4). */
+/* Document schemas (spec 8.3, 14.9.4).
+ *
+ * Nothing is compiled or cached: both checking and validating read the
+ * schema's encoded bytes directly, rule by rule, each time. A rule's
+ * sub-schemas are kept as cdb_value views into those bytes. */
 #include <string.h>
 
 #include "cdb_schema.h"
 
+/* One parsed rule (see cdb_schema.h). A types mask of 0 means any type. */
 typedef struct rule {
     uint64_t field;
     uint64_t types;
@@ -16,6 +21,7 @@ typedef struct rule {
     cdb_value elem_object;
 } rule;
 
+/* A types mask: an int using only the defined type bits. */
 static cdb_status get_types(const cdb_value *v, uint64_t *types)
 {
     if (v->type != CDB_TYPE_INT || v->as.i64 < 0 || (uint64_t)v->as.i64 > CDB_SCHEMA_TYPES_ALL)
@@ -24,6 +30,10 @@ static cdb_status get_types(const cdb_value *v, uint64_t *types)
     return CDB_OK;
 }
 
+/* Parses one rule object. CDB_E_INVALID_ARG for a field of the wrong type
+ * or a missing field ID; CDB_E_UNSUPPORTED for a rule field this build does
+ * not know (it must not enforce less than the schema says). Sub-schemas are
+ * only type-checked here; check() recurses into them. */
 static cdb_status parse_rule(const cdb_value *rv, cdb_byte_order o, rule *r)
 {
     cdb_value_iter it;
@@ -87,6 +97,8 @@ static cdb_status parse_rule(const cdb_value *rv, cdb_byte_order o, rule *r)
     return have_field ? CDB_OK : CDB_E_INVALID_ARG;
 }
 
+/* Reads a schema object's two fields: open (default true) and the rules
+ * array. Unknown fields are CDB_E_UNSUPPORTED. */
 static cdb_status parse_schema(const cdb_value *sv, cdb_byte_order o, int *open, cdb_value *fields, int *has_fields)
 {
     cdb_value_iter it;
@@ -121,6 +133,9 @@ static cdb_status parse_schema(const cdb_value *sv, cdb_byte_order o, int *open,
     }
 }
 
+/* Checks a schema and, recursively, every sub-schema in its rules. Depth
+ * is bounded by the value encoding's own nesting limit. Only the top
+ * level's *trivial is reported. */
 static cdb_status check(const cdb_value *sv, cdb_byte_order o, int *trivial)
 {
     cdb_value fields, rv;
@@ -168,11 +183,16 @@ cdb_status cdb_schema_check(const uint8_t *schema, size_t len, cdb_byte_order or
 
 static cdb_status validate_object(const cdb_value *sv, const cdb_value *dv, cdb_byte_order o);
 
+/* Whether type t is in a mask (0 allows every type). */
 static int type_allowed(uint64_t types, cdb_value_type t)
 {
     return types == 0 || (types & CDB_SCHEMA_TYPE(t)) != 0;
 }
 
+/* Checks one present field against its rule: its type, its maximum length
+ * (bytes for strings and binary, elements for arrays; other types have no
+ * length), an object's sub-schema, and an array's element types and
+ * element sub-schema (applied to object elements only). */
 static cdb_status validate_value(const rule *r, const cdb_value *v, cdb_byte_order o)
 {
     cdb_status s;
@@ -208,7 +228,9 @@ static cdb_status validate_value(const rule *r, const cdb_value *v, cdb_byte_ord
 }
 
 /* Walks the document's fields and the schema's rules together; both are in
- * ascending field-ID order. */
+ * ascending field-ID order. A rule passed without a matching field means a
+ * missing field (an error if required); a field with no rule is allowed
+ * only when the schema is open. */
 static cdb_status validate_object(const cdb_value *sv, const cdb_value *dv, cdb_byte_order o)
 {
     cdb_value fields, rv, v;
@@ -260,6 +282,8 @@ static cdb_status validate_object(const cdb_value *sv, const cdb_value *dv, cdb_
     }
 }
 
+/* The document is not validated as canonical here; callers do that before
+ * (cdb_doc checks every body when the change is made). */
 cdb_status cdb_schema_validate(const uint8_t *schema, size_t schema_len, const uint8_t *doc, size_t doc_len,
                                cdb_byte_order order)
 {

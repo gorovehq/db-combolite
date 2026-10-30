@@ -1,3 +1,11 @@
+/* Fault-injecting environment (cdb_faultenv.h). Test-only.
+ *
+ * Each file and directory has two states: what the running process sees
+ * (exists, name) and what would survive a crash (durable_exists,
+ * durable_name). Creates, removes and renames change only the first;
+ * syncing the parent directory copies it to the second. At reboot after a
+ * crash, the durable state wins. File contents are handled by each file's
+ * fault device, on the shared crash clock. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -45,6 +53,8 @@ static int dir_present(cdb_faultenv *fe, const char *path)
     return strcmp(path, ".") == 0 || find_dir(fe, path) != NULL;
 }
 
+/* A file slot free in both states (a removed file still holds its slot
+ * until the removal is durable, since a crash could bring it back). */
 static int file_slot(cdb_faultenv *fe)
 {
     int i;
@@ -54,6 +64,10 @@ static int file_slot(cdb_faultenv *fe)
     return -1;
 }
 
+/* Opening an existing file rebinds its device (contents kept). Creating
+ * one needs its parent directory to exist, counts as a crash point, and
+ * gives the file a fresh device carved from the arena: current image,
+ * durable image and log data, one file_capacity each. */
 static cdb_status fe_open(void *ctx, const char *path, unsigned flags, cdb_storage *out)
 {
     cdb_faultenv *fe = (cdb_faultenv *)ctx;
@@ -193,6 +207,9 @@ static cdb_status fe_exists(void *ctx, const char *path, int *exists)
     return CDB_OK;
 }
 
+/* Makes the directory's entries durable: every file or subdirectory whose
+ * current or durable name lies directly in it gets its current state
+ * copied to its durable state. */
 static cdb_status fe_sync_dir(void *ctx, const char *path)
 {
     cdb_faultenv *fe = (cdb_faultenv *)ctx;
@@ -238,6 +255,9 @@ static cdb_status fe_now(void *ctx, int64_t *ns)
     return CDB_OK;
 }
 
+/* The allocator: malloc, with every live block remembered (up to
+ * CDB_FAULTENV_MAX_ALLOCS) so a reboot can free them and tests can count
+ * leaks. Returns NULL when switched off or full. */
 static void *fe_alloc(void *ctx, size_t size)
 {
     cdb_faultenv *fe = (cdb_faultenv *)ctx;
@@ -322,6 +342,9 @@ void cdb_faultenv_reboot(cdb_faultenv *fe)
     int crashed = fe->clock.crashed;
     int i;
 
+    /* Without a crash every current state is kept (an orderly shutdown);
+     * after one, only the durable state survives. Directories first, so a
+     * file whose directory was lost is lost too. */
     free_all(fe);
     for (i = 0; i < CDB_FAULTENV_MAX_DIRS; i++) {
         cdb_faultenv_dir *d = &fe->dirs[i];

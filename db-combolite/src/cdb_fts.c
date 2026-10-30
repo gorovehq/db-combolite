@@ -11,6 +11,9 @@
 
 #define BM25_K1 1.2
 #define BM25_B 0.75
+/* Index keys: a term of at most 64 bytes as a key string (it never holds a
+ * zero byte, since NUL is a separator, so nothing is escaped) plus the
+ * 2-byte terminator and an 8-byte entry ID fit easily. */
 #define KEY_MAX 96u
 
 /* Settings fields (spec 14.14). */
@@ -21,6 +24,8 @@ size_t cdb_fts_buffers_size(size_t page_size, size_t doc_max)
     return cdb_doc_buffer_size(page_size, doc_max) + 2u * page_size;
 }
 
+/* Two document versions, each with fewer words than bytes: twice the
+ * largest document (body plus a page for envelope and summary). */
 size_t cdb_fts_tokens_needed(size_t page_size, size_t doc_max)
 {
     return doc_max ? 2u * (doc_max + page_size) : 2u * page_size;
@@ -74,6 +79,8 @@ static size_t decode_cp(const uint8_t *p, size_t len, uint32_t *cp)
     return n;
 }
 
+/* The simple splitter's separator set (spec 14.14.1). The malformed-byte
+ * stand-in U+FFFD is not a separator, so bad bytes stay inside words. */
 static int is_separator(uint32_t cp)
 {
     if (cp < 0x80u)
@@ -89,6 +96,10 @@ static int is_separator(uint32_t cp)
     return cp == 0xFEFFu;
 }
 
+/* Tokens point into text (no copying, no folding: folding happens when
+ * words are compared and keyed). A word longer than 64 bytes is kept as its
+ * first characters that fit in 64 bytes; the rest of it is skipped, not
+ * made into another word. */
 size_t cdb_fts_split(const uint8_t *text, size_t len, cdb_fts_token *out, size_t cap, size_t *n)
 {
     size_t i = 0, found = 0;
@@ -120,6 +131,7 @@ size_t cdb_fts_split(const uint8_t *text, size_t len, cdb_fts_token *out, size_t
     return found;
 }
 
+/* ASCII-only lower-casing; every other byte is left as it is. */
 static uint8_t fold(uint8_t c)
 {
     return (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
@@ -157,6 +169,8 @@ static size_t group(cdb_fts_token *t, size_t n)
     return u + 1;
 }
 
+/* Words of a value at an indexed path: a string, or the strings directly
+ * inside an array (not nested deeper). Anything else adds nothing. */
 static void split_value(const cdb_value *v, cdb_byte_order o, cdb_fts_token *out, size_t cap, size_t *n)
 {
     if (v->type == CDB_TYPE_STRING) {
@@ -185,6 +199,8 @@ cdb_status cdb_fts_collect(const cdb_fts_config *cfg, const cdb_fts_doc *d, cdb_
         return CDB_OK;
     if (cdb_value_read(d->body, d->body_len, order, &root) != CDB_OK || root.type != CDB_TYPE_OBJECT)
         return CDB_E_CORRUPT;
+    /* Follow each configured path through nested objects; a path that
+     * does not exist in this document contributes nothing. */
     for (p = 0; p < cfg->npaths; p++) {
         cdb_value v = root;
         int found = 1;
@@ -207,6 +223,8 @@ cdb_status cdb_fts_collect(const cdb_fts_config *cfg, const cdb_fts_doc *d, cdb_
 
 /* -------------------------------------------------------- settings */
 
+/* At least one thing to index (a path or the summary); every path 1 to
+ * CDB_FTS_MAX_DEPTH field IDs long. */
 cdb_status cdb_fts_check_config(const cdb_fts_config *cfg)
 {
     unsigned p;
@@ -314,6 +332,9 @@ cdb_status cdb_fts_decode(const uint8_t *in, size_t len, cdb_byte_order order, c
 
 /* -------------------------------------------------------- index records */
 
+/* Keys: the folded term as a key string, optionally followed by an entry
+ * ID (postings); or an entry ID alone (lengths, where 0 holds the pool
+ * totals). */
 static size_t term_key(uint8_t *k, const cdb_fts_token *t, int with_entry, uint64_t entry)
 {
     char word[CDB_FTS_MAX_WORD];
@@ -336,6 +357,8 @@ static size_t entry_key(uint8_t *k, uint64_t entry)
     return kb.len;
 }
 
+/* 4-byte big-endian counters (document and term frequencies, lengths); a
+ * missing row reads as 0. */
 static cdb_status get_u32(cdb_index *ix, const uint8_t *k, size_t klen, uint32_t *out, int *found)
 {
     uint8_t v[4];
@@ -360,6 +383,8 @@ static cdb_status put_u32(cdb_index *ix, const uint8_t *k, size_t klen, uint32_t
     return cdb_index_put(ix, k, klen, v, sizeof v);
 }
 
+/* The pool totals under lengths key 0: live documents and words indexed in
+ * all (BM25 needs N and the average length). */
 static cdb_status get_stats(struct cdb_doc_pool *pool, uint64_t *docs, uint64_t *words)
 {
     uint8_t k[KEY_MAX], v[16];
@@ -376,7 +401,8 @@ static cdb_status get_stats(struct cdb_doc_pool *pool, uint64_t *docs, uint64_t 
     return CDB_OK;
 }
 
-/* Changes a term's document frequency by delta (+1 or -1). */
+/* Changes a term's document frequency by delta (+1 or -1). A term whose
+ * frequency reaches 0 is removed from the dictionary. */
 static cdb_status adjust_df(struct cdb_doc_pool *pool, const cdb_fts_token *t, int delta)
 {
     uint8_t k[KEY_MAX];
@@ -411,6 +437,9 @@ cdb_status cdb_fts_create(cdb_db *db, struct cdb_doc_pool *pool)
                             &db->cfg.catalog_work);
 }
 
+/* Brings the index from a document's old state to its new one (either may
+ * be "not live"). fts_tokens is split in two halves, one per version; each
+ * half is big enough by construction (cdb_fts_tokens_needed). */
 cdb_status cdb_fts_update(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry,
                           const cdb_fts_doc *before, const cdb_fts_doc *after)
 {
@@ -449,6 +478,7 @@ cdb_status cdb_fts_update(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry,
             j++;
         }
     }
+    /* The document's own length row, then the pool totals. */
     if (after->body) {
         if ((s = put_u32(&pool->fts_lengths, k, entry_key(k, entry), (uint32_t)tb)) != CDB_OK)
             return s;
@@ -475,6 +505,8 @@ cdb_status cdb_fts_update(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry,
 
 /* -------------------------------------------------------- search */
 
+/* One query term during a search: its postings key prefix, its idf, and
+ * the posting the scan is currently on (done when its postings ran out). */
 typedef struct term_state {
     uint8_t prefix[KEY_MAX];
     size_t plen;
@@ -524,6 +556,9 @@ static void add_hit(cdb_fts_hit *hits, size_t max, size_t *n, uint64_t entry, do
     hits[pos].score = score;
 }
 
+/* BM25 score of one document: the sum, over the query terms whose current
+ * posting is this document, of idf * tf * (k1 + 1) / (tf + k1 * (1 - b +
+ * b * len / avgdl)). */
 static cdb_status score(struct cdb_doc_pool *pool, const term_state *ts, unsigned nt, uint64_t entry,
                         double avgdl, double *out)
 {
@@ -545,6 +580,12 @@ static cdb_status score(struct cdb_doc_pool *pool, const term_state *ts, unsigne
     return CDB_OK;
 }
 
+/* Steps: split and group the query (at most 16 distinct words); look up
+ * each word's document frequency and position it on its first posting;
+ * then walk all postings lists together in entry order. ANY scores the
+ * lowest current entry; ALL leapfrogs every list up to the highest current
+ * entry until they agree. Each scored entry goes into the top-max list.
+ * The query's words are kept in fts_tokens. */
 cdb_status cdb_fts_search(cdb_db *db, struct cdb_doc_pool *pool, const char *query, size_t len, int mode,
                           cdb_fts_hit *hits, size_t max, size_t *n)
 {

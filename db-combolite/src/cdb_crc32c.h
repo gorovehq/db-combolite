@@ -14,6 +14,7 @@ uint32_t cdb_crc32c_update(uint32_t crc, const void *data, size_t len);
 uint32_t cdb_crc32c_sw(uint32_t crc, const void *data, size_t len);
 int cdb_crc32c_hw(void);
 
+/* CRC-32C of one buffer. */
 static inline uint32_t cdb_crc32c(const void *data, size_t len)
 {
     return cdb_crc32c_update(0, data, len);

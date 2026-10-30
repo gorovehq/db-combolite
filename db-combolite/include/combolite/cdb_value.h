@@ -14,8 +14,9 @@
 
 #include "combolite/cdb_common.h"
 
-#define CDB_VALUE_MAX_DEPTH 32
+#define CDB_VALUE_MAX_DEPTH 32 /* deepest nesting of arrays and objects */
 
+/* On-disk type tags (spec 14.6.1). */
 enum {
     CDB_TAG_NULL = 0x00,
     CDB_TAG_FALSE = 0x01,
@@ -34,6 +35,8 @@ enum {
     CDB_TAG_FIRST_VARIABLE = 0x40
 };
 
+/* Decoded types, as reported by the reader (both boolean tags map to
+ * CDB_TYPE_BOOL). */
 typedef enum cdb_value_type {
     CDB_TYPE_NULL,
     CDB_TYPE_BOOL,
@@ -72,8 +75,26 @@ typedef enum cdb_decimal_mode {
     CDB_DECIMAL_COMPACT = 1 /* at most 38 digits; fits in 128 bits */
 } cdb_decimal_mode;
 
-/* ---------------------------------------------------------------- writer */
+/* ---------------------------------------------------------------- writer
+ *
+ * Usage: init the writer over a buffer, write exactly one root value (which
+ * may be an array or object containing others), then read the length with
+ * cdb_value_writer_len. Inside an object, call cdb_value_field before each
+ * value. Every call returns the writer's error, which is sticky, so a
+ * sequence of calls can be checked once at the end (w.error):
+ *   CDB_E_BUFFER_TOO_SMALL  the buffer is full
+ *   CDB_E_STATE             a call out of order (a value with no field in an
+ *                           object, a second root value, an unmatched end)
+ *   CDB_E_NOT_CANONICAL     field IDs not strictly increasing
+ *   CDB_E_DEPTH             nesting deeper than CDB_VALUE_MAX_DEPTH
+ *   CDB_E_OVERFLOW          a number or size beyond what the encoding allows
+ *                           (or a decimal too large for compact mode)
+ *   CDB_E_INVALID_ARG       bad input: a string that is not UTF-8, a NULL
+ *                           pointer with a length, a bad precision or shape
+ * cdb_value_write_encoded also passes on the validator's errors.
+ * The buffer belongs to the caller; the writer only keeps a pointer to it. */
 
+/* One open array or object (internal to the writer). */
 typedef struct cdb_value_frame {
     uint8_t kind;          /* CDB_TAG_ARRAY or CDB_TAG_OBJECT */
     uint8_t expect_value;  /* object: a field ID was written, its value is due */
@@ -99,6 +120,8 @@ typedef struct cdb_value_writer {
     cdb_value_frame frames[CDB_VALUE_MAX_DEPTH];
 } cdb_value_writer;
 
+/* Starts a writer over buf (cap bytes). order is the byte order of the file
+ * the value is for; decimal_mode limits which decimals are accepted. */
 void cdb_value_writer_init(cdb_value_writer *w, uint8_t *buf, size_t cap,
                            cdb_byte_order order, cdb_decimal_mode decimal_mode);
 
@@ -141,8 +164,13 @@ cdb_status cdb_value_begin_object(cdb_value_writer *w);
 cdb_status cdb_value_field(cdb_value_writer *w, uint64_t field_id);
 cdb_status cdb_value_end_object(cdb_value_writer *w);
 
-/* ---------------------------------------------------------------- reader */
+/* ---------------------------------------------------------------- reader
+ *
+ * The reader never copies: every pointer in a cdb_value points into the
+ * buffer it was read from, which must stay unchanged while the value is in
+ * use. Malformed input gives CDB_E_MALFORMED or CDB_E_TRUNCATED. */
 
+/* One decoded value. Which member of `as` is valid depends on type. */
 typedef struct cdb_value {
     cdb_value_type type;
     uint8_t tag;
@@ -174,6 +202,8 @@ typedef struct cdb_value {
  * this value only; use cdb_value_validate for a full canonical check. */
 cdb_status cdb_value_read(const uint8_t *buf, size_t len, cdb_byte_order order, cdb_value *out);
 
+/* Iterator over an array's items or an object's fields, in stored order
+ * (objects: ascending field ID). */
 typedef struct cdb_value_iter {
     const uint8_t *pos;
     const uint8_t *end;
@@ -196,7 +226,9 @@ cdb_status cdb_value_object_next(cdb_value_iter *it, uint64_t *field_id, cdb_val
 cdb_status cdb_value_object_get(const cdb_value *object, cdb_byte_order order,
                                 uint64_t field_id, cdb_value *value, int *found);
 
-/* Element bytes of a vector, converted to host order where needed. */
+/* Element bytes of a vector, converted to host order where needed.
+ * Only F32 vectors are supported; another element type, or an index past
+ * the last element, is CDB_E_INVALID_ARG. */
 cdb_status cdb_value_vector_f32(const cdb_value *vec, cdb_byte_order order, uint64_t index, float *out);
 
 #define CDB_VALIDATE_ALLOW_UNKNOWN 0x1u /* accept, and skip, unknown variable-size tags */

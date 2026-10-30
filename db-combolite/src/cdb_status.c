@@ -1,5 +1,7 @@
+/* Human-readable names for status codes (cdb_common.h). */
 #include "combolite/cdb_common.h"
 
+/* Returns a string literal; codes not listed get a generic name. */
 const char *cdb_status_str(cdb_status status)
 {
     switch (status) {

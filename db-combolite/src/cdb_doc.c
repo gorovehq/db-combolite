@@ -1,4 +1,21 @@
-/* Documents: revision chains, patches and the document apply (spec 8, 14.9). */
+/* Documents: revision chains, patches and the document apply (spec 8, 14.9).
+ *
+ * Two halves, which must agree:
+ * - The public calls (cdb_doc_insert, _replace, _patch, _delete) run inside
+ *   an open transaction. They check everything that could go wrong (store,
+ *   document exists, schema, size limits) against the document as the
+ *   transaction sees it, and only then journal a change record. They do not
+ *   touch document pages.
+ * - cdb_doc_apply runs when the transaction commits, and again during
+ *   recovery. It turns each change record into a new revision page and
+ *   updates the head and revisions indexes, plus any full-text index and
+ *   vector-source bookkeeping. It must never fail for logical reasons
+ *   (spec 14.9.3): anything odd (a missing document, a dropped store) makes
+ *   it do nothing, because a failure would recur on every reopen.
+ *
+ * A document's current state is rebuilt by starting from the nearest full
+ * revision (original or checkpoint) and applying the patches stored in the
+ * delta revisions after it, in order. */
 #include <string.h>
 
 #include "combolite/cdb_value.h"
@@ -23,8 +40,8 @@
 /* Head index value: revision, page, chain length, kind. */
 #define HEAD_SIZE 21u
 
-#define MAX_CHAIN 64u
-#define MAX_PATH 16u
+#define MAX_CHAIN 64u    /* longest delta chain read back; a longer one is treated as corrupt */
+#define MAX_PATH 16u     /* deepest field path a patch operation may use */
 #define DEFAULT_CHECKPOINT_EVERY 16u
 
 /* Insert/replace payload flag: a summary follows. */
@@ -32,11 +49,14 @@
 
 /* -------------------------------------------------------- buffers */
 
+/* Payload bytes of one page. */
 static size_t capacity(const cdb_db *db)
 {
     return cdb_page_capacity(db->pager.fmt, db->pager.page_size);
 }
 
+/* One document buffer: the largest body plus a page of slack (or one page
+ * when bodies always fit a page). */
 size_t cdb_doc_buffer_size(size_t page_size, size_t doc_max)
 {
     return doc_max ? doc_max + page_size : page_size;
@@ -59,9 +79,13 @@ static size_t dbuf_size(const cdb_db *db)
 }
 
 /* Document buffers first (a body, or a change payload in B_WORK), then the
- * page-sized ones. */
+ * page-sized ones. B_DOC0 and B_DOC1 take turns holding a document while
+ * patches are applied (one is read, the other written). B_PAGE receives
+ * revision pages and overflow pages; B_SUMMARY keeps a summary safe while
+ * B_PAGE is reused; B_SCHEMA caches the pool's current schema. */
 enum { B_DOC0 = 0, B_DOC1 = 1, B_WORK = 2, B_PAGE = 3, B_SUMMARY = 4, B_SCHEMA = 5 };
 
+/* Start of buffer i inside cfg.doc_buffers. */
 static uint8_t *buf(cdb_db *db, unsigned i)
 {
     if (i <= B_WORK)
@@ -69,6 +93,8 @@ static uint8_t *buf(cdb_db *db, unsigned i)
     return db->cfg.doc_buffers + 3u * dbuf_size(db) + (size_t)(i - B_PAGE) * db->pager.page_size;
 }
 
+/* Logical page IDs inside revision pages use the file's address width and
+ * byte order. (Index values, by contrast, store them as 8 big-endian bytes.) */
 static uint64_t load_lid(const cdb_db *db, const uint8_t *b)
 {
     return db->pager.addr_width == 8 ? cdb_load_u64(b, db->pager.order) : cdb_load_u32(b, db->pager.order);
@@ -89,7 +115,9 @@ static unsigned checkpoint_every(const cdb_db *db)
 
 /* -------------------------------------------------------- pools */
 
-/* Records a pool's roots and entry counter, staged for reconciliation. */
+/* Records a pool's roots and entry counter, staged for reconciliation.
+ * Used both by the flush before every archive commit and by the slot code
+ * before it evicts the pool (cdb_slots.h). */
 static cdb_status save_pool(cdb_db *db, void *slot)
 {
     struct cdb_doc_pool *p = (struct cdb_doc_pool *)slot;
@@ -103,8 +131,20 @@ static cdb_status save_pool(cdb_db *db, void *slot)
     return CDB_OK;
 }
 
+/* Document pools pin nothing: any idle pool may be evicted once saved. */
 const cdb_slot_ops cdb_doc_slot_ops = { NULL, save_pool };
 
+/* Finds the in-memory state of document pool `store`, loading it from the
+ * catalog into a slot (cdb_slots.h) when it is not open. Loading opens the
+ * head and revisions indexes (if the pool has any documents yet) and the
+ * full-text indexes (if it has full-text search). Every call records a use
+ * of the slot, which keeps it from eviction for the open transaction or
+ * operation scope.
+ * Errors: CDB_E_UNSUPPORTED without a catalog or doc_buffers, or for a
+ * full-text pool when the full-text buffers are not configured;
+ * CDB_E_INVALID_ARG if the store is not a document pool; CDB_E_NOT_FOUND if
+ * it is unknown or dropped; CDB_E_BUFFER_TOO_SMALL if no slot can be had
+ * (at max_open, or out of memory, with nothing evictable). */
 static cdb_status pool_get(cdb_db *db, uint64_t store, struct cdb_doc_pool **out)
 {
     struct cdb_doc_pool *free_slot = (struct cdb_doc_pool *)cdb_slots_find(&db->pool_slots, store);
@@ -158,6 +198,9 @@ static cdb_status pool_get(cdb_db *db, uint64_t store, struct cdb_doc_pool **out
     return CDB_OK;
 }
 
+/* Creates the pool's head and revisions indexes on its first write. Marks
+ * the pool dirty so the next reconciliation records the new roots in the
+ * store record. */
 static cdb_status pool_indexes(cdb_db *db, struct cdb_doc_pool *p)
 {
     cdb_status s;
@@ -174,6 +217,9 @@ static cdb_status pool_indexes(cdb_db *db, struct cdb_doc_pool *p)
     return CDB_OK;
 }
 
+/* Called by cdb_db before every archive commit: stages each changed pool's
+ * index roots and entry counter into its catalog record (no commit here),
+ * then does the same for vector collections and time-series stores. */
 cdb_status cdb_doc_flush_pools(cdb_db *db)
 {
     cdb_slot_iter it;
@@ -191,6 +237,8 @@ cdb_status cdb_doc_flush_pools(cdb_db *db)
 
 /* -------------------------------------------------------- index records */
 
+/* Head index value (spec 14.9.2), 21 bytes, all big-endian: the head
+ * revision ID (8), its page (8), chain length (4), revision kind (1). */
 typedef struct head_rec {
     uint64_t rev;
     uint64_t lid;
@@ -198,6 +246,9 @@ typedef struct head_rec {
     uint8_t kind;
 } head_rec;
 
+/* Index keys: entry ID (head index), or entry ID + revision ID (revisions
+ * index), in the order-preserving key encoding, so revisions of one entry
+ * sort together in revision order. */
 static size_t k_head(uint8_t *k, uint64_t entry)
 {
     cdb_key_builder kb;
@@ -215,6 +266,7 @@ static size_t k_rev(uint8_t *k, uint64_t entry, uint64_t rev)
     return kb.len;
 }
 
+/* Reads the head record. A pool with no indexes yet has no documents. */
 static cdb_status head_get(struct cdb_doc_pool *p, uint64_t entry, head_rec *h, int *found)
 {
     uint8_t k[16], v[HEAD_SIZE];
@@ -246,6 +298,8 @@ static cdb_status head_put(struct cdb_doc_pool *p, uint64_t entry, const head_re
     return cdb_index_put(&p->head, k, k_head(k, entry), v, sizeof v);
 }
 
+/* Page of revision rev of entry. Only called for revisions known to exist,
+ * so a miss is CDB_E_CORRUPT. */
 static cdb_status rev_lid(struct cdb_doc_pool *p, uint64_t entry, uint64_t rev, uint64_t *lid)
 {
     uint8_t k[16], v[8];
@@ -262,6 +316,8 @@ static cdb_status rev_lid(struct cdb_doc_pool *p, uint64_t entry, uint64_t rev, 
 
 /* -------------------------------------------------------- envelopes */
 
+/* A revision's envelope, decoded (spec 14.9.1), with pointers to its
+ * summary and body. summary is NULL when the revision has none. */
 typedef struct envelope {
     uint64_t entry, rev, parent, commit, principal;
     uint32_t schema;
@@ -301,6 +357,7 @@ static cdb_status read_revision(cdb_db *db, uint64_t lid, envelope *e, uint8_t *
     p = pl + ENV_SIZE;
     if (e->kind > CDB_REV_TOMBSTONE)
         return CDB_E_CORRUPT;
+    /* Optional summary: one string value. */
     if (e->flags & ENV_FLAG_SUMMARY) {
         cdb_value v;
         if (cdb_value_read(p, (size_t)(end - p), o, &v) != CDB_OK || v.type != CDB_TYPE_STRING)
@@ -309,6 +366,10 @@ static cdb_status read_revision(cdb_db *db, uint64_t lid, envelope *e, uint8_t *
         e->summary_len = v.payload_len;
         p += v.encoded_len;
     }
+    /* Body in overflow: total length (8), first chain page (address
+     * width), then the part of the body that fits this page. The total must
+     * exceed the inline part (or there would be no chain) and stay within
+     * the configured limit. */
     if (e->flags & ENV_FLAG_OVERFLOW) {
         size_t aw = db->pager.addr_width, inline_len;
         uint64_t total, first;
@@ -332,12 +393,14 @@ static cdb_status read_revision(cdb_db *db, uint64_t lid, envelope *e, uint8_t *
         return cdb_overflow_read(&db->pager, first, h.store_id, dest + inline_len, e->body_len - inline_len,
                                  buf(db, B_PAGE));
     }
+    /* Ordinary case: the body is the rest of the payload. */
     e->body = p;
     e->body_len = (size_t)(end - p);
     return CDB_OK;
 }
 
-/* Bytes the summary takes in a revision page: a string value. */
+/* Bytes the summary takes in a revision page: a string value (one tag byte,
+ * a varint length, the bytes). */
 static size_t summary_bytes(int has_summary, size_t summary_len)
 {
     return has_summary ? 1u + cdb_varint_size(summary_len) + summary_len : 0u;
@@ -362,7 +425,10 @@ static int revision_fits(const cdb_db *db, int has_summary, size_t summary_len, 
 
 /* Builds a revision payload in the page buffer and writes it to a new page.
  * A body that does not fit goes first to an overflow chain, all but the
- * part the revision page holds; the chain uses the page buffer meanwhile. */
+ * part the revision page holds; the chain uses the page buffer meanwhile.
+ * (That is why the chain is written before the page is assembled.) A new
+ * logical page is allocated for every revision: revisions are history and
+ * are never rewritten. e->body must not point into B_PAGE. */
 static cdb_status write_revision(cdb_db *db, struct cdb_doc_pool *pool, const envelope *e, uint64_t *lid)
 {
     uint8_t *pl = buf(db, B_PAGE);
@@ -401,6 +467,8 @@ static cdb_status write_revision(cdb_db *db, struct cdb_doc_pool *pool, const en
     }
     if (len != head)
         return CDB_E_CORRUPT; /* the summary did not take the size counted */
+    /* With a chain: total length and first chain page come before the
+     * inline part of the body. */
     if (first) {
         cdb_store_u64(pl + len, (uint64_t)e->body_len, o);
         store_lid(db, pl + len + 8, first);
@@ -419,6 +487,8 @@ static cdb_status write_revision(cdb_db *db, struct cdb_doc_pool *pool, const en
 
 /* -------------------------------------------------------- patches */
 
+/* One parsed patch operation [op, path, value] (spec 14.9.2). value points
+ * into the patch bytes. */
 typedef struct patch_op {
     int64_t op;
     uint64_t path[MAX_PATH];
@@ -427,6 +497,9 @@ typedef struct patch_op {
     size_t value_len;
 } patch_op;
 
+/* Parses one operation. It must be exactly [int op, [field IDs...], value]
+ * for a set, or [2, [field IDs...]] for a remove; the path must have 1 to
+ * MAX_PATH non-negative IDs. Anything else is CDB_E_INVALID_ARG. */
 static cdb_status parse_op(const cdb_value *opv, cdb_byte_order o, patch_op *op)
 {
     cdb_value_iter it, pi;
@@ -496,7 +569,8 @@ static cdb_status validate_patch(const uint8_t *patch, size_t len, cdb_byte_orde
     }
 }
 
-/* Writes the chain of objects that leads to a set at a new path. */
+/* Writes the chain of objects that leads to a set at a new path: field
+ * path[depth], then nested single-field objects down to the value. */
 static cdb_status write_chain(cdb_value_writer *w, const patch_op *op, unsigned depth)
 {
     cdb_status s;
@@ -513,7 +587,12 @@ static cdb_status write_chain(cdb_value_writer *w, const patch_op *op, unsigned 
 
 /* Writes object obj (NULL: empty) with one operation applied at depth.
  * A set through a field that is not an object replaces that field; a remove
- * of a path that does not exist changes nothing. */
+ * of a path that does not exist changes nothing.
+ *
+ * Objects store their fields in ascending field-ID order (the canonical
+ * form, spec 14.6.5), so this copies fields across in order and inserts or
+ * replaces the target field at its sorted position. `handled` records that
+ * the target's position has been passed. */
 static cdb_status rewrite(cdb_value_writer *w, const cdb_value *obj, cdb_byte_order o,
                           const patch_op *op, unsigned depth)
 {
@@ -535,11 +614,17 @@ static cdb_status rewrite(cdb_value_writer *w, const cdb_value *obj, cdb_byte_or
                 return s;
             if (done)
                 break;
+            /* Passed the target's position without seeing it: the field is
+             * new, so a set writes it here. */
             if (!handled && fid > target) {
                 handled = 1;
                 if (op->op == CDB_PATCH_SET && (s = write_chain(w, op, depth)) != CDB_OK)
                     return s;
             }
+            /* The target field: at the end of the path, set replaces it and
+             * remove drops it; otherwise recurse into it if it is an object,
+             * or (for a set) replace it with a new chain. A remove through a
+             * non-object falls through and keeps the field unchanged. */
             if (fid == target) {
                 handled = 1;
                 if (depth + 1 == op->depth) {
@@ -558,17 +643,22 @@ static cdb_status rewrite(cdb_value_writer *w, const cdb_value *obj, cdb_byte_or
                     continue;
                 }
             }
+            /* Any other field is copied unchanged. */
             if ((s = cdb_value_field(w, fid)) != CDB_OK || (s = cdb_value_write_encoded(w, v.start, v.encoded_len)) != CDB_OK)
                 return s;
         }
     }
+    /* The target sorts after every existing field (or obj is empty). */
     if (!handled && op->op == CDB_PATCH_SET && (s = write_chain(w, op, depth)) != CDB_OK)
         return s;
     return cdb_value_end_object(w);
 }
 
 /* Applies a patch to the document in buffer *cur (length *len), alternating
- * between the two document buffers. *cur and *len follow the result. */
+ * between the two document buffers. *cur and *len follow the result.
+ * Each operation rewrites the whole document into the other buffer. A
+ * malformed stored patch is CDB_E_CORRUPT; a result too big for a document
+ * buffer is CDB_E_OVERFLOW. */
 static cdb_status apply_patch(cdb_db *db, unsigned *cur, size_t *len, const uint8_t *patch, size_t plen)
 {
     cdb_byte_order o = db->pager.order;
@@ -603,7 +693,12 @@ static cdb_status apply_patch(cdb_db *db, unsigned *cur, size_t *len, const uint
 }
 
 /* A patch turning document a into document b: top-level fields that differ
- * are set, and fields b lacks are removed. Written to the work buffer. */
+ * are set, and fields b lacks are removed. Written to the work buffer.
+ * This is how a replace is stored as a delta (spec 14.9.2). Both objects
+ * list fields in ascending ID order, so one merge-style pass over the two
+ * field lists finds every difference. A changed field is replaced whole;
+ * nested objects are not diffed. CDB_E_OVERFLOW if the patch does not fit
+ * the work buffer. */
 static cdb_status diff(cdb_db *db, const uint8_t *a, size_t alen, const uint8_t *b, size_t blen, size_t *plen)
 {
     cdb_byte_order o = db->pager.order;
@@ -665,6 +760,9 @@ static cdb_status diff(cdb_db *db, const uint8_t *a, size_t alen, const uint8_t 
 
 /* -------------------------------------------------------- reading */
 
+/* A rebuilt document: the body is in document buffer `buffer`, the summary
+ * (if any) in B_SUMMARY. target.summary and target.body are cleared, since
+ * they pointed into buffers that were reused while rebuilding. */
 typedef struct materialized {
     unsigned buffer;     /* B_DOC0 or B_DOC1 */
     size_t len;
@@ -674,7 +772,9 @@ typedef struct materialized {
 } materialized;
 
 /* Rebuilds revision rev (0 = head): from the nearest full revision at or
- * before it, applying each patch in turn. */
+ * before it, applying each patch in turn.
+ * Uses B_DOC0, B_DOC1, B_WORK, B_PAGE and B_SUMMARY. CDB_E_NOT_FOUND for an
+ * unknown entry, a revision past the head, or a tombstone. */
 static cdb_status materialize(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry, uint64_t rev,
                               materialized *m)
 {
@@ -693,6 +793,11 @@ static cdb_status materialize(cdb_db *db, struct cdb_doc_pool *pool, uint64_t en
     cur = rev ? rev : head.rev;
     if (cur > head.rev)
         return CDB_E_NOT_FOUND;
+    /* Pass 1: walk back through parent links from the target revision until
+     * a full revision (anything but a delta), collecting the pages in
+     * lids[] (newest first). Envelopes are checked against the IDs we
+     * expect, and parents must strictly decrease, so a damaged chain cannot
+     * loop. */
     for (;;) {
         uint64_t lid;
         if (n >= MAX_CHAIN)
@@ -721,8 +826,9 @@ static cdb_status materialize(cdb_db *db, struct cdb_doc_pool *pool, uint64_t en
     if (e.kind == CDB_REV_TOMBSTONE)
         return CDB_E_CORRUPT; /* a delta cannot follow a tombstone */
 
-    /* The full revision at the base of the chain, then each patch (patches
-     * in overflow chains are gathered in the work buffer). */
+    /* Pass 2: the full revision at the base of the chain, then each patch
+     * (patches in overflow chains are gathered in the work buffer). The
+     * summary is taken from the newest revision in the chain that has one. */
     if ((s = read_revision(db, lids[n - 1], &e, buf(db, B_DOC0))) != CDB_OK)
         return s;
     if (e.body != buf(db, B_DOC0))
@@ -760,6 +866,8 @@ cdb_status cdb_doc_get(cdb_db *db, uint64_t store, uint64_t entry, uint64_t rev,
         return s;
     if ((s = materialize(db, pool, entry, rev, &m)) != CDB_OK)
         return s;
+    /* Report sizes even when the caller's buffers are too small, so the
+     * caller can retry. */
     *body_len = m.len;
     if (m.len > cap)
         return CDB_E_BUFFER_TOO_SMALL;
@@ -783,7 +891,8 @@ cdb_status cdb_doc_get(cdb_db *db, uint64_t store, uint64_t entry, uint64_t rev,
 
 /* -------------------------------------------------------- apply */
 
-/* Splits an insert/replace payload: flags, optional summary, body. */
+/* Splits an insert/replace payload: flags, optional summary, body
+ * (spec 14.9.3). The outputs point into d->data. */
 static cdb_status split_payload(const cdb_delta *d, const uint8_t **summary, size_t *slen,
                                 const uint8_t **body, size_t *blen)
 {
@@ -806,7 +915,9 @@ static cdb_status split_payload(const cdb_delta *d, const uint8_t **summary, siz
     return CDB_OK;
 }
 
-/* Writes revision e for the entry and points the head at it. */
+/* Writes revision e for the entry and points the head at it. chain is the
+ * number of deltas since the last full revision, including this one (0 for
+ * a full revision or tombstone). */
 static cdb_status commit_revision(cdb_db *db, struct cdb_doc_pool *pool, envelope *e, uint32_t chain)
 {
     uint8_t k[16], v[8];
@@ -846,6 +957,7 @@ static cdb_status apply_change(cdb_db *db, const cdb_delta *d)
         return s;
     if (d->entry_id == 0)
         return CDB_OK;
+    /* Keep the counter past every ID seen, including during replay. */
     if (d->entry_id >= pool->next_entry) {
         pool->next_entry = d->entry_id + 1; /* replay never hands an ID out again */
         pool->dirty = 1;
@@ -854,6 +966,8 @@ static cdb_status apply_change(cdb_db *db, const cdb_delta *d)
         return s;
     live = found && head.kind != CDB_REV_TOMBSTONE;
 
+    /* The new revision follows the head: revision IDs count up from 1 per
+     * entry, and the parent is the previous head. */
     memset(&e, 0, sizeof e);
     e.entry = d->entry_id;
     e.rev = found ? head.rev + 1 : 1;
@@ -870,6 +984,7 @@ static cdb_status apply_change(cdb_db *db, const cdb_delta *d)
         size_t slen, blen;
         if (split_payload(d, &summary, &slen, &body, &blen) != CDB_OK)
             return CDB_OK;
+        /* Insert (also after a delete): the body is written whole. */
         if (!live) {
             if (d->op == CDB_OP_REPLACE)
                 return CDB_OK; /* nothing to replace */
@@ -882,6 +997,8 @@ static cdb_status apply_change(cdb_db *db, const cdb_delta *d)
         }
         e.summary = summary; /* a summary changes only when one is given */
         e.summary_len = slen;
+        /* Replace of a live document: store it as a delta (the diff from
+         * the current state) unless the chain is due for a checkpoint. */
         if (head.chain + 1u < checkpoint_every(db)) {
             materialized m;
             size_t plen;
@@ -899,6 +1016,8 @@ static cdb_status apply_change(cdb_db *db, const cdb_delta *d)
             /* The patch would not fit its page; the whole document does
              * (checked when the change was made). */
         }
+        /* Checkpoint: the new body whole. A checkpoint carries the current
+         * summary forward when the change gives none (spec 14.9.2). */
         {
             materialized m;
             if (summary == NULL) {
@@ -916,6 +1035,9 @@ static cdb_status apply_change(cdb_db *db, const cdb_delta *d)
         }
     }
     case CDB_OP_PATCH:
+        /* The patch was validated when journaled; a bad one here is skipped,
+         * never failed. Normally it is stored as given, as a delta; when the
+         * chain is due, the patched document is stored as a checkpoint. */
         if (!live || validate_patch(d->data, d->len, db->pager.order) != CDB_OK)
             return CDB_OK;
         if (head.chain + 1u >= checkpoint_every(db)) {
@@ -936,6 +1058,7 @@ static cdb_status apply_change(cdb_db *db, const cdb_delta *d)
         e.body_len = d->len;
         return commit_revision(db, pool, &e, head.chain + 1u);
     case CDB_OP_DELETE:
+        /* A tombstone revision with no body; history stays readable. */
         if (!live)
             return CDB_OK;
         e.kind = CDB_REV_TOMBSTONE;
@@ -948,7 +1071,10 @@ static cdb_status apply_change(cdb_db *db, const cdb_delta *d)
 }
 
 /* The document's current state for the full-text index, copied out of the
- * document buffers. body is NULL when it is not live. */
+ * document buffers. body is NULL when it is not live.
+ * With copy, body and summary are copied into fts_buffers, because the
+ * apply that follows reuses the document buffers. Without copy they point
+ * into the document buffers. */
 static cdb_status fts_capture(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry, cdb_fts_doc *out,
                               int copy)
 {
@@ -979,7 +1105,12 @@ static cdb_status fts_capture(cdb_db *db, struct cdb_doc_pool *pool, uint64_t en
 }
 
 /* The document apply: the change itself, then the full-text index from the
- * document's state before and after it. */
+ * document's state before and after it.
+ *
+ * This is the default cdb_apply_fn, and it dispatches by store: the link
+ * store goes to cdb_link_apply, vector collections to cdb_vec_apply,
+ * time-series stores to cdb_ts_apply, and document pools are handled here. A store that is none of these (unknown,
+ * dropped, another model) is ignored, as the never-fail rule requires. */
 cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
 {
     cdb_db *db = (cdb_db *)ctx;
@@ -1001,6 +1132,9 @@ cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
         int handled;
         return cdb_ts_apply(db, d, &handled);
     }
+    /* Not a document pool (or documents not configured): it may be a vector
+     * collection or time-series store that is not open yet; each model's
+     * apply says whether it took the change. */
     s = pool_get(db, d->store_id, &pool);
     if (s == CDB_E_INVALID_ARG || s == CDB_E_UNSUPPORTED) {
         int handled;
@@ -1017,6 +1151,8 @@ cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
         return s;
     if (!pool->fts_on || d->entry_id == 0)
         return apply_change(db, d);
+    /* With full-text search: capture the document before, apply, and if a
+     * new revision was written, update the index from before to after. */
     if ((s = head_get(pool, d->entry_id, &h0, &had)) != CDB_OK
         || (s = fts_capture(db, pool, d->entry_id, &before, 1)) != CDB_OK)
         return s;
@@ -1052,6 +1188,9 @@ cdb_status cdb_doc_head(cdb_db *db, uint64_t store, uint64_t entry, uint64_t *re
 
 /* -------------------------------------------------------- full text */
 
+/* A catalog change: reconciles first (cdb_db_catalog_begin), builds the
+ * index, records its settings and roots in the store record (which
+ * commits), then rotates the journal (cdb_db_catalog_end). */
 cdb_status cdb_doc_create_full_text(cdb_db *db, uint64_t store, const cdb_fts_config *cfg)
 {
     struct cdb_doc_pool *pool;
@@ -1075,7 +1214,11 @@ cdb_status cdb_doc_create_full_text(cdb_db *db, uint64_t store, const cdb_fts_co
     pool->fts = *cfg;
     s = cdb_fts_create(db, pool);
     if (s == CDB_OK && pool->have_indexes) {
-        /* Index the documents already in the pool. */
+        /* Index the documents already in the pool: walk the head index
+         * (every entry, in ID order), skip deleted ones, and add each live
+         * document as a change from "nothing" to its current state. The
+         * cursor's page buffer lies inside fts_buffers, after one document
+         * buffer and one page. */
         cdb_index_cursor c;
         uint8_t k[16], v[HEAD_SIZE];
         size_t klen, vlen;
@@ -1123,7 +1266,11 @@ cdb_status cdb_doc_search(cdb_db *db, uint64_t store, const char *query, size_t 
 /* -------------------------------------------------------- schemas */
 
 /* Loads the pool's current schema into the schema buffer. *active is 0
- * when the pool has no schema or one that accepts every document. */
+ * when the pool has no schema or one that accepts every document.
+ * The buffer is a one-entry cache keyed by (store, version), so repeated
+ * changes to one pool do not re-read the catalog. A schema with rules this
+ * build does not know gives CDB_E_UNSUPPORTED, which refuses the write:
+ * the engine never enforces less than a schema says (spec 14.9.4). */
 static cdb_status schema_load(cdb_db *db, struct cdb_doc_pool *pool, int *active)
 {
     cdb_status s;
@@ -1150,6 +1297,8 @@ static cdb_status schema_validate(cdb_db *db, const uint8_t *doc, size_t len)
     return cdb_schema_validate(buf(db, B_SCHEMA), db->schema_len, doc, len, db->pager.order);
 }
 
+/* Checks the schema is well formed before storing it, so a bad schema can
+ * never become current. */
 cdb_status cdb_doc_set_schema(cdb_db *db, uint64_t store, const void *schema, size_t len, uint32_t *version)
 {
     struct cdb_doc_pool *pool;
@@ -1199,6 +1348,9 @@ cdb_status cdb_doc_get_schema(cdb_db *db, uint64_t store, uint32_t version, void
 #define STAGE_DELETED 0x1u
 #define STAGE_SUMMARY 0x2u
 
+/* Where a document's record sits in doc_stage, if it has one. Only the
+ * summary's length is staged, not its text: the size checks need nothing
+ * more. */
 typedef struct staged {
     int found;
     size_t off;      /* of the record in doc_stage */
@@ -1216,6 +1368,8 @@ typedef struct tx_view {
     size_t summary_len;
 } tx_view;
 
+/* Linear scan of the staging records for (store, entry). Records are packed
+ * back to back from the start of doc_stage. */
 static void stage_find(const cdb_db *db, uint64_t store, uint64_t entry, staged *st)
 {
     const uint8_t *p = db->cfg.doc_stage;
@@ -1237,12 +1391,18 @@ static void stage_find(const cdb_db *db, uint64_t store, uint64_t entry, staged 
 }
 
 /* Records the document's new state, replacing its old record. state is
- * never inside doc_stage. */
+ * never inside doc_stage.
+ * The invariant that keeps this safe: a document either has an up-to-date
+ * record here, or stage_overflow is set (and replay_tx then reads the
+ * journal). So the old record is always removed first, and if the new one
+ * does not fit (or there is no doc_stage at all), the overflow flag is set
+ * instead. Cannot fail. */
 static void stage_put(cdb_db *db, uint64_t store, uint64_t entry, const staged *old, const tx_view *v,
                       const uint8_t *state)
 {
     uint8_t *p = db->cfg.doc_stage, *r;
     size_t avail, len = v->live ? v->len : 0u;
+    /* Remove the old record by closing the gap. */
     if (old->found) {
         size_t size = STAGE_HDR + old->len;
         memmove(p + old->off, p + old->off + size, db->stage_used - old->off - size);
@@ -1253,6 +1413,7 @@ static void stage_put(cdb_db *db, uint64_t store, uint64_t entry, const staged *
         db->stage_overflow = 1;
         return;
     }
+    /* Append the new record at the end. */
     r = p + db->stage_used;
     memset(r, 0, STAGE_HDR);
     cdb_store_u64(r, store, CDB_ORDER_BIG);
@@ -1267,12 +1428,15 @@ static void stage_put(cdb_db *db, uint64_t store, uint64_t entry, const staged *
 
 /* The committed document with the open transaction's journaled changes to
  * it applied in order, as the document apply will apply them. With
- * need_state, a live document's body ends up in document buffer v->b. */
+ * need_state, a live document's body ends up in document buffer v->b.
+ * Without need_state only liveness is worked out, which is much cheaper.
+ * Used when the document has no staging record. */
 static cdb_status replay_tx(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry, int need_state, tx_view *v)
 {
     uint64_t off;
     cdb_status s;
 
+    /* Start from the committed state (as of the last applied commit). */
     memset(v, 0, sizeof *v);
     if (need_state) {
         materialized m;
@@ -1295,6 +1459,8 @@ static cdb_status replay_tx(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entr
     }
     if (!db->stage_overflow)
         return CDB_OK; /* every change of this transaction is staged */
+    /* Then replay this transaction's own records for the entry, read back
+     * from the journal, mirroring what the apply will do with them. */
     for (off = db->tx_start; off < db->journal.end;) {
         cdb_record r;
         cdb_delta d;
@@ -1346,6 +1512,9 @@ static cdb_status replay_tx(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entr
     return CDB_OK;
 }
 
+/* The document as the open transaction sees it: from its staging record if
+ * it has one, otherwise rebuilt by replay_tx. A staged body is copied into
+ * B_DOC0. */
 static cdb_status tx_doc(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry, const staged *st,
                          int need_state, tx_view *v)
 {
@@ -1365,6 +1534,10 @@ static cdb_status tx_doc(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry, 
 
 /* -------------------------------------------------------- transactions */
 
+/* Common checks for every document change: a transaction must be open, the
+ * database must use the built-in apply (a custom apply would not know how to
+ * apply document records), and the store must be a document pool. *guarded
+ * says whether the pool has an active schema to validate against. */
 static cdb_status tx_pool(cdb_db *db, uint64_t store, struct cdb_doc_pool **pool, int *guarded)
 {
     cdb_status s;
@@ -1377,6 +1550,13 @@ static cdb_status tx_pool(cdb_db *db, uint64_t store, struct cdb_doc_pool **pool
     return schema_load(db, *pool, guarded);
 }
 
+/* Insert and replace. Steps: the body must be a valid, canonical object;
+ * for a replace, the document must be live as the transaction sees it; the
+ * resulting revision (with the summary it will carry) must fit; it must
+ * satisfy the schema. Only then is the payload built in B_WORK
+ * (flags, optional summary, body: spec 14.9.3) and journaled, and the new
+ * state staged. Errors: CDB_E_INVALID_ARG, CDB_E_NOT_FOUND, CDB_E_OVERFLOW,
+ * CDB_E_SCHEMA; nothing is journaled on any error. */
 static cdb_status put_body(cdb_db *db, struct cdb_doc_pool *pool, int guarded, uint64_t entry, uint8_t op,
                            const char *summary, size_t summary_len, const void *body, size_t body_len)
 {
@@ -1415,6 +1595,8 @@ static cdb_status put_body(cdb_db *db, struct cdb_doc_pool *pool, int guarded, u
         return s;
     p[len++] = summary ? (uint8_t)PAYLOAD_SUMMARY : 0u;
     if (summary) {
+        /* The value writer is used only to check the summary is UTF-8; the
+         * payload itself stores a plain varint length and the bytes. */
         cdb_value_writer w;
         cdb_value_writer_init(&w, p + len, cap - len, db->pager.order, CDB_DECIMAL_COMPACT);
         if (cdb_value_write_string(&w, summary, summary_len) != CDB_OK)
@@ -1431,6 +1613,9 @@ static cdb_status put_body(cdb_db *db, struct cdb_doc_pool *pool, int guarded, u
     return CDB_OK;
 }
 
+/* The entry ID is taken from the pool's counter, which advances only after
+ * the change is journaled. An aborted insert still uses up its ID; IDs are
+ * never reused. */
 cdb_status cdb_doc_insert(cdb_db *db, uint64_t store, const char *summary, size_t summary_len,
                           const void *body, size_t body_len, uint64_t *entry)
 {
@@ -1460,6 +1645,9 @@ cdb_status cdb_doc_replace(cdb_db *db, uint64_t store, uint64_t entry, const cha
     return put_body(db, pool, guarded, entry, CDB_OP_REPLACE, summary, summary_len, body, body_len);
 }
 
+/* A patch is checked twice for size: the patch itself must fit as a delta
+ * revision's body, and the patched document must fit as a later checkpoint.
+ * The schema check runs on the patched document. */
 cdb_status cdb_doc_patch(cdb_db *db, uint64_t store, uint64_t entry, const void *patch, size_t patch_len)
 {
     struct cdb_doc_pool *pool;
@@ -1493,6 +1681,8 @@ cdb_status cdb_doc_patch(cdb_db *db, uint64_t store, uint64_t entry, const void 
     return CDB_OK;
 }
 
+/* Delete only needs liveness, not the document's contents. Link rules are
+ * checked here, before journaling, so the apply never has to refuse. */
 cdb_status cdb_doc_delete(cdb_db *db, uint64_t store, uint64_t entry)
 {
     struct cdb_doc_pool *pool;

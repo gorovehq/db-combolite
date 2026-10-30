@@ -1,3 +1,15 @@
+/* Time-series block payloads (spec 14.11.1; layout in cdb_tsblock.h).
+ *
+ * Three operations: build (encode a whole block from points), decode
+ * (validate and read every point back), and append (add one newer point to
+ * an existing block without decoding it, using the encoder state saved
+ * after its last point). Append works by copying the old block section by
+ * section into a new buffer and extending each column's bitstream in
+ * place; the result must equal what build would produce, byte for byte.
+ *
+ * Errors: on the build side, anything that does not fit the output is
+ * CDB_E_OVERFLOW; on the read side, every structural problem is
+ * CDB_E_MALFORMED and a non-canonical form CDB_E_NOT_CANONICAL. */
 #include "cdb_tsblock.h"
 
 #include <string.h>
@@ -6,9 +18,11 @@
 #include "cdb_endian.h"
 #include "cdb_varint.h"
 
-/* Column kinds. */
+/* Column kinds: how a field's present values are stored. */
 enum { K_INT, K_F64, K_F32, K_BOOL, K_STR, K_PLAIN, K_BAD };
 
+/* The column kind for a value type; K_BAD for a type a column cannot hold
+ * (unknown types). */
 static int kind_of(uint8_t type)
 {
     switch (type) {
@@ -38,6 +52,7 @@ static int64_t u2i(uint64_t u)
     return -(int64_t)(~u) - 1;
 }
 
+/* Bytes needed for a stream of `bits` bits. */
 static size_t nbytes(uint64_t bits)
 {
     return (size_t)((bits + 7u) / 8u);
@@ -50,6 +65,8 @@ static int utf8_valid(const uint8_t *s, size_t len)
 
 /* ---- output cursor ------------------------------------------------------- */
 
+/* Appends to out[0..cap); every write checks room first and fails with
+ * CDB_E_OVERFLOW, writing nothing, when it does not fit. */
 typedef struct obuf {
     uint8_t *p;
     size_t cap, len;
@@ -110,6 +127,7 @@ static cdb_status o_bits_end(obuf *b, size_t cntpos, const cdb_bitw *w)
     return CDB_OK;
 }
 
+/* A full bit writer means the block does not fit: report it as overflow. */
 static cdb_status enc_err(cdb_status st)
 {
     return st == CDB_E_BUFFER_TOO_SMALL ? CDB_E_OVERFLOW : st;
@@ -117,6 +135,7 @@ static cdb_status enc_err(cdb_status st)
 
 /* ---- input cursor -------------------------------------------------------- */
 
+/* Reads from p[0..len); reading past the end is CDB_E_MALFORMED. */
 typedef struct rd {
     const uint8_t *p;
     size_t len, pos;
@@ -180,6 +199,7 @@ static cdb_status r_bits_end(const cdb_bitr *br, uint32_t bits)
     return cdb_bitr_check_end(br);
 }
 
+/* A codec running off the end of its stream means a damaged block. */
 static cdb_status dec_err(cdb_status st)
 {
     return (st == CDB_E_TRUNCATED || st == CDB_E_BUFFER_TOO_SMALL) ? CDB_E_MALFORMED : st;
@@ -230,6 +250,9 @@ static void dict_entry(const uint8_t *d, size_t dl, uint32_t i, const uint8_t **
 
 /* ---- argument checks ----------------------------------------------------- */
 
+/* A layout is valid with at most CDB_TS_MAX_FIELDS fields of known types
+ * in strictly ascending ID order, a known precision, only known flags, and
+ * a non-empty window. */
 static cdb_status check_layout(const cdb_ts_layout *L)
 {
     unsigned f;
@@ -262,6 +285,9 @@ static cdb_status check_plain(const uint8_t *s, size_t len, uint8_t type, cdb_by
     return CDB_OK;
 }
 
+/* Checks one caller-supplied value fits its column: an f32 pattern in the
+ * low 32 bits, a bool 0 or 1, a string valid UTF-8, a plain value one
+ * canonical value of exactly the field's type. */
 static cdb_status check_val(uint8_t type, const cdb_ts_val *v, cdb_byte_order o)
 {
     if (!v->present)
@@ -284,6 +310,7 @@ static cdb_status check_val(uint8_t type, const cdb_ts_val *v, cdb_byte_order o)
     }
 }
 
+/* Encoder state at the start of a block whose first timestamp is first. */
 static void state_init(cdb_tsblock_state *s, int64_t first)
 {
     unsigned f;
@@ -309,6 +336,10 @@ static cdb_status enc_val(cdb_bitw *w, int kind, cdb_tsblock_state *s, unsigned 
 
 /* ---- build --------------------------------------------------------------- */
 
+/* Writes a string column after its bitmap: the dictionary (entry count and
+ * byte length are reserved, then filled in), then the index stream. The
+ * dictionary is built in the output itself, so looking a string up means
+ * scanning the entries written so far. */
 static cdb_status build_string(obuf *b, const cdb_ts_point *pts, size_t n, unsigned f, cdb_tsblock_state *s)
 {
     size_t cntpos = b->len, dstart, i, cp;
@@ -380,6 +411,7 @@ cdb_status cdb_tsblock_build(const cdb_ts_layout *L, const cdb_ts_point *pts, si
     cdb_status rc;
     uint8_t hdr[CDB_TS_BLOCK_HEADER];
 
+    /* Validate everything before writing anything. */
     if (L == NULL || pts == NULL || out == NULL || len == NULL || n == 0 || n > CDB_TS_BLOCK_MAX_POINTS ||
         (o != CDB_ORDER_LITTLE && o != CDB_ORDER_BIG))
         return CDB_E_INVALID_ARG;
@@ -436,6 +468,8 @@ cdb_status cdb_tsblock_build(const cdb_ts_layout *L, const cdb_ts_point *pts, si
             rc = o_need(&b, bm);
         if (rc != CDB_OK)
             return rc;
+        /* Presence bitmap: bit i (most significant first) set when point i
+         * has this field. */
         memset(b.p + b.len, 0, bm);
         for (i = 0; i < n; i++)
             if (pts[i].v[f].present)
@@ -445,6 +479,8 @@ cdb_status cdb_tsblock_build(const cdb_ts_layout *L, const cdb_ts_point *pts, si
         if (kind == K_STR) {
             rc = build_string(&b, pts, n, f, &s);
         } else if (kind == K_PLAIN) {
+            /* Plain: a reserved byte length, then the encodings back to
+             * back; the length is filled in at the end. */
             size_t lp = b.len;
             rc = o_u32(&b, 0);
             for (i = 0; i < n && rc == CDB_OK; i++)
@@ -474,7 +510,12 @@ cdb_status cdb_tsblock_build(const cdb_ts_layout *L, const cdb_ts_point *pts, si
 
 /* ---- decode -------------------------------------------------------------- */
 
-/* Walks and fully validates a block. out (may be NULL) gets the points. */
+/* Walks and fully validates a block. out (may be NULL) gets the points.
+ * Shared by parse (no points wanted) and decode. Checks, in order: header
+ * fields in range; timestamps strictly increasing and inside the window;
+ * per field, ascending IDs, a known type, zero bitmap padding, and the
+ * column decoded exactly to the end of its stream; no trailing bytes.
+ * The encoder state is rebuilt along the way, so an append can follow. */
 static cdb_status walk(const uint8_t *pl, size_t len, cdb_byte_order o, cdb_ts_layout *L, cdb_ts_point *out,
                        size_t cap, uint32_t *count_out, int64_t *first_out, int64_t *last_out,
                        cdb_tsblock_state *st_out)
@@ -566,6 +607,7 @@ static cdb_status walk(const uint8_t *pl, size_t len, cdb_byte_order o, cdb_ts_l
         rc = r_take(&r, nbytes(count), &bm);
         if (rc != CDB_OK)
             return rc;
+        /* The bitmap's unused low bits in its last byte must be zero. */
         if ((count & 7u) && (bm[count >> 3] & (0xFFu >> (count & 7u))) != 0)
             return CDB_E_NOT_CANONICAL;
 
@@ -605,6 +647,8 @@ static cdb_status walk(const uint8_t *pl, size_t len, cdb_byte_order o, cdb_ts_l
             }
             if (e != dn)
                 return CDB_E_MALFORMED;
+            /* Indexes: each new entry must be the next unused one, and by
+             * the end every entry must have been used. */
             rc = r_bits(&r, &br, &bits);
             if (rc != CDB_OK)
                 return rc;
@@ -636,6 +680,8 @@ static cdb_status walk(const uint8_t *pl, size_t len, cdb_byte_order o, cdb_ts_l
             const uint8_t *vals;
             size_t pos = 0;
 
+            /* Plain: one canonical value of the field's type per present
+             * point, back to back, filling the byte length exactly. */
             rc = r_u32(&r, &pl_len);
             if (rc == CDB_OK)
                 rc = r_take(&r, pl_len, &vals);
@@ -739,7 +785,9 @@ cdb_status cdb_tsblock_decode(const uint8_t *pl, size_t len, cdb_byte_order o, c
 
 /* ---- append -------------------------------------------------------------- */
 
-/* Copies a bit column from r to b and opens it for appending. */
+/* Copies a bit column from r to b and opens it for appending: the writer
+ * resumes after the old stream's last bit, so the next code continues in
+ * the same byte (the old padding was zero, as cdb_bitw_put needs). */
 static cdb_status app_bits(rd *r, obuf *b, size_t *cp, cdb_bitw *w)
 {
     uint32_t bits;
@@ -781,6 +829,9 @@ cdb_status cdb_tsblock_append(const uint8_t *pl, size_t len, cdb_byte_order o, c
     nfields = cdb_load_u16(pl + 28, o);
     wstart = u2i(cdb_load_u64(pl + 8, o));
     wend = u2i(cdb_load_u64(pl + 16, o));
+    /* The old block is not validated again: the caller's state must belong
+     * to it (its count is the cheap check), and the walk below only fails
+     * on a block that is too short. */
     if (count != st->count || count == 0 || nfields > CDB_TS_MAX_FIELDS)
         return CDB_E_INVALID_ARG;
     if (count >= CDB_TS_BLOCK_MAX_POINTS)
@@ -788,6 +839,7 @@ cdb_status cdb_tsblock_append(const uint8_t *pl, size_t len, cdb_byte_order o, c
     if (p->ts <= st->t.prev_t || p->ts < wstart || p->ts >= wend)
         return CDB_E_INVALID_ARG;
 
+    /* Work on a copy of the state; *st is updated only on success. */
     r.p = pl;
     r.len = len;
     r.pos = 0;
@@ -866,6 +918,8 @@ cdb_status cdb_tsblock_append(const uint8_t *pl, size_t len, cdb_byte_order o, c
                 return rc;
             if (dn != st->dict_n[f])
                 return CDB_E_INVALID_ARG;
+            /* A string not yet in the dictionary is added at its end, and
+             * both dictionary counts in the column grow accordingly. */
             idx = dn;
             if (v->present) {
                 rc = dict_find(d, dl, v->bytes, v->len, &idx, &k);

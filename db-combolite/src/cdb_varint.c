@@ -1,5 +1,9 @@
+/* LEB128 varints (spec 14.6.1): 7 value bits per byte, least significant
+ * group first; the high bit of each byte says another byte follows. A
+ * 64-bit value takes at most 10 bytes. */
 #include "cdb_varint.h"
 
+/* Bytes the encoding of v takes: one per started group of 7 bits. */
 size_t cdb_varint_size(uint64_t v)
 {
     size_t n = 1;
@@ -21,6 +25,10 @@ size_t cdb_varint_encode(uint64_t v, uint8_t *out)
     return n;
 }
 
+/* Errors: CDB_E_TRUNCATED when the input ends mid-varint, CDB_E_OVERFLOW
+ * for more than 64 bits, CDB_E_NOT_CANONICAL for a longer form than needed
+ * (a final zero byte after a continuation). *v and *n are set only on
+ * success. */
 cdb_status cdb_varint_decode(const uint8_t *in, size_t len, uint64_t *v, size_t *n)
 {
     uint64_t result = 0;

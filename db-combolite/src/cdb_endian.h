@@ -1,5 +1,7 @@
 /* Fixed-width loads and stores in an explicit byte order (spec 14.1.2).
- * Byte-at-a-time, so they are safe on any alignment and any host order. */
+ * Byte-at-a-time, so they are safe on any alignment and any host order.
+ * Any order other than CDB_ORDER_BIG is treated as little-endian; callers
+ * validate the order where it comes from untrusted input. */
 #ifndef CDB_ENDIAN_H
 #define CDB_ENDIAN_H
 
@@ -65,6 +67,7 @@ static inline uint64_t cdb_load_u64(const uint8_t *p, cdb_byte_order order)
     return v;
 }
 
+/* The CPU's own byte order: whether the low byte of 1 is stored first. */
 static inline cdb_byte_order cdb_host_byte_order(void)
 {
     const uint16_t probe = 1;

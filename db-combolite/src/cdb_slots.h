@@ -30,7 +30,7 @@ struct cdb_db;
 
 /* The first member of every slot. */
 typedef struct cdb_slot {
-    int in_use;
+    int in_use;          /* holds an open store; 0: free */
     uint64_t store_id;
     uint64_t last_use;   /* the set's clock at its last use */
     uint64_t tx_use;     /* the transaction it was last used in; 0: none */

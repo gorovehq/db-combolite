@@ -1,7 +1,15 @@
+/* Fault-injecting in-memory storage device (cdb_faultdev.h). Test-only.
+ *
+ * The log records every program, erase and truncate since the last sync,
+ * in order, with a copy of the written bytes. At reboot after a crash, the
+ * durable image gets a chosen part of the log applied (none, a prefix, a
+ * prefix plus a torn write, or only the last write) and becomes the new
+ * current image. */
 #include <string.h>
 
 #include "cdb_faultdev.h"
 
+/* Whether [offset, offset + len) lies inside the device, without overflow. */
 static int in_bounds(const cdb_faultdev *d, uint64_t offset, uint64_t len)
 {
     return offset <= d->cfg.capacity && len <= d->cfg.capacity - offset;
@@ -17,6 +25,7 @@ int cdb_fault_clock_tick(cdb_fault_clock *clock)
     return 0;
 }
 
+/* Crash state lives on the shared clock when there is one. */
 static int is_crashed(const cdb_faultdev *d)
 {
     return d->cfg.clock ? d->cfg.clock->crashed : d->crashed;
@@ -35,6 +44,9 @@ static int count_op(cdb_faultdev *d)
     return 0;
 }
 
+/* Appends a record to the log (with a copy of the data for a program).
+ * CDB_E_BUFFER_TOO_SMALL when the caller's log memory is full; the test
+ * then needs a bigger log or more frequent syncs. */
 static cdb_status log_write(cdb_faultdev *d, uint64_t offset, const void *data, size_t len, int is_erase)
 {
     cdb_fault_record *r;
@@ -113,6 +125,8 @@ static cdb_status fd_erase(void *ctx, uint64_t offset, uint64_t len)
     return CDB_OK;
 }
 
+/* The barrier: everything so far becomes durable and the log empties. A
+ * sync struck by the crash makes nothing durable. */
 static cdb_status fd_sync(void *ctx)
 {
     cdb_faultdev *d = (cdb_faultdev *)ctx;
@@ -143,6 +157,9 @@ static cdb_status fd_size(void *ctx, uint64_t *out)
     return CDB_OK;
 }
 
+/* A truncate is logged like a write (as a truncate record holding the new
+ * size), so it too can be lost in a crash. Cut bytes read back as 0xFF,
+ * like erased media. */
 static cdb_status fd_truncate(void *ctx, uint64_t size)
 {
     cdb_faultdev *d = (cdb_faultdev *)ctx;
@@ -211,6 +228,8 @@ void cdb_faultdev_crash_now(cdb_faultdev *dev, cdb_crash_mode mode,
     dev->torn_bytes = torn_bytes;
 }
 
+/* Applies a logged record to the durable image; len lets a write be torn
+ * (only its first len bytes land). */
 static void apply_record(cdb_faultdev *d, const cdb_fault_record *r, size_t len)
 {
     if (r->is_truncate) {
@@ -242,6 +261,8 @@ void cdb_faultdev_reboot(cdb_faultdev *dev)
         memcpy(dev->cfg.durable, dev->cfg.current, dev->cfg.capacity);
         dev->durable_size = dev->current_size;
     } else {
+        /* DROP_UNSYNCED applies nothing; the other modes apply the parts
+         * of the log they keep, in log order. */
         if (dev->mode == CDB_CRASH_KEEP_PREFIX || dev->mode == CDB_CRASH_TORN)
             keep = dev->keep_writes < dev->log_len ? dev->keep_writes : dev->log_len;
         for (i = 0; i < keep; i++)
