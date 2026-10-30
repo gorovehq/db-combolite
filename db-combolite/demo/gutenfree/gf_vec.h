@@ -1,0 +1,54 @@
+/* GutenFree Diet: vectors (spec 7) and links (spec 6).
+ *
+ *   passage_vec   f32 x 384, cosine, one per passage, source = the passage
+ *                 document (so search can tell a stale vector), with a
+ *                 neighbour graph (k = 16) for approximate search
+ *   passage_bits  the same vectors as 384 sign bits (48 bytes), Hamming
+ *   book_vec      the mean of a book's passage vectors, source = its
+ *                 catalog row
+ *   similar_to    links between book_vec entries (N:M, recorded), to each
+ *                 book's nearest books, weight = cosine similarity */
+#ifndef GF_VEC_H
+#define GF_VEC_H
+
+#include "gf_books.h"
+#include "gf_catalog.h"
+#include "gf_embed.h"
+
+#define GF_SIMILAR 5u
+
+typedef struct gf_vec {
+    uint64_t passages;
+    uint64_t bits;
+    uint64_t books;
+    uint64_t similar;   /* link type */
+} gf_vec;
+
+typedef struct gf_embed_stats {
+    uint64_t passages;
+    uint64_t tokens;
+    double embed_ms;    /* in the model */
+    double commit_ms;   /* writing every vector of the book */
+    double ms;
+} gf_embed_stats;
+
+/* Opens the collections and the link type, creating them the first time. */
+cdb_status gf_vec_open(gf_db *g, gf_vec *v);
+
+/* Embeds every passage of the book in catalog row `row` and stores the
+ * vectors in one transaction. CDB_E_EXISTS: it has vectors already. */
+cdb_status gf_vec_embed_book(gf_db *g, const gf_catalog *c, const gf_books *b, const gf_vec *v, gf_embed *e,
+                             uint64_t row, gf_embed_stats *st);
+
+/* Links every book vector to its GF_SIMILAR nearest; adds only links that
+ * are missing. *added counts them. */
+cdb_status gf_vec_link_similar(gf_db *g, const gf_vec *v, uint64_t *added);
+
+/* Encodes a vector value: f32, or with bits set, its sign bits. */
+size_t gf_vec_encode(const float *f, int bits, uint8_t *out, size_t cap);
+
+/* The book_vec entry of a catalog row; *found 0 if it has none. */
+cdb_status gf_vec_book_entry(gf_db *g, const gf_catalog *c, const gf_vec *v, uint64_t row, uint64_t *entry,
+                             int *found);
+
+#endif

@@ -76,3 +76,8 @@ if(CDB_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
 endif()
+
+option(CDB_BUILD_DEMO "Build the GutenFree Diet demo (needs ncurses)" OFF)
+if(CDB_BUILD_DEMO)
+  add_subdirectory(demo/gutenfree)
+endif()
