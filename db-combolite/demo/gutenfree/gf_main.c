@@ -39,6 +39,7 @@
 #include "gf_catalog.h"
 #include "gf_db.h"
 #include "gf_embed.h"
+#include "gf_jobs.h"
 #include "gf_metrics.h"
 #include "gf_probe.h"
 #include "gf_ui.h"
@@ -64,7 +65,8 @@ static const gf_item items[] = {
     { 's', "Search the text of every book", NULL },
     { 'v', "Semantic search (vectors)", NULL },
     { 'e', "Embed stored books (vectors, links, graph)", NULL },
-    { 'd', "Diagnostics: gauges, live probe load", NULL },
+    { 'f', "Download queue (runs in the background)", NULL },
+    { 'd', "Diagnostics: gauges, live probe load (F2 or Ctrl-D from any screen)", NULL },
     { 'q', "Quit", NULL },
 };
 #define NITEMS (sizeof items / sizeof items[0])
@@ -451,6 +453,7 @@ int main(int argc, char **argv)
         rc = cli ? ingest_cli(&g, gutindex, batch) : cli_books ? ingest_books_cli(&g, books) : embed_cli(&g, model);
     } else {
         app.g = &g;
+        gf_jobs_set_app(&app);
         app.base = base;
         app.model = model;
         app.books_dir = books;
@@ -474,7 +477,7 @@ int main(int argc, char **argv)
             int ch;
             unsigned i;
             draw(base, &g, open_ms, note);
-            ch = getch();
+            ch = gf_getch(); /* downloads go on while the menu waits */
             note = "unknown key";
             for (i = 0; i < NITEMS; i++) {
                 if (ch != items[i].key)
@@ -482,7 +485,12 @@ int main(int argc, char **argv)
                 note = items[i].pending;
                 if (note != NULL)
                     break;
-                if (ch == 'q')
+                if (ch == 'q' && gf_jobs_active()) {
+                    gf_status(" a download is running: the current book would be dropped. Quit anyway? y/n ");
+                    refresh();
+                    quit = gf_getch() == 'y';
+                    note = quit ? NULL : "download still running (f shows it)";
+                } else if (ch == 'q')
                     quit = 1;
                 else if (s != CDB_OK)
                     note = "the stores could not be opened";
@@ -500,6 +508,8 @@ int main(int argc, char **argv)
                     gf_screen_semantic(&app);
                 else if (ch == 'e')
                     gf_screen_embed(&app);
+                else if (ch == 'f')
+                    gf_screen_queue(&app);
             }
         }
         endwin();
