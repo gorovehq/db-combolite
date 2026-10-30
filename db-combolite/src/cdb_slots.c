@@ -49,6 +49,13 @@ void cdb_slots_touch(const cdb_db *db, cdb_slots *s, void *slot)
     cdb_slot *t = (cdb_slot *)slot;
     t->last_use = ++s->clock;
     t->tx_use = db->in_tx ? db->tx_id : 0;
+    t->op_use = db->op_depth ? db->op_id : 0;
+}
+
+/* The open transaction or operation scope has used it. */
+static int busy(const cdb_db *db, const cdb_slot *t)
+{
+    return (db->in_tx && t->tx_use == db->tx_id) || (db->op_depth && t->op_use == db->op_id);
 }
 
 static void zero_slots(cdb_slot_chunk *c, size_t elem)
@@ -122,7 +129,7 @@ cdb_status cdb_slots_claim(cdb_db *db, cdb_slots *s, void **out)
     for (c = s->chunks; c != NULL; c = c->next)
         for (i = 0; i < c->n; i++) {
             cdb_slot *t = slot_at(c, s->elem, i);
-            if ((db->in_tx && t->tx_use == db->tx_id) || (s->ops->pinned != NULL && s->ops->pinned(t)))
+            if (busy(db, t) || (s->ops->pinned != NULL && s->ops->pinned(t)))
                 continue;
             if (victim == NULL || t->last_use < victim->last_use)
                 victim = t;
@@ -181,7 +188,7 @@ void cdb_slots_shrink(cdb_db *db, cdb_slots *s)
         int idle = 1;
         for (i = 0; i < c->n && idle; i++) {
             cdb_slot *t = slot_at(c, s->elem, i);
-            if (t->in_use && (t->last_use > s->floor || (s->ops->pinned != NULL && s->ops->pinned(t))))
+            if (t->in_use && (t->last_use > s->floor || busy(db, t) || (s->ops->pinned != NULL && s->ops->pinned(t))))
                 idle = 0;
         }
         if (idle) {

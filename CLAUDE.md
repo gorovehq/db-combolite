@@ -103,8 +103,10 @@ These were agreed with the user:
     - **Growth:** slots grow in chunks of 4, from `cfg.slot_mem` and then the environment's allocator, up to `cfg.max_open` (0: no cap).
     - **At the cap:** the least recently used store is closed. Its state is staged to the catalog first. A store the open transaction has used is never closed, nor a time-series store with held points.
     - **Shrinking:** reconciliation frees chunks idle since the previous reconciliation.
-    - **Pointer lifetime:** a slot pointer is valid until the next open of the same model outside a transaction. Each model's slot struct starts with `cdb_slot`, so its store is `p->slot.store_id`.
-    - **Tests:** the fault environment's allocator frees everything at reboot, as a crash would. `cdb_faultenv_live_allocs()` counts what is live.
+    - **Pointer lifetime:** a slot pointer is valid until the next open of the same model outside a transaction or operation scope. Code that holds one store while opening another of the same model (a join) must wrap the work in `cdb_db_op_begin`/`cdb_db_op_end`. Scopes nest. Each model's slot struct starts with `cdb_slot`, so its store is `p->slot.store_id`.
+    - **Tests:**
+      - The fault environment's allocator frees everything at reboot, as a crash would. `cdb_faultenv_live_allocs()` counts what is live.
+      - ctest runs the multi-store suites a second time as `<suite>_cap1`, with `CDB_TEST_MAX_OPEN=1`. A test that needs several stores of one model in one transaction calls `need_open(n)`.
 - `src/cdb_faultenv.*`: several fault devices on one shared crash clock, plus directory entries that are lost on crash unless their directory was synced. Test-only.
 - `src/cdb_faultdev.*`: an in-memory device that simulates power loss: unsynced writes are dropped, kept in part or torn. It is built only into the `combolite_testing` library, never into the production library.
   - **Crash modes:** drop every unsynced write, keep an in-order prefix of them, tear a write partway, or reorder (only the latest write survives, the way a real disk can land writes out of order).

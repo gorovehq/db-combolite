@@ -4,8 +4,9 @@
  * A set grows in chunks of CDB_SLOTS_CHUNK slots as stores are opened, up
  * to cdb_db_config.max_open (0: no cap). At the cap, opening another store
  * evicts the one used longest ago, after saving its unsaved state to the
- * catalog; it reopens on its next use. A slot the open transaction has used
- * is never evicted, nor one its model pins. Reconciliation frees the chunks
+ * catalog; it reopens on its next use. A slot the open transaction or the
+ * current operation scope (cdb_db_op_begin) has used is never evicted, nor
+ * one its model pins. Reconciliation frees the chunks
  * whose stores have all been idle since the reconciliation before.
  *
  * Chunks come from caller memory (cdb_db_config.slot_mem) first, then from
@@ -13,7 +14,9 @@
  * memory it was given.
  *
  * A slot pointer stays valid until the next open of a store of the same
- * model outside a transaction, or the next reconciliation. */
+ * model outside a transaction or operation scope, or the next
+ * reconciliation. Code that holds one store while opening another of the
+ * same model, such as a join, must run inside a scope. */
 #ifndef CDB_SLOTS_H
 #define CDB_SLOTS_H
 
@@ -31,6 +34,7 @@ typedef struct cdb_slot {
     uint64_t store_id;
     uint64_t last_use;   /* the set's clock at its last use */
     uint64_t tx_use;     /* the transaction it was last used in; 0: none */
+    uint64_t op_use;     /* the operation scope it was last used in; 0: none */
 } cdb_slot;
 
 /* What a model tells the set about its slots. */

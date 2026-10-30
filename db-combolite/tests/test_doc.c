@@ -925,6 +925,32 @@ static void test_open_pools_kept_in_transaction(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+/* Outside a transaction, an operation scope keeps the pools it read open:
+ * a join holding one pool cannot lose it to the next. Scopes nest. */
+static void test_open_pools_kept_in_scope(void)
+{
+    uint64_t pools[2];
+    size_t len;
+    cfg.max_open = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    make_pools(pools, 2);
+    insert_one(pools[0]);
+    insert_one(pools[1]);
+    cdb_db_op_begin(&db);
+    TEST_ASSERT_TRUE(doc_exists(pools[0], 1));
+    cdb_db_op_begin(&db);
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUFFER_TOO_SMALL, cdb_doc_get(&db, pools[1], 1, 0, out, sizeof out, &len, NULL, 0,
+                                                              NULL, NULL)); /* pools[0] is held */
+    cdb_db_op_end(&db);
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUFFER_TOO_SMALL, cdb_doc_get(&db, pools[1], 1, 0, out, sizeof out, &len, NULL, 0,
+                                                              NULL, NULL)); /* the outer scope still holds it */
+    TEST_ASSERT_NOT_NULL(cdb_slots_find(&db.pool_slots, pools[0]));
+    cdb_db_op_end(&db);
+    TEST_ASSERT_TRUE(doc_exists(pools[1], 1));
+    TEST_ASSERT_NULL(cdb_slots_find(&db.pool_slots, pools[0]));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 /* Without an allocator, slots come from caller memory only, and that
  * memory bounds them as a cap would. */
 static void test_open_pools_caller_memory(void)
@@ -1116,6 +1142,7 @@ int main(void)
     RUN_TEST(test_open_pools_grow);
     RUN_TEST(test_open_pools_evict);
     RUN_TEST(test_open_pools_kept_in_transaction);
+    RUN_TEST(test_open_pools_kept_in_scope);
     RUN_TEST(test_open_pools_caller_memory);
     RUN_TEST(test_open_pools_shrink);
     RUN_TEST(test_schema_enforced);

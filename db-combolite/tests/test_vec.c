@@ -1,5 +1,6 @@
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "unity.h"
@@ -48,6 +49,10 @@ void setUp(void)
 {
     init_env();
     memset(&cfg, 0, sizeof cfg);
+    {
+        const char *cap = getenv("CDB_TEST_MAX_OPEN"); /* the cap-1 runs (tests/CMakeLists.txt) */
+        cfg.max_open = cap != NULL ? (unsigned)atoi(cap) : 0;
+    }
     cfg.pager.arena = arena;
     cfg.pager.arena_size = sizeof arena;
     cfg.pager.nodes = nodes;
@@ -67,6 +72,14 @@ void setUp(void)
 }
 
 void tearDown(void) {}
+
+/* The test uses n stores of one model in a single transaction: raise a
+ * smaller cap (the cap-1 runs) to n, which that transaction needs. */
+static void need_open(unsigned n)
+{
+    if (cfg.max_open != 0 && cfg.max_open < n)
+        cfg.max_open = n;
+}
 
 static cdb_status open_db(void)
 {
@@ -650,6 +663,7 @@ static void test_transaction_rules(void)
     cdb_vec_hit h[2];
     size_t n;
 
+    need_open(2);
     rng = 5u;
     v = make_vec(CDB_VEC_F32, 0);
     other = make_vec(CDB_VEC_I8, 0);
