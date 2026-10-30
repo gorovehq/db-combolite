@@ -52,7 +52,8 @@ add_library(combolite
   src/cdb_doc.c
   src/cdb_schema.c
   src/cdb_fts.c
-  src/cdb_vec.c)
+  src/cdb_vec.c
+  src/cdb_link.c)
 target_include_directories(combolite
   PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

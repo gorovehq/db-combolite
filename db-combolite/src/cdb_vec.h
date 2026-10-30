@@ -102,6 +102,10 @@ cdb_status cdb_vec_insert(cdb_db *db, uint64_t store, const void *vec, size_t le
 cdb_status cdb_vec_replace(cdb_db *db, uint64_t store, uint64_t entry, const void *vec, size_t len);
 cdb_status cdb_vec_delete(cdb_db *db, uint64_t store, uint64_t entry);
 
+/* Whether a vector exists as the open transaction sees it (for links).
+ * CDB_E_INVALID_ARG: not a vector collection. */
+cdb_status cdb_vec_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *live);
+
 /* Copies the committed vector as an encoded value, and its source. */
 cdb_status cdb_vec_get(cdb_db *db, uint64_t store, uint64_t entry, void *out, size_t cap, size_t *len,
                        uint64_t *source_store, uint64_t *source_entry);

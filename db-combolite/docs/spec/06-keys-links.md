@@ -49,6 +49,9 @@ The mapping is a **stored structure** that is kept up to date. Rankings are comp
 
 *Cardinality*, as in "matrix ordinality, cardinality", means **relationship cardinality**: one-to-one, one-to-many and many-to-many.
 
+- **One-to-many** means each target has at most one live source of that link type, like a parent. One-to-one also gives each source at most one live target.
+- **A pair is linked once.** Two entries can be linked under a type only once: a link that was removed or tombstoned is never revived, so its history stays.
+
 ### 6.6 Neuron mapping
 
 Neuron mapping is a **weighted graph of links between entries**, designed for agent memory.
@@ -60,6 +63,10 @@ Neuron mapping is a **weighted graph of links between entries**, designed for ag
 
 - **By default**, links that point to a deleted entry are kept and marked as **tombstones** (dangling). History stays intact, which governance records require.
 - **The behaviour can be configured per link type.** A link type can instead specify cascade (the links are deleted along with the entry) or refuse (the entry can't be deleted while links to it exist).
+- **Both directions.** A deleted entry's links into it and out of it are tombstoned, each marked with the end that is gone. Removing a link also tombstones it.
+- **Refuse is checked when the delete is made.** A refuse-type link that is still found when the delete is applied (during recovery, say) is tombstoned: applying a committed change never fails.
+- **Dropping a store** tombstones every link with an end in it, whatever the link type, as part of the drop.
+- **Ends must exist.** Both ends of a new link must exist when it is made, as the open transaction sees them.
 
 ### 6.8 How the stored rankings are kept up to date
 
@@ -77,6 +84,7 @@ The operator decides how strictly each link type's declared cardinality (6.5) is
 
 - **What teaches a weight.** Several signals count as entries being used together: being read in the same query, being used in the same session, and an explicit **reinforce** call from the application. The best mix of these signals, and the rules for how weights fade over time, will be settled by experiment during development.
 - **Batched weight updates.** A change to a weight is first written to a delta track (Section 1.3). The changes are then applied in batches during reconciliation, not on every read.
+- **Time.** A link records when it was created or last reinforced, in nanoseconds since the Unix epoch: the platform clock when there is one, otherwise a time the application gives. Until the learning rules are settled, an explicit reinforce sets a link's weight and time directly.
 
 ### 6.11 Links that cross an encryption boundary live in a joined store
 

@@ -98,6 +98,10 @@ cdb_status cdb_doc_search(cdb_db *db, uint64_t store, const char *query, size_t 
  * other models that refer to documents. CDB_E_INVALID_ARG: not a pool. */
 cdb_status cdb_doc_head(cdb_db *db, uint64_t store, uint64_t entry, uint64_t *rev, int *live);
 
+/* Whether a document exists as the open transaction sees it (for links).
+ * CDB_E_INVALID_ARG: not a document pool; CDB_E_NOT_FOUND: no such store. */
+cdb_status cdb_doc_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *live);
+
 /* Buffer sizes for a page size and doc_max (0: bodies fit one page). */
 size_t cdb_doc_buffer_size(size_t page_size, size_t doc_max);
 size_t cdb_doc_buffers_size(size_t page_size, size_t doc_max);

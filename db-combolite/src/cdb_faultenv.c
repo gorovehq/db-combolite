@@ -228,9 +228,24 @@ static cdb_status fe_sync_dir(void *ctx, const char *path)
     return CDB_OK;
 }
 
+static cdb_status fe_now(void *ctx, int64_t *ns)
+{
+    cdb_faultenv *fe = (cdb_faultenv *)ctx;
+    if (!fe->has_time)
+        return CDB_E_UNSUPPORTED;
+    *ns = fe->time_ns;
+    return CDB_OK;
+}
+
 static const cdb_env_ops faultenv_ops = {
-    fe_open, fe_remove, fe_rename, fe_mkdir, fe_rmdir, fe_exists, fe_sync_dir
+    fe_open, fe_remove, fe_rename, fe_mkdir, fe_rmdir, fe_exists, fe_sync_dir, fe_now
 };
+
+void cdb_faultenv_set_time(cdb_faultenv *fe, int on, int64_t ns)
+{
+    fe->has_time = on;
+    fe->time_ns = ns;
+}
 
 cdb_status cdb_faultenv_init(cdb_faultenv *fe, const cdb_faultenv_config *cfg, cdb_env *out)
 {

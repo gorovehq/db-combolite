@@ -5,6 +5,7 @@
 #include "cdb_doc.h"
 #include "cdb_endian.h"
 #include "cdb_key.h"
+#include "cdb_link.h"
 #include "cdb_varint.h"
 #include "cdb_vec.h"
 
@@ -1739,7 +1740,9 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
             && (s = cdb_index_delete(&c->sources, k, k_source(k, r.source_store, r.source_entry, d->entry_id),
                                      &found)) != CDB_OK)
             return s;
-        return cdb_index_delete(&c->entries, k, k_u64(k, d->entry_id), &found);
+        if ((s = cdb_index_delete(&c->entries, k, k_u64(k, d->entry_id), &found)) != CDB_OK)
+            return s;
+        return cdb_link_on_delete(db, d->store_id, d->entry_id); /* its links (spec 6.7) */
     default:
         return CDB_OK;
     }
@@ -1851,10 +1854,25 @@ cdb_status cdb_vec_delete(cdb_db *db, uint64_t store, uint64_t entry)
         return s;
     if (!live)
         return CDB_E_NOT_FOUND;
+    if ((s = cdb_link_check_delete(db, store, entry)) != CDB_OK)
+        return s; /* a refuse-type link points at it (spec 6.7) */
     if ((s = cdb_tx_put(db, store, entry, CDB_OP_DELETE, NULL, 0)) != CDB_OK)
         return s;
     c->touched_tx = db->tx_id;
     return CDB_OK;
+}
+
+cdb_status cdb_vec_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *live)
+{
+    coll *c;
+    entry_rec r;
+    cdb_status s;
+    *live = 0;
+    if ((s = coll_get(db, store, &c)) != CDB_OK)
+        return s;
+    if (entry == 0 || entry >= c->next_entry)
+        return CDB_OK;
+    return db->in_tx ? live_in_tx(db, c, entry, live) : entry_get(c, entry, &r, live);
 }
 
 /* -------------------------------------------------------- reading */

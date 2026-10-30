@@ -235,6 +235,10 @@ static cdb_status decode_store(cdb_catalog *cat, const uint8_t *p, size_t len, c
     if (cdb_value_validate(p, len, o, CDB_DECIMAL_COMPACT, 0) != CDB_OK
         || cdb_value_read(p, len, o, &obj) != CDB_OK || obj.type != CDB_TYPE_OBJECT)
         return CDB_E_CORRUPT;
+    if ((s = field_int(&obj, o, F_KIND, &v[F_KIND - 1])) != CDB_OK)
+        return s;
+    if (v[F_KIND - 1] != CDB_OBJ_STORE)
+        return CDB_E_NOT_FOUND; /* another kind of object: not a store */
     for (i = 0; i < 11; i++) {
         if (i + 1 == F_NAME)
             continue;
@@ -243,8 +247,7 @@ static cdb_status decode_store(cdb_catalog *cat, const uint8_t *p, size_t len, c
     }
     if ((s = cdb_value_object_get(&obj, o, F_NAME, &name, &found)) != CDB_OK)
         return s;
-    if (!found || name.type != CDB_TYPE_STRING || name.payload_len > CDB_CATALOG_NAME_MAX
-        || v[F_KIND - 1] != CDB_OBJ_STORE)
+    if (!found || name.type != CDB_TYPE_STRING || name.payload_len > CDB_CATALOG_NAME_MAX)
         return CDB_E_CORRUPT;
     memset(out, 0, sizeof *out);
     out->id = (uint64_t)v[F_ID - 1];
@@ -448,8 +451,11 @@ cdb_status cdb_catalog_create_store_ex(cdb_catalog *cat, const char *name, size_
     key k;
     cdb_status s;
 
-    if (model < CDB_MODEL_RELATIONAL || model > CDB_MODEL_TIME_SERIES || (vector == NULL && vector_len)
+    if (model < CDB_MODEL_RELATIONAL || model > CDB_MODEL_LINK || (vector == NULL && vector_len)
         || vector_len > CDB_CATALOG_SETTINGS_MAX)
+        return CDB_E_INVALID_ARG;
+    /* Names starting with '$' are the engine's own; only the link store has one. */
+    if (name != NULL && len > 0 && (name[0] == '$') != (model == CDB_MODEL_LINK))
         return CDB_E_INVALID_ARG;
     if ((s = ensure_created(cat)) != CDB_OK)
         return s;
@@ -719,4 +725,119 @@ cdb_status cdb_catalog_field_name(cdb_catalog *cat, uint64_t store_id, uint64_t 
     if ((s = get_either(cat, &k, name, cap, len, &found)) != CDB_OK)
         return s;
     return found ? CDB_OK : CDB_E_NOT_FOUND;
+}
+
+/* -------------------------------------------------------- link types */
+
+/* Link-type record (spec 14.13): kind, ID, name, then these fields. */
+enum { LT_CARDINALITY = 4, LT_ENFORCED, LT_ON_DELETE };
+
+cdb_status cdb_catalog_find_link_type(cdb_catalog *cat, const char *name, size_t len, uint64_t *id, int *found)
+{
+    uint8_t v[8];
+    size_t vlen;
+    key k;
+    cdb_status s;
+    if ((s = k_name(&k, CDB_OBJ_LINK_TYPE, name, len)) != CDB_OK)
+        return s;
+    if ((s = get_either(cat, &k, v, sizeof v, &vlen, found)) != CDB_OK)
+        return s;
+    if (*found) {
+        if (vlen != 8)
+            return CDB_E_CORRUPT;
+        *id = cdb_load_u64(v, CDB_ORDER_BIG);
+    }
+    return CDB_OK;
+}
+
+cdb_status cdb_catalog_create_link_type(cdb_catalog *cat, const cdb_link_type_info *in, uint64_t *id)
+{
+    uint8_t ref[REF_SIZE], idv[8];
+    uint64_t existing, next;
+    size_t len;
+    int found;
+    cdb_value_writer w;
+    key k;
+    cdb_status s;
+
+    if ((s = ensure_created(cat)) != CDB_OK)
+        return s;
+    if ((s = check_name(cat, in->name, in->name_len)) != CDB_OK)
+        return s;
+    if ((s = cdb_catalog_find_link_type(cat, in->name, in->name_len, &existing, &found)) != CDB_OK)
+        return s;
+    if (found)
+        return CDB_E_EXISTS;
+    next = cdb_catalog_next_store_id(cat);
+    cdb_value_writer_init(&w, cat->page, cdb_page_capacity(cat->pager->fmt, cat->pager->page_size),
+                          cat->pager->order, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, F_KIND);         cdb_value_write_int(&w, CDB_OBJ_LINK_TYPE);
+    cdb_value_field(&w, F_ID);           cdb_value_write_int(&w, (int64_t)next);
+    cdb_value_field(&w, F_NAME);         cdb_value_write_string(&w, in->name, in->name_len);
+    cdb_value_field(&w, LT_CARDINALITY); cdb_value_write_int(&w, in->cardinality);
+    cdb_value_field(&w, LT_ENFORCED);    cdb_value_write_int(&w, in->enforced);
+    cdb_value_field(&w, LT_ON_DELETE);   cdb_value_write_int(&w, in->on_delete);
+    cdb_value_end_object(&w);
+    if (w.error != CDB_OK)
+        return w.error;
+    len = cdb_value_writer_len(&w);
+    if ((s = write_record(cat, ref, 1, cat->page, len)) != CDB_OK)
+        return s;
+    if ((s = k_object(&k, next)) != CDB_OK || (s = put_both(cat, &k, ref, REF_SIZE)) != CDB_OK)
+        return s;
+    cdb_store_u64(idv, next, CDB_ORDER_BIG);
+    if ((s = k_name(&k, CDB_OBJ_LINK_TYPE, in->name, in->name_len)) != CDB_OK
+        || (s = put_both(cat, &k, idv, sizeof idv)) != CDB_OK)
+        return s;
+    if ((s = finish(cat, next + 1)) != CDB_OK)
+        return s;
+    *id = next;
+    return CDB_OK;
+}
+
+cdb_status cdb_catalog_get_link_type(cdb_catalog *cat, uint64_t id, cdb_link_type_info *out)
+{
+    uint8_t ref[REF_SIZE];
+    const uint8_t *p;
+    size_t len, vlen;
+    int found;
+    cdb_byte_order o = cat->pager->order;
+    cdb_value obj, name;
+    int64_t v[6];
+    unsigned f;
+    key k;
+    cdb_status s;
+
+    if ((s = k_object(&k, id)) != CDB_OK || (s = get_either(cat, &k, ref, REF_SIZE, &vlen, &found)) != CDB_OK)
+        return s;
+    if (!found)
+        return CDB_E_NOT_FOUND;
+    if (vlen != REF_SIZE)
+        return CDB_E_CORRUPT;
+    if ((s = read_record(cat, ref, &p, &len)) != CDB_OK)
+        return s;
+    if (cdb_value_validate(p, len, o, CDB_DECIMAL_COMPACT, 0) != CDB_OK || cdb_value_read(p, len, o, &obj) != CDB_OK
+        || obj.type != CDB_TYPE_OBJECT)
+        return CDB_E_CORRUPT;
+    if ((s = field_int(&obj, o, F_KIND, &v[0])) != CDB_OK)
+        return s;
+    if (v[0] != CDB_OBJ_LINK_TYPE)
+        return CDB_E_NOT_FOUND;
+    for (f = F_ID; f <= LT_ON_DELETE; f++)
+        if (f != F_NAME && (s = field_int(&obj, o, f, &v[f - 1u])) != CDB_OK)
+            return s;
+    if ((s = cdb_value_object_get(&obj, o, F_NAME, &name, &found)) != CDB_OK)
+        return s;
+    if (!found || name.type != CDB_TYPE_STRING || name.payload_len > CDB_CATALOG_NAME_MAX || (uint64_t)v[1] != id
+        || v[3] < 0 || v[3] > 255 || v[4] < 0 || v[4] > 1 || v[5] < 0 || v[5] > 255)
+        return CDB_E_CORRUPT;
+    memset(out, 0, sizeof *out);
+    out->id = id;
+    memcpy(out->name, name.payload, name.payload_len);
+    out->name_len = name.payload_len;
+    out->cardinality = (uint8_t)v[3];
+    out->enforced = (uint8_t)v[4];
+    out->on_delete = (uint8_t)v[5];
+    return CDB_OK;
 }

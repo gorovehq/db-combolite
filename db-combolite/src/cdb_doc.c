@@ -6,6 +6,7 @@
 #include "cdb_endian.h"
 #include "cdb_fts.h"
 #include "cdb_key.h"
+#include "cdb_link.h"
 #include "cdb_overflow.h"
 #include "cdb_schema.h"
 #include "cdb_vec.h"
@@ -925,7 +926,9 @@ static cdb_status apply_change(cdb_db *db, const cdb_delta *d)
         if (!live)
             return CDB_OK;
         e.kind = CDB_REV_TOMBSTONE;
-        return commit_revision(db, pool, &e, 0);
+        if ((s = commit_revision(db, pool, &e, 0)) != CDB_OK)
+            return s;
+        return cdb_link_on_delete(db, d->store_id, d->entry_id); /* its links (spec 6.7) */
     default:
         return CDB_OK;
     }
@@ -975,6 +978,8 @@ cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
     (void)pager;
 
     /* The built-in apply serves every data model it knows. */
+    if (cdb_link_is_store(db, d->store_id))
+        return cdb_link_apply(db, d);
     if (cdb_vec_is_open(db, d->store_id)) {
         int handled;
         return cdb_vec_apply(db, d, &handled);
@@ -1484,9 +1489,29 @@ cdb_status cdb_doc_delete(cdb_db *db, uint64_t store, uint64_t entry)
         return s;
     if (!now.live)
         return CDB_E_NOT_FOUND;
+    if ((s = cdb_link_check_delete(db, store, entry)) != CDB_OK)
+        return s; /* a refuse-type link points at it (spec 6.7) */
     if ((s = cdb_tx_put(db, store, entry, CDB_OP_DELETE, NULL, 0)) != CDB_OK)
         return s;
     memset(&now, 0, sizeof now);
     stage_put(db, store, entry, &st, &now, NULL);
+    return CDB_OK;
+}
+
+cdb_status cdb_doc_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *live)
+{
+    struct cdb_doc_pool *pool;
+    staged st;
+    tx_view v;
+    cdb_status s;
+    *live = 0;
+    if ((s = pool_get(db, store, &pool)) != CDB_OK)
+        return s;
+    if (entry == 0 || entry >= pool->next_entry)
+        return CDB_OK;
+    stage_find(db, store, entry, &st);
+    if ((s = tx_doc(db, pool, entry, &st, 0, &v)) != CDB_OK)
+        return s;
+    *live = v.live;
     return CDB_OK;
 }

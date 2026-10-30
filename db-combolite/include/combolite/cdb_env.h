@@ -23,6 +23,9 @@ typedef struct cdb_env_ops {
     cdb_status (*exists)(void *ctx, const char *path, int *exists);
     /* Makes every create, remove and rename inside the directory durable. */
     cdb_status (*sync_dir)(void *ctx, const char *path);
+    /* Optional: the wall-clock time in nanoseconds since 1970-01-01 UTC.
+     * NULL, or CDB_E_UNSUPPORTED, means the platform has no clock. */
+    cdb_status (*now)(void *ctx, int64_t *ns);
 } cdb_env_ops;
 
 typedef struct cdb_env {
