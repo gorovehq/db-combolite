@@ -182,9 +182,15 @@ AES-GCM and ChaCha20-Poly1305 both take a 12-byte nonce:
   |---|---|
   | `0x0001` | anchor map |
   | `0x0002` | free space |
+  | `0x0003` | index node (14.8.7) |
+  | `0x0004` | catalog record (14.3) |
+  | `0x0005` | document revision (14.9.2) |
+  | `0x0006` | vector block (14.12.3) |
+  | `0x0007` | overflow (14.15) |
   | `0x7F00` | reserved for tests |
 
   Further page types are assigned IDs when they are built.
+- **Page header flags** (offset 5) take bits in the order Section 13 lists them: bit 0 compressed, bit 1 member of an extent, bit 2 overflow continuation, bit 3 tamper-evident, bit 4 written in `danger_mode`; bits 5–7 are reserved, zero. Only bit 2 is set so far.
 - **Zero means "none".** Logical page ID `0` and physical page `0` both mean "no page".
 - **Physical page numbers** count from the start of the file, in units of the file's page size. The **data area** starts after the two header slots (1,024 bytes) and the location-0 area (1,024 bytes), rounded up to a page boundary. System pages that are addressed physically, such as anchor-map and free-space pages, carry logical ID `0`, store `0` and domain `0`.
 
@@ -669,7 +675,8 @@ Index nodes are logical pages of type `0x0003`. A child pointer is a **logical p
 - **Splitting.** A node that overflows is split greedily into pieces about three quarters full, at most 16 pieces. The first key of each later piece becomes its separator.
 - **Splitting the root.** When the root splits, its contents move to new children, and the root, keeping its logical ID, becomes their parent one level higher.
 - **Deleting.** Underfull nodes are not merged. Empty nodes are removed, along with their parent entry. A root left with a single child absorbs that child.
-- **Size limits.** A key, and a value, may each be at most (capacity − 8) / 8 − 4 bytes, so that any four entries fit in one node.
+- **Size limits.** A key, and an inline value, may each be at most (capacity − 8) / 8 − 4 bytes, so that any four entries fit in one node.
+- **Overflow values.** A longer value (up to 2³² − 1 bytes) is kept in an overflow chain (14.15). Its leaf entry still records the value's full length; since that exceeds the inline limit, the bytes that follow are the chain's first logical ID, at the file's address width, instead of the value. Replacing or deleting the value releases its chain. Keys are always inline.
 
 **Key type ranks (14.8.4):**
 
@@ -720,7 +727,8 @@ Documents (Section 8) and rows of row-oriented tables (Section 9) share one **re
   - An ordered index keyed by *(entry ID, revision ID)* locates every revision.
   - A second index, keyed by entry ID, points to each entry's **head** revision.
 - **Pages.** Records are packed into document or row pages behind a slot directory, in the same way as index leaves (14.8.3).
-  - *Current implementation:* each document revision occupies one logical page of type `0x0005`: the page header (13), then the envelope. A revision must fit in one page until overflow pages (14.15) exist. Packing several revisions per page is deferred.
+  - *Current implementation:* each document revision occupies one logical page of type `0x0005`: the page header (13), then the envelope. Envelope flags: bit 0 has summary, bit 1 body in overflow. With bit 1 set, the summary (if any) is followed by the body's total length (8 bytes) and the first logical ID of an overflow chain (address width), then as much of the body as the page holds; the chain (14.15) holds the rest. The summary always stays in the revision page. Packing several revisions per page is deferred.
+  - *Size:* the operator's `doc_max` bounds a document body; 0 means the whole revision fits one page. Callers supply buffers of that size, since the core does not allocate. Revisions are history and keep their chains.
 - **Index values.**
   - **Head index** (key: entry ID): 21 bytes — head revision ID (8), revision page ID (8), chain length since the last original or checkpoint (4), revision kind (1).
   - **Revisions index** (key: entry ID, revision ID): the revision page ID (8).
@@ -746,7 +754,7 @@ The data-change payloads (14.4.5) for document pools, keyed by store and entry:
 
 **Applying never fails for logical reasons.** The built-in document apply runs again during recovery, so a change to a missing or deleted document, or to a dropped or non-document store, does nothing instead of failing. A failure there would recur on every reopen. Input is validated when the change is made, inside the transaction.
 
-**Every revision fits its page.** A change is checked against the document as the transaction sees it, including the transaction's own earlier changes. The resulting document, with the summary it will carry, must fit in one revision page, so a later checkpoint always fits. Otherwise the change is refused with *overflow* and nothing is journaled. A change to a document that is missing or deleted at that point is refused with *not found*. When a replace's patch form would not fit its page, the apply writes the whole document as a checkpoint instead.
+**Every revision is within the limits.** A change is checked against the document as the transaction sees it, including the transaction's own earlier changes. The resulting document, with the summary it will carry, must fit: envelope and summary in the revision page, and the body there too, or with `doc_max` set, within `doc_max` bytes. So a later checkpoint always fits. Otherwise the change is refused with *overflow* and nothing is journaled. A patch is a delta revision's body and is held to the same limit. A change to a document that is missing or deleted at that point is refused with *not found*. When a replace's patch form would not fit the work buffer, the apply writes the whole document as a checkpoint instead.
 
 ### 14.9.4 Document schemas (Section 8.3)
 
@@ -983,6 +991,7 @@ The structures above are built from three ordered indexes (14.8). Prefix-compres
 ## 14.15 Blobs and overflow pages
 
 - **Overflow chain.** An overflow page holds the logical ID of the next page in the chain (or 0 at the end), followed by a payload. A value that doesn't fit in its page continues along this chain.
+  - *Current implementation:* overflow pages have type `0x0007` and the overflow-continuation header flag (bit 2), and belong to the store of the value they hold. The next page's ID is written at the file's address width, in the file's byte order. Every page but the last is full; the owner records the value's total length and the chain's first page, so a reader checks each page's type, store and payload length against what the chain still needs. Chains are logical pages like any other, so an uncommitted chain disappears with its change. Used by index values (14.8.7) and document bodies (14.9.2).
 - **Blobs.** Attachments (Section 8.4) are stored as **extents** of contiguous pages wherever possible. A blob record holds:
   - the content hash;
   - the total length;

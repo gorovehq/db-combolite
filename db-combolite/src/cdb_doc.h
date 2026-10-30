@@ -16,7 +16,15 @@
  * sees it; a violation is CDB_E_SCHEMA and nothing is journaled. Existing
  * documents are not re-validated when the schema changes (spec 4.3).
  *
- * Buffers: cdb_db_config.doc_buffers holds six page_size buffers, and
+ * Size: with cdb_db_config.doc_max 0, a revision (envelope, summary and
+ * body) fits one page. With doc_max set, a body may be up to doc_max bytes:
+ * what does not fit the revision page continues in an overflow chain (spec
+ * 14.15). The summary always fits the revision page.
+ *
+ * Buffers: cdb_db_config.doc_buffers holds cdb_doc_buffers_size() bytes:
+ * three document buffers (cdb_doc_buffer_size() each: doc_max and a page,
+ * or one page) and three page_size buffers. A change's journal record holds
+ * the whole body, so record_buf must hold doc_max plus two pages.
  * cdb_db_config.catalog_work is shared with the pool indexes. For pools with
  * a schema, the optional cdb_db_config.doc_stage caches the state of each
  * document the open transaction changed (24 bytes plus the document). It
@@ -89,6 +97,10 @@ cdb_status cdb_doc_search(cdb_db *db, uint64_t store, const char *query, size_t 
 /* The head revision of a document (0 and *live 0 when there is none), for
  * other models that refer to documents. CDB_E_INVALID_ARG: not a pool. */
 cdb_status cdb_doc_head(cdb_db *db, uint64_t store, uint64_t entry, uint64_t *rev, int *live);
+
+/* Buffer sizes for a page size and doc_max (0: bodies fit one page). */
+size_t cdb_doc_buffer_size(size_t page_size, size_t doc_max);
+size_t cdb_doc_buffers_size(size_t page_size, size_t doc_max);
 
 /* Engine hooks used by cdb_db. */
 cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d);

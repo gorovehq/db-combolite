@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "combolite/cdb_value.h"
+#include "cdb_doc.h"
 #include "cdb_endian.h"
 #include "cdb_fts.h"
 #include "cdb_key.h"
@@ -15,9 +16,21 @@
 /* Settings fields (spec 14.14). */
 enum { S_TERMS = 1, S_POSTINGS, S_LENGTHS, S_SPLITTER, S_SUMMARY, S_PATHS };
 
-static uint8_t *fts_buf(cdb_db *db, unsigned i)
+size_t cdb_fts_buffers_size(size_t page_size, size_t doc_max)
 {
-    return db->cfg.fts_buffers + (size_t)i * db->pager.page_size;
+    return cdb_doc_buffer_size(page_size, doc_max) + 2u * page_size;
+}
+
+size_t cdb_fts_tokens_needed(size_t page_size, size_t doc_max)
+{
+    return doc_max ? 2u * (doc_max + page_size) : 2u * page_size;
+}
+
+/* fts_buffers: a document's earlier body and summary (cdb_doc), then the
+ * cursor page. */
+static uint8_t *cursor_page(cdb_db *db)
+{
+    return db->cfg.fts_buffers + cdb_doc_buffer_size(db->pager.page_size, db->cfg.doc_max) + db->pager.page_size;
 }
 
 /* -------------------------------------------------------- words */
@@ -481,7 +494,7 @@ static cdb_status advance(cdb_db *db, struct cdb_doc_pool *pool, term_state *t, 
     cdb_status s;
     memcpy(k, t->prefix, t->plen);
     cdb_store_u64(k + t->plen, from, CDB_ORDER_BIG);
-    if ((s = cdb_index_seek(&c, &pool->fts_postings, fts_buf(db, 2), k, t->plen + 8u)) != CDB_OK)
+    if ((s = cdb_index_seek(&c, &pool->fts_postings, cursor_page(db), k, t->plen + 8u)) != CDB_OK)
         return s;
     if ((s = cdb_index_next(&c, got, sizeof got, &klen, v, sizeof v, &vlen, &done)) != CDB_OK)
         return s;

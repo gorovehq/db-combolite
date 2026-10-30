@@ -41,6 +41,7 @@ add_library(combolite
   src/cdb_header.c
   src/cdb_page.c
   src/cdb_pager.c
+  src/cdb_overflow.c
   src/cdb_hostenv.c
   src/cdb_journal.c
   src/cdb_db.c

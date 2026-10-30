@@ -26,6 +26,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M11 | Full-text search: term dictionary, postings, BM25 (spec 8.10, 14.14) | done |
 | M12 | Vector collections: blocks, exact search, sources with staleness (spec 7, 14.12) | done |
 | M13 | Neighbour graph: stored rankings and approximate search (spec 6.4, 6.8, 7.4) | done |
+| M14 | Overflow pages: index values and document bodies larger than a page (spec 14.8.7, 14.9.2, 14.15) | done |
 
 ## Commands
 
@@ -79,9 +80,10 @@ These were agreed with the user:
 - **Engine layers, bottom up:**
   - `cdb_storage` and `cdb_env`: files and directories.
   - `cdb_header`, `cdb_page` and `cdb_pager`: the archive. The pager provides copy-on-write logical pages.
-  - `cdb_key` and `cdb_index`: order-preserving keys and the B+tree. Index nodes are logical pages, so the pager's copy-on-write sits underneath, and an index's root logical ID never changes.
+  - `cdb_overflow`: chains of overflow pages (type `0x0007`) for values longer than the page that refers to them. The owner keeps the length and first page.
+  - `cdb_key` and `cdb_index`: order-preserving keys and the B+tree. Index nodes are logical pages, so the pager's copy-on-write sits underneath, and an index's root logical ID never changes. A value longer than `cdb_index_max_value()` goes to an overflow chain; keys are always inline.
   - `cdb_catroot` and `cdb_catalog`: the catalog. Root slots sit at location 0, and the body is one mirrored B+tree with prefixed keys. Catalog changes commit immediately.
-  - `cdb_doc`: document pools. It provides insert, replace, patch and delete inside transactions, revision history, and the built-in apply hook. **The apply hook must never fail for logical reasons**, because it runs again during recovery.
+  - `cdb_doc`: document pools. It provides insert, replace, patch and delete inside transactions, revision history, and the built-in apply hook. **The apply hook must never fail for logical reasons**, because it runs again during recovery. With `cdb_db_config.doc_max` set, a body may be that large and continues past its revision page in an overflow chain. The caller sizes buffers with `cdb_doc_buffers_size()`, `cdb_fts_buffers_size()` and `cdb_fts_tokens_needed()`, and `record_buf` must hold `doc_max` plus two pages. `tests/test_bigdoc.c` covers this; `test_doc.c` covers `doc_max` 0.
   - `cdb_fts`: full-text search. Splits words, maintains the terms, postings and lengths indexes from each document's state before and after a change (called from the document apply), and ranks searches with BM25.
   - `cdb_vec`: vector collections. Vectors are packed into vector blocks, with entries, blocks and sources indexes. The built-in apply (`cdb_doc_apply`) dispatches vector stores here. Hits report whether their source document has changed since the vector was written.
     - **Neighbour graph** (optional, `cdb_vec_create_graph`): each entry's exact K nearest neighbours, in graph, reverse and pending indexes (spec 14.12.4). Commits only queue work; reconciliation refreshes a budget of pending entries, and `cdb_vec_refresh` does the rest.

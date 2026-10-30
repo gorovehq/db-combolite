@@ -18,11 +18,12 @@
  * The index changes in the document apply, at commit, from the document's
  * state before and after: it never fails for logical reasons.
  *
- * Buffers: cdb_db_config.fts_buffers holds three page_size buffers;
- * fts_tokens holds fts_tokens_cap words, at least 2 * page_size. A revision
- * (body and summary) fits one page (spec 14.9.3), so it has fewer words
- * than page_size, and both versions of a changed document always fit:
- * no word is ever left out. Pools are refused with a smaller array. */
+ * Buffers: cdb_db_config.fts_buffers holds cdb_fts_buffers_size() bytes: a
+ * document buffer (cdb_doc.h) and two page_size buffers. fts_tokens holds
+ * fts_tokens_cap words, at least cdb_fts_tokens_needed(): a version of a
+ * document has fewer words than bytes (body up to doc_max, or one page in
+ * all; summary within a page), so both versions of a changed document always
+ * fit and no word is ever left out. Pools are refused with a smaller array. */
 #ifndef CDB_FTS_H
 #define CDB_FTS_H
 
@@ -67,6 +68,10 @@ cdb_status cdb_fts_encode(const cdb_fts_config *cfg, uint64_t terms, uint64_t po
                           cdb_byte_order order, uint8_t *out, size_t cap, size_t *len);
 cdb_status cdb_fts_decode(const uint8_t *in, size_t len, cdb_byte_order order, cdb_fts_config *cfg,
                           uint64_t *terms, uint64_t *postings, uint64_t *lengths);
+
+/* Buffer sizes for a page size and doc_max (cdb_doc.h). */
+size_t cdb_fts_buffers_size(size_t page_size, size_t doc_max);
+size_t cdb_fts_tokens_needed(size_t page_size, size_t doc_max);
 
 /* Index maintenance and search, for cdb_doc. */
 cdb_status cdb_fts_create(cdb_db *db, struct cdb_doc_pool *pool);

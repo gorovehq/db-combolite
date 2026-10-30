@@ -6,6 +6,7 @@
 #include "cdb_endian.h"
 #include "cdb_fts.h"
 #include "cdb_key.h"
+#include "cdb_overflow.h"
 #include "cdb_schema.h"
 #include "cdb_vec.h"
 #include "cdb_varint.h"
@@ -15,6 +16,7 @@
  * then the summary (a string value) if flagged, then the body. */
 #define ENV_SIZE 48u
 #define ENV_FLAG_SUMMARY 0x01u
+#define ENV_FLAG_OVERFLOW 0x02u /* body length (8) and chain (address width) follow the summary */
 
 /* Head index value: revision, page, chain length, kind. */
 #define HEAD_SIZE 21u
@@ -33,12 +35,50 @@ static size_t capacity(const cdb_db *db)
     return cdb_page_capacity(db->pager.fmt, db->pager.page_size);
 }
 
-static uint8_t *buf(cdb_db *db, unsigned i)
+size_t cdb_doc_buffer_size(size_t page_size, size_t doc_max)
 {
-    return db->cfg.doc_buffers + (size_t)i * db->pager.page_size;
+    return doc_max ? doc_max + page_size : page_size;
 }
 
-enum { B_DOC0 = 0, B_DOC1 = 1, B_PAGE = 2, B_WORK = 3, B_SUMMARY = 4, B_SCHEMA = 5 };
+size_t cdb_doc_buffers_size(size_t page_size, size_t doc_max)
+{
+    return 3u * cdb_doc_buffer_size(page_size, doc_max) + 3u * page_size;
+}
+
+/* The longest body a document may have. */
+static size_t body_max(const cdb_db *db)
+{
+    return db->cfg.doc_max ? db->cfg.doc_max : capacity(db);
+}
+
+static size_t dbuf_size(const cdb_db *db)
+{
+    return cdb_doc_buffer_size(db->pager.page_size, db->cfg.doc_max);
+}
+
+/* Document buffers first (a body, or a change payload in B_WORK), then the
+ * page-sized ones. */
+enum { B_DOC0 = 0, B_DOC1 = 1, B_WORK = 2, B_PAGE = 3, B_SUMMARY = 4, B_SCHEMA = 5 };
+
+static uint8_t *buf(cdb_db *db, unsigned i)
+{
+    if (i <= B_WORK)
+        return db->cfg.doc_buffers + (size_t)i * dbuf_size(db);
+    return db->cfg.doc_buffers + 3u * dbuf_size(db) + (size_t)(i - B_PAGE) * db->pager.page_size;
+}
+
+static uint64_t load_lid(const cdb_db *db, const uint8_t *b)
+{
+    return db->pager.addr_width == 8 ? cdb_load_u64(b, db->pager.order) : cdb_load_u32(b, db->pager.order);
+}
+
+static void store_lid(const cdb_db *db, uint8_t *b, uint64_t lid)
+{
+    if (db->pager.addr_width == 8)
+        cdb_store_u64(b, lid, db->pager.order);
+    else
+        cdb_store_u32(b, (uint32_t)lid, db->pager.order);
+}
 
 static unsigned checkpoint_every(const cdb_db *db)
 {
@@ -86,7 +126,8 @@ static cdb_status pool_get(cdb_db *db, uint64_t store, struct cdb_doc_pool **out
     }
     if (info.full_text_len) {
         uint64_t terms, postings, lengths;
-        if (db->cfg.fts_buffers == NULL || db->cfg.fts_tokens == NULL || db->cfg.fts_tokens_cap < 2u * (size_t)db->pager.page_size)
+        if (db->cfg.fts_buffers == NULL || db->cfg.fts_tokens == NULL
+            || db->cfg.fts_tokens_cap < cdb_fts_tokens_needed(db->pager.page_size, db->cfg.doc_max))
             return CDB_E_UNSUPPORTED; /* the index would fall behind its documents */
         if ((s = cdb_fts_decode(info.full_text, info.full_text_len, db->pager.order, &free_slot->fts, &terms,
                                 &postings, &lengths)) != CDB_OK)
@@ -217,8 +258,12 @@ typedef struct envelope {
     size_t body_len;
 } envelope;
 
-/* Reads revision page lid into the page buffer and parses its envelope. */
-static cdb_status read_revision(cdb_db *db, uint64_t lid, envelope *e)
+/* Reads revision page lid into the page buffer and parses its envelope. The
+ * body and summary point into the page buffer, except for a body in an
+ * overflow chain: with dest it is gathered there (and the summary moves to
+ * the summary buffer, since the page buffer reads the chain); without dest,
+ * e->body is NULL and only its length is known. */
+static cdb_status read_revision(cdb_db *db, uint64_t lid, envelope *e, uint8_t *dest)
 {
     cdb_page_header h;
     const uint8_t *pl, *p, *end;
@@ -250,32 +295,80 @@ static cdb_status read_revision(cdb_db *db, uint64_t lid, envelope *e)
         e->summary_len = v.payload_len;
         p += v.encoded_len;
     }
+    if (e->flags & ENV_FLAG_OVERFLOW) {
+        size_t aw = db->pager.addr_width, inline_len;
+        uint64_t total, first;
+        if ((size_t)(end - p) < 8u + aw)
+            return CDB_E_CORRUPT;
+        total = cdb_load_u64(p, o);
+        first = load_lid(db, p + 8);
+        p += 8u + aw;
+        inline_len = (size_t)(end - p);
+        if (total <= inline_len || total > body_max(db))
+            return CDB_E_CORRUPT; /* or doc_max was lowered */
+        e->body_len = (size_t)total;
+        if (dest == NULL)
+            return CDB_OK;
+        if (e->summary) {
+            memmove(buf(db, B_SUMMARY), e->summary, e->summary_len);
+            e->summary = buf(db, B_SUMMARY);
+        }
+        memcpy(dest, p, inline_len);
+        e->body = dest;
+        return cdb_overflow_read(&db->pager, first, h.store_id, dest + inline_len, e->body_len - inline_len,
+                                 buf(db, B_PAGE));
+    }
     e->body = p;
     e->body_len = (size_t)(end - p);
     return CDB_OK;
 }
 
-/* Whether a revision with this summary and body fits in one page. */
+/* Bytes the summary takes in a revision page: a string value. */
+static size_t summary_bytes(int has_summary, size_t summary_len)
+{
+    return has_summary ? 1u + cdb_varint_size(summary_len) + summary_len : 0u;
+}
+
+/* Whether a revision with this summary and body can be written: the
+ * envelope and summary fit the revision page, and the body fits there too
+ * or, with doc_max set, is at most doc_max bytes (an overflow chain holds
+ * the rest, after its length and first page). */
 static int revision_fits(const cdb_db *db, int has_summary, size_t summary_len, size_t body_len)
 {
     size_t cap = capacity(db), need = ENV_SIZE;
-    if (has_summary) {
-        if (summary_len > cap)
-            return 0;
-        need += 1u + cdb_varint_size(summary_len) + summary_len;
-    }
-    return need <= cap && body_len <= cap - need;
+    if (has_summary && summary_len > cap)
+        return 0;
+    need += summary_bytes(has_summary, summary_len);
+    if (need > cap)
+        return 0;
+    if (body_len <= cap - need)
+        return 1;
+    return db->cfg.doc_max && body_len <= db->cfg.doc_max && need + 8u + db->pager.addr_width <= cap;
 }
 
-/* Builds a revision payload in the page buffer and writes it to a new page. */
+/* Builds a revision payload in the page buffer and writes it to a new page.
+ * A body that does not fit goes first to an overflow chain, all but the
+ * part the revision page holds; the chain uses the page buffer meanwhile. */
 static cdb_status write_revision(cdb_db *db, struct cdb_doc_pool *pool, const envelope *e, uint64_t *lid)
 {
     uint8_t *pl = buf(db, B_PAGE);
-    size_t cap = capacity(db), len = ENV_SIZE;
+    size_t cap = capacity(db), len = ENV_SIZE, inline_len = e->body_len;
+    size_t head = ENV_SIZE + summary_bytes(e->summary != NULL, e->summary_len);
     cdb_byte_order o = db->pager.order;
+    uint64_t first = 0;
     cdb_page_header t;
     cdb_status s;
 
+    if (head > cap)
+        return CDB_E_OVERFLOW;
+    if (e->body_len > cap - head) {
+        if (!revision_fits(db, e->summary != NULL, e->summary_len, e->body_len))
+            return CDB_E_OVERFLOW;
+        inline_len = cap - head - 8u - db->pager.addr_width;
+        if ((s = cdb_overflow_write(&db->pager, pool->store_id, e->body + inline_len, e->body_len - inline_len, pl,
+                                    &first)) != CDB_OK)
+            return s;
+    }
     memset(pl, 0, ENV_SIZE);
     cdb_store_u64(pl, e->entry, o);
     cdb_store_u64(pl + 8, e->rev, o);
@@ -284,7 +377,7 @@ static cdb_status write_revision(cdb_db *db, struct cdb_doc_pool *pool, const en
     cdb_store_u64(pl + 32, e->principal, o);
     cdb_store_u32(pl + 40, e->schema, o);
     pl[44] = e->kind;
-    pl[45] = e->summary ? (uint8_t)ENV_FLAG_SUMMARY : 0u;
+    pl[45] = (uint8_t)((e->summary ? ENV_FLAG_SUMMARY : 0u) | (first ? ENV_FLAG_OVERFLOW : 0u));
     if (e->summary) {
         cdb_value_writer w;
         cdb_value_writer_init(&w, pl + len, cap - len, o, CDB_DECIMAL_COMPACT);
@@ -292,11 +385,16 @@ static cdb_status write_revision(cdb_db *db, struct cdb_doc_pool *pool, const en
             return s == CDB_E_BUFFER_TOO_SMALL ? CDB_E_OVERFLOW : s;
         len += cdb_value_writer_len(&w);
     }
-    if (e->body_len > cap - len)
-        return CDB_E_OVERFLOW; /* documents larger than a page need overflow pages */
-    if (e->body_len)
-        memmove(pl + len, e->body, e->body_len);
-    len += e->body_len;
+    if (len != head)
+        return CDB_E_CORRUPT; /* the summary did not take the size counted */
+    if (first) {
+        cdb_store_u64(pl + len, (uint64_t)e->body_len, o);
+        store_lid(db, pl + len + 8, first);
+        len += 8u + db->pager.addr_width;
+    }
+    if (inline_len)
+        memmove(pl + len, e->body, inline_len);
+    len += inline_len;
     if ((s = cdb_pager_alloc(&db->pager, lid)) != CDB_OK)
         return s;
     memset(&t, 0, sizeof t);
@@ -482,7 +580,7 @@ static cdb_status apply_patch(cdb_db *db, unsigned *cur, size_t *len, const uint
             return CDB_E_CORRUPT;
         if (cdb_value_read(buf(db, *cur), *len, o, &doc) != CDB_OK || doc.type != CDB_TYPE_OBJECT)
             return CDB_E_CORRUPT;
-        cdb_value_writer_init(&w, buf(db, next), capacity(db), o, CDB_DECIMAL_COMPACT);
+        cdb_value_writer_init(&w, buf(db, next), dbuf_size(db), o, CDB_DECIMAL_COMPACT);
         if ((s = rewrite(&w, &doc, o, &op, 0)) != CDB_OK)
             return s == CDB_E_BUFFER_TOO_SMALL ? CDB_E_OVERFLOW : s;
         *cur = next;
@@ -504,7 +602,7 @@ static cdb_status diff(cdb_db *db, const uint8_t *a, size_t alen, const uint8_t 
 
     if (cdb_value_read(a, alen, o, &va) != CDB_OK || cdb_value_read(b, blen, o, &vb) != CDB_OK)
         return CDB_E_CORRUPT;
-    cdb_value_writer_init(&w, buf(db, B_WORK), capacity(db), o, CDB_DECIMAL_COMPACT);
+    cdb_value_writer_init(&w, buf(db, B_WORK), dbuf_size(db), o, CDB_DECIMAL_COMPACT);
     cdb_value_begin_array(&w);
     if ((s = cdb_value_object_iter(&va, o, &ia)) != CDB_OK || (s = cdb_value_object_iter(&vb, o, &ib)) != CDB_OK)
         return s;
@@ -589,7 +687,7 @@ static cdb_status materialize(cdb_db *db, struct cdb_doc_pool *pool, uint64_t en
             lid = head.lid;
         else if ((s = rev_lid(pool, entry, cur, &lid)) != CDB_OK)
             return s;
-        if ((s = read_revision(db, lid, &e)) != CDB_OK)
+        if ((s = read_revision(db, lid, &e, NULL)) != CDB_OK)
             return s;
         if (e.entry != entry || e.rev != cur)
             return CDB_E_CORRUPT;
@@ -609,22 +707,24 @@ static cdb_status materialize(cdb_db *db, struct cdb_doc_pool *pool, uint64_t en
     if (e.kind == CDB_REV_TOMBSTONE)
         return CDB_E_CORRUPT; /* a delta cannot follow a tombstone */
 
-    /* The full revision at the base of the chain, then each patch. */
-    if ((s = read_revision(db, lids[n - 1], &e)) != CDB_OK)
+    /* The full revision at the base of the chain, then each patch (patches
+     * in overflow chains are gathered in the work buffer). */
+    if ((s = read_revision(db, lids[n - 1], &e, buf(db, B_DOC0))) != CDB_OK)
         return s;
-    memcpy(buf(db, B_DOC0), e.body, e.body_len);
+    if (e.body != buf(db, B_DOC0))
+        memcpy(buf(db, B_DOC0), e.body, e.body_len);
     m->buffer = B_DOC0;
     m->len = e.body_len;
     if (e.summary) {
-        memcpy(buf(db, B_SUMMARY), e.summary, e.summary_len);
+        memmove(buf(db, B_SUMMARY), e.summary, e.summary_len);
         m->has_summary = 1;
         m->summary_len = e.summary_len;
     }
     for (i = n - 1; i-- > 0;) {
-        if ((s = read_revision(db, lids[i], &e)) != CDB_OK)
+        if ((s = read_revision(db, lids[i], &e, buf(db, B_WORK))) != CDB_OK)
             return s;
         if (e.summary) {
-            memcpy(buf(db, B_SUMMARY), e.summary, e.summary_len);
+            memmove(buf(db, B_SUMMARY), e.summary, e.summary_len);
             m->has_summary = 1;
             m->summary_len = e.summary_len;
         }
@@ -851,7 +951,7 @@ static cdb_status fts_capture(cdb_db *db, struct cdb_doc_pool *pool, uint64_t en
         out->summary_len = m.summary_len;
     }
     if (copy) {
-        uint8_t *b = db->cfg.fts_buffers, *sm = db->cfg.fts_buffers + db->pager.page_size;
+        uint8_t *b = db->cfg.fts_buffers, *sm = db->cfg.fts_buffers + dbuf_size(db);
         memcpy(b, out->body, out->body_len);
         out->body = b;
         if (out->summary) {
@@ -942,7 +1042,8 @@ cdb_status cdb_doc_create_full_text(cdb_db *db, uint64_t store, const cdb_fts_co
         return CDB_E_EXISTS;
     if ((s = cdb_fts_check_config(cfg)) != CDB_OK)
         return s;
-    if (db->cfg.fts_buffers == NULL || db->cfg.fts_tokens == NULL || db->cfg.fts_tokens_cap < 2u * (size_t)db->pager.page_size)
+    if (db->cfg.fts_buffers == NULL || db->cfg.fts_tokens == NULL
+        || db->cfg.fts_tokens_cap < cdb_fts_tokens_needed(db->pager.page_size, db->cfg.doc_max))
         return CDB_E_UNSUPPORTED;
     if ((s = cdb_db_catalog_begin(db)) != CDB_OK)
         return s;
@@ -954,7 +1055,7 @@ cdb_status cdb_doc_create_full_text(cdb_db *db, uint64_t store, const cdb_fts_co
         uint8_t k[16], v[HEAD_SIZE];
         size_t klen, vlen;
         int done;
-        s = cdb_index_seek(&c, &pool->head, db->cfg.fts_buffers + 2u * db->pager.page_size, NULL, 0);
+        s = cdb_index_seek(&c, &pool->head, db->cfg.fts_buffers + dbuf_size(db) + db->pager.page_size, NULL, 0);
         while (s == CDB_OK) {
             cdb_fts_doc none, doc;
             if ((s = cdb_index_next(&c, k, sizeof k, &klen, v, sizeof v, &vlen, &done)) != CDB_OK || done)
@@ -1266,7 +1367,7 @@ static cdb_status put_body(cdb_db *db, struct cdb_doc_pool *pool, int guarded, u
         return CDB_E_INVALID_ARG;
     if (summary == NULL && summary_len)
         return CDB_E_INVALID_ARG;
-    if (summary_len > cap || body_len > cap)
+    if (summary_len > cap || body_len > body_max(db))
         return CDB_E_OVERFLOW;
     stage_find(db, pool->store_id, entry, &st);
     memset(&now, 0, sizeof now);
@@ -1282,7 +1383,7 @@ static cdb_status put_body(cdb_db *db, struct cdb_doc_pool *pool, int guarded, u
         now.has_summary = 1;
         now.summary_len = summary_len;
     }
-    /* The revision must fit in one page, with the summary it will carry. */
+    /* The revision must be writable, with the summary it will carry. */
     if (!revision_fits(db, now.has_summary, now.summary_len, body_len))
         return CDB_E_OVERFLOW;
     if (guarded && (s = schema_validate(db, (const uint8_t *)body, body_len)) != CDB_OK)
@@ -1347,8 +1448,8 @@ cdb_status cdb_doc_patch(cdb_db *db, uint64_t store, uint64_t entry, const void 
         return CDB_E_NOT_FOUND;
     if (patch == NULL || validate_patch((const uint8_t *)patch, patch_len, db->pager.order) != CDB_OK)
         return CDB_E_INVALID_ARG;
-    if (ENV_SIZE + patch_len > capacity(db))
-        return CDB_E_OVERFLOW;
+    if (!revision_fits(db, 0, 0, patch_len))
+        return CDB_E_OVERFLOW; /* the patch is a delta revision's body */
     stage_find(db, store, entry, &st);
     if ((s = tx_doc(db, pool, entry, &st, 1, &now)) != CDB_OK)
         return s;

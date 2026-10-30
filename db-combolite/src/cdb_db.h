@@ -78,11 +78,13 @@ typedef struct cdb_db_config {
     unsigned flags;
     cdb_index_work catalog_work;  /* optional: the catalog is available when set */
     uint8_t *catalog_page;        /* page_size bytes, with catalog_work */
-    uint8_t *doc_buffers;         /* documents: 6 * page_size bytes (cdb_doc.h) */
+    uint8_t *doc_buffers;         /* documents: cdb_doc_buffers_size() bytes (cdb_doc.h) */
+    size_t doc_max;               /* documents: largest body in bytes, kept in overflow pages
+                                     past the revision page; 0 means a body fits one page */
     unsigned checkpoint_every;    /* documents: full revision every N; 0 means 16 */
     uint8_t *doc_stage;           /* documents: per-transaction staging (cdb_doc.h) */
     size_t doc_stage_size;
-    uint8_t *fts_buffers;         /* full-text: 3 * page_size bytes (cdb_fts.h) */
+    uint8_t *fts_buffers;         /* full-text: cdb_fts_buffers_size() bytes (cdb_fts.h) */
     uint8_t *vec_buffers;         /* vectors: 3 * page_size bytes (cdb_vec.h) */
     uint8_t *vec_work;            /* vectors with a neighbour graph: working memory (cdb_vec.h) */
     size_t vec_work_size;
@@ -91,7 +93,7 @@ typedef struct cdb_db_config {
     uint64_t vec_exact_below;     /* automatic path: exact below this many vectors; 0 means 10000 */
     unsigned vec_mode;            /* operator's search path: CDB_VEC_AUTO, _EXACT or _APPROX */
     cdb_fts_token *fts_tokens;    /* full-text: words of two document versions */
-    size_t fts_tokens_cap;
+    size_t fts_tokens_cap;        /* at least cdb_fts_tokens_needed() */
 } cdb_db_config;
 
 typedef struct cdb_db {
