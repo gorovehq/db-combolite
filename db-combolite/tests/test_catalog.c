@@ -256,6 +256,17 @@ static void test_mirror_serves_damaged_body(void)
     TEST_ASSERT_TRUE(find("survivor", &id));
 }
 
+static void test_body_serves_damaged_mirror(void)
+{
+    cdb_anchor_entry e;
+    uint64_t id;
+    create("survivor", CDB_MODEL_DOCUMENT);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_lookup(&pager, pager.catroot.mirror_root, &e));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_faultdev_flip_bit(&dev, e.phys * PAGE + 200u, 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, reopen());
+    TEST_ASSERT_TRUE(find("survivor", &id));
+}
+
 /* ------------------------------------------------------- crash sweep */
 
 /* S0: alpha. S1: + beta. S2: alpha renamed gamma. S3: beta schema v1.
@@ -367,6 +378,7 @@ int main(void)
     RUN_TEST(test_damaged_newest_slot_falls_back);
     RUN_TEST(test_both_slots_damaged);
     RUN_TEST(test_mirror_serves_damaged_body);
+    RUN_TEST(test_body_serves_damaged_mirror);
     RUN_TEST(test_crash_sweep);
     return UNITY_END();
 }

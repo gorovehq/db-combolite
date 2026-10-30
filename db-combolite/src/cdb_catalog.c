@@ -384,15 +384,19 @@ cdb_status cdb_catalog_open(cdb_catalog *cat, cdb_pager *p, const cdb_index_work
     cat->page = page;
     if (!p->cat_exists || p->catroot.body_root == 0)
         return CDB_OK; /* no catalog yet: created by the first change */
+    /* One copy damaged: the other serves for both (spec 3.5). */
     s = cdb_index_open(&cat->body, p, p->catroot.body_root, work);
-    if (s == CDB_OK)
-        s = cdb_index_open(&cat->mirror, p, p->catroot.mirror_root, work);
     if (s == CDB_E_CORRUPT) {
-        /* One copy is damaged: serve reads from the other (spec 3.5). */
         if (cdb_index_open(&cat->body, p, p->catroot.mirror_root, work) != CDB_OK)
             return CDB_E_CORRUPT;
         cat->mirror = cat->body;
         s = CDB_OK;
+    } else if (s == CDB_OK) {
+        s = cdb_index_open(&cat->mirror, p, p->catroot.mirror_root, work);
+        if (s == CDB_E_CORRUPT) {
+            cat->mirror = cat->body;
+            s = CDB_OK;
+        }
     }
     if (s != CDB_OK)
         return s;
