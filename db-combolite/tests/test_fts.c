@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "unity.h"
@@ -48,6 +49,10 @@ void setUp(void)
 {
     init_env();
     memset(&cfg, 0, sizeof cfg);
+    {
+        const char *cap = getenv("CDB_TEST_MAX_OPEN"); /* the cap-1 runs (tests/CMakeLists.txt) */
+        cfg.max_open = cap != NULL ? (unsigned)atoi(cap) : 0;
+    }
     cfg.pager.arena = arena;
     cfg.pager.arena_size = sizeof arena;
     cfg.pager.nodes = nodes;

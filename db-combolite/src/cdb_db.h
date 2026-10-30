@@ -222,6 +222,9 @@ typedef struct cdb_db {
     size_t stage_used;    /* bytes of doc_stage in use by the open transaction */
     int stage_overflow;   /* a change could not be staged: consult the journal */
     int set_aside;        /* recovery set a companion aside (spec 1.12.2) */
+    unsigned op_depth;    /* operation scopes open (cdb_db_op_begin) */
+    uint64_t op_id;       /* the outermost one's ID */
+    uint64_t op_seq;      /* the last ID given out */
 } cdb_db;
 
 /* Opens <base>.cdbarch, recovering if needed, and starts a session. If the
@@ -232,6 +235,14 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
 
 /* Reconciles everything and leaves the database as one file at rest. */
 cdb_status cdb_db_close(cdb_db *db);
+
+/* An operation scope: every store opened inside it stays open until the
+ * outermost scope ends, as stores a transaction uses do (cdb_slots.h).
+ * Code that holds one store while it opens another of the same model
+ * outside a transaction, such as a join, must run inside one. Scopes nest;
+ * each begin needs its end. */
+void cdb_db_op_begin(cdb_db *db);
+void cdb_db_op_end(cdb_db *db);
 
 cdb_status cdb_tx_begin(cdb_db *db, cdb_durability durability);
 cdb_status cdb_tx_put(cdb_db *db, uint64_t store_id, uint64_t entry_id, uint8_t op,

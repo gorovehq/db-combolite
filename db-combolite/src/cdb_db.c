@@ -365,6 +365,18 @@ static cdb_status usable(const cdb_db *db)
     return db->failed ? CDB_E_STATE : CDB_OK;
 }
 
+void cdb_db_op_begin(cdb_db *db)
+{
+    if (db->op_depth++ == 0)
+        db->op_id = ++db->op_seq;
+}
+
+void cdb_db_op_end(cdb_db *db)
+{
+    if (db->op_depth > 0)
+        db->op_depth--;
+}
+
 cdb_status cdb_tx_begin(cdb_db *db, cdb_durability durability)
 {
     if (usable(db) != CDB_OK || db->in_tx)
