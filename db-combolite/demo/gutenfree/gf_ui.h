@@ -28,8 +28,10 @@ void gf_put_clip(int y, int x, const char *s, int width);
  * returns the row after the last one used. */
 int gf_put_wrap(int y, int x, int width, int maxy, const char *s);
 
-/* Draws the reverse-video status line at the bottom. */
+/* Draws the reverse-video status line at the bottom, with the background
+ * download's line on the right. refresh redraws the last one. */
 void gf_status(const char *fmt, ...);
+void gf_status_refresh(void);
 
 /* Asks for a line of input on the status row; returns its length, 0 if
  * cancelled. */
@@ -47,9 +49,11 @@ void gf_screen_similar(gf_app *a, uint64_t row);
 void gf_screen_embed(gf_app *a);
 /* Fetches the book in catalog row `row` from the mirror, stores it and
  * embeds it (when the model is there); offers to open it. */
+/* Queues the book in catalog row `row` and starts the background download
+ * (gf_jobs.h); opens the reader instead if it is already on the shelf. */
 void gf_screen_add(gf_app *a, uint64_t row);
-/* Fetches the queued catalog rows one by one; leaves in rows[] (and the
- * queue) only those that did not make it onto the shelf. */
-void gf_screen_fetch_queue(gf_app *a, uint64_t *rows, unsigned n);
+/* The download queue: its books and their state; starts and stops the
+ * background job. */
+void gf_screen_queue(gf_app *a);
 
 #endif

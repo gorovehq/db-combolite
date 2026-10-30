@@ -7,6 +7,7 @@
 
 /* Engine headers before curses.h (gf_main.c). */
 #include "gf_ui.h"
+#include "gf_jobs.h"
 #include "gf_metrics.h"
 #include "gf_probe.h"
 #include "cdb_doc.h"
@@ -63,20 +64,39 @@ int gf_put_wrap(int y, int x, int width, int maxy, const char *s)
     return y;
 }
 
-void gf_status(const char *fmt, ...)
+static char status_text[512];
+
+/* The status bar: the screen's own text, and on the right what the
+ * background download is doing. */
+void gf_status_refresh(void)
 {
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
+    const char *job = gf_jobs_status();
+    int jw = 0, y, x;
+    getyx(stdscr, y, x);
+    for (const char *p = job; *p; p++)
+        jw += ((unsigned char)*p & 0xC0) != 0x80;
     attron(A_REVERSE);
     move(LINES - 1, 0);
     clrtoeol();
-    gf_put_clip(LINES - 1, 0, buf, COLS);
-    for (int x = getcurx(stdscr); x < COLS; x++)
+    gf_put_clip(LINES - 1, 0, status_text, jw > 0 && COLS > jw + 20 ? COLS - jw - 3 : COLS);
+    for (int c = getcurx(stdscr); c < COLS; c++)
         addch(' ');
+    if (jw > 0 && COLS > jw + 20) {
+        attron(A_BOLD);
+        gf_put_clip(LINES - 1, COLS - jw - 1, job, jw);
+        attroff(A_BOLD);
+    }
     attroff(A_REVERSE);
+    move(y, x);
+}
+
+void gf_status(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(status_text, sizeof status_text, fmt, ap);
+    va_end(ap);
+    gf_status_refresh();
 }
 
 int gf_prompt(const char *question, char *out, int cap)
@@ -141,7 +161,7 @@ void gf_screen_book(gf_app *a, uint64_t entry)
     gf_status(" row %llu read in %.3f ms | r: read | a: add | m: more like this | any other key: back ",
               (unsigned long long)entry, ms);
     refresh();
-    switch (getch()) {
+    switch (gf_getch()) {
     case 'r':
         if (s == CDB_OK && b.passages > 0)
             gf_screen_reader(a, b.first_passage);
@@ -161,32 +181,6 @@ void gf_screen_book(gf_app *a, uint64_t entry)
 /* ------------------------------------------------------------ catalog */
 
 #define MATCH_MAX 200000u
-#define QUEUE_MAX 8192u
-
-/* The download queue: catalog rows marked for fetching. */
-static uint64_t queue[QUEUE_MAX];
-static unsigned nqueue;
-
-static int queued(uint64_t row)
-{
-    for (unsigned i = 0; i < nqueue; i++)
-        if (queue[i] == row)
-            return (int)i;
-    return -1;
-}
-
-static void enqueue(uint64_t row)
-{
-    if (queued(row) < 0 && nqueue < QUEUE_MAX)
-        queue[nqueue++] = row;
-}
-
-static void dequeue(uint64_t row)
-{
-    int i = queued(row);
-    if (i >= 0)
-        queue[i] = queue[--nqueue];
-}
 
 static const struct {
     uint32_t index;
@@ -239,7 +233,7 @@ static int filter_form(gf_filter *f)
         mvprintw(4 + nf, 4, "Genres come from pg_catalog.csv bookshelves (gf_fetch.py --catalog, then merge-csv).");
         gf_status(" up/down: field | Enter: edit (space toggles) | c: clear all | a: apply | q: cancel ");
         refresh();
-        switch (getch()) {
+        switch (gf_getch()) {
         case KEY_UP: case 'k':
             if (sel > 0)
                 sel--;
@@ -328,7 +322,7 @@ void gf_screen_catalog(gf_app *a)
                 mvprintw(2, 2, "The catalog is empty. Press [i] on the main menu to ingest GUTINDEX.");
                 gf_status(" any key: back ");
                 refresh();
-                getch();
+                gf_getch();
                 return;
             }
         }
@@ -345,7 +339,7 @@ void gf_screen_catalog(gf_app *a)
         mvprintw(0, 1, "Card catalog by %s", sorts[sort].name);
         attroff(A_BOLD);
         printw(" | filter: %s| %zu of %llu books (%.0f ms) | queue: %u", summary, n, (unsigned long long)scanned,
-               filter_ms, nqueue);
+               filter_ms, gf_queue_n());
         for (i = 0; i < rows && (size_t)(top + i) < n; i++) {
             static gf_book b;
             char line[1200];
@@ -360,7 +354,7 @@ void gf_screen_catalog(gf_app *a)
             case GF_CATALOG_LOCC_INDEX: extra = b.locc; break;
             default: break;
             }
-            snprintf(line, sizeof line, "%s%s%7lld  %s%s%s%s%s%s", queued(row) >= 0 ? "[*]" : "[ ]",
+            snprintf(line, sizeof line, "%s%s%7lld  %s%s%s%s%s%s", gf_queue_has(row) ? "[*]" : "[ ]",
                      b.passages > 0 ? "\xe2\x96\xa0" : " ", (long long)b.ebook, extra[0] ? "[" : "", extra,
                      extra[0] ? "] " : "", b.title, b.author[0] ? " -- " : "", b.author);
             if (top + i == sel)
@@ -373,11 +367,11 @@ void gf_screen_catalog(gf_app *a)
         }
         if (note[0])
             mvprintw(LINES - 2, 2, "%s", note);
-        gf_status(" Space: queue | A: queue all %zu | F: fetch %u queued | x: clear | /: filter | o: sort | Enter: details | a: add | g: ebook # | q ",
-                  n, nqueue);
+        gf_status(" Space: queue | A: queue all %zu | f: download queue (%u) | /: filter | o: sort | Enter: details | g: ebook # | q ",
+                  n, gf_queue_n());
         refresh();
 
-        ch = getch();
+        ch = gf_getch();
         note[0] = '\0';
         switch (ch) {
         case KEY_UP: case 'k':
@@ -402,27 +396,21 @@ void gf_screen_catalog(gf_app *a)
             break;
         case ' ':
             if (n > 0) {
-                if (queued(list[sel]) >= 0)
-                    dequeue(list[sel]);
+                if (gf_queue_has(list[sel]))
+                    gf_queue_remove_row(list[sel]);
                 else
-                    enqueue(list[sel]);
+                    gf_queue_add(list[sel]);
                 if ((size_t)(sel + 1) < n)
                     sel++;
             }
             break;
         case 'A':
-            for (size_t k = 0; k < n && nqueue < QUEUE_MAX; k++)
-                enqueue(list[k]);
-            snprintf(note, sizeof note, "queue now holds %u books (F fetches them)", nqueue);
+            for (size_t k = 0; k < n; k++)
+                gf_queue_add(list[k]);
+            snprintf(note, sizeof note, "the queue holds %u books: f opens it", gf_queue_n());
             break;
-        case 'x':
-            nqueue = 0;
-            break;
-        case 'F':
-            if (nqueue > 0) {
-                gf_screen_fetch_queue(a, queue, nqueue);
-                apply = 1; /* on-shelf marks changed */
-            }
+        case 'f': case 'F':
+            gf_screen_queue(a);
             break;
         case '/':
             if (filter_form(&f))
@@ -435,10 +423,6 @@ void gf_screen_catalog(gf_app *a)
         case '\n': case KEY_ENTER:
             if (n > 0)
                 gf_screen_book(a, list[sel]);
-            break;
-        case 'a':
-            if (n > 0)
-                gf_screen_add(a, list[sel]);
             break;
         case 'g': {
             char buf[24];
@@ -539,7 +523,7 @@ void gf_screen_ingest(gf_app *a, const char *gutindex)
                  st.ms > 0 ? (double)st.inserted / (st.ms / 1000.0) : 0.0);
     gf_status(" any key: back ");
     refresh();
-    getch();
+    gf_getch();
 }
 
 /* ------------------------------------------------------------ lists */
@@ -575,7 +559,7 @@ static int pick(const char *title, char (*lines)[PICK_LINE], int n, const char *
             mvprintw(2, 2, "nothing here");
         gf_status("%s", status);
         refresh();
-        ch = getch();
+        ch = gf_getch();
         if ((ch == KEY_UP || ch == 'k') && sel > 0)
             sel--;
         else if ((ch == KEY_DOWN || ch == 'j') && sel + 1 < n)
@@ -692,7 +676,7 @@ void gf_screen_reader(gf_app *a, uint64_t passage)
         gf_status(" passage %lld of %llu | read %.3f ms | space: next, b: back, j/k: scroll, q: close ", (long long)seq + 1,
                   (unsigned long long)b.passages, ms);
         refresh();
-        ch = getch();
+        ch = gf_getch();
         if (ch == 'q' || ch == 27)
             return;
         if ((ch == 'j' || ch == KEY_DOWN) && top + height < nrows)
@@ -846,7 +830,7 @@ static void context_panel(const gf_measure *m, const gauge *gg)
     gf_status(" any key: back ");
     refresh();
     timeout(-1);
-    getch();
+    gf_getch();
 }
 
 static long file_size(const char *path)
@@ -972,7 +956,9 @@ void gf_screen_diag(gf_app *a)
         refresh();
 
         timeout(load ? 100 : 500);
-        ch = getch();
+        ch = getch(); /* not gf_getch: this screen redraws on its own clock */
+        if (ch == ERR)
+            gf_jobs_tick(load ? 50.0 : 300.0);
         frame++;
         if (ch == 'q' || ch == 27)
             break;
@@ -1004,7 +990,7 @@ static int load_model(gf_app *a)
         mvprintw(4, 2, "Could not load it. Run demo/gutenfree/tools/gf_model.py first.");
         gf_status(" any key: back ");
         refresh();
-        getch();
+        gf_getch();
         return 0;
     }
     gf_metric("embed.load_ms", gf_now_ms() - t0);
@@ -1181,7 +1167,7 @@ void gf_screen_embed(gf_app *a)
             gf_metric("vec.commit_us_per_vector", st.commit_ms * 1000.0 / (double)(2 * st.passages + 1));
             gf_metrics_flush(a->g);
         }
-        if (getch() == 'q')
+        if (getch() == 'q') /* timeout(0): a poll, not a wait */
             stop = 1;
     }
     timeout(-1);
@@ -1213,230 +1199,154 @@ void gf_screen_embed(gf_app *a)
     }
     gf_status(" any key: back ");
     refresh();
-    getch();
+    gf_getch();
 }
 
 /* ------------------------------------------------------------ adding a book */
 
-#define FETCH_SCRIPT "demo/gutenfree/tools/gf_fetch.py"
-
-/* Runs gf_fetch.py for one ebook, without a shell, printing its output from
- * row *y down. Returns its exit status (0: fetched), or -1. */
-static int run_fetch(gf_app *a, int64_t ebook, int *y)
+static void draw_queue(gf_app *a, int sel, int top, int rows)
 {
-    char num[24], line[512];
-    char *argv[] = { "python3", "-I", FETCH_SCRIPT, "--mirror", NULL, "--ebook", num, "--pause", "0", "--out",
-                     NULL, NULL };
-    int fds[2], status = -1;
-    pid_t pid;
-    FILE *out;
-
-    snprintf(num, sizeof num, "%lld", (long long)ebook);
-    argv[4] = (char *)a->mirror;
-    argv[10] = (char *)a->books_dir;
-    if (pipe(fds) != 0)
-        return -1;
-    if ((pid = fork()) < 0) {
-        close(fds[0]);
-        close(fds[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        dup2(fds[1], STDOUT_FILENO);
-        dup2(fds[1], STDERR_FILENO);
-        close(fds[0]);
-        close(fds[1]);
-        execvp(argv[0], argv);
-        _exit(127);
-    }
-    close(fds[1]);
-    if ((out = fdopen(fds[0], "r")) != NULL) {
-        while (fgets(line, sizeof line, out) != NULL) {
-            line[strcspn(line, "\n")] = '\0';
-            if (*y < LINES - 4)
-                gf_put_clip((*y)++, 6, line, COLS - 8);
-            refresh();
-        }
-        fclose(out);
-    } else {
-        close(fds[0]);
-    }
-    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status))
-        return -1;
-    return WEXITSTATUS(status);
-}
-
-/* Fetches, stores and (with the model) embeds one book, reporting from row
- * *y down. Returns 1 when the book is now on the shelf. */
-static int add_one(gf_app *a, uint64_t row, int *y)
-{
-    gf_book b;
-    gf_book_stats st;
-    cdb_status s;
-    int rc;
-    double t = gf_now_ms();
-
-    if (gf_catalog_read(a->g, &a->cat, row, &b) != CDB_OK)
-        return 0;
-    if (b.passages > 0)
-        return 1;
-    mvprintw((*y)++, 4, "fetching #%lld from %s ...", (long long)b.ebook, a->mirror);
-    refresh();
-    rc = run_fetch(a, b.ebook, y);
-    if (rc != 0) {
-        mvprintw((*y)++, 4, rc < 0 ? "could not run python3 %s" : "no text on the mirror for this ebook (%s)",
-                 FETCH_SCRIPT);
-        return 0;
-    }
-    mvprintw((*y)++, 4, "fetched in %.1f s; storing passages and the full-text index ...",
-             (gf_now_ms() - t) / 1000.0);
-    refresh();
-    s = gf_books_ingest_file(a->g, &a->cat, &a->books, b.ebook, a->books_dir, &st);
-    if (s != CDB_OK) {
-        mvprintw((*y)++, 4, "store failed at %s: %s", st.step, cdb_status_str(s));
-        return 0;
-    }
-    mvprintw((*y)++, 4, "stored %llu bytes as %llu passages in %.0f ms (commit %.0f ms)",
-             (unsigned long long)st.bytes, (unsigned long long)st.passages, st.ms, st.commit_ms);
-    gf_metric("book.ms_per_passage", st.ms / (double)st.passages);
-    if (a->emb == NULL && access(a->model, R_OK) == 0)
-        a->emb = gf_embed_open(a->model);
-    if (a->emb != NULL) {
-        gf_embed_stats es;
-        mvprintw((*y)++, 4, "embedding %llu passages ...", (unsigned long long)st.passages);
-        refresh();
-        s = gf_vec_embed_book(a->g, &a->cat, &a->books, &a->vec, a->emb, row, &es);
-        if (s == CDB_OK) {
-            gf_metric("embed.ms_per_passage", es.embed_ms / (double)es.passages);
-            gf_metric("vec.commit_us_per_vector", es.commit_ms * 1000.0 / (double)(2 * es.passages + 1));
-            mvprintw((*y)++, 4, "embedded in %.1f s (%.0f ms per passage)", es.embed_ms / 1000.0,
-                     es.embed_ms / (double)es.passages);
-        } else {
-            mvprintw((*y)++, 4, "embedding failed: %s", cdb_status_str(s));
-        }
-    } else {
-        mvprintw((*y)++, 4, "no embedding model (tools/gf_model.py): vectors skipped");
-    }
-    gf_metrics_flush(a->g);
-    refresh();
-    return 1;
-}
-
-/* After a batch: similar_to links and the neighbour graph, once. */
-static void finish_vectors(gf_app *a, int y)
-{
-    uint64_t links = 0;
-    size_t remaining = 0;
-    double t;
-    cdb_status s;
-    if (a->emb == NULL)
-        return;
-    mvprintw(y, 4, "linking similar books and refreshing the neighbour graph ...");
-    refresh();
-    t = gf_now_ms();
-    s = gf_vec_link_similar(a->g, &a->vec, &links);
-    if (s == CDB_OK)
-        s = cdb_vec_refresh(&a->g->db, a->vec.passages, 0, &remaining);
-    gf_metric("vec.graph_refresh_ms", gf_now_ms() - t);
-    gf_metrics_flush(a->g);
-    move(y, 0);
-    clrtoeol();
-    mvprintw(y, 4, "%llu similar_to links added; graph refreshed in %.1f s: %s", (unsigned long long)links,
-             (gf_now_ms() - t) / 1000.0, cdb_status_str(s));
-}
-
-void gf_screen_fetch_queue(gf_app *a, uint64_t *rows, unsigned n)
-{
-    unsigned i, added = 0, failed = 0, skipped = 0;
-    int stop = 0;
-    double t0 = gf_now_ms();
-
-    if (n > 50) {
-        erase();
-        attron(A_BOLD);
-        mvprintw(2, 2, "Fetch %u books?", n);
-        attroff(A_BOLD);
-        mvprintw(4, 4, "The mirror is asked for one book at a time, with a 2 s pause between books.");
-        mvprintw(5, 4, "Embedding takes about 80 ms per passage, roughly 10-30 s per book on this machine.");
-        mvprintw(6, 4, "Estimate: %.0f to %.0f minutes. q stops after the current book.", n * 5.0 / 60.0,
-                 n * 35.0 / 60.0);
-        gf_status(" y: start | any other key: cancel ");
-        refresh();
-        if (getch() != 'y')
-            return;
-    }
-    for (i = 0; i < n && !stop; i++) {
-        gf_book b;
-        int y = 4;
-        if (gf_catalog_read(a->g, &a->cat, rows[i], &b) != CDB_OK)
-            continue;
-        if (b.passages > 0) {
-            skipped++;
-            continue;
-        }
-        erase();
-        attron(A_BOLD);
-        mvprintw(0, 2, "Fetching the queue: book %u of %u", i + 1, n);
-        attroff(A_BOLD);
-        mvprintw(1, 4, "%u added, %u failed, %u already on the shelf, %.0f s so far", added, failed, skipped,
-                 (gf_now_ms() - t0) / 1000.0);
-        gf_put_clip(2, 4, b.title, COLS - 8);
-        gf_status(" q: stop after this book ");
-        refresh();
-        if (add_one(a, rows[i], &y))
-            added++;
-        else
-            failed++;
-        timeout(0);
-        if (getch() == 'q')
-            stop = 1;
-        timeout(-1);
-        if (!stop && i + 1 < n)
-            napms(2000); /* be gentle with the mirror */
-    }
-    /* Keep only what did not make it onto the shelf. */
-    for (i = 0; i < n;) {
-        gf_book b;
-        if (gf_catalog_read(a->g, &a->cat, rows[i], &b) == CDB_OK && b.passages > 0)
-            rows[i] = rows[--n];
-        else
-            i++;
-    }
-    nqueue = n;
+    static const char *const label[] = { "queued  ", "WORKING ", "added   ", "failed  ", "on shelf" };
+    static const int pair[] = { 0, 4, 3, 1, 3 };
+    unsigned n = gf_queue_n();
+    int i;
     erase();
     attron(A_BOLD);
-    mvprintw(0, 2, "Queue done%s", stop ? " (stopped early)" : "");
+    mvprintw(0, 2, "Download queue: %u books, %u to fetch", n, gf_queue_waiting());
     attroff(A_BOLD);
-    mvprintw(2, 4, "%u added, %u failed, %u already on the shelf, in %.0f s; %u left in the queue", added, failed,
-             skipped, (gf_now_ms() - t0) / 1000.0, nqueue);
-    if (added > 0)
-        finish_vectors(a, 4);
-    gf_status(" any key: back ");
+    if (gf_jobs_active() || gf_jobs_status()[0]) {
+        printw("   ");
+        attron(A_BOLD | (has_colors() ? COLOR_PAIR(4) : 0));
+        printw("%s", gf_jobs_status());
+        attroff(A_BOLD | (has_colors() ? COLOR_PAIR(4) : 0));
+    }
+    for (i = 0; i < rows && (unsigned)(top + i) < n; i++) {
+        static gf_book b;
+        char line[900];
+        unsigned k = (unsigned)(top + i);
+        int st = gf_queue_state(k);
+        gf_catalog_read(a->g, &a->cat, gf_queue_row(k), &b);
+        snprintf(line, sizeof line, "%7lld  %.300s%s%.120s  %s%.60s", (long long)b.ebook, b.title,
+                 b.author[0] ? " -- " : "", b.author, b.genre[0] ? "| " : "", b.genre);
+        if (has_colors() && pair[st])
+            attron(COLOR_PAIR(pair[st]));
+        mvprintw(1 + i, 1, "%s", label[st]);
+        if (has_colors() && pair[st])
+            attroff(COLOR_PAIR(pair[st]));
+        if ((int)k == sel)
+            attron(A_REVERSE);
+        gf_put_clip(1 + i, 11, line, COLS - 12);
+        if ((int)k == sel)
+            attroff(A_REVERSE);
+    }
+    if (n == 0)
+        mvprintw(2, 4, "The queue is empty. In the card catalog, Space queues a book and A queues every match.");
+}
+
+/* Asks before a big batch; returns 1 to go ahead. */
+static int confirm_batch(unsigned waiting)
+{
+    if (waiting <= 50)
+        return 1;
+    erase();
+    attron(A_BOLD);
+    mvprintw(2, 2, "Fetch %u books?", waiting);
+    attroff(A_BOLD);
+    mvprintw(4, 4, "The mirror is asked for one book at a time, with a 2 s pause between books.");
+    mvprintw(5, 4, "Embedding takes about 80 ms per passage, roughly 10-30 s per book on this machine.");
+    mvprintw(6, 4, "Estimate: %.0f to %.0f minutes. It runs in the background: use the app meanwhile.",
+             waiting * 5.0 / 60.0, waiting * 35.0 / 60.0);
+    gf_status(" y: start | any other key: cancel ");
     refresh();
-    getch();
+    return gf_getch() == 'y';
+}
+
+void gf_screen_queue(gf_app *a)
+{
+    int sel = 0, top = 0;
+
+    if (has_colors()) {
+        start_color();
+        use_default_colors();
+        init_pair(1, COLOR_RED, -1);
+        init_pair(3, COLOR_GREEN, -1);
+        init_pair(4, COLOR_CYAN, -1);
+    }
+    for (;;) {
+        int rows = LINES - 3, ch;
+        unsigned n = gf_queue_n(), waiting = gf_queue_waiting();
+        if (sel >= (int)n)
+            sel = n > 0 ? (int)n - 1 : 0;
+        if (sel < top)
+            top = sel;
+        if (sel >= top + rows)
+            top = sel - rows + 1;
+        draw_queue(a, sel, top, rows);
+        if (gf_jobs_active())
+            gf_status(" running in the background: q goes back, the download goes on | p: stop after this book | d: remove ");
+        else
+            gf_status(" Enter or s: fetch %u in the background | d: remove | c: remove finished | x: clear all | q: back ",
+                      waiting);
+        refresh();
+        /* Redraw as the job moves, without waiting for a key. */
+        timeout(250);
+        ch = getch(); /* not gf_getch: redraws on its own clock */
+        timeout(-1);
+        if (gf_key_diag(ch))
+            continue;
+        if (ch == ERR) {
+            gf_jobs_tick(150.0);
+            continue;
+        }
+        switch (ch) {
+        case KEY_UP: case 'k':
+            if (sel > 0)
+                sel--;
+            break;
+        case KEY_DOWN: case 'j':
+            if ((unsigned)(sel + 1) < n)
+                sel++;
+            break;
+        case KEY_NPAGE:
+            sel += rows;
+            break;
+        case KEY_PPAGE:
+            sel = sel > rows ? sel - rows : 0;
+            break;
+        case '\n': case KEY_ENTER: case 's':
+            if (!gf_jobs_active() && waiting > 0 && confirm_batch(waiting))
+                gf_jobs_start(a);
+            break;
+        case 'p':
+            gf_jobs_stop();
+            break;
+        case 'd': case KEY_DC:
+            gf_queue_remove((unsigned)sel);
+            break;
+        case 'c':
+            gf_queue_clear_finished();
+            break;
+        case 'x':
+            gf_queue_clear();
+            break;
+        case 'q': case 27:
+            return;
+        default:
+            break;
+        }
+    }
 }
 
 void gf_screen_add(gf_app *a, uint64_t row)
 {
     gf_book b;
-    int y = 2;
-
     if (gf_catalog_read(a->g, &a->cat, row, &b) != CDB_OK)
         return;
-    if (b.passages == 0) {
-        erase();
-        attron(A_BOLD);
-        mvprintw(0, 2, "Adding #%lld: %.60s", (long long)b.ebook, b.title);
-        attroff(A_BOLD);
-        gf_status(" working ... ");
-        refresh();
-        if (add_one(a, row, &y))
-            finish_vectors(a, y + 1);
-        gf_status(" r: read it now | any other key: back ");
-        refresh();
-        if (getch() != 'r' || gf_catalog_read(a->g, &a->cat, row, &b) != CDB_OK)
-            return;
-    }
-    if (b.passages > 0)
+    if (b.passages > 0) {
         gf_screen_reader(a, b.first_passage);
+        return;
+    }
+    gf_queue_add(row);
+    if (!gf_jobs_active())
+        gf_jobs_start(a);
 }

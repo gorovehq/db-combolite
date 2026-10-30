@@ -32,6 +32,25 @@ typedef struct gf_embed_stats {
     double ms;
 } gf_embed_stats;
 
+/* Embedding one book a slice at a time, for the background download job:
+ * start checks the book, step embeds passages until budget_ms is spent,
+ * commit stores every vector in one transaction. Holds its own memory. */
+typedef struct gf_vec_job {
+    uint64_t row;
+    gf_book bk;
+    uint64_t n, i;         /* passages, and how many are embedded */
+    double mean[GF_EMBED_DIMS];
+    float (*vecs)[GF_EMBED_DIMS];
+    gf_embed_stats st;
+} gf_vec_job;
+
+/* CDB_E_EXISTS: the book has vectors; CDB_E_NOT_FOUND: no passages. */
+cdb_status gf_vec_job_start(gf_db *g, const gf_catalog *c, const gf_vec *v, uint64_t row, gf_vec_job *j);
+/* *done is 1 once every passage is embedded. */
+cdb_status gf_vec_job_step(gf_db *g, const gf_books *b, gf_embed *e, gf_vec_job *j, double budget_ms, int *done);
+cdb_status gf_vec_job_commit(gf_db *g, const gf_catalog *c, const gf_books *b, const gf_vec *v, gf_vec_job *j);
+void gf_vec_job_free(gf_vec_job *j);
+
 /* Opens the collections and the link type, creating them the first time. */
 cdb_status gf_vec_open(gf_db *g, gf_vec *v);
 
