@@ -28,6 +28,7 @@ typedef enum cdb_page_format {
 #define CDB_PAGE_TYPE_DOCUMENT 0x0005u
 #define CDB_PAGE_TYPE_VECTOR 0x0006u
 #define CDB_PAGE_TYPE_OVERFLOW 0x0007u
+#define CDB_PAGE_TYPE_TS_BLOCK 0x0008u
 #define CDB_PAGE_TYPE_DATA_TEST 0x7F00u /* reserved for tests */
 
 /* Page header flags (spec 13), in the order section 13 lists them. */

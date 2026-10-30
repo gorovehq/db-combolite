@@ -68,7 +68,7 @@ static uint16_t half_canonical(uint16_t bits, cdb_vector_elem elem)
     return bits;
 }
 
-static int utf8_valid(const uint8_t *s, size_t len)
+int cdb_value_utf8_valid(const uint8_t *s, size_t len)
 {
     size_t i = 0;
 
@@ -408,7 +408,7 @@ cdb_status cdb_value_write_string(cdb_value_writer *w, const char *utf8, size_t 
         return s;
     if (utf8 == NULL && len != 0)
         return w_fail(w, CDB_E_INVALID_ARG);
-    if (len != 0 && !utf8_valid((const uint8_t *)utf8, len))
+    if (len != 0 && !cdb_value_utf8_valid((const uint8_t *)utf8, len))
         return w_fail(w, CDB_E_INVALID_ARG);
     return w_bytes(w, CDB_TAG_STRING, utf8, len);
 }
@@ -1077,7 +1077,7 @@ static cdb_status validate_at(const validate_ctx *c, const uint8_t *buf, size_t 
         break;
     }
     case CDB_TYPE_STRING:
-        if (!utf8_valid(v.payload, v.payload_len))
+        if (!cdb_value_utf8_valid(v.payload, v.payload_len))
             return CDB_E_MALFORMED;
         break;
     case CDB_TYPE_DECIMAL:

@@ -9,6 +9,7 @@
 #include "cdb_link.h"
 #include "cdb_overflow.h"
 #include "cdb_schema.h"
+#include "cdb_ts.h"
 #include "cdb_vec.h"
 #include "cdb_varint.h"
 
@@ -173,7 +174,10 @@ cdb_status cdb_doc_flush_pools(cdb_db *db)
             p->dirty = 0;
         }
     }
-    return cdb_vec_flush(db);
+    {
+        cdb_status s = cdb_vec_flush(db);
+        return s == CDB_OK ? cdb_ts_flush(db) : s;
+    }
 }
 
 /* -------------------------------------------------------- index records */
@@ -984,10 +988,17 @@ cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
         int handled;
         return cdb_vec_apply(db, d, &handled);
     }
+    if (cdb_ts_is_open(db, d->store_id)) {
+        int handled;
+        return cdb_ts_apply(db, d, &handled);
+    }
     s = pool_get(db, d->store_id, &pool);
     if (s == CDB_E_INVALID_ARG || s == CDB_E_UNSUPPORTED) {
         int handled;
         cdb_status vs = cdb_vec_apply(db, d, &handled);
+        if (handled)
+            return vs;
+        vs = cdb_ts_apply(db, d, &handled);
         if (handled)
             return vs;
     }

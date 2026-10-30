@@ -94,6 +94,13 @@ typedef struct cdb_db_config {
     unsigned vec_mode;            /* operator's search path: CDB_VEC_AUTO, _EXACT or _APPROX */
     cdb_fts_token *fts_tokens;    /* full-text: words of two document versions */
     size_t fts_tokens_cap;        /* at least cdb_fts_tokens_needed() */
+    uint8_t *ts_buffers;          /* time series: 3 * page_size bytes (cdb_ts.h) */
+    uint8_t *ts_work;             /* time series: cdb_ts_work_size() bytes, for late points and reads */
+    size_t ts_work_size;
+    /* Time series: called when a point replaces one with the same timestamp
+     * (spec 10.6), at apply, so again on recovery. Optional. */
+    void (*ts_collision)(void *ctx, uint64_t store, uint64_t series, int64_t ts);
+    void *ts_collision_ctx;
 } cdb_db_config;
 
 typedef struct cdb_db {
@@ -160,6 +167,20 @@ typedef struct cdb_db {
         cdb_index reverse;       /* (neighbour, entry): entry lists neighbour; (0, entry): an entry point */
         cdb_index pending;       /* entries whose list needs work */
     } vecs[CDB_DB_MAX_POOLS];
+    /* Open time-series stores (cdb_ts.h). */
+    struct cdb_ts_store {
+        int in_use;
+        int dirty;               /* next_entry changed since the catalog has it */
+        uint64_t store_id;
+        uint64_t next_entry;     /* the next series ID */
+        uint8_t late_mode;       /* CDB_TS_LATE_* */
+        int64_t lateness;        /* ns, for CDB_TS_LATE_WITHIN */
+        cdb_index keys;          /* series key -> series ID */
+        cdb_index series;        /* series ID -> series record */
+        cdb_index blocks;        /* (series, first timestamp) -> block page, count, last timestamp */
+        cdb_index held;          /* (series, timestamp) -> a late point held until reconciliation */
+        uint64_t touched_tx;     /* the open transaction changed this store */
+    } tss[CDB_DB_MAX_POOLS];
     /* The one link store (cdb_link.h), looked up on first use. */
     struct cdb_link_store {
         int looked;              /* the catalog was asked for it */

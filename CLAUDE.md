@@ -28,6 +28,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M13 | Neighbour graph: stored rankings and approximate search (spec 6.4, 6.8, 7.4) | done |
 | M14 | Overflow pages: index values and document bodies larger than a page (spec 14.8.7, 14.9.2, 14.15) | done |
 | M15 | Links: link types, the link store, delete and drop rules; the environment clock (spec 6, 14.4, 14.13) | done |
+| M16 | Time series: series, bit-level column blocks, late modes incl. hold-and-forward, collisions (spec 10, 14.11) | done |
 
 ## Commands
 
@@ -92,6 +93,10 @@ These were agreed with the user:
     - **Search:** exact below `vec_exact_below` (default 10,000), otherwise a best-first walk from the entry points plus a direct pass over pending vectors.
     - `tests/bench_graph` (not run by ctest) measures build time, exact and approximate query time, and recall. Run it from the Release build.
   - `cdb_link`: links between entries (spec 6, 14.13.1). Link types are catalog objects of kind 2. Every link lives in the one link store (`$links`, model 5) in forward and reverse indexes. Changes are LINK and UNLINK records, checked as the open transaction sees things. Document and vector deletes call `cdb_link_check_delete` before journaling and `cdb_link_on_delete` after applying, and `cdb_db_drop_store` calls `cdb_link_on_drop`. The environment's optional `now` clock gives link times and commit timestamps.
+  - Time series (spec 10, 14.11.1), in three layers:
+    - `cdb_tsbits`: the bit codecs (buckets, delta-of-delta, XOR floats, dictionary indexes).
+    - `cdb_tsblock`: a block payload. Its tests check that appending point by point gives exactly the bytes of building the block at once.
+    - `cdb_ts`: the store, with keys, series, blocks and held indexes. It handles series by key, batched appends, late modes (hold parks points in the held index, and `cdb_ts_flush` folds them in at reconciliation), collisions, `drop_before` and range reads.
   - `cdb_schema`: checks schemas and validates documents against them. Validation happens in `cdb_doc` when a change is made, against the document as the open transaction sees it: from the staging cache (`doc_stage`), or, after the cache overflows, from the transaction's own journal records.
   - `cdb_journal` and `cdb_db`: transactions, reconciliation and recovery. Changes reach pages only through the `cdb_apply_fn` hook, and the data models will plug in there.
 - `src/cdb_faultenv.*`: several fault devices on one shared crash clock, plus directory entries that are lost on crash unless their directory was synced. Test-only.
