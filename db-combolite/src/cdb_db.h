@@ -111,6 +111,7 @@ typedef struct cdb_db_config {
      * (spec 10.6), at apply, so again on recovery. Optional. */
     void (*ts_collision)(void *ctx, uint64_t store, uint64_t series, int64_t ts);
     void *ts_collision_ctx;
+    uint8_t *table_buffers;       /* tables: cdb_table_buffers_size() bytes (cdb_table.h) */
     /* Open stores (cdb_slots.h): the most document pools, vector
      * collections and time-series stores, each, open at once; 0: no cap.
      * Slots grow with use, in chunks of 4, from slot_mem first and then
@@ -142,6 +143,8 @@ struct cdb_doc_pool {
     cdb_index fts_terms;     /* term -> document frequency */
     cdb_index fts_postings;  /* (term, entry) -> term frequency */
     cdb_index fts_lengths;   /* entry -> words indexed; 0 -> pool totals */
+    int is_table;            /* a relational table (cdb_table.h): only the table layer may write it */
+    uint32_t keep;           /* tables without history: revisions kept per row (spec 9.11); 0 = all */
 };
 
 /* An open vector collection (cdb_vec.h). */
@@ -182,6 +185,44 @@ struct cdb_ts_store {
     uint64_t touched_tx;     /* the open transaction changed this store */
 };
 
+/* An open table (cdb_table.h): its current columns and its indexes. The row
+ * data is the document pool's; this is the table layer's own state, parsed
+ * from the schema and settings. */
+#define CDB_TABLE_MAX_COLUMNS 64u
+#define CDB_TABLE_MAX_INDEXES 8u
+#define CDB_TABLE_MAX_KEY_COLUMNS 8u
+#define CDB_TABLE_DEFAULTS_MAX 1024u  /* all encoded default values together */
+
+struct cdb_table_store {
+    cdb_slot slot;           /* first: in_use, store_id, use (cdb_slots.h) */
+    uint32_t version;        /* schema version the columns come from; 0: no columns yet */
+    uint32_t keep;           /* revisions kept per row; 0 = all */
+    uint32_t next_index;     /* the number the next created index gets */
+    unsigned ncols;
+    struct cdb_table_col {
+        uint64_t id;         /* field ID */
+        uint32_t added;      /* schema version that added it */
+        uint16_t def_off;    /* default value in defaults[], if def_len */
+        uint16_t def_len;
+        uint8_t type;        /* cdb_value_type */
+        uint8_t not_null;
+    } cols[CDB_TABLE_MAX_COLUMNS]; /* in field-ID order */
+    uint8_t defaults[CDB_TABLE_DEFAULTS_MAX];
+    unsigned npk;
+    uint64_t pk[CDB_TABLE_MAX_KEY_COLUMNS];
+    unsigned nidx;
+    struct cdb_table_idx {
+        uint32_t number;     /* stable index number (0: the primary key) */
+        uint8_t unique;
+        unsigned n;
+        uint64_t fields[CDB_TABLE_MAX_KEY_COLUMNS];
+        cdb_index ix;
+    } idx[CDB_TABLE_MAX_INDEXES];
+    size_t before_len;       /* the row before an apply (cdb_table_apply_before) */
+    uint32_t before_schema;
+    int before_live;
+};
+
 /* Caller memory for n open stores of each kind, without an allocator. */
 size_t cdb_db_slot_mem_size(unsigned n);
 
@@ -216,6 +257,7 @@ typedef struct cdb_db {
     cdb_slots pool_slots;
     cdb_slots vec_slots;
     cdb_slots ts_slots;
+    cdb_slots table_slots;   /* struct cdb_table_store */
     size_t slot_mem_used;    /* bytes of cfg.slot_mem carved into chunks */
     /* The one link store (cdb_link.h), looked up on first use. */
     struct cdb_link_store {
@@ -233,6 +275,7 @@ typedef struct cdb_db {
     size_t stage_used;    /* bytes of doc_stage in use by the open transaction */
     int stage_overflow;   /* a change could not be staged: consult the journal */
     int set_aside;        /* recovery set a companion aside (spec 1.12.2) */
+    int via_table;        /* the table layer is calling the document engine (cdb_table.h) */
     unsigned op_depth;    /* operation scopes open (cdb_db_op_begin) */
     uint64_t op_id;       /* the outermost one's ID */
     uint64_t op_seq;      /* the last ID given out */

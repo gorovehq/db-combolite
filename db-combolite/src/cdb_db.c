@@ -22,6 +22,7 @@
 #include "cdb_db.h"
 #include "cdb_doc.h"
 #include "cdb_link.h"
+#include "cdb_table.h"
 #include "cdb_ts.h"
 #include "cdb_vec.h"
 
@@ -347,6 +348,8 @@ size_t cdb_db_slot_mem_size(unsigned n)
              + cdb_slots_chunk_bytes(sizeof(struct cdb_vec_coll), last);
     total += (chunks - 1u) * cdb_slots_chunk_bytes(sizeof(struct cdb_ts_store), CDB_SLOTS_CHUNK)
              + cdb_slots_chunk_bytes(sizeof(struct cdb_ts_store), last);
+    total += (chunks - 1u) * cdb_slots_chunk_bytes(sizeof(struct cdb_table_store), CDB_SLOTS_CHUNK)
+             + cdb_slots_chunk_bytes(sizeof(struct cdb_table_store), last);
     return total;
 }
 
@@ -357,6 +360,7 @@ static void release_slots(cdb_db *db)
     cdb_slots_release(db, &db->pool_slots);
     cdb_slots_release(db, &db->vec_slots);
     cdb_slots_release(db, &db->ts_slots);
+    cdb_slots_release(db, &db->table_slots);
 }
 
 static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg, const cdb_header *create);
@@ -386,6 +390,7 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
     cdb_slots_init(&db->pool_slots, sizeof(struct cdb_doc_pool), &cdb_doc_slot_ops);
     cdb_slots_init(&db->vec_slots, sizeof(struct cdb_vec_coll), &cdb_vec_slot_ops);
     cdb_slots_init(&db->ts_slots, sizeof(struct cdb_ts_store), &cdb_ts_slot_ops);
+    cdb_slots_init(&db->table_slots, sizeof(struct cdb_table_store), &cdb_table_slot_ops);
     if ((s = open_db(db, base, cfg, create)) != CDB_OK)
         release_slots(db); /* recovery may have opened stores */
     return s;
@@ -688,6 +693,7 @@ cdb_status cdb_db_reconcile(cdb_db *db)
     cdb_slots_shrink(db, &db->pool_slots);
     cdb_slots_shrink(db, &db->vec_slots);
     cdb_slots_shrink(db, &db->ts_slots);
+    cdb_slots_shrink(db, &db->table_slots);
     /* Every change in the journal is now in the archive. */
     return rotate_journal(db);
 }
@@ -739,6 +745,8 @@ cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
     if ((slot = cdb_slots_find(&db->pool_slots, id)) != NULL
         || (slot = cdb_slots_find(&db->vec_slots, id)) != NULL
         || (slot = cdb_slots_find(&db->ts_slots, id)) != NULL)
+        slot->in_use = 0;
+    if ((slot = cdb_slots_find(&db->table_slots, id)) != NULL)
         slot->in_use = 0;
     return rotate_journal(db);
 }

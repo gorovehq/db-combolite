@@ -146,5 +146,11 @@ cdb_status cdb_catalog_field_id(cdb_catalog *cat, uint64_t store_id, const char 
  * CDB_E_NOT_FOUND for an unknown ID. */
 cdb_status cdb_catalog_field_name(cdb_catalog *cat, uint64_t store_id, uint64_t field_id,
                                   char *name, size_t cap, size_t *len);
+/* Renames a field; its ID stays. With name NULL the field's name is freed
+ * instead: looking the name up no longer finds it (so cdb_catalog_field_id
+ * hands out a new ID for it), while the reverse lookup still gives the old
+ * name. Commits immediately. CDB_E_EXISTS: the new name is another field's. */
+cdb_status cdb_catalog_field_rename(cdb_catalog *cat, uint64_t store_id, uint64_t field_id, const char *name,
+                                    size_t len);
 
 #endif

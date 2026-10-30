@@ -33,7 +33,7 @@ static uint8_t record_buf[2u * PAGE];
 static uint8_t cat_work[96u * 1024u];
 static cdb_index_entry cat_entries[2048];
 static uint8_t cat_page[PAGE];
-static uint8_t doc_buffers[6u * PAGE];
+static uint8_t doc_buffers[8u * PAGE];
 static uint8_t vec_buffers[3u * PAGE];
 static uint8_t vec_work[1024u * 1024u];
 static cdb_db_config cfg;

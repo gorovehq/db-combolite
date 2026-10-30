@@ -26,7 +26,7 @@ static uint8_t record_buf[2u * PAGE];
 static uint8_t cat_work[24u * 1024u];
 static cdb_index_entry cat_entries[512];
 static uint8_t cat_page[PAGE];
-static uint8_t doc_buffers[6u * PAGE];
+static uint8_t doc_buffers[8u * PAGE];
 static uint8_t ts_buffers[3u * PAGE];
 static uint8_t ts_work[(CDB_TS_BLOCK_MAX_POINTS + 1u) * sizeof(cdb_ts_point)];
 static cdb_db_config cfg;

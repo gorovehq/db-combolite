@@ -827,6 +827,44 @@ cdb_status cdb_catalog_field_name(cdb_catalog *cat, uint64_t store_id, uint64_t 
     return found ? CDB_OK : CDB_E_NOT_FOUND;
 }
 
+/* Two dictionary changes for table columns (spec 9.8). The ID never
+ * changes, so stored values keep their meaning. */
+cdb_status cdb_catalog_field_rename(cdb_catalog *cat, uint64_t store_id, uint64_t field_id, const char *name,
+                                    size_t len)
+{
+    char old[CDB_CATALOG_NAME_MAX];
+    uint8_t v[8];
+    size_t olen, vlen;
+    int found;
+    key k;
+    cdb_status s;
+
+    if (name != NULL && (s = check_name(cat, name, len)) != CDB_OK)
+        return s;
+    if ((s = cdb_catalog_field_name(cat, store_id, field_id, old, sizeof old, &olen)) != CDB_OK)
+        return s;
+    if (name != NULL) {
+        /* The new name must be free, or already this field's. */
+        if ((s = k_field_name(&k, store_id, name, len)) != CDB_OK
+            || (s = get_either(cat, &k, v, sizeof v, &vlen, &found)) != CDB_OK)
+            return s;
+        if (found)
+            return vlen == 8 && cdb_load_u64(v, CDB_ORDER_BIG) == field_id ? CDB_OK : CDB_E_EXISTS;
+    }
+    /* The old name stops pointing at the field... */
+    if ((s = k_field_name(&k, store_id, old, olen)) != CDB_OK || (s = delete_both(cat, &k)) != CDB_OK)
+        return s;
+    if (name != NULL) {
+        /* ...and the new one points at it, in both directions. */
+        cdb_store_u64(v, field_id, CDB_ORDER_BIG);
+        if ((s = k_field_name(&k, store_id, name, len)) != CDB_OK || (s = put_both(cat, &k, v, sizeof v)) != CDB_OK
+            || (s = k_pair(&k, KEY_FIELD_BY_ID, store_id, field_id)) != CDB_OK
+            || (s = put_both(cat, &k, name, len)) != CDB_OK)
+            return s;
+    }
+    return finish(cat, cat->pager->catroot.next_object_id);
+}
+
 /* -------------------------------------------------------- link types */
 
 /* Link-type record (spec 14.13): kind, ID, name, then these fields. Link

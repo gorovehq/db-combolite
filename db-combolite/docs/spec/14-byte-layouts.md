@@ -188,6 +188,7 @@ AES-GCM and ChaCha20-Poly1305 both take a 12-byte nonce:
   | `0x0006` | vector block (14.12.3) |
   | `0x0007` | overflow (14.15) |
   | `0x0008` | time-series block (14.11.1) |
+  | `0x0009` | nibblet page: small records of any store (14.18) |
   | `0x7F00` | reserved for tests |
 
   Further page types are assigned IDs when they are built.
@@ -225,7 +226,8 @@ Logical IDs in this structure are always 8 bytes, even in 32-bit files, so the s
 | 72 | 8 | Public dedup index root | |
 | 80 | 8 | Public audit series root | Section 10.7 |
 | 88 | 8 | Next object ID | the store, enclave and procedure ID counter; IDs are never reused (Section 4.12) |
-| 96 | 388 | Reserved | zero |
+| 96 | 8 | Public nibblet free-space root | the free-space index of public nibblet pages (14.18.3); 0 until the first nibblet |
+| 104 | 380 | Reserved | zero |
 | 484 | 8 | End magic | `0A 54 41 43 42 44 43 89` (the start magic reversed) |
 | 492 | 16 | Tamper-evident tag | |
 | 508 | 4 | CRC32C | covers bytes 0–507 |
@@ -799,7 +801,21 @@ A row-oriented table is a B+tree clustered by **entry ID**, with the same struct
   - A unique index stores the key and maps it to the entry ID.
   - A row with a null in any indexed column is still indexed, with the entry ID appended to its key so that nulls never collide (Section 9.9).
 - **Permitted type widenings** (Section 9.8): int to decimal, and f32 to f64. More can be added; each must lose no information.
-- The exact page and record layouts are recorded here as M17 is built.
+- **Rows** are encoded objects (14.6) holding only their non-null columns, keyed by column field ID. Each revision's envelope records the schema version it was written under, which tells a reader which columns were added after it (Section 9.8).
+- **Table schema** (a schema version, 4.11), as an object:
+  - field 1: the columns in field-ID order. Each column is an object of field 1 field ID, 2 type (the shared type tags of 9.1), 3 not-null (bool), 4 default (one encoded value, when there is one) and 5 the schema version that added it;
+  - field 2: the primary key's field IDs, in key order.
+- **Table settings** (the store's settings object, 14.3.3 field 16):
+  - 1 keep (0 means every revision; N means the last N);
+  - 2 layout (0 means row-oriented);
+  - 3 the indexes, each an object of 1 number (the primary key's index is 0), 2 field IDs, 3 unique (bool) and 4 root page;
+  - 4 the number the next index gets.
+- **Index keys and values.**
+  - A key is the indexed columns' values in the order-preserving encoding, a null as the null component.
+  - For a non-unique index, or a key that contains a null, the entry ID follows as 8 big-endian bytes.
+  - The value is the entry ID (8 bytes, big-endian).
+  - Decimal, array, object and vector columns cannot be indexed yet (14.8.4 has no encoding for them).
+- **Limits** (M17): 64 columns, 8 indexes, 8 columns per index or primary key, 1 KB of default values in all.
 
 ### 14.10.2 Column-oriented tables
 
@@ -1086,6 +1102,50 @@ The validation map belongs to the **compatible** page class.
 | 8 | "Verified through" watermark |
 | 8 | Time the last full scrub finished |
 | … | Bitmap: 1 = verified since the last change |
+
+---
+
+## 14.18 Nibblet pages (Section 16)
+
+### 14.18.1 Page layout
+
+A nibblet page is a logical page of type `0x0009`. Its header names store 0, because the page is shared (16.2). Payload, in the file's byte order:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | Encryption domain ID (0 = public) |
+| 8 | 2 | Slot count |
+| 10 | 2 | Lowest record offset: records occupy this offset up to the payload's end |
+| 12 | 2 | Free bytes, including the gaps left by removed records |
+| 14 | 4 × slots | Slot directory: record offset (2) and record length (2); length 0 marks a free slot |
+
+- **Records** are packed from the end of the payload toward the directory. A record holds, in order:
+  - the owner's store ID (8 bytes);
+  - the record kind (1 byte; Section 16.5);
+  - the owner key's length (1 byte) and the owner key, the key under which the owner's index refers to the record;
+  - the record itself, such as a revision's stored form (14.9.1) or a time-series block payload (14.11.1).
+
+  The first three make the back-reference (16.2).
+- **Compaction.** Gaps are closed by moving records and rewriting their offsets; slot numbers never change. A freed slot is reused by the next record placed in the page.
+
+### 14.18.2 Record addresses
+
+Every owner refers to a record by a page ID, and adds a 2-byte slot when the record is a nibblet. For time-series blocks (14.11.1), the blocks index value gains the slot after its page ID, and the value's length tells the two forms apart. For revisions:
+
+- **Revisions index value** (14.9.2):
+  - 8 bytes: a revision on its own page (the logical page ID);
+  - 10 bytes: a nibblet (the page ID, then a 2-byte slot).
+- **Head record:**
+  - 21 bytes: the head revision is on its own page;
+  - 23 bytes: the same fields, then the head's 2-byte slot.
+
+  Older files hold only the 8-byte and 21-byte forms, and both forms stay valid.
+
+### 14.18.3 Free-space index
+
+- **Where it lives.** The public domain's free-space index is an ordered index whose root is recorded in the catalog root slot (14.3.2, offset 96), beside the public dedup and audit roots. It is created with the first nibblet, which can happen during an apply or a recovery replay, and its root reaches the archive with the next commit. Enclave domains will record their roots in the enclave directory, as their dedup indexes do.
+- **Keys** are big-endian: (domain ID 8, free bytes 2, page ID 8). The value is empty.
+- **Best fit** seeks to (domain, record size, 0) and takes the first key in that domain. Every placement, removal and merge updates the page's key.
 
 ## Open questions (do not specify until answered)
 

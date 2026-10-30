@@ -23,7 +23,7 @@ static uint8_t record_buf[2u * PAGE];
 static uint8_t cat_work[24u * 1024u];
 static cdb_index_entry cat_entries[512];
 static uint8_t cat_page[PAGE];
-static uint8_t doc_buffers[6u * PAGE];
+static uint8_t doc_buffers[8u * PAGE];
 static uint8_t doc_stage[4096];
 static cdb_db_config cfg;
 static cdb_db db;

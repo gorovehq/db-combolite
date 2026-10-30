@@ -118,6 +118,24 @@ cdb_status cdb_doc_head(cdb_db *db, uint64_t store, uint64_t entry, uint64_t *re
  * CDB_E_INVALID_ARG: not a document pool; CDB_E_NOT_FOUND: no such store. */
 cdb_status cdb_doc_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *live);
 
+/* For the table layer (cdb_table.h), which sets db->via_table around these.
+ * get_in_tx copies a document's body as the open transaction sees it
+ * (committed state outside a transaction); *live 0 when it does not exist or
+ * is deleted. tx_entries calls fn with each entry of the store the open
+ * transaction has changed, possibly more than once; nothing outside one. */
+typedef cdb_status (*cdb_doc_entry_fn)(void *ctx, uint64_t entry);
+cdb_status cdb_doc_get_in_tx(cdb_db *db, uint64_t store, uint64_t entry, void *body, size_t cap, size_t *len,
+                             int *live, uint32_t *schema);
+cdb_status cdb_doc_tx_entries(cdb_db *db, uint64_t store, cdb_doc_entry_fn fn, void *ctx);
+/* The first committed live entry after `after`, in entry order; *done 1 at
+ * the end. Uses the page buffer, so calls must not interleave with reads. */
+cdb_status cdb_doc_next_live(cdb_db *db, uint64_t store, uint64_t after, uint64_t *entry, int *done);
+/* Nibblet merging (cdb_nib.h) moved a revision; CDB_E_NOT_FOUND if its
+ * store or revision is gone, so the record is dropped. */
+cdb_status cdb_doc_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t addr);
+/* A table's revision window changed (spec 9.11): the open pool follows. */
+cdb_status cdb_doc_set_keep(cdb_db *db, uint64_t store, uint32_t keep);
+
 /* Buffer sizes for a page size and doc_max (0: bodies fit one page). */
 size_t cdb_doc_buffer_size(size_t page_size, size_t doc_max);
 size_t cdb_doc_buffers_size(size_t page_size, size_t doc_max);
