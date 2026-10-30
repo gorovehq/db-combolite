@@ -79,6 +79,8 @@ Keyword search with relevance ranking is part of db-combolite. Because a built-i
 
 A pool has at most one full-text index, over the fields the operator names and optionally the summary (the *declared* mode of 8.5). It is kept up to date at every commit and ranks results with BM25. The layout is in 14.14.1.
 
+Grouping a document's words uses the C library's `qsort`, which may allocate memory internally on some hosts. This is accepted as an exception to the rule that the core does not allocate: the engine's own code still takes its memory only from the caller, either as buffers or through the environment's optional allocator.
+
 ### 8.11 External attachments are verified and encrypted
 
 - The catalog records the **content hash** of every external attachment, so any tampering is detected.
