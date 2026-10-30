@@ -31,6 +31,8 @@ static const uint8_t ten_pow_38[16] = {
 
 /* ------------------------------------------------------------ helpers */
 
+/* A NaN has every exponent bit set and a nonzero mantissa; all exponent
+ * bits with a zero mantissa is infinity, which stays as it is. */
 static int f64_is_nan(uint64_t bits)
 {
     return (bits & UINT64_C(0x7FF0000000000000)) == UINT64_C(0x7FF0000000000000)
@@ -242,6 +244,9 @@ static cdb_status w_fail(cdb_value_writer *w, cdb_status status)
     return status;
 }
 
+/* Whether n more bytes fit between the encoded bytes and the staged
+ * directory entries; records CDB_E_BUFFER_TOO_SMALL if not. Every writer
+ * asks before writing anything, so a refused write leaves no partial item. */
 static cdb_status w_room(cdb_value_writer *w, size_t n)
 {
     if (n > w->scratch_top - w->len)
@@ -278,6 +283,7 @@ static void w_end_value(cdb_value_writer *w)
     }
 }
 
+/* Unchecked appends: the caller has already reserved the room with w_room. */
 static void w_put_byte(cdb_value_writer *w, uint8_t b)
 {
     w->buf[w->len++] = b;
@@ -295,6 +301,9 @@ static void w_put_varint(cdb_value_writer *w, uint64_t v)
     w->len += cdb_varint_encode(v, w->buf + w->len);
 }
 
+/* Encoded bytes start at the front of buf and directory staging at its very
+ * end. A NULL buffer with a nonzero capacity is an error from the start,
+ * and like every writer error it sticks. */
 void cdb_value_writer_init(cdb_value_writer *w, uint8_t *buf, size_t cap,
                            cdb_byte_order order, cdb_decimal_mode decimal_mode)
 {
@@ -312,6 +321,7 @@ size_t cdb_value_writer_len(const cdb_value_writer *w)
     return w->len;
 }
 
+/* Values that are only a tag byte: null, false and true. */
 static cdb_status w_simple(cdb_value_writer *w, uint8_t tag)
 {
     cdb_status s = w_begin_value(w);
@@ -334,6 +344,8 @@ cdb_status cdb_value_write_bool(cdb_value_writer *w, int value)
     return w_simple(w, value ? CDB_TAG_TRUE : CDB_TAG_FALSE);
 }
 
+/* Tag, then the value zigzag-mapped (small negatives become small unsigned
+ * numbers) as a varint, so small magnitudes of either sign stay short. */
 cdb_status cdb_value_write_int(cdb_value_writer *w, int64_t value)
 {
     uint64_t z = cdb_zigzag_encode(value);
@@ -348,6 +360,9 @@ cdb_status cdb_value_write_int(cdb_value_writer *w, int64_t value)
     return CDB_OK;
 }
 
+/* Tag, then the bits in the file's byte order, made canonical first: every
+ * NaN becomes the one quiet NaN and -0 becomes +0, so equal values always
+ * encode the same (f32 below likewise). */
 cdb_status cdb_value_write_f64(cdb_value_writer *w, double value)
 {
     uint64_t bits;
@@ -380,6 +395,8 @@ cdb_status cdb_value_write_f32(cdb_value_writer *w, float value)
     return CDB_OK;
 }
 
+/* Tag, a precision byte, then the ticks as a fixed 8-byte signed integer in
+ * the file's byte order. */
 cdb_status cdb_value_write_timestamp(cdb_value_writer *w, cdb_ts_precision precision, int64_t ticks)
 {
     cdb_status s = w_begin_value(w);
@@ -397,6 +414,7 @@ cdb_status cdb_value_write_timestamp(cdb_value_writer *w, cdb_ts_precision preci
     return CDB_OK;
 }
 
+/* Tag, then two varints: the store ID and the entry ID. */
 cdb_status cdb_value_write_ref(cdb_value_writer *w, uint64_t store_id, uint64_t entry_id)
 {
     cdb_status s = w_begin_value(w);
@@ -428,6 +446,7 @@ static cdb_status w_bytes(cdb_value_writer *w, uint8_t tag, const void *data, si
     return CDB_OK;
 }
 
+/* Invalid UTF-8 is refused here, so a stored string is always valid. */
 cdb_status cdb_value_write_string(cdb_value_writer *w, const char *utf8, size_t len)
 {
     cdb_status s = w_begin_value(w);
@@ -448,6 +467,10 @@ cdb_status cdb_value_write_binary(cdb_value_writer *w, const void *data, size_t 
     return w_bytes(w, CDB_TAG_BINARY, data, len);
 }
 
+/* Tag, payload length, then the payload: the scale as a varint and the
+ * unscaled integer as big-endian two's complement. The caller passes the
+ * shortest form (no byte that only repeats the sign); in compact mode the
+ * magnitude must also stay below 10^38 (spec 14.6.4). */
 cdb_status cdb_value_write_decimal(cdb_value_writer *w, uint64_t scale,
                                    const uint8_t *unscaled_be, size_t unscaled_len)
 {
@@ -485,6 +508,10 @@ cdb_status cdb_value_write_decimal_i64(cdb_value_writer *w, uint64_t scale, int6
     return cdb_value_write_decimal(w, scale, be + start, 8 - start);
 }
 
+/* Element bytes that are already in the file's form, copied as given. Only
+ * their length is checked against the element type and dims; the caller
+ * vouches that they are canonical (the vector store copies out vectors it
+ * wrote itself). Layout as for cdb_value_write_vector below. */
 cdb_status cdb_value_write_vector_raw(cdb_value_writer *w, cdb_vector_elem elem, uint64_t dims,
                                       const void *data, size_t len)
 {
@@ -506,6 +533,9 @@ cdb_status cdb_value_write_vector_raw(cdb_value_writer *w, cdb_vector_elem elem,
     return CDB_OK;
 }
 
+/* Tag, payload length, then the payload: the element type byte, dims as a
+ * varint, and the elements. Each element is converted from host form to
+ * the file's byte order and made canonical on the way. */
 cdb_status cdb_value_write_vector(cdb_value_writer *w, cdb_vector_elem elem,
                                   uint64_t dims, const void *elems)
 {
@@ -561,6 +591,8 @@ cdb_status cdb_value_write_vector(cdb_value_writer *w, cdb_vector_elem elem,
     return CDB_OK;
 }
 
+/* Embeds a value that is already encoded, after validating all of it, so a
+ * writer never passes on bytes that are not canonical. */
 cdb_status cdb_value_write_encoded(cdb_value_writer *w, const void *value, size_t len)
 {
     cdb_status s = w_begin_value(w);
@@ -609,6 +641,7 @@ cdb_status cdb_value_begin_object(cdb_value_writer *w)
     return w_begin_container(w, CDB_TAG_OBJECT);
 }
 
+/* The innermost open container if it is of this kind, else NULL. */
 static cdb_value_frame *w_top(cdb_value_writer *w, uint8_t kind)
 {
     if (w->depth == 0 || w->frames[w->depth - 1].kind != kind)
@@ -737,6 +770,11 @@ static cdb_status read_varint(const uint8_t **p, const uint8_t *end, uint64_t *v
     return s;
 }
 
+/* Decodes the value at buf: its type, its encoded length and views into buf
+ * for its parts. It checks only what it needs to find the value's extent and
+ * its own header fields; the contents (UTF-8, canonical floats, nested
+ * values) are the validator's job. Varints are rejected here if they are
+ * longer than needed (cdb_varint_decode). */
 cdb_status cdb_value_read(const uint8_t *buf, size_t len, cdb_byte_order order, cdb_value *out)
 {
     const uint8_t *p = buf + 1;
@@ -753,6 +791,8 @@ cdb_status cdb_value_read(const uint8_t *buf, size_t len, cdb_byte_order order, 
     out->tag = buf[0];
     out->start = buf;
 
+    /* Fixed-shape types: the tag alone says how many bytes follow. Floats
+     * are returned as stored, without canonicalizing them. */
     switch (buf[0]) {
     case CDB_TAG_NULL:
         out->type = CDB_TYPE_NULL;
@@ -828,6 +868,9 @@ cdb_status cdb_value_read(const uint8_t *buf, size_t len, cdb_byte_order order, 
     out->encoded_len = (size_t)(p - buf) + (size_t)v;
     pend = p + v;
 
+    /* Each known type's own header inside the payload. A varint that runs
+     * past the payload is MALFORMED, not TRUNCATED: the payload length
+     * already said where the value ends. */
     switch (buf[0]) {
     case CDB_TAG_STRING:
         out->type = CDB_TYPE_STRING;
@@ -836,6 +879,7 @@ cdb_status cdb_value_read(const uint8_t *buf, size_t len, cdb_byte_order order, 
         out->type = CDB_TYPE_BINARY;
         return CDB_OK;
     case CDB_TAG_DECIMAL:
+        /* The scale, then at least one byte of unscaled integer. */
         if ((s = read_varint(&p, pend, &out->as.decimal.scale)) != CDB_OK)
             return s == CDB_E_TRUNCATED ? CDB_E_MALFORMED : s;
         if (p == pend)
@@ -845,6 +889,8 @@ cdb_status cdb_value_read(const uint8_t *buf, size_t len, cdb_byte_order order, 
         out->as.decimal.unscaled_len = (size_t)(pend - p);
         return CDB_OK;
     case CDB_TAG_ARRAY:
+        /* The element count, then the elements back to back; they are read
+         * one at a time by the array iterator. */
         if ((s = read_varint(&p, pend, &out->as.array.count)) != CDB_OK)
             return s == CDB_E_TRUNCATED ? CDB_E_MALFORMED : s;
         out->type = CDB_TYPE_ARRAY;
@@ -855,6 +901,10 @@ cdb_status cdb_value_read(const uint8_t *buf, size_t len, cdb_byte_order order, 
         uint8_t widths;
         unsigned entry;
         uint64_t count;
+        /* The field count; a width byte (bits 0-1: field ID width code,
+         * bits 4-5: offset width code, other bits zero); a directory of
+         * count fixed-width (field ID, offset) entries; then the values
+         * (spec 14.6.3). The directory must fit inside the payload. */
         if ((s = read_varint(&p, pend, &count)) != CDB_OK)
             return s == CDB_E_TRUNCATED ? CDB_E_MALFORMED : s;
         if (p == pend)
@@ -877,6 +927,8 @@ cdb_status cdb_value_read(const uint8_t *buf, size_t len, cdb_byte_order order, 
     }
     case CDB_TAG_VECTOR: {
         cdb_vector_elem elem;
+        /* The element type byte, dims, then exactly the bytes that type and
+         * dims need. */
         if (p == pend)
             return CDB_E_MALFORMED;
         elem = (cdb_vector_elem)*p++;
@@ -898,6 +950,8 @@ cdb_status cdb_value_read(const uint8_t *buf, size_t len, cdb_byte_order order, 
     }
 }
 
+/* Array iteration: each element is read with the bounds of what remains of
+ * the array's body, and the iterator moves past its encoded length. */
 cdb_status cdb_value_array_iter(const cdb_value *array, cdb_byte_order order, cdb_value_iter *it)
 {
     if (array == NULL || it == NULL || array->type != CDB_TYPE_ARRAY)
@@ -923,6 +977,8 @@ cdb_status cdb_value_array_next(cdb_value_iter *it, cdb_value *item, int *done)
     return CDB_OK;
 }
 
+/* Object iteration walks the directory in order, which is field ID order,
+ * and reads each value at its offset within the values area. */
 cdb_status cdb_value_object_iter(const cdb_value *object, cdb_byte_order order, cdb_value_iter *it)
 {
     if (object == NULL || it == NULL || object->type != CDB_TYPE_OBJECT)
@@ -992,6 +1048,8 @@ cdb_status cdb_value_object_get(const cdb_value *object, cdb_byte_order order,
     return CDB_OK;
 }
 
+/* One element of an f32 vector by index, converted from the file's byte
+ * order. */
 cdb_status cdb_value_vector_f32(const cdb_value *vec, cdb_byte_order order, uint64_t index, float *out)
 {
     uint32_t bits;
@@ -1074,6 +1132,9 @@ static cdb_status validate_array(const validate_ctx *c, const cdb_value *v, unsi
     return n == v->as.array.count ? CDB_OK : CDB_E_MALFORMED;
 }
 
+/* A canonical object: field IDs strictly increasing; values back to back in
+ * directory order from offset 0, each valid itself and together filling the
+ * values area exactly; and the smallest directory widths that fit. */
 static cdb_status validate_object(const validate_ctx *c, const cdb_value *v, unsigned depth)
 {
     const uint8_t *dp = v->as.object.directory;
@@ -1121,6 +1182,9 @@ static cdb_status validate_at(const validate_ctx *c, const uint8_t *buf, size_t 
     if ((s = cdb_value_read(buf, len, c->order, &v)) != CDB_OK)
         return s;
 
+    /* The reader has checked the extent and headers; what is left are the
+     * canonical rules per type. Null, booleans, integers, timestamps,
+     * references and binary have none beyond that. */
     switch (v.type) {
     case CDB_TYPE_F64: {
         uint64_t bits = cdb_load_u64(buf + 1, c->order);
