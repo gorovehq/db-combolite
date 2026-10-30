@@ -190,10 +190,9 @@ static size_t pending_left(uint64_t coll)
 
 static struct cdb_vec_coll *coll_of(uint64_t store)
 {
-    int i;
-    for (i = 0; i < CDB_DB_MAX_POOLS; i++)
-        if (db.vecs[i].in_use && db.vecs[i].store_id == store)
-            return &db.vecs[i];
+    struct cdb_vec_coll *c = (struct cdb_vec_coll *)cdb_slots_find(&db.vec_slots, store);
+    if (c != NULL)
+        return c;
     TEST_FAIL_MESSAGE("collection not open");
     return NULL;
 }

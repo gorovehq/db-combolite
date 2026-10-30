@@ -109,5 +109,6 @@ size_t cdb_doc_buffers_size(size_t page_size, size_t doc_max);
 /* Engine hooks used by cdb_db. */
 cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d);
 cdb_status cdb_doc_flush_pools(cdb_db *db);
+extern const cdb_slot_ops cdb_doc_slot_ops; /* open pools (cdb_slots.h) */
 
 #endif

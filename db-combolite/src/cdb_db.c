@@ -5,6 +5,8 @@
 #include "cdb_db.h"
 #include "cdb_doc.h"
 #include "cdb_link.h"
+#include "cdb_ts.h"
+#include "cdb_vec.h"
 
 #define JOURNAL_SLOT 0u
 #define DEFAULT_SYNC_EVERY 32u
@@ -258,10 +260,33 @@ static cdb_status start_session(cdb_db *db)
     return cdb_pager_commit(&db->pager);
 }
 
+size_t cdb_db_slot_mem_size(unsigned n)
+{
+    unsigned chunks = (n + CDB_SLOTS_CHUNK - 1u) / CDB_SLOTS_CHUNK, last = n - (chunks - 1u) * CDB_SLOTS_CHUNK;
+    size_t total = 0;
+    if (n == 0)
+        return 0;
+    total += (chunks - 1u) * cdb_slots_chunk_bytes(sizeof(struct cdb_doc_pool), CDB_SLOTS_CHUNK)
+             + cdb_slots_chunk_bytes(sizeof(struct cdb_doc_pool), last);
+    total += (chunks - 1u) * cdb_slots_chunk_bytes(sizeof(struct cdb_vec_coll), CDB_SLOTS_CHUNK)
+             + cdb_slots_chunk_bytes(sizeof(struct cdb_vec_coll), last);
+    total += (chunks - 1u) * cdb_slots_chunk_bytes(sizeof(struct cdb_ts_store), CDB_SLOTS_CHUNK)
+             + cdb_slots_chunk_bytes(sizeof(struct cdb_ts_store), last);
+    return total;
+}
+
+static void release_slots(cdb_db *db)
+{
+    cdb_slots_release(db, &db->pool_slots);
+    cdb_slots_release(db, &db->vec_slots);
+    cdb_slots_release(db, &db->ts_slots);
+}
+
+static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg, const cdb_header *create);
+
 cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const cdb_db_config *cfg,
                        const cdb_header *create)
 {
-    int exists;
     cdb_status s;
 
     if (db == NULL || env == NULL || base == NULL || cfg == NULL
@@ -279,6 +304,21 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
         db->cfg.apply = cdb_doc_apply; /* documents (spec 8) */
         db->cfg.apply_ctx = db;
     }
+    if (db->cfg.slot_mem == NULL)
+        db->cfg.slot_mem_size = 0;
+    cdb_slots_init(&db->pool_slots, sizeof(struct cdb_doc_pool), &cdb_doc_slot_ops);
+    cdb_slots_init(&db->vec_slots, sizeof(struct cdb_vec_coll), &cdb_vec_slot_ops);
+    cdb_slots_init(&db->ts_slots, sizeof(struct cdb_ts_store), &cdb_ts_slot_ops);
+    if ((s = open_db(db, base, cfg, create)) != CDB_OK)
+        release_slots(db); /* recovery may have opened stores */
+    return s;
+}
+
+static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg, const cdb_header *create)
+{
+    int exists;
+    cdb_status s;
+
     if ((s = set_paths(db, base)) != CDB_OK)
         return s;
 
@@ -504,6 +544,10 @@ cdb_status cdb_db_reconcile(cdb_db *db)
     set_journal_slot(db, 1, db->applied);
     if ((s = cdb_pager_commit(&db->pager)) != CDB_OK)
         return s;
+    /* Stores idle since the last reconciliation give their slots back. */
+    cdb_slots_shrink(db, &db->pool_slots);
+    cdb_slots_shrink(db, &db->vec_slots);
+    cdb_slots_shrink(db, &db->ts_slots);
     /* Every change in the journal is now in the archive. */
     return rotate_journal(db);
 }
@@ -535,7 +579,7 @@ cdb_status cdb_db_find_store(cdb_db *db, const char *name, size_t len, uint64_t 
 cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
 {
     cdb_status s = catalog_ready(db);
-    int i;
+    cdb_slot *slot;
     if (s == CDB_OK && cdb_link_is_store(db, id))
         s = CDB_E_INVALID_ARG; /* the link store is the engine's own */
     /* Its entries' links are tombstoned; the drop's commit carries that. */
@@ -546,14 +590,10 @@ cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
     if (s != CDB_OK)
         return s;
     /* Forget the store's open state, so it reads as dropped from now on. */
-    for (i = 0; i < CDB_DB_MAX_POOLS; i++) {
-        if (db->pools[i].in_use && db->pools[i].store_id == id)
-            db->pools[i].in_use = 0;
-        if (db->vecs[i].in_use && db->vecs[i].store_id == id)
-            db->vecs[i].in_use = 0;
-        if (db->tss[i].in_use && db->tss[i].store_id == id)
-            db->tss[i].in_use = 0;
-    }
+    if ((slot = cdb_slots_find(&db->pool_slots, id)) != NULL
+        || (slot = cdb_slots_find(&db->vec_slots, id)) != NULL
+        || (slot = cdb_slots_find(&db->ts_slots, id)) != NULL)
+        slot->in_use = 0;
     return rotate_journal(db);
 }
 
@@ -591,8 +631,10 @@ cdb_status cdb_db_close(cdb_db *db)
 {
     cdb_status s;
 
-    if (db->failed)
+    if (db->failed) {
+        release_slots(db); /* their state is lost with the session anyway */
         return CDB_E_STATE;
+    }
     if (db->in_tx && (s = cdb_tx_abort(db)) != CDB_OK)
         return s;
     if ((s = cdb_doc_flush_pools(db)) != CDB_OK)
@@ -600,6 +642,7 @@ cdb_status cdb_db_close(cdb_db *db)
     set_journal_slot(db, 0, db->applied);
     if ((s = cdb_pager_commit(&db->pager)) != CDB_OK)
         return s;
+    release_slots(db); /* everything they held is in the archive */
     /* The archive no longer needs the working directory. */
     cdb_storage_close(&db->journal_st);
     if ((s = env_remove(db, db->journal_path)) != CDB_OK)

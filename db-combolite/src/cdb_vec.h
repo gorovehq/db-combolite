@@ -152,5 +152,6 @@ size_t cdb_vec_work_size(cdb_vector_elem elem, uint32_t dims, uint32_t k);
 int cdb_vec_is_open(const cdb_db *db, uint64_t store);
 cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled);
 cdb_status cdb_vec_flush(cdb_db *db);
+extern const cdb_slot_ops cdb_vec_slot_ops; /* open collections (cdb_slots.h) */
 
 #endif

@@ -840,6 +840,136 @@ static void test_dropped_pool_is_gone(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+/* ------------------------------------------------------- open stores */
+
+#define MANY_POOLS 12
+
+static void make_pools(uint64_t *pools, int n)
+{
+    char name[16];
+    int i;
+    for (i = 0; i < n; i++) {
+        snprintf(name, sizeof name, "p%d", i);
+        pools[i] = make_pool(name);
+    }
+}
+
+/* One insert per pool, each in its own transaction; returns the entry. */
+static uint64_t insert_one(uint64_t pool)
+{
+    doc v = make_doc("x", NULL, NULL);
+    uint64_t e;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    e = insert(pool, NULL, &v);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    return e;
+}
+
+/* No cap: slots grow a chunk at a time, and close gives them all back. */
+static void test_open_pools_grow(void)
+{
+    uint64_t pools[MANY_POOLS];
+    int i;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    make_pools(pools, MANY_POOLS);
+    for (i = 0; i < MANY_POOLS; i++)
+        TEST_ASSERT_EQUAL_UINT64(1, insert_one(pools[i]));
+    TEST_ASSERT_EQUAL_UINT(MANY_POOLS / CDB_SLOTS_CHUNK, cdb_faultenv_live_allocs(&fe));
+    for (i = 0; i < MANY_POOLS; i++)
+        TEST_ASSERT_TRUE(doc_exists(pools[i], 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    TEST_ASSERT_EQUAL_UINT(0, cdb_faultenv_live_allocs(&fe));
+}
+
+/* At the cap the pool used longest ago is closed. Its unsaved entry
+ * counter survives: IDs continue after it reopens, and after a reopen. */
+static void test_open_pools_evict(void)
+{
+    uint64_t pools[3];
+    int round;
+    cfg.max_open = 2;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    make_pools(pools, 3);
+    for (round = 1; round <= 3; round++) {
+        TEST_ASSERT_EQUAL_UINT64((uint64_t)round, insert_one(pools[0]));
+        TEST_ASSERT_EQUAL_UINT64((uint64_t)round, insert_one(pools[1]));
+        TEST_ASSERT_EQUAL_UINT64((uint64_t)round, insert_one(pools[2])); /* evicts pools[0] */
+    }
+    TEST_ASSERT_NULL(cdb_slots_find(&db.pool_slots, pools[0]));
+    TEST_ASSERT_EQUAL_UINT(1, cdb_faultenv_live_allocs(&fe)); /* one chunk of 2 */
+    TEST_ASSERT_TRUE(doc_exists(pools[0], 3));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_EQUAL_UINT64(4, insert_one(pools[0]));
+    TEST_ASSERT_EQUAL_UINT64(4, insert_one(pools[1]));
+    TEST_ASSERT_EQUAL_UINT64(4, insert_one(pools[2]));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+/* A pool the open transaction has used is never closed under it. */
+static void test_open_pools_kept_in_transaction(void)
+{
+    doc v = make_doc("x", NULL, NULL);
+    uint64_t pools[3], e;
+    cfg.max_open = 2;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    make_pools(pools, 3);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    insert(pools[0], NULL, &v);
+    insert(pools[1], NULL, &v);
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUFFER_TOO_SMALL, cdb_doc_insert(&db, pools[2], NULL, 0, v.b, v.n, &e));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_UINT64(1, insert_one(pools[2])); /* a new transaction may evict */
+    TEST_ASSERT_TRUE(doc_exists(pools[0], 1));
+    TEST_ASSERT_TRUE(doc_exists(pools[1], 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+/* Without an allocator, slots come from caller memory only, and that
+ * memory bounds them as a cap would. */
+static void test_open_pools_caller_memory(void)
+{
+    static cdb_slot_align mem[4096];
+    uint64_t pools[3];
+    int round;
+    TEST_ASSERT_TRUE(cdb_db_slot_mem_size(2) <= sizeof mem);
+    cdb_faultenv_set_alloc(&fe, 0);
+    cfg.slot_mem = mem;
+    cfg.slot_mem_size = cdb_db_slot_mem_size(2);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    make_pools(pools, 3);
+    for (round = 1; round <= 2; round++) {
+        TEST_ASSERT_EQUAL_UINT64((uint64_t)round, insert_one(pools[0]));
+        TEST_ASSERT_EQUAL_UINT64((uint64_t)round, insert_one(pools[1]));
+        TEST_ASSERT_EQUAL_UINT64((uint64_t)round, insert_one(pools[2]));
+    }
+    TEST_ASSERT_EQUAL_UINT(0, cdb_faultenv_live_allocs(&fe));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+/* Reconciliation frees chunks whose pools were idle since the one before;
+ * a dropped pool's slot is free at once. */
+static void test_open_pools_shrink(void)
+{
+    uint64_t pools[CDB_SLOTS_CHUNK + 1];
+    int i;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    make_pools(pools, CDB_SLOTS_CHUNK + 1);
+    for (i = 0; i <= (int)CDB_SLOTS_CHUNK; i++)
+        insert_one(pools[i]);
+    TEST_ASSERT_EQUAL_UINT(2, cdb_faultenv_live_allocs(&fe));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db)); /* all were used since the last one */
+    TEST_ASSERT_EQUAL_UINT(2, cdb_faultenv_live_allocs(&fe));
+    insert_one(pools[0]);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db)); /* only pools[0]'s chunk was used */
+    TEST_ASSERT_EQUAL_UINT(1, cdb_faultenv_live_allocs(&fe));
+    TEST_ASSERT_EQUAL_UINT64(2, insert_one(pools[CDB_SLOTS_CHUNK])); /* reopens */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_drop_store(&db, pools[0]));
+    TEST_ASSERT_NULL(cdb_slots_find(&db.pool_slots, pools[0]));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    TEST_ASSERT_EQUAL_UINT(0, cdb_faultenv_live_allocs(&fe));
+}
+
 /* ------------------------------------------------------- crash sweep */
 
 /* Pool "adr". S0: nothing (or empty pool). S1: A = a1, B = b1. S2: A = a2 (patched).
@@ -983,6 +1113,11 @@ int main(void)
     RUN_TEST(test_growth_past_the_page_is_refused);
     RUN_TEST(test_replace_falls_back_to_full_revision);
     RUN_TEST(test_dropped_pool_is_gone);
+    RUN_TEST(test_open_pools_grow);
+    RUN_TEST(test_open_pools_evict);
+    RUN_TEST(test_open_pools_kept_in_transaction);
+    RUN_TEST(test_open_pools_caller_memory);
+    RUN_TEST(test_open_pools_shrink);
     RUN_TEST(test_schema_enforced);
     RUN_TEST(test_set_schema_rejects_bad_schemas);
     RUN_TEST(test_staging_large);

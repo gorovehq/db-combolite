@@ -26,6 +26,12 @@ typedef struct cdb_env_ops {
     /* Optional: the wall-clock time in nanoseconds since 1970-01-01 UTC.
      * NULL, or CDB_E_UNSUPPORTED, means the platform has no clock. */
     cdb_status (*now)(void *ctx, int64_t *ns);
+    /* Optional, as a pair: memory the engine may grow into and give back,
+     * such as open-store slots (cdb_db_config.max_open). alloc returns
+     * memory aligned for any object, or NULL when there is none to give.
+     * NULL hooks mean the engine uses only memory the caller supplied. */
+    void *(*alloc)(void *ctx, size_t size);
+    void (*free)(void *ctx, void *p);
 } cdb_env_ops;
 
 typedef struct cdb_env {

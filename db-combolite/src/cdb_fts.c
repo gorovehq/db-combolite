@@ -401,13 +401,13 @@ static cdb_status adjust_df(struct cdb_doc_pool *pool, const cdb_fts_token *t, i
 cdb_status cdb_fts_create(cdb_db *db, struct cdb_doc_pool *pool)
 {
     cdb_status s;
-    if ((s = cdb_index_create(&pool->fts_terms, &db->pager, pool->store_id,
+    if ((s = cdb_index_create(&pool->fts_terms, &db->pager, pool->slot.store_id,
                               CDB_INDEX_FLAG_UNIQUE | CDB_INDEX_FLAG_PREFIX, &db->cfg.catalog_work)) != CDB_OK)
         return s;
-    if ((s = cdb_index_create(&pool->fts_postings, &db->pager, pool->store_id,
+    if ((s = cdb_index_create(&pool->fts_postings, &db->pager, pool->slot.store_id,
                               CDB_INDEX_FLAG_UNIQUE | CDB_INDEX_FLAG_PREFIX, &db->cfg.catalog_work)) != CDB_OK)
         return s;
-    return cdb_index_create(&pool->fts_lengths, &db->pager, pool->store_id, CDB_INDEX_FLAG_UNIQUE,
+    return cdb_index_create(&pool->fts_lengths, &db->pager, pool->slot.store_id, CDB_INDEX_FLAG_UNIQUE,
                             &db->cfg.catalog_work);
 }
 

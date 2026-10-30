@@ -275,10 +275,9 @@ static cdb_fts_token oracle_words[PAGE];
 
 static struct cdb_doc_pool *pool_of(uint64_t store)
 {
-    int i;
-    for (i = 0; i < CDB_DB_MAX_POOLS; i++)
-        if (db.pools[i].in_use && db.pools[i].store_id == store)
-            return &db.pools[i];
+    struct cdb_doc_pool *p = (struct cdb_doc_pool *)cdb_slots_find(&db.pool_slots, store);
+    if (p != NULL)
+        return p;
     TEST_FAIL_MESSAGE("pool not open");
     return NULL;
 }
