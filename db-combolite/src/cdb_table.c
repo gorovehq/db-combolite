@@ -8,15 +8,23 @@
 #include "cdb_doc.h"
 #include "cdb_endian.h"
 #include "cdb_key.h"
+#include "cdb_rowgroup.h"
+#include "cdb_varint.h"
 #include "cdb_table.h"
 
 /* Store settings object (field 16; spec 14.10.1): 1 keep, 2 layout (0 =
- * row), 3 indexes, 4 next index number. An index: 1 number, 2 field IDs,
- * 3 unique, 4 root. */
+ * row, 1 = column), 3 indexes, 4 next index number; column-oriented only
+ * (spec 14.10.2): 5 groups index root, 6 pending index root, 7 rows per
+ * group, 8 value bytes per column per group. An index: 1 number, 2 field
+ * IDs, 3 unique, 4 root. */
 #define SET_KEEP 1u
 #define SET_LAYOUT 2u
 #define SET_INDEXES 3u
 #define SET_NEXT_INDEX 4u
+#define SET_GROUPS 5u
+#define SET_PENDING 6u
+#define SET_GROUP_ROWS 7u
+#define SET_CHUNK_CAP 8u
 #define IX_NUMBER 1u
 #define IX_FIELDS 2u
 #define IX_UNIQUE 3u
@@ -193,6 +201,7 @@ static cdb_status parse_settings(cdb_db *db, table *t, const uint8_t *settings, 
     t->keep = 0;
     t->nidx = 0;
     t->next_index = 1;
+    t->layout = 0;
     if (len == 0)
         return CDB_OK;
     if (cdb_value_read(settings, len, o, &obj) != CDB_OK || obj.type != CDB_TYPE_OBJECT)
@@ -203,6 +212,29 @@ static cdb_status parse_settings(cdb_db *db, table *t, const uint8_t *settings, 
     if ((s = get_uint(&obj, o, SET_NEXT_INDEX, UINT32_MAX, &v)) != CDB_OK)
         return s;
     t->next_index = v ? (uint32_t)v : 1u;
+    if ((s = get_uint(&obj, o, SET_LAYOUT, CDB_TABLE_LAYOUT_COLUMN, &v)) != CDB_OK)
+        return s;
+    t->layout = (uint8_t)v;
+    if (t->layout == CDB_TABLE_LAYOUT_COLUMN) {
+        uint64_t groups, pending, rows, cap;
+        if ((s = get_uint(&obj, o, SET_GROUPS, UINT64_MAX, &groups)) != CDB_OK
+            || (s = get_uint(&obj, o, SET_PENDING, UINT64_MAX, &pending)) != CDB_OK
+            || (s = get_uint(&obj, o, SET_GROUP_ROWS, CDB_RG_ROWS_MAX, &rows)) != CDB_OK
+            || (s = get_uint(&obj, o, SET_CHUNK_CAP, UINT32_MAX, &cap)) != CDB_OK)
+            return s;
+        if ((groups == 0) != (pending == 0) || rows == 0 || cap == 0)
+            return CDB_E_CORRUPT;
+        t->group_rows = (uint32_t)rows;
+        t->chunk_cap = (uint32_t)cap;
+        memset(&t->groups, 0, sizeof t->groups);
+        memset(&t->pending, 0, sizeof t->pending);
+        /* Roots of 0: creation stopped before the indexes were made; the
+         * table has no columns either (cdb_table_create). */
+        if (groups != 0
+            && ((s = cdb_index_open(&t->groups, &db->pager, groups, &db->cfg.catalog_work)) != CDB_OK
+                || (s = cdb_index_open(&t->pending, &db->pager, pending, &db->cfg.catalog_work)) != CDB_OK))
+            return s;
+    }
     if ((s = get_field(&obj, o, SET_INDEXES, &a, &found)) != CDB_OK || !found)
         return s;
     if (a.type != CDB_TYPE_ARRAY || cdb_value_array_iter(&a, o, &it) != CDB_OK)
@@ -650,6 +682,8 @@ static cdb_status tx_table(cdb_db *db, uint64_t store, table **t)
         return CDB_E_STATE;
     if ((s = table_get(db, store, t)) != CDB_OK)
         return s;
+    if ((*t)->layout == CDB_TABLE_LAYOUT_COLUMN)
+        return CDB_E_UNSUPPORTED; /* column-oriented rows: M18 layers 2-4 */
     return (*t)->version == 0 ? CDB_E_STATE : CDB_OK;
 }
 
@@ -753,6 +787,8 @@ cdb_status cdb_table_get(cdb_db *db, uint64_t store, uint64_t entry, void *out, 
     cdb_status s;
     db->via_table = 1;
     s = table_get(db, store, &t);
+    if (s == CDB_OK && t->layout == CDB_TABLE_LAYOUT_COLUMN)
+        s = CDB_E_UNSUPPORTED;
     if (s == CDB_OK)
         s = read_row(db, t, entry, out, cap, len);
     db->via_table = 0;
@@ -769,6 +805,8 @@ static cdb_status find_row(cdb_db *db, uint64_t store, const void *key, size_t k
     *found = 0;
     if ((s = table_get(db, store, &t)) != CDB_OK)
         return s;
+    if (t->layout == CDB_TABLE_LAYOUT_COLUMN)
+        return CDB_E_UNSUPPORTED;
     if (t->npk == 0 || (x = index_of(t, 0)) == NULL)
         return CDB_E_STATE; /* no primary key */
     if ((s = array_key(db, x, (const uint8_t *)key, key_len, k, &klen)) != CDB_OK)
@@ -804,6 +842,8 @@ static cdb_status scan(cdb_db *db, uint64_t store, uint32_t index, const void *f
     *n = 0;
     if ((s = table_get(db, store, &t)) != CDB_OK)
         return s;
+    if (t->layout == CDB_TABLE_LAYOUT_COLUMN)
+        return CDB_E_UNSUPPORTED;
     if (index == CDB_TABLE_NO_INDEX) {
         /* Entry order: the committed live rows. */
         while (*n < max) {
@@ -944,7 +984,7 @@ static cdb_status encode_settings(cdb_db *db, const table *t, uint64_t next_inde
     cdb_value_field(&w, SET_KEEP);
     cdb_value_write_int(&w, (int64_t)t->keep);
     cdb_value_field(&w, SET_LAYOUT);
-    cdb_value_write_int(&w, 0);
+    cdb_value_write_int(&w, (int64_t)t->layout);
     cdb_value_field(&w, SET_INDEXES);
     cdb_value_begin_array(&w);
     for (i = 0; i < t->nidx; i++) {
@@ -966,6 +1006,16 @@ static cdb_status encode_settings(cdb_db *db, const table *t, uint64_t next_inde
     cdb_value_end_array(&w);
     cdb_value_field(&w, SET_NEXT_INDEX);
     cdb_value_write_int(&w, (int64_t)next_index);
+    if (t->layout == CDB_TABLE_LAYOUT_COLUMN) {
+        cdb_value_field(&w, SET_GROUPS);
+        cdb_value_write_int(&w, (int64_t)t->groups.root);
+        cdb_value_field(&w, SET_PENDING);
+        cdb_value_write_int(&w, (int64_t)t->pending.root);
+        cdb_value_field(&w, SET_GROUP_ROWS);
+        cdb_value_write_int(&w, (int64_t)t->group_rows);
+        cdb_value_field(&w, SET_CHUNK_CAP);
+        cdb_value_write_int(&w, (int64_t)t->chunk_cap);
+    }
     cdb_value_end_object(&w);
     if (w.error != CDB_OK)
         return w.error == CDB_E_BUFFER_TOO_SMALL ? CDB_E_OVERFLOW : w.error;
@@ -1163,6 +1213,24 @@ cdb_status cdb_table_create(cdb_db *db, const char *name, size_t len, const cdb_
      * the next use of the table loads its own copy from the catalog. */
     memset(t, 0, sizeof *t);
     t->keep = def->keep;
+    if (def->layout > CDB_TABLE_LAYOUT_COLUMN)
+        return CDB_E_INVALID_ARG;
+    t->layout = (uint8_t)def->layout;
+    if (t->layout == CDB_TABLE_LAYOUT_COLUMN) {
+        int alloc = db->env.ops->alloc != NULL && db->env.ops->free != NULL;
+        t->group_rows = def->group_rows ? def->group_rows : CDB_RG_ROWS_DEFAULT;
+        t->chunk_cap = def->chunk_cap ? def->chunk_cap : CDB_RG_CAP_DEFAULT;
+        /* The entry-ID chunk must fit (cdb_rg_init). A row is never larger
+         * than the cap (checked when it is written), so a group of one row
+         * always fits too; the cap does not depend on doc_max. */
+        if (t->group_rows > CDB_RG_ROWS_MAX
+            || t->chunk_cap < (size_t)t->group_rows * (1u + CDB_VARINT_MAX_LEN))
+            return CDB_E_INVALID_ARG;
+        if (db->cfg.col_work == NULL)
+            return CDB_E_UNSUPPORTED;
+        if (db->cfg.col_work_size < cdb_rg_work_size(db->pager.page_size, t->group_rows, t->chunk_cap, !alloc))
+            return CDB_E_BUFFER_TOO_SMALL;
+    }
     for (i = 0; i < def->ncolumns; i++)
         if ((s = check_column(db, t, &def->columns[i], &t->cols[i], &used)) != CDB_OK)
             return s;
@@ -1204,6 +1272,14 @@ cdb_status cdb_table_create(cdb_db *db, const char *name, size_t len, const cdb_
     t->slot.store_id = *store;
     db->via_table = 1;
     s = CDB_OK;
+    if (t->layout == CDB_TABLE_LAYOUT_COLUMN
+        && ((s = cdb_index_create(&t->groups, &db->pager, *store, CDB_INDEX_FLAG_UNIQUE, &db->cfg.catalog_work))
+                != CDB_OK
+            || (s = cdb_index_create(&t->pending, &db->pager, *store, CDB_INDEX_FLAG_UNIQUE,
+                                     &db->cfg.catalog_work)) != CDB_OK)) {
+        db->via_table = 0;
+        return cdb_db_catalog_end(db, s);
+    }
     if (def->npk > 0)
         s = add_index(db, *store, t, pk, def->npk, 1, 0);
     if (s == CDB_OK)
@@ -1412,6 +1488,8 @@ static cdb_status do_create_index(cdb_db *db, uint64_t store, table *t, uint64_t
 {
     const index_arg *a = (const index_arg *)arg;
     cdb_status s;
+    if (t->layout == CDB_TABLE_LAYOUT_COLUMN)
+        return CDB_E_UNSUPPORTED; /* it would be built from the row store */
     if (next == 0 || next >= UINT32_MAX)
         return CDB_E_OVERFLOW;
     if ((s = add_index(db, store, t, a->fields, a->n, a->unique, (uint32_t)next)) != CDB_OK)
@@ -1451,4 +1529,44 @@ static cdb_status do_drop_index(cdb_db *db, uint64_t store, table *t, uint64_t n
 cdb_status cdb_table_drop_index(cdb_db *db, uint64_t store, uint32_t index)
 {
     return change(db, store, do_drop_index, &index);
+}
+
+/* -------------------------------------------------------- column-oriented */
+
+static cdb_status rowgroups(cdb_db *db, uint64_t store, cdb_rg *g)
+{
+    table *t;
+    cdb_status s;
+    if ((s = table_get(db, store, &t)) != CDB_OK)
+        return s;
+    if (t->layout != CDB_TABLE_LAYOUT_COLUMN)
+        return CDB_E_INVALID_ARG;
+    if (t->groups.root == 0)
+        return CDB_E_STATE; /* creation did not finish */
+    if (db->cfg.col_work == NULL)
+        return CDB_E_UNSUPPORTED;
+    return cdb_rg_init(g, db, store, &t->groups, t->group_rows, t->chunk_cap, db->cfg.col_work,
+                       db->cfg.col_work_size);
+}
+
+cdb_status cdb_table_rowgroups(cdb_db *db, uint64_t store, struct cdb_rg *g)
+{
+    cdb_status s;
+    db->via_table = 1;
+    s = rowgroups(db, store, g);
+    db->via_table = 0;
+    return s;
+}
+
+cdb_status cdb_table_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t addr)
+{
+    cdb_rg g;
+    cdb_status s = cdb_table_rowgroups(db, store, &g);
+    /* A dropped or unknown store, or one that is not a column-oriented
+     * table, does not own the chunk: the merge drops it. */
+    if (s == CDB_E_NOT_FOUND || s == CDB_E_INVALID_ARG)
+        return CDB_E_NOT_FOUND;
+    if (s != CDB_OK)
+        return s;
+    return cdb_rg_nib_moved(&g, okey, oklen, addr);
 }

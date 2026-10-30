@@ -112,6 +112,9 @@ typedef struct cdb_db_config {
     void (*ts_collision)(void *ctx, uint64_t store, uint64_t series, int64_t ts);
     void *ts_collision_ctx;
     uint8_t *table_buffers;       /* tables: cdb_table_buffers_size() bytes (cdb_table.h) */
+    uint8_t *col_work;            /* column-oriented tables: cdb_rg_work_size() bytes for the
+                                     largest group size and cap in use (cdb_rowgroup.h) */
+    size_t col_work_size;
     /* Open stores (cdb_slots.h): the most document pools, vector
      * collections and time-series stores, each, open at once; 0: no cap.
      * Slots grow with use, in chunks of 4, from slot_mem first and then
@@ -198,6 +201,11 @@ struct cdb_table_store {
     uint32_t version;        /* schema version the columns come from; 0: no columns yet */
     uint32_t keep;           /* revisions kept per row; 0 = all */
     uint32_t next_index;     /* the number the next created index gets */
+    uint8_t layout;          /* 0 row-oriented, 1 column-oriented */
+    uint32_t group_rows;     /* column-oriented: most rows per group */
+    uint32_t chunk_cap;      /* column-oriented: most value bytes per column per group */
+    cdb_index groups;        /* column-oriented: row groups by last entry ID */
+    cdb_index pending;       /* column-oriented: changes not yet in a group */
     unsigned ncols;
     struct cdb_table_col {
         uint64_t id;         /* field ID */

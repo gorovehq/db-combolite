@@ -48,7 +48,7 @@ Nibblets are a **general facility**. Any part of the engine that would otherwise
 |---|---|---|
 | 1 Document and table revisions (14.9.2) | revisions index: (entry, revision) | M17 |
 | 2 Time-series blocks of sparse series (14.11.1); a block graduates to its own page as it fills | blocks index: (series, first timestamp) | M17 |
-| 3 Column chunks of small tables (14.10.2) | the row group's chunk list | M18 |
+| 3 Column chunks of small tables (14.10.2) | the row group's chunk list: (group's last entry ID, field ID) | M18 |
 | 4 The last, partly filled page of an overflow chain (14.15) | the chain's owner | later (backlog) |
 
 Some data already packs small records, so it gains nothing from nibblets and does not use them:

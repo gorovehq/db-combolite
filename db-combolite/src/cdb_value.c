@@ -163,6 +163,30 @@ static int decimal_fits_compact(const uint8_t *b, size_t len)
     return memcmp(mag, ten_pow_38, sizeof mag) < 0;
 }
 
+/* Public wrappers over the canonical checks above, for a caller that holds
+ * a value's pieces without its tag byte and so cannot call
+ * cdb_value_validate itself (spec 14.6.5; see cdb_value.h). They call
+ * straight through to the same logic cdb_value_validate uses. */
+int cdb_value_decimal_is_canonical(const uint8_t *unscaled_be, size_t len)
+{
+    return decimal_is_canonical(unscaled_be, len);
+}
+
+int cdb_value_decimal_fits_compact(const uint8_t *unscaled_be, size_t len)
+{
+    return decimal_fits_compact(unscaled_be, len);
+}
+
+uint32_t cdb_value_f32_canonical(uint32_t bits)
+{
+    return f32_canonical(bits);
+}
+
+uint16_t cdb_value_half_canonical(uint16_t bits, cdb_vector_elem elem)
+{
+    return half_canonical(bits, elem);
+}
+
 /* Bits per vector element; 0 for an unknown element type. */
 static size_t vector_elem_size_bits(cdb_vector_elem elem)
 {

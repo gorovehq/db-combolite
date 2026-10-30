@@ -832,6 +832,92 @@ A row-oriented table is a B+tree clustered by **entry ID**, with the same struct
 - **Changes.** Changes arrive through the delta tracks. At reconciliation, each affected row group is rewritten copy-on-write.
 - **History.** Columnar tables that have history turned on (Section 9.6) keep that history in a **row-format side store**, using the same envelope as 14.9. Analytic scans stay fast, and the revision trail remains complete.
 
+### 14.10.2.1 Column chunk encodings (current layout)
+
+A column chunk's **values** part (14.10.2) holds the chunk's present (non-null) values, all of the column's type. The null bitmap, the encoding ID and the compression codec (Section 2.5, 14.10.2) sit outside this part and are known to the caller; so are the value count *n* (from the null bitmap) and the column's type tag, so neither is stored in the encoded bytes.
+
+**Items.** Within a chunk, a value is stored as an **item**: the canonical encoding of 14.6 with the tag dropped, since every value in a chunk shares the column's tag.
+
+| Column type | Item bytes |
+|---|---|
+| int | zigzag varint (14.6, no tag) |
+| f64 / f32 | 8 / 4 bytes, file byte order |
+| timestamp | precision byte, then 8 bytes, file byte order |
+| ref | two varints |
+| bool | one byte, 0 = false, 1 = true (the two bool tags share one column type) |
+| tag ≥ 0x40 (string, binary, decimal, array, object, vector) | length varint, then that many payload bytes |
+
+Item bytes are equal if and only if the values are equal, since values are canonical. A null value and the reserved fixed tags 0x08–0x3F never appear in a column.
+
+**Encoding IDs** (stored by the caller in the chunk header):
+
+| ID | Name | Bytes |
+|---|---|---|
+| 0 | plain | the *n* items, one after another |
+| 1 | dictionary | varint *k* (distinct items, 1 ≤ *k* ≤ *n*), the *k* items in order of first use, then *n* indexes, each in `bitlen(k − 1)` bits (0 bits when *k* = 1), as one bitstream |
+| 2 | run-length | pairs of (varint run length ≥ 1, item) until *n* values are covered; adjacent runs never hold the same item |
+| 3 | bit-packed | integer-like columns only (int, timestamp, bool): for timestamp, a precision byte shared by every value; then a zigzag varint of the minimum *m*, a byte *w* (0–64), then the *n* values (*v* − *m*, computed in `uint64`) in *w* bits each. *w* is the bit length of the largest *v* − *m*, so some value equals *m* and some value needs all *w* bits. A timestamp column whose values do not share one precision cannot be bit-packed |
+
+A bitstream is most-significant-bit first (Section 10.3's bit codecs); the bits after the last one are zero, and the stream ends exactly there. None of these forms has a fixed-width offset or length field — every count, run length and the dictionary's *k* is a varint, so a chunk's own byte form never caps it at 4 GiB.
+
+**Choice** (Section 9.12): the chunk is encoded every way that applies, and the smallest result is kept; a tie goes to the lowest ID. An empty chunk (*n* = 0) is plain and zero bytes; any other encoding with *n* = 0 is rejected as not canonical.
+
+**Canonical form** (14.6.5) of the encodings: every set of values has exactly one encoded form per encoding ID. Rejected as not canonical: dictionary entries repeated, out of first-use order, or unused; adjacent runs of the same item; a bit width wider than needed; a minimum no value reaches; non-zero padding bits; trailing bytes. Rejected as corrupt: a run length of 0, a run-length total that disagrees with *n*, an out-of-range index or count, a width over 64, bit-packing on a type that does not support it, a value that wraps below the minimum. An item is checked as deeply as a tag-less item allows: fixed-shape scalars and strings get the same canonical check as a tagged value; array and object elements are themselves full tagged values and are validated recursively, including the container's own canonical rules (ascending field IDs, contiguous offsets, smallest directory widths); binary has no canonical rule beyond its bytes; decimal and vector items get the same canonical bit-pattern checks as a tagged value (shortest two's-complement form and the compact-mode limit for decimal; canonical float bits for vector elements).
+
+### 14.10.2.2 Row groups, headers and chunks (current layout)
+
+**Table settings** (the store's settings object, 14.3.3 field 16) of a column-oriented table: fields 1–4 as in 14.10.1, with 2 layout = 1, and:
+
+| Field | Value |
+|---|---|
+| 5 | groups index root page |
+| 6 | pending rows index root page |
+| 7 | most rows in a group (default 1024; at most 65,536) |
+| 8 | the **cap**: most value bytes one column may hold in a group (default 64 KiB) |
+
+- **Bounds** (Section 9.12). A group closes at field 7's row count, or earlier when any column's values would pass the cap. The cap must hold the entry-ID chunk: at least 11 bytes per row. A row larger than the cap is refused when it is written, so a group of one row always fits.
+- **Roots of 0** in fields 5 and 6 mean table creation stopped part-way. The table then has no columns, and every row call refuses it.
+
+**Groups index.** One entry per group. The key is the group's **last** entry ID (8 bytes, big-endian), so seeking an entry ID lands on the only group that can hold it. Groups cover disjoint, ascending ranges of entry IDs; a range may have gaps. The value is the group header, all big-endian:
+
+| Size | Field |
+|---|---|
+| 8 | first entry ID |
+| 4 | row count (1 to 65,536) |
+| 4 | schema version the group was written under |
+| 2 | column count |
+| | chunk references: the entry-ID chunk first, then one per column in ascending field-ID order |
+
+A **chunk reference**:
+
+| Size | Field |
+|---|---|
+| 8 | field ID; 0 for the entry-ID chunk |
+| 1 | the column's value tag (14.6); a bool column uses the false tag |
+| 1 | address length, 8 or 10 |
+| 8 or 10 | the chunk's address (14.18.2): a nibblet, or the first page of an overflow chain |
+| 4 | the chunk's stored bytes |
+| 4 | null count |
+| 1 + *n* | minimum: length, then the smallest present value in the shared encoding |
+| 1 + *n* | maximum: likewise, the largest |
+
+- **Statistics.** Minimum and maximum are kept only when each is at most **32 bytes**, and only for types with an order (bool, int, f64, f32, timestamp, reference, string, binary). Otherwise both lengths are 0. Values compare as their index keys would (14.8.4); strings and binaries compare by bytes, the shorter first on a tie.
+- **Checks on read.** The row count fits the entry-ID range; field IDs ascend; no null count passes the row count; statistics come in pairs, are canonical values of the column's type, and minimum ≤ maximum; the bytes end exactly at the last reference. Anything else is corrupt.
+
+**Entry-ID chunk.** The group's entry IDs, strictly ascending, stored as an int column with no nulls. Position *p* in every column chunk is the row whose entry ID is at position *p* here. Its first and last values equal the header's first entry ID and the key.
+
+**Chunk bytes:**
+
+| Size | Field |
+|---|---|
+| 1 | encoding ID (14.10.2.1) |
+| 1 | codec (Section 15.1): 0 none, 1 LZMA2 |
+| ⌈rows / 8⌉ | null bitmap, present only when the null count is not 0: bit *p*, most significant bit first, set when row *p* is null; unused bits zero |
+| rest | the present values in the encoding's form (14.10.2.1); with codec 1, that form compressed in the form of 15.2 |
+
+- **Compression** (Section 15.4) is always tried on a chunk's values, and kept only when it saves at least 1/8.
+- **Where a chunk lives** (Section 16.1). A chunk of at most a quarter page is a **nibblet of kind 3**. Its back-reference key is the group's last entry ID, then the field ID (8 + 8 bytes, big-endian), which is enough to find and update the reference when the nibblet moves. A larger chunk is an overflow chain of its own (14.15). A chunk stored the other way is rejected as not canonical.
+
 ---
 
 ## 14.11 Time-series blocks

@@ -95,6 +95,8 @@ With history off, a table keeps its **last N revisions** of each row (9.11).
 
 - **Changes.** Committed changes go to a per-table **pending rows** index. Reconciliation folds them in, rewriting each affected row group once (14.10.2), and scans read the row groups together with the pending rows.
 - **Row groups.** They hold **1024 rows** by default. This value is provisional, can be configured per table, and will be revisited with the host benchmarking tool.
+- **Memory bound.** A group also closes early when any column's values would pass a per-table **byte cap** (64 KiB by default, provisional like the row count). So the memory one group needs is fixed by the row count and the cap, and works from caller memory alone. Groups therefore cover entry-ID ranges of varying width. Reconciliation splits a group that grows past the cap, so a write is never refused because a group is full. Underfull groups are not merged yet.
+- **Row size.** A column-oriented table's rows are bounded by its cap, not by the document limit: a row larger than the cap is refused when it is written. This guarantees that a group of one row always fits.
 - **Encodings.** The encoding of each column chunk is chosen **automatically**: the chunk is encoded every way that applies, and the smallest result is kept.
 - **Compression.** After encoding, a chunk is compressed with **xz** (LZMA2, through the vendored liblzma) at a low preset, with a dictionary no larger than the chunk. The compressed form is kept only if it saves at least 1/8 of the size; codec 0 means uncompressed. Section 15 covers compression in detail.
 

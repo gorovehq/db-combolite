@@ -60,10 +60,13 @@ cdb_add_bench(bench_graph)
 cdb_add_test(test_ts)
 cdb_add_test(test_nib)
 cdb_add_test(test_table)
+cdb_add_test(test_codec)
+cdb_add_test(test_colenc)
+cdb_add_test(test_rowgroup)
 
 # The suites that use several stores again, with one open store of each
 # model at a time, so a store closed while still in use shows up here.
-foreach(name test_link test_fts test_vec test_ts test_table)
+foreach(name test_link test_fts test_vec test_ts test_table test_rowgroup)
   add_test(NAME ${name}_cap1 COMMAND ${name})
   set_tests_properties(${name}_cap1 PROPERTIES ENVIRONMENT CDB_TEST_MAX_OPEN=1)
 endforeach()

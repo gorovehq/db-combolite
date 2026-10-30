@@ -56,12 +56,21 @@ typedef struct cdb_table_column {
     size_t default_len;
 } cdb_table_column;
 
+#define CDB_TABLE_LAYOUT_ROW 0u
+#define CDB_TABLE_LAYOUT_COLUMN 1u
+
 typedef struct cdb_table_def {
     const cdb_table_column *columns;
     unsigned ncolumns;
     const unsigned *primary_key;  /* positions in columns[]; NULL for none */
     unsigned npk;
     uint32_t keep;                /* 0: every revision; N: the last N (spec 9.11) */
+    /* Column-oriented tables (spec 9.12; cdb_rowgroup.h). They need
+     * cdb_db_config.col_work. Row calls on them are not built yet and
+     * return CDB_E_UNSUPPORTED. */
+    unsigned layout;              /* CDB_TABLE_LAYOUT_* */
+    uint32_t group_rows;          /* 0: CDB_RG_ROWS_DEFAULT */
+    uint32_t chunk_cap;           /* 0: CDB_RG_CAP_DEFAULT; also the largest row the table takes */
 } cdb_table_def;
 
 /* A column as described. */
@@ -152,5 +161,13 @@ cdb_status cdb_table_keep_setting(const uint8_t *settings, size_t len, cdb_byte_
 cdb_status cdb_table_apply_before(cdb_db *db, uint64_t store, uint64_t entry);
 cdb_status cdb_table_apply_after(cdb_db *db, uint64_t store, uint64_t entry);
 extern const cdb_slot_ops cdb_table_slot_ops; /* open tables (cdb_slots.h) */
+
+/* Column-oriented tables: sets g up over the table's row groups, with
+ * cfg.col_work. CDB_E_INVALID_ARG if the table is row-oriented. */
+struct cdb_rg;
+cdb_status cdb_table_rowgroups(cdb_db *db, uint64_t store, struct cdb_rg *g);
+/* A column-chunk nibblet moved (cdb_nib_merge). CDB_E_NOT_FOUND if its
+ * table is gone or no group refers to it. */
+cdb_status cdb_table_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t addr);
 
 #endif
