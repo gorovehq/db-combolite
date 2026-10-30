@@ -96,7 +96,7 @@ With history off, a table keeps its **last N revisions** of each row (9.11).
 - **Changes.** Committed changes go to a per-table **pending rows** index. Reconciliation folds them in, rewriting each affected row group once (14.10.2), and scans read the row groups together with the pending rows.
 - **Row groups.** They hold **1024 rows** by default. This value is provisional, can be configured per table, and will be revisited with the host benchmarking tool.
 - **Encodings.** The encoding of each column chunk is chosen **automatically**: the chunk is encoded every way that applies, and the smallest result is kept.
-- **Compression.** After encoding, a chunk is compressed with **xz** (LZMA2, through the vendored liblzma) at a low preset, with a dictionary no larger than the chunk. The compressed form is kept only if it saves at least 1/8 of the size; codec 0 means uncompressed.
+- **Compression.** After encoding, a chunk is compressed with **xz** (LZMA2, through the vendored liblzma) at a low preset, with a dictionary no larger than the chunk. The compressed form is kept only if it saves at least 1/8 of the size; codec 0 means uncompressed. Section 15 covers compression in detail.
 
 ## Open questions (do not specify until answered)
 

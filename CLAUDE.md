@@ -30,7 +30,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M15 | Links: link types, the link store, delete and drop rules; the environment clock (spec 6, 14.4, 14.13) | done |
 | M16 | Time series: series, bit-level column blocks, late modes incl. hold-and-forward, collisions (spec 10, 14.11) | done |
 | M17 | Row-oriented tables on document pools: column schemas and schema changes, not-null/unique/primary keys, secondary indexes, history on or last-N (spec 9, 14.10.1) | planned |
-| M18 | Column-oriented tables: row groups, automatic column encodings, pending rows folded at reconciliation, xz compression of chunks (spec 9.12, 14.10.2) | planned |
+| M18 | Column-oriented tables and compression: row groups, automatic column encodings, pending rows folded at reconciliation; xz (LZMA2) for column chunks, large document bodies, journal records and in-page compression (spec 9.12, 14.10.2, 15) | planned |
 
 ## Commands
 

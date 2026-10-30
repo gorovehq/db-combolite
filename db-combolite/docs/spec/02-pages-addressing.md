@@ -110,7 +110,7 @@ The algorithm used for page checksums is chosen per file and recorded in a heade
 
 ### 2.10 Compression: defaults, with an override and a warning
 
-The spec sets a sensible default compression strategy for each data type (2.5). Operators may override the default. If they do, the library warns them about the possible consequences.
+The spec sets a sensible default compression strategy for each data type (2.5). Operators may override the default. If they do, the library warns them about the possible consequences. Section 15 gives the codecs, the defaults and the warning in detail.
 
 ### 2.11 The common page header
 
