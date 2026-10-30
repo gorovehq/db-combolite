@@ -34,6 +34,7 @@
 #define CDB_NIB_ADDR_FLAG (UINT64_C(1) << 63)
 #define CDB_NIB_KIND_REVISION 1u   /* a document or table revision (owner key: entry, revision) */
 #define CDB_NIB_KIND_TS_BLOCK 2u   /* a time-series block (owner key: series, first timestamp) */
+#define CDB_NIB_KIND_COLCHUNK 3u   /* a column chunk (owner key: group's last entry, field ID) */
 #define CDB_NIB_KEY_MAX 32u        /* longest owner key */
 #define CDB_NIB_MERGE_BUDGET 16u   /* pages merged per reconciliation */
 

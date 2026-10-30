@@ -70,6 +70,7 @@ add_library(combolite
   src/cdb_nib.c
   src/cdb_codec.c
   src/cdb_colenc.c
+  src/cdb_rowgroup.c
   src/cdb_table.c
   src/cdb_key.c
   src/cdb_index.c
