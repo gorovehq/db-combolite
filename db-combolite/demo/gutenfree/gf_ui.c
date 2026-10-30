@@ -987,7 +987,7 @@ static int load_model(gf_app *a)
     t0 = gf_now_ms();
     a->emb = gf_embed_open(a->model);
     if (a->emb == NULL) {
-        mvprintw(4, 2, "Could not load it. Run demo/gutenfree/tools/gf_model.py first.");
+        mvprintw(4, 2, "Could not load it. Run python3 gf_model.py first.");
         gf_status(" any key: back ");
         refresh();
         gf_getch();

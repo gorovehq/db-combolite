@@ -39,3 +39,6 @@ else()
 endif()
 target_compile_definitions(gutenfree PRIVATE GF_BUILD_LABEL="${GF_BUILD_LABEL}")
 target_link_libraries(gutenfree PRIVATE combolite llama ${CURSES_LIBRARIES})
+# The binary goes next to its scripts and data/, so it runs as ./gutenfree
+# from demo/gutenfree/ (the last build made wins; git ignores it).
+set_target_properties(gutenfree PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

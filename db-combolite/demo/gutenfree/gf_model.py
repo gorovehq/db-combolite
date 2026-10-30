@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GutenFree Diet: download the embedding model the demo uses.
 
-    gf_model.py [--file NAME] [--out DIR]
+    python3 gf_model.py [--file NAME] [--out DIR]   (default: data/models/ next to it)
 
 The model is bge-small-en-v1.5 (BAAI, MIT licence): 33M parameters, 384
 dimensions, a 512-token window, English. The GGUF conversion comes from
@@ -22,7 +22,7 @@ import urllib.request
 
 REPO = "CompendiumLabs/bge-small-en-v1.5-gguf"
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.normpath(os.path.join(HERE, "..", "..", "..", "datastore", "gutenberg", "models"))
+OUT = os.path.join(HERE, "data", "models")
 USER_AGENT = "GutenFreeDiet/0.1 (db-combolite demo)"
 
 

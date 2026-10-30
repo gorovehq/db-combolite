@@ -11,7 +11,7 @@
  *                                           add genres, subjects and dates
  *                                           (ingest-index does it too when
  *                                           the file is there; fetch it with
- *                                           tools/gf_fetch.py --catalog)
+ *                                           gf_fetch.py --catalog)
  *   gutenfree filter key=value ...          the catalog filter: title= author=
  *                                           genre= subject= lang= locc= type=
  *                                           from= to= shelf sort=<index 0-7>
@@ -19,12 +19,12 @@
  *   gutenfree probe [seconds] [base]        run the diagnostics probe load
  *   gutenfree metrics [base]                print what each measure holds
  *   gutenfree embed [model.gguf] [base]     embed every stored passage (the
- *                                           model from tools/gf_model.py), link
+ *                                           model from gf_model.py), link
  *                                           similar books, refresh the graph
  *
  * base is the database path without extension: the last argument, else
- * $GUTENFREE_DB, else datastore/gutenberg/gutenfree (giving
- * gutenfree.cdbarch); run from db-combolite/. Only one process may have a
+ * $GUTENFREE_DB, else data/gutenfree (giving data/gutenfree.cdbarch);
+ * run from demo/gutenfree/, where the build puts the binary. Only one process may have a
  * database open at a time: the engine does not stop a second one yet. The screens arrive one at a time as the demo grows. */
 #define _POSIX_C_SOURCE 200809L
 #include <locale.h>
@@ -48,9 +48,10 @@
 
 #include <curses.h>
 
-#define GF_DEFAULT_BASE "datastore/gutenberg/gutenfree"
-#define GF_DEFAULT_GUTINDEX "datastore/gutenberg/GUTINDEX/GUTINDEX.ALL.new"
-#define GF_DEFAULT_BOOKS "datastore/gutenberg/books"
+/* Relative to demo/gutenfree/, where the demo runs from. */
+#define GF_DEFAULT_BASE "data/gutenfree"
+#define GF_DEFAULT_GUTINDEX "data/GUTINDEX.ALL"
+#define GF_DEFAULT_BOOKS "data/books"
 
 typedef struct gf_item {
     int key;
@@ -176,7 +177,7 @@ static int ingest_books_cli(gf_db *g, const char *dir)
     }
     snprintf(path, sizeof path, "%s/manifest.tsv", dir);
     if ((mf = fopen(path, "r")) == NULL) {
-        fprintf(stderr, "gutenfree: no %s (run tools/gf_fetch.py first)\n", path);
+        fprintf(stderr, "gutenfree: no %s (run python3 gf_fetch.py first)\n", path);
         return 1;
     }
     while (fgets(line, sizeof line, mf) != NULL) {
@@ -231,7 +232,7 @@ static int embed_cli(gf_db *g, const char *model)
     }
     t0 = gf_now_ms();
     if ((e = gf_embed_open(model)) == NULL) {
-        fprintf(stderr, "gutenfree: cannot load %s (run tools/gf_model.py)\n", model);
+        fprintf(stderr, "gutenfree: cannot load %s (run python3 gf_model.py)\n", model);
         return 1;
     }
     printf("model loaded in %.0f ms\n", gf_now_ms() - t0);
@@ -414,7 +415,7 @@ int main(int argc, char **argv)
                "          | ingest-books [dir] [base] | embed [model.gguf] [base] | filter key=value ...\n"
                "          | probe [seconds] [base] | metrics [base]\n"
                "base: database path without extension (default %s, or $GUTENFREE_DB).\n"
-               "See demo/gutenfree/README.md.\n", GF_DEFAULT_BASE);
+               "Run from demo/gutenfree/; see README.md there.\n", GF_DEFAULT_BASE);
         return 0;
     }
     if (getenv("GUTENFREE_DB") != NULL && getenv("GUTENFREE_DB")[0] != '\0')

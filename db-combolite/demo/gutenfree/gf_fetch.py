@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """GutenFree Diet: fetch a seeded random sample of books from a Gutenberg mirror.
 
-    gf_fetch.py --mirror URL [--count N] [--seed S] [--lang L] [--pause SEC]
-    gf_fetch.py --mirror URL --ebook N [--ebook M ...]   specific books
-    gf_fetch.py --mirror URL --catalog                   pg_catalog.csv (subjects,
-                                                         bookshelves), for genres
-    gf_fetch.py --mirror URL --gutindex                  GUTINDEX.ALL, the catalog
-                                                         index (run this first)
+    python3 gf_fetch.py --gutindex          GUTINDEX.ALL, the catalog index (first)
+    python3 gf_fetch.py --catalog           pg_catalog.csv: genres, subjects, dates
+    python3 gf_fetch.py [--count N] [--seed S] [--lang L] [--pause SEC]
+                                            a seeded random sample of books
+    python3 gf_fetch.py --ebook N [--ebook M ...]   specific books
+    (each also takes --mirror URL)
 
-Never fetches from www.gutenberg.org: the mirror is required, taken from
-MIRRORS.ALL. Two that were checked to use the layout below:
+Everything lands in data/ next to this script. Never fetches from
+www.gutenberg.org: --mirror is a mirror from MIRRORS.ALL, by default
+Project Gutenberg's own pglaf.org mirror. Two that were checked to use the
+layout below:
 
     https://gutenberg.pglaf.org/        Project Gutenberg's own San Diego mirror
     https://mirror.cs.odu.edu/gutenberg/  Old Dominion University (fallback)
@@ -36,7 +38,8 @@ import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.normpath(os.path.join(HERE, "..", "..", "..", "datastore", "gutenberg"))
+DATA = os.path.join(HERE, "data")
+MIRROR = "https://gutenberg.pglaf.org/"
 USER_AGENT = "GutenFreeDiet/0.1 (db-combolite demo; seeded sample, paced)"
 
 # "Title, by Author<spaces>79873": an entry's first line ends in its number.
@@ -111,7 +114,7 @@ def strip_markers(text):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--mirror", required=True, help="mirror base URL, from MIRRORS.ALL")
+    ap.add_argument("--mirror", default=MIRROR, help=f"mirror base URL, from MIRRORS.ALL (default {MIRROR})")
     ap.add_argument("--count", type=int, default=25, help="books to fetch (default 25)")
     ap.add_argument("--seed", type=int, default=1, help="sample seed (default 1)")
     ap.add_argument("--lang", default="English", help="language, or 'any' (default English)")
@@ -119,7 +122,7 @@ def main():
     ap.add_argument("--ebook", type=int, action="append", help="fetch this ebook number (repeatable)")
     ap.add_argument("--catalog", action="store_true", help="fetch cache/epub/feeds/pg_catalog.csv instead")
     ap.add_argument("--gutindex", action="store_true", help="fetch GUTINDEX.ALL (the catalog index) instead")
-    ap.add_argument("--index", default=os.path.join(DATA, "GUTINDEX", "GUTINDEX.ALL.new"))
+    ap.add_argument("--index", default=os.path.join(DATA, "GUTINDEX.ALL"))
     ap.add_argument("--out", default=os.path.join(DATA, "books"))
     a = ap.parse_args()
 

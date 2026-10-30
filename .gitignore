@@ -12,7 +12,11 @@ db-combolite/build*/
 *.cdbwork/
 *.gguf
 # Test data pools: fetched, not committed (Project Gutenberg index and books).
-db-combolite/datastore/gutenberg/*
-!db-combolite/datastore/gutenberg/README.md
+db-combolite/datastore/gutenberg/
+# The demo's binary and local data (only data/README.md is tracked).
+db-combolite/demo/gutenfree/gutenfree
+db-combolite/demo/gutenfree/data/*
+!db-combolite/demo/gutenfree/data/README.md
+__pycache__/
 # Sub-agent activity log, tailed by the user.
 db-combolite/workspace/agents.log
