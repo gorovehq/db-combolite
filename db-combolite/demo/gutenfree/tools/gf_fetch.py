@@ -5,6 +5,8 @@
     gf_fetch.py --mirror URL --ebook N [--ebook M ...]   specific books
     gf_fetch.py --mirror URL --catalog                   pg_catalog.csv (subjects,
                                                          bookshelves), for genres
+    gf_fetch.py --mirror URL --gutindex                  GUTINDEX.ALL, the catalog
+                                                         index (run this first)
 
 Never fetches from www.gutenberg.org: the mirror is required, taken from
 MIRRORS.ALL. Two that were checked to use the layout below:
@@ -116,6 +118,7 @@ def main():
     ap.add_argument("--pause", type=float, default=2.0, help="seconds between books (default 2)")
     ap.add_argument("--ebook", type=int, action="append", help="fetch this ebook number (repeatable)")
     ap.add_argument("--catalog", action="store_true", help="fetch cache/epub/feeds/pg_catalog.csv instead")
+    ap.add_argument("--gutindex", action="store_true", help="fetch GUTINDEX.ALL (the catalog index) instead")
     ap.add_argument("--index", default=os.path.join(DATA, "GUTINDEX", "GUTINDEX.ALL.new"))
     ap.add_argument("--out", default=os.path.join(DATA, "books"))
     a = ap.parse_args()
@@ -123,9 +126,14 @@ def main():
     if "www.gutenberg.org" in a.mirror or "//gutenberg.org" in a.mirror:
         sys.exit("gf_fetch: use a mirror, not www.gutenberg.org")
 
-    if a.catalog:
-        url = a.mirror.rstrip("/") + "/cache/epub/feeds/pg_catalog.csv"
-        path = os.path.join(DATA, "pg_catalog.csv")
+    if a.catalog or a.gutindex:
+        if a.gutindex:
+            url = a.mirror.rstrip("/") + "/GUTINDEX.ALL"
+            os.makedirs(os.path.dirname(a.index), exist_ok=True)
+            path = a.index
+        else:
+            url = a.mirror.rstrip("/") + "/cache/epub/feeds/pg_catalog.csv"
+            path = os.path.join(DATA, "pg_catalog.csv")
         data = fetch(url)
         with open(path + ".part", "wb") as f:
             f.write(data)

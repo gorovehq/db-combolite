@@ -37,9 +37,8 @@ cmake --build build-demo-rel -j --target gutenfree
 The scripts fetch only from Gutenberg mirrors, never from www.gutenberg.org. Everything lands in `datastore/gutenberg/`, which git ignores.
 
 ```sh
-# 1. The catalog index. Download GUTINDEX.ALL from a mirror into
-#    datastore/gutenberg/GUTINDEX/GUTINDEX.ALL.new
-#    (e.g. https://gutenberg.pglaf.org/GUTINDEX.ALL).
+# 1. The catalog index, GUTINDEX.ALL (about 9 MB).
+python3 demo/gutenfree/tools/gf_fetch.py --mirror https://gutenberg.pglaf.org/ --gutindex
 # 2. Bibliographic data: genres (bookshelves), subjects, dates, LoCC classes.
 python3 demo/gutenfree/tools/gf_fetch.py --mirror https://gutenberg.pglaf.org/ --catalog
 # 3. The embedding model: bge-small-en-v1.5, Q8_0 GGUF, about 37 MB, SHA-256 checked.
