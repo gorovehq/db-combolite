@@ -49,6 +49,55 @@ Each table decides whether it keeps a revision history:
 
 The default comes from a **configuration setting**, in the same way as the layout default in 9.2. Out of the box that setting is **on**, in keeping with the governance-first stance. Any table can override it.
 
+With history off, a table keeps its **last N revisions** of each row (9.11).
+
+### 9.7 Tables are built on document pools
+
+- A row-oriented table is a document pool with a **table schema**. Each row is an encoded object (14.6) whose field IDs are the table's column IDs.
+- Revisions, patches, checkpoints, transactions and crash safety are those of documents (Section 8).
+- **The API** works on rows as encoded objects:
+  - insert, replace, patch and delete;
+  - get a row by entry ID, or by primary key;
+  - a range scan over any index, and a full scan.
+
+  Column-oriented tables take the same calls (9.12).
+
+### 9.8 Columns and schema changes
+
+- **Where columns are defined.** A table's columns are defined in the catalog's schema history (Section 4.11), as versions of the table schema. Each column has a name (in the field dictionary), a type (9.1), a not-null flag and an optional **constant default**. A default is used when an insert leaves the column out.
+- **Rows are never rewritten by a schema change.** Each row records the schema version it was written under, and an older row is read through the current version.
+- **Supported changes:**
+  - **Add a column.** It is nullable or has a default, and older rows read it as that default or as null. A not-null column added later must have a default.
+  - **Drop a column.** It is hidden from reads at once, and its stored values disappear as rows are rewritten. A column used by an index or the primary key can be dropped only after that index is.
+  - **Rename a column.** Only its name in the field dictionary changes.
+  - **Change a column's type.** Only widening that never loses data is allowed; the permitted widenings are listed with the layout (14.10.1). Anything else is refused.
+
+### 9.9 Constraints are checked when the change is made
+
+- **Which constraints.** Not-null, unique and the primary key.
+- **When.** They are checked when the insert or update is made, against the table and its indexes as the open transaction sees them. Applying a committed change never refuses one, so recovery cannot trip on a constraint.
+- **Nulls in unique indexes never collide.** Any number of rows may hold null in a unique column; uniqueness applies to the non-null values. Primary-key columns are implicitly not-null.
+- **Check rules (9.4) wait for the query layer,** whose expressions they need.
+
+### 9.10 Secondary indexes
+
+- An index covers one or more columns, and composite indexes are allowed.
+- Creating an index on a table that already has rows builds it before the call returns.
+- From then on, applying each change keeps the index current.
+
+### 9.11 Tables without history keep their last N revisions
+
+- With history off (9.6), each row keeps only its **last N revisions**. N can be configured per table and defaults to **1**, which means the current row only.
+- When older revisions are pruned, the oldest revision kept becomes a full revision, so the patch chain still works.
+- A delete removes the row. Links to it are still tombstoned (Section 6.7).
+
+### 9.12 Column-oriented tables
+
+- **Changes.** Committed changes go to a per-table **pending rows** index. Reconciliation folds them in, rewriting each affected row group once (14.10.2), and scans read the row groups together with the pending rows.
+- **Row groups.** They hold **1024 rows** by default. This value is provisional, can be configured per table, and will be revisited with the host benchmarking tool.
+- **Encodings.** The encoding of each column chunk is chosen **automatically**: the chunk is encoded every way that applies, and the smallest result is kept.
+- **Compression.** After encoding, a chunk is compressed with **xz** (LZMA2, through the vendored liblzma) at a low preset, with a dictionary no larger than the chunk. The compressed form is kept only if it saves at least 1/8 of the size; codec 0 means uncompressed.
+
 ## Open questions (do not specify until answered)
 
 None at present.

@@ -794,6 +794,13 @@ Each rule is an object:
 
 A row-oriented table is a B+tree clustered by **entry ID**, with the same structure as 14.8. Each leaf value is a record envelope (14.9) that has no summary. Primary keys and other indexes are separate ordered indexes that point to the entry ID.
 
+- **Tables are document pools** with a table schema (Section 9.7), so the head and revision indexes are those of 14.9.2.
+- **Row index keys.** Index keys use the order-preserving encoding (14.8.4) of the indexed columns, in order.
+  - A unique index stores the key and maps it to the entry ID.
+  - A row with a null in any indexed column is still indexed, with the entry ID appended to its key so that nulls never collide (Section 9.9).
+- **Permitted type widenings** (Section 9.8): int to decimal, and f32 to f64. More can be added; each must lose no information.
+- The exact page and record layouts are recorded here as M17 is built.
+
 ### 14.10.2 Column-oriented tables
 
 - **Row groups.** Rows are stored in **row groups** of N rows. N can be configured, and its default comes from the device-class table.

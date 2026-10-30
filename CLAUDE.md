@@ -29,6 +29,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M14 | Overflow pages: index values and document bodies larger than a page (spec 14.8.7, 14.9.2, 14.15) | done |
 | M15 | Links: link types, the link store, delete and drop rules; the environment clock (spec 6, 14.4, 14.13) | done |
 | M16 | Time series: series, bit-level column blocks, late modes incl. hold-and-forward, collisions (spec 10, 14.11) | done |
+| M17 | Row-oriented tables on document pools: column schemas and schema changes, not-null/unique/primary keys, secondary indexes, history on or last-N (spec 9, 14.10.1) | planned |
+| M18 | Column-oriented tables: row groups, automatic column encodings, pending rows folded at reconciliation, xz compression of chunks (spec 9.12, 14.10.2) | planned |
 
 ## Commands
 
@@ -142,6 +144,7 @@ The confirmed meanings of these terms are in `docs/spec/06-keys-links.md`:
    - **Unity**, for tests.
    - **mbedTLS**, for cryptography, behind a crypto interface of our own. Never hand-roll cryptography.
    - **ICU**, for language-aware collation on hosts that are not microcontrollers (spec 14.8.6).
+   - **xz (liblzma)**, for LZMA2 compression of column chunks (spec 9.12). It is vendored in `third-party/xz` from a pinned release whose signature has been checked, never 5.6.0 or 5.6.1 (CVE-2024-3094), and its allocations go through the environment's allocator.
 
 ### Role in the larger effort
 
