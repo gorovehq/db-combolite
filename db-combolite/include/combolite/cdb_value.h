@@ -206,4 +206,8 @@ cdb_status cdb_value_vector_f32(const cdb_value *vec, cdb_byte_order order, uint
 cdb_status cdb_value_validate(const uint8_t *buf, size_t len, cdb_byte_order order,
                               cdb_decimal_mode decimal_mode, unsigned flags);
 
+/* Whether s[0..len) is well-formed UTF-8 (no overlongs, surrogates or code
+ * points past U+10FFFF): the check strings get (14.6). */
+int cdb_value_utf8_valid(const uint8_t *s, size_t len);
+
 #endif

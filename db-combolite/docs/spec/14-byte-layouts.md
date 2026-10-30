@@ -187,6 +187,7 @@ AES-GCM and ChaCha20-Poly1305 both take a 12-byte nonce:
   | `0x0005` | document revision (14.9.2) |
   | `0x0006` | vector block (14.12.3) |
   | `0x0007` | overflow (14.15) |
+  | `0x0008` | time-series block (14.11.1) |
   | `0x7F00` | reserved for tests |
 
   Further page types are assigned IDs when they are built.
@@ -256,7 +257,7 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
   | 5 | encryption domain | 11 | flags; bit 0 = dropped |
   | 6 | page-size code (log₂) | 12 | document pools: head index root; link store: forward index root (optional) |
   | 13 | document pools: revisions index root; link store: reverse index root (optional) | 14 | document pools: next entry ID (optional) |
-  | 15 | document pools: full-text settings, an object (14.14.1; optional) | 16 | vector collections: settings, an object (14.12.3) |
+  | 15 | document pools: full-text settings, an object (14.14.1; optional) | 16 | settings, an object: vector collections (14.12.3), time-series stores (14.11.1) |
 
   Optional fields that are absent read as zero.
 
@@ -812,7 +813,7 @@ A row-oriented table is a B+tree clustered by **entry ID**, with the same struct
 
 ## 14.11 Time-series blocks
 
-- **Series lookup.** An ordered index on the **series key** returns the series entry ID. A second ordered index on *(series entry ID, window start)* returns the block for that window.
+- **Series lookup.** An ordered index on the **series key** returns the series entry ID. A second ordered index on *(series entry ID, first timestamp)* returns the blocks, so a busy window can span several blocks (14.11.1).
 - **Block header:**
 
 | Size | Field |
@@ -839,6 +840,34 @@ A row-oriented table is a B+tree clustered by **entry ID**, with the same struct
 
   - a **presence bitmap**, because a point doesn't have to carry every field.
 - **Derived and downsampled series** (Section 10.4) are ordinary series.
+
+### 14.11.1 Current layout
+
+- **Store.** A store of model 4 holds any number of series. Its settings object is store record field 16 (14.3.3): 1 late mode (0 accept · 1 accept within the lateness · 2 reject · 3 hold) · 2 lateness (ns) · 3–6 root page IDs of the keys, series, blocks and held indexes. Series IDs are the store's entry IDs (field 14).
+- **Indexes** (keys big-endian; a timestamp in a key has its sign bit flipped):
+
+  | Index | Key | Value |
+  |---|---|---|
+  | keys | series key: the name, then each tag's key and value, tags sorted by key (14.8.4 strings) | series ID (8) |
+  | series | series ID | series record |
+  | blocks | series ID · first timestamp | block page (8) · point count (4) · last timestamp (8) |
+  | held | series ID · timestamp | the point's values, an encoded object |
+
+- **Series record**, big-endian: precision (1) · change-of-value (1) · field count (1) · has points (1) · window in ticks (8) · last timestamp (8) · newest block's key timestamp (8) · that block's encoder state: point count (4), previous timestamp (8), previous delta (8); then per field: ID (8) · type (1) · state (int: previous value, 8; f64/f32: previous bits, 8, and started, 1; string: dictionary size, 4; others: none).
+- **Blocks.** One logical page of type `0x0008` per block, with at most 1,024 points of one window: the window is the multiple of the window size at or below a timestamp, and a block never crosses one. The payload:
+  - Header, 32 bytes, in the file's byte order: series · window start · window end · point count · field count (2) · precision · flags (bit 0 change-of-value in effect, bit 1 holds late points folded in).
+  - Timestamp column: the first timestamp (8), a bit count (4), then the bitstream of the later points.
+  - Per field, in ID order: field ID (8) · type (1) · a presence bitmap of one bit per point · then, over the present values: int, f64, f32 and bool: bit count (4) and bitstream; string: dictionary entry count (4), dictionary byte length (4), the entries (varint length and UTF-8 bytes; distinct, in order of first use), bit count (4) and bitstream; any other type: byte length (4) and the values' canonical encodings.
+- **Bitstreams** are written most significant bit first; the bits after the last one, to the end of its byte, are zero, and no whole byte is left over.
+  - *Bucket code* for an unsigned z, the smallest that fits: `0` (z = 0) · `10` + 7 bits · `110` + 15 bits · `1110` + 31 bits · `1111` + 64 bits.
+  - *Timestamps:* each later point codes zigzag(delta − previous delta), wrapping, with the previous delta 0 for the second point.
+  - *Integers:* zigzag(value − previous value), wrapping, starting from 0.
+  - *Floats:* the first value's bit pattern (64 or 32 bits); then, for x = bits XOR previous bits, `0` when x = 0, else `1`, the count of leading zeros (6 bits; 5 for f32), the significant length − 1 (6 bits; 5), and the significant bits. Patterns are stored exactly, NaNs included.
+  - *Booleans:* one bit each. *Strings:* the dictionary index in w bits, where w is the bit length of n, the entries so far; index n adds a new entry.
+  - Readers reject any other form: a bigger bucket than needed, wrong float lengths, non-zero padding, an unused or repeated dictionary entry.
+- **Change payloads** (14.4.5), keyed by the store and series ID, big-endian. Insert (create a series): precision · change-of-value · window (8) · field count · (field ID (8), type) each · key length (2) · key. Patch (append): a point count (varint), then per point its timestamp (8) and its values (varint length, encoded object). Delete (drop before): a timestamp (8). A batch must fit one journal record and one page.
+- **Applying a point.** Newer than the series' last: appended to the newest block when it is in the same window and fits, else a new block. Older or equal: merged into the block of its window that it belongs to, which is rewritten, split in halves as needed, and flagged as holding late points. A point equal to the stored one at its timestamp is stored once; otherwise its fields replace the stored ones field by field, and the collision callback is called. With change-of-value storage, a newer point equal to the last one is not stored.
+- **Late points** are checked when the change is made, against the series as the open transaction sees it: reject refuses any point older than the last; accept within refuses one later than the lateness. In hold mode a late point is parked in the held index when applied, unseen by reads, and folded in at reconciliation; dropping removes held points too.
 
 ---
 

@@ -17,6 +17,7 @@ Time series are sequences of timestamped values: metrics, sensor readings, event
 
 - Each series picks its timestamp **precision** when it is created: seconds, milliseconds, microseconds or nanoseconds.
 - The **application may supply** a point's timestamp, for example sensor time or imported data. When it doesn't, the timestamp comes from the **primary coordinator's clock** (Section 5.2), so timestamps assigned in different processes are consistent with each other (review G8).
+- Until the coordinator exists, the clock is the environment's. A point with no timestamp, on a platform with no clock, is refused.
 - A point is addressed as *(series entry ID, timestamp)*. Points have no IDs of their own (Section 6.1).
 
 ### 10.3 Storage in time-windowed column blocks
@@ -49,11 +50,14 @@ The operator chooses how points that arrive late are handled. Some operators wan
 - **reject** all late points;
 - **hold and forward**: hold late points in a delta track (Section 1.3), then fold them into the series at reconciliation.
 
+The mode is set per store. A point is late when it is older than the series' newest point. Refusals happen when the change is made. In hold mode the journal is the delta track: a late point is parked when its commit is applied, unseen by reads, and folded in at the next reconciliation; recovery replays it the same way (14.11.1).
+
 ### 10.6 Duplicates and collisions
 
 - **True duplicates.** A point whose series, timestamp and values all match a stored point is stored once.
 - **Change-of-value storage.** When identical values arrive at successive timestamps, they are collapsed into one point. A new point is stored only when the value changes.
-- **Timestamp collisions.** If a point arrives with the timestamp of an existing point but with **different** values, only the changed value is kept. The library also **logs a warning** about the collision, so application developers can find and fix the cause. The warning is written to the system audit series (10.7) and includes the value that was **replaced**. The series itself keeps only the changed value, but the governance record still holds what was overwritten.
+- **Change-of-value storage is off by default** and can be turned on per series: metrics keep every sample unless told otherwise.
+- **Timestamp collisions.** If a point arrives with the timestamp of an existing point but with **different** values, only the changed value is kept: the new point's fields replace the stored ones, field by field, and fields it lacks keep their values. Until the audit series exists, the warning goes to an optional callback the application configures. The library also **logs a warning** about the collision, so application developers can find and fix the cause. The warning is written to the system audit series (10.7) and includes the value that was **replaced**. The series itself keeps only the changed value, but the governance record still holds what was overwritten.
 
 ### 10.7 The built-in system audit series
 

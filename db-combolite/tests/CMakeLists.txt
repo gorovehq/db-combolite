@@ -45,6 +45,8 @@ cdb_add_test(test_schema)
 cdb_add_test(test_fts)
 cdb_add_test(test_vec)
 cdb_add_test(test_graph)
+cdb_add_test(test_tsbits)
+cdb_add_test(test_tsblock)
 
 # Benchmarks: built with the tests, run by hand (not part of ctest).
 function(cdb_add_bench name)
@@ -55,3 +57,4 @@ function(cdb_add_bench name)
 endfunction()
 
 cdb_add_bench(bench_graph)
+cdb_add_test(test_ts)

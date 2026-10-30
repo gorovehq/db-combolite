@@ -551,6 +551,8 @@ cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
             db->pools[i].in_use = 0;
         if (db->vecs[i].in_use && db->vecs[i].store_id == id)
             db->vecs[i].in_use = 0;
+        if (db->tss[i].in_use && db->tss[i].store_id == id)
+            db->tss[i].in_use = 0;
     }
     return rotate_journal(db);
 }
