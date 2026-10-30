@@ -16,8 +16,9 @@ static const uint8_t start_magic[8] = { 0x89, 0x43, 0x44, 0x42, 0x43, 0x41, 0x54
 static const uint8_t end_magic[8] = { 0x0A, 0x54, 0x41, 0x43, 0x42, 0x44, 0x43, 0x89 };
 
 #define EPOCH 1u
-#define OFF_RESERVED 96u
-#define RESERVED_LEN 388u
+#define OFF_NIB_ROOT 96u  /* public nibblet free-space root (spec 14.18.3) */
+#define OFF_RESERVED 104u
+#define RESERVED_LEN 380u
 #define OFF_END_MAGIC 484u
 #define OFF_TAG 492u   /* tamper-evident tag: left zero, not checked yet */
 #define OFF_CRC 508u
@@ -41,6 +42,7 @@ void cdb_catroot_encode(const cdb_catroot *r, uint8_t out[CDB_CATROOT_SLOT_SIZE]
     cdb_store_u64(out + 72, r->dedup_root, o);
     cdb_store_u64(out + 80, r->audit_root, o);
     cdb_store_u64(out + 88, r->next_object_id, o);
+    cdb_store_u64(out + OFF_NIB_ROOT, r->nib_root, o);
     memcpy(out + OFF_END_MAGIC, end_magic, sizeof end_magic);
     cdb_store_u32(out + OFF_CRC, cdb_crc32c(out, OFF_CRC), o);
 }
@@ -75,5 +77,6 @@ cdb_status cdb_catroot_decode(const uint8_t in[CDB_CATROOT_SLOT_SIZE], cdb_catro
     r->dedup_root = cdb_load_u64(in + 72, o);
     r->audit_root = cdb_load_u64(in + 80, o);
     r->next_object_id = cdb_load_u64(in + 88, o);
+    r->nib_root = cdb_load_u64(in + OFF_NIB_ROOT, o);
     return CDB_OK;
 }

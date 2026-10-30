@@ -29,8 +29,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M14 | Overflow pages: index values and document bodies larger than a page (spec 14.8.7, 14.9.2, 14.15) | done |
 | M15 | Links: link types, the link store, delete and drop rules; the environment clock (spec 6, 14.4, 14.13) | done |
 | M16 | Time series: series, bit-level column blocks, late modes incl. hold-and-forward, collisions (spec 10, 14.11) | done |
-| M17 | Row-oriented tables on document pools: column schemas and schema changes, not-null/unique/primary keys, secondary indexes, history on or last-N (spec 9, 14.10.1) | planned |
-| M18 | Column-oriented tables and compression: row groups, automatic column encodings, pending rows folded at reconciliation; xz (LZMA2) for column chunks, large document bodies, journal records and in-page compression (spec 9.12, 14.10.2, 15) | planned |
+| M17 | Row-oriented tables on document pools, and nibblets (small records packed in shared pages) for document and table revisions and sparse time-series blocks: column schemas and schema changes, not-null/unique/primary keys, secondary indexes, history on or last-N (spec 9, 14.10.1, 16, 14.18) | done |
+| M18 | Column-oriented tables and compression: row groups (small column chunks as nibblets), automatic column encodings, pending rows folded at reconciliation; xz (LZMA2) for column chunks, large document bodies, journal records and in-page compression (spec 9.12, 14.10.2, 15) | planned |
 
 ## Commands
 
@@ -99,6 +99,20 @@ These were agreed with the user:
     - `cdb_tsbits`: the bit codecs (buckets, delta-of-delta, XOR floats, dictionary indexes).
     - `cdb_tsblock`: a block payload. Its tests check that appending point by point gives exactly the bytes of building the block at once.
     - `cdb_ts`: the store, with keys, series, blocks and held indexes. It handles series by key, batched appends, late modes (hold parks points in the held index, and `cdb_ts_flush` folds them in at reconciliation), collisions, `drop_before` and range reads.
+  - `cdb_nib`: nibblets (spec 16, 14.18), small records packed into shared slotted pages (type `0x0009`).
+    - **Which records:** document and table revisions, and time-series blocks, up to a quarter page.
+    - **Address:** (page, slot), packed in memory into one `uint64_t` with the top bit set. On disk an address is 8 or 10 bytes, and the length tells which.
+    - **Back-reference:** each record carries its owner's store, its kind and the owner's index key.
+    - **Free space:** a free-space index whose root is in the catalog root slot (offset 96) gives best-fit placement.
+    - **Merging:** `cdb_doc_flush_pools` merges under-half-full pages at each reconciliation and tells each owner its record's new address (`cdb_doc_nib_moved`, `cdb_ts_nib_moved`). A record whose store was dropped is discarded then.
+    - **Always on:** the two working pages are the last two pages of `doc_buffers`.
+  - `cdb_table`: relational tables (spec 9.7–9.11, 14.10.1).
+    - **Built on document pools:** a table is a document pool whose rows are encoded objects keyed by column field ID. The document calls refuse a table unless `db->via_table` is set, which the table layer does around its own calls.
+    - **Columns** live in the schema history. A row is read through the current columns using the schema version it was written under: dropped columns are hidden, added columns read as their default, widened types are converted. Rows are never rewritten.
+    - **Checks** for not-null, unique and primary keys happen when the change is made, against the indexes plus the open transaction's own rows (`cdb_doc_get_in_tx`, `cdb_doc_tx_entries`).
+    - **Index upkeep:** `cdb_doc_apply` calls `cdb_table_apply_before` and `cdb_table_apply_after` around each change.
+    - **History off:** `keep` N makes the document engine write only full revisions and free the older ones, and a delete removes the row.
+    - **Tests:** `tests/test_table.c` and `tests/test_nib.c` cover this.
   - `cdb_schema`: checks schemas and validates documents against them. Validation happens in `cdb_doc` when a change is made, against the document as the open transaction sees it: from the staging cache (`doc_stage`), or, after the cache overflows, from the transaction's own journal records.
   - `cdb_journal` and `cdb_db`: transactions, reconciliation and recovery. Changes reach pages only through the `cdb_apply_fn` hook, and the data models will plug in there.
   - `cdb_slots`: the open stores of each model (document pools, vector collections, time-series stores).

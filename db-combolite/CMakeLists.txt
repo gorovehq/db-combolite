@@ -46,6 +46,8 @@ add_library(combolite
   src/cdb_journal.c
   src/cdb_db.c
   src/cdb_slots.c
+  src/cdb_nib.c
+  src/cdb_table.c
   src/cdb_key.c
   src/cdb_index.c
   src/cdb_catroot.c

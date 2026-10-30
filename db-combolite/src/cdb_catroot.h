@@ -26,6 +26,7 @@ typedef struct cdb_catroot {
     uint64_t dedup_root;
     uint64_t audit_root;
     uint64_t next_object_id;   /* never reused (spec 4.12) */
+    uint64_t nib_root;         /* public nibblet free-space index (spec 14.18.3); 0 = none yet */
 } cdb_catroot;
 
 void cdb_catroot_encode(const cdb_catroot *r, uint8_t out[CDB_CATROOT_SLOT_SIZE], cdb_byte_order order);

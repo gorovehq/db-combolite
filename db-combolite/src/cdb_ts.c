@@ -17,6 +17,7 @@
 #include "cdb_doc.h"
 #include "cdb_endian.h"
 #include "cdb_key.h"
+#include "cdb_nib.h"
 #include "cdb_ts.h"
 #include "cdb_varint.h"
 
@@ -895,13 +896,62 @@ typedef struct blk {
     int64_t first, last;
 } blk;
 
+/* The value: the block's address (8 bytes for a page, 10 for a nibblet:
+ * spec 14.18.2), then the count (4) and last timestamp (8). */
 static cdb_status blk_put(ts_store *t, uint64_t series, const blk *b)
 {
-    uint8_t k[16], v[BLOCK_VAL];
-    cdb_store_u64(v, b->lid, CDB_ORDER_BIG);
-    cdb_store_u32(v + 8, b->count, CDB_ORDER_BIG);
-    cdb_store_u64(v + 12, (uint64_t)b->last, CDB_ORDER_BIG);
-    return cdb_index_put(&t->blocks, k, k_series_ts(k, series, b->first), v, BLOCK_VAL);
+    uint8_t k[16], v[BLOCK_VAL + 2u];
+    size_t a = cdb_nib_addr_store(v, b->lid);
+    cdb_store_u32(v + a, b->count, CDB_ORDER_BIG);
+    cdb_store_u64(v + a + 4, (uint64_t)b->last, CDB_ORDER_BIG);
+    return cdb_index_put(&t->blocks, k, k_series_ts(k, series, b->first), v, a + 12u);
+}
+
+static cdb_status blk_decode(const uint8_t *v, size_t vlen, blk *b)
+{
+    size_t a = vlen - 12u;
+    cdb_status s;
+    if (vlen != BLOCK_VAL && vlen != BLOCK_VAL + 2u)
+        return CDB_E_CORRUPT;
+    if ((s = cdb_nib_addr_load(v, a, &b->lid)) != CDB_OK)
+        return s;
+    b->count = cdb_load_u32(v + a, CDB_ORDER_BIG);
+    b->last = (int64_t)cdb_load_u64(v + a + 4, CDB_ORDER_BIG);
+    return CDB_OK;
+}
+
+/* A block nibblet moved (cdb_nib_merge): its row in the blocks index
+ * points at the new address. CDB_E_NOT_FOUND: the store or block is gone. */
+cdb_status cdb_ts_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t addr)
+{
+    uint8_t v[BLOCK_VAL + 2u];
+    size_t vlen;
+    ts_store *t;
+    blk b = { 0, 0, 0, 0 };
+    int found;
+    cdb_status s;
+    if (oklen != 16)
+        return CDB_E_CORRUPT;
+    s = ts_get(db, store, &t);
+    if (s == CDB_E_NOT_FOUND || s == CDB_E_INVALID_ARG)
+        return CDB_E_NOT_FOUND;
+    if (s != CDB_OK)
+        return s;
+    if ((s = cdb_index_get(&t->blocks, okey, oklen, v, sizeof v, &vlen, &found)) != CDB_OK)
+        return s;
+    if (!found)
+        return CDB_E_NOT_FOUND;
+    if ((s = blk_decode(v, vlen, &b)) != CDB_OK)
+        return s;
+    b.lid = addr;
+    b.first = key_ts(okey);
+    return blk_put(t, cdb_load_u64(okey, CDB_ORDER_BIG), &b);
+}
+
+/* Frees a block's storage: its page, or its nibblet. */
+static cdb_status blk_release(cdb_db *db, uint64_t addr)
+{
+    return cdb_nib_is(addr) ? cdb_nib_free(db, addr) : cdb_pager_free(&db->pager, addr);
 }
 
 static cdb_status blk_del(ts_store *t, uint64_t series, int64_t first)
@@ -915,7 +965,7 @@ static cdb_status blk_del(ts_store *t, uint64_t series, int64_t first)
 static cdb_status blk_at(cdb_db *db, ts_store *t, uint64_t series, int64_t from, blk *b, int *found)
 {
     cdb_index_cursor c;
-    uint8_t k[16], got[16], v[BLOCK_VAL];
+    uint8_t k[16], got[16], v[BLOCK_VAL + 2u];
     size_t klen, vlen;
     int done;
     cdb_status s;
@@ -925,12 +975,9 @@ static cdb_status blk_at(cdb_db *db, ts_store *t, uint64_t series, int64_t from,
         return s == CDB_E_BUFFER_TOO_SMALL ? CDB_E_CORRUPT : s;
     if (done || klen != 16 || cdb_load_u64(got, CDB_ORDER_BIG) != series)
         return CDB_OK;
-    if (vlen != BLOCK_VAL)
-        return CDB_E_CORRUPT;
+    if ((s = blk_decode(v, vlen, b)) != CDB_OK)
+        return s;
     b->first = key_ts(got);
-    b->lid = cdb_load_u64(v, CDB_ORDER_BIG);
-    b->count = cdb_load_u32(v + 8, CDB_ORDER_BIG);
-    b->last = (int64_t)cdb_load_u64(v + 12, CDB_ORDER_BIG);
     *found = 1;
     return CDB_OK;
 }
@@ -939,7 +986,13 @@ static cdb_status blk_at(cdb_db *db, ts_store *t, uint64_t series, int64_t from,
 static cdb_status blk_read(cdb_db *db, const ts_store *t, const blk *b, const uint8_t **pl, size_t *len)
 {
     cdb_page_header h;
-    cdb_status s = cdb_pager_read(&db->pager, b->lid, tbuf(db, B_READ), &h);
+    cdb_status s;
+    if (cdb_nib_is(b->lid)) {
+        /* A small block lives in a nibblet (spec 16.5). */
+        *pl = tbuf(db, B_READ) + cdb_page_header_size(db->pager.fmt);
+        return cdb_nib_get(db, b->lid, tbuf(db, B_READ) + cdb_page_header_size(db->pager.fmt), capacity(db), len);
+    }
+    s = cdb_pager_read(&db->pager, b->lid, tbuf(db, B_READ), &h);
     if (s != CDB_OK)
         return s == CDB_E_NOT_FOUND ? CDB_E_CORRUPT : s;
     if (h.type != CDB_PAGE_TYPE_TS_BLOCK || h.store_id != t->slot.store_id)
@@ -957,6 +1010,32 @@ static cdb_status blk_write(cdb_db *db, const ts_store *t, uint64_t lid, const u
     h.type = CDB_PAGE_TYPE_TS_BLOCK;
     h.store_id = t->slot.store_id;
     return cdb_pager_write(&db->pager, lid, &h, pl, len);
+}
+
+/* Stores a block payload under the block's key (series, first): as a
+ * nibblet when it is small (spec 16.5), otherwise on a page, reusing old's
+ * page when old is one. old is the block's previous address (0: none) and
+ * is released when not reused; *addr gets the new one. */
+static cdb_status blk_store(cdb_db *db, const ts_store *t, uint64_t series, int64_t first, uint64_t old,
+                           const uint8_t *pl, size_t len, uint64_t *addr)
+{
+    uint8_t k[16];
+    cdb_status s;
+    if (cdb_nib_fits(db, len)) {
+        if (old && (s = blk_release(db, old)) != CDB_OK)
+            return s;
+        return cdb_nib_put(db, t->slot.store_id, CDB_NIB_KIND_TS_BLOCK, k, k_series_ts(k, series, first), pl, len,
+                           addr);
+    }
+    if (old && cdb_nib_is(old)) {
+        if ((s = cdb_nib_free(db, old)) != CDB_OK)
+            return s;
+        old = 0; /* graduates to a page of its own */
+    }
+    if (old == 0 && (s = cdb_pager_alloc(&db->pager, &old)) != CDB_OK)
+        return s;
+    *addr = old;
+    return blk_write(db, t, old, pl, len);
 }
 
 /* Writes points [0, n) of the work array (or the one point p) as new
@@ -988,12 +1067,9 @@ static cdb_status write_points(cdb_db *db, ts_store *t, const srec *r, uint64_t 
         }
         if (s != CDB_OK)
             return s;
-        b.lid = reuse;
+        if ((s = blk_store(db, t, series, pts[done].ts, reuse, tbuf(db, B_OUT), len, &b.lid)) != CDB_OK)
+            return s;
         reuse = 0;
-        if (b.lid == 0 && (s = cdb_pager_alloc(&db->pager, &b.lid)) != CDB_OK)
-            return s;
-        if ((s = blk_write(db, t, b.lid, tbuf(db, B_OUT), len)) != CDB_OK)
-            return s;
         b.count = (uint32_t)take;
         b.first = pts[done].ts;
         b.last = pts[done + take - 1].ts;
@@ -1148,7 +1224,7 @@ static cdb_status apply_point(cdb_db *db, ts_store *t, srec *r, uint64_t series,
                 r->st = st;
                 b.count++;
                 b.last = p->ts;
-                if ((s = blk_write(db, t, b.lid, tbuf(db, B_OUT), out)) != CDB_OK)
+                if ((s = blk_store(db, t, series, b.first, b.lid, tbuf(db, B_OUT), out, &b.lid)) != CDB_OK)
                     return s;
                 return blk_put(t, series, &b);
             }
@@ -1186,7 +1262,7 @@ static cdb_status drop_before(cdb_db *db, ts_store *t, srec *r, uint64_t series,
         if ((s = blk_del(t, series, b.first)) != CDB_OK)
             return s;
         if (b.last < ts) {
-            if ((s = cdb_pager_free(&db->pager, b.lid)) != CDB_OK)
+            if ((s = blk_release(db, b.lid)) != CDB_OK)
                 return s;
             if (b.first == r->last_block)
                 r->has_points = 0; /* the newest block went: nothing is left */

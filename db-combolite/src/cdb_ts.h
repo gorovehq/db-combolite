@@ -108,5 +108,7 @@ int cdb_ts_is_open(cdb_db *db, uint64_t store);
 cdb_status cdb_ts_apply(cdb_db *db, const cdb_delta *d, int *handled);
 cdb_status cdb_ts_flush(cdb_db *db); /* at reconciliation: held points, entry counters */
 extern const cdb_slot_ops cdb_ts_slot_ops; /* open stores (cdb_slots.h) */
+/* Nibblet merging moved a block (cdb_nib.h); CDB_E_NOT_FOUND if gone. */
+cdb_status cdb_ts_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t addr);
 
 #endif

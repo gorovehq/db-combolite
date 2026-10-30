@@ -27,7 +27,7 @@ static uint8_t record_buf[DOC_MAX + 2u * PAGE];
 static uint8_t cat_work[24u * 1024u];
 static cdb_index_entry cat_entries[512];
 static uint8_t cat_page[PAGE];
-static uint8_t doc_buffers[3u * DBUF + 3u * PAGE];
+static uint8_t doc_buffers[3u * DBUF + 5u * PAGE];
 static uint8_t doc_stage[64u * 1024u];
 static uint8_t fts_buffers[DBUF + 2u * PAGE];
 static cdb_fts_token fts_tokens[2u * (DOC_MAX + PAGE)];
