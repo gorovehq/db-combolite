@@ -24,7 +24,10 @@
 #define CDB_KEY_RANK_BINARY 0x58u
 #define CDB_KEY_RANK_REF 0x60u
 
-/* Appends components to a caller buffer. Errors are sticky. */
+/* Appends components to a caller buffer. Errors are sticky: after the
+ * first failure (CDB_E_BUFFER_TOO_SMALL, CDB_E_INVALID_ARG) every call
+ * returns it and adds nothing, so a sequence can be checked once at the end
+ * through k.error. */
 typedef struct cdb_key_builder {
     uint8_t *buf;
     size_t cap;

@@ -10,18 +10,25 @@
 #include "combolite/cdb_common.h"
 #include "combolite/cdb_storage.h"
 
-#define CDB_ENV_CREATE 0x1u
-#define CDB_ENV_READONLY 0x2u
+#define CDB_ENV_CREATE 0x1u   /* open: create the file if it does not exist */
+#define CDB_ENV_READONLY 0x2u /* open: read-only access */
 
+/* The operations an environment provides. ctx is the environment's own
+ * state, passed back on every call. Paths are zero-terminated strings using
+ * '/' as the separator. A missing file or directory should be reported as
+ * CDB_E_NOT_FOUND, other failures as CDB_E_IO. */
 typedef struct cdb_env_ops {
     /* Opens a file. The storage stays valid until it is closed. */
     cdb_status (*open)(void *ctx, const char *path, unsigned flags, cdb_storage *out);
     cdb_status (*remove)(void *ctx, const char *path);
+    /* Replaces `to` if it exists; durable once the directory is synced. */
     cdb_status (*rename)(void *ctx, const char *from, const char *to);
+    /* Creating a directory that already exists is not an error. */
     cdb_status (*mkdir)(void *ctx, const char *path);
     /* CDB_E_STATE: the directory is not empty, for example because a
      * companion was set aside in it (spec 1.12.2). */
     cdb_status (*rmdir)(void *ctx, const char *path);
+    /* *exists is 1 if path names an existing file or directory. */
     cdb_status (*exists)(void *ctx, const char *path, int *exists);
     /* Makes every create, remove and rename inside the directory durable. */
     cdb_status (*sync_dir)(void *ctx, const char *path);
@@ -36,6 +43,8 @@ typedef struct cdb_env_ops {
     void (*free)(void *ctx, void *p);
 } cdb_env_ops;
 
+/* An environment handle: an operation table plus its state. Copied by
+ * value; ctx must outlive every copy. */
 typedef struct cdb_env {
     const cdb_env_ops *ops;
     void *ctx;
@@ -52,6 +61,9 @@ typedef struct cdb_hostenv {
     int used[CDB_HOSTENV_MAX_FILES];
 } cdb_hostenv;
 
+/* Binds *out to the host (POSIX) environment backed by *he. *he must stay
+ * valid while *out is in use. Opening more than CDB_HOSTENV_MAX_FILES files
+ * at once gives CDB_E_BUFFER_TOO_SMALL. */
 void cdb_hostenv_init(cdb_hostenv *he, cdb_env *out);
 
 #endif

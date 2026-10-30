@@ -1,3 +1,13 @@
+/* Bit-level codecs for time-series columns (spec 14.11.1, "Bitstreams").
+ *
+ * All arithmetic on differences is done in uint64_t, where overflow wraps
+ * by definition; the results are turned back into int64_t with u2i. This
+ * avoids signed overflow, which C leaves undefined, so any timestamps or
+ * integers (even ones whose difference overflows int64) round-trip.
+ *
+ * To keep encodes all or nothing, each encoder checks there is room for
+ * all of its bits before writing any; each decoder remembers its start
+ * position and rewinds to it on any failure. */
 #include "cdb_tsbits.h"
 
 #include <string.h>
@@ -10,6 +20,7 @@ static uint64_t zz(uint64_t u)
     return (u << 1) ^ (0u - (u >> 63));
 }
 
+/* The inverse: 0, 1, 2, 3, 4 ... back to 0, -1, 1, -2, 2 ... */
 static uint64_t unzz(uint64_t z)
 {
     return (z >> 1) ^ (0u - (z & 1u));
@@ -24,6 +35,7 @@ static int64_t u2i(uint64_t u)
     return -(int64_t)(~u) - 1;
 }
 
+/* Whether nbits more fit in the writer's buffer. */
 static int has_room(const cdb_bitw *w, size_t nbits)
 {
     return nbits <= w->cap_bits - w->bits;
@@ -61,6 +73,8 @@ cdb_status cdb_bitw_put(cdb_bitw *w, uint64_t value, unsigned nbits)
         return CDB_E_INVALID_ARG;
     if (!has_room(w, nbits))
         return CDB_E_BUFFER_TOO_SMALL;
+    /* Fill byte by byte: each round takes as many of the remaining high
+     * bits of value as fit in the current byte. */
     while (nbits > 0) {
         size_t byte = pos >> 3;
         unsigned off = (unsigned)(pos & 7u);
@@ -95,6 +109,8 @@ cdb_status cdb_bitr_get(cdb_bitr *r, uint64_t *value, unsigned nbits)
         return CDB_E_INVALID_ARG;
     if (nbits > r->len_bits - r->pos)
         return CDB_E_TRUNCATED;
+    /* The mirror of cdb_bitw_put: gather the bits byte by byte, most
+     * significant first. */
     while (nbits > 0) {
         size_t byte = pos >> 3;
         unsigned off = (unsigned)(pos & 7u);
@@ -116,10 +132,12 @@ cdb_status cdb_bitr_check_end(const cdb_bitr *r)
     size_t left = r->len_bits - r->pos;
     unsigned tail;
 
+    /* A whole unread byte is never padding. */
     if (left >= 8u)
         return CDB_E_NOT_CANONICAL;
     if (left == 0)
         return CDB_OK;
+    /* The unread low bits of the last byte must be zero. */
     tail = (unsigned)r->buf[r->pos >> 3] & ((1u << left) - 1u);
     return tail ? CDB_E_NOT_CANONICAL : CDB_OK;
 }
@@ -143,6 +161,9 @@ size_t cdb_tsb_bucket_bits(uint64_t z)
     return 4 + 64;
 }
 
+/* Prefix first ('0', '10', '110', '1110' or '1111'), then the payload of
+ * the bucket's width. The room check up front means the puts cannot run
+ * out of space halfway. */
 cdb_status cdb_tsb_bucket_encode(cdb_bitw *w, uint64_t z)
 {
     cdb_status st;
@@ -172,6 +193,9 @@ cdb_status cdb_tsb_bucket_encode(cdb_bitw *w, uint64_t z)
 
 cdb_status cdb_tsb_bucket_decode(cdb_bitr *r, uint64_t *z)
 {
+    /* Indexed by the number of leading 1 bits: the payload width, and the
+     * smallest value that may use that bucket (anything smaller belongs in
+     * a smaller bucket, so it is not canonical). */
     static const unsigned width[5] = { 0, 7, 15, 31, 64 };
     static const uint64_t min[5] = { 0, 1, B7, B15, B31 };
     size_t start = r->pos;
@@ -179,6 +203,7 @@ cdb_status cdb_tsb_bucket_decode(cdb_bitr *r, uint64_t *z)
     uint64_t bit, v = 0;
     cdb_status st;
 
+    /* Count leading 1s, up to four (the fourth needs no closing 0). */
     while (ones < 4u) {
         st = cdb_bitr_get(r, &bit, 1);
         if (st != CDB_OK)
@@ -211,6 +236,8 @@ void cdb_tsb_time_init(cdb_tsb_time *s, int64_t first_t)
     s->prev_delta = 0;
 }
 
+/* t - previous t, wrapping. Each later timestamp is coded as the bucket of
+ * zigzag(delta - previous delta): steady intervals cost one bit. */
 static uint64_t time_delta(const cdb_tsb_time *s, int64_t t)
 {
     return (uint64_t)t - (uint64_t)s->prev_t;
@@ -300,7 +327,10 @@ static unsigned trail_zeros(uint64_t x)
     return n;
 }
 
-/* lbits is the width of the L and (M - 1) fields: 6 for f64, 5 for f32. */
+/* lbits is the width of the L and (M - 1) fields: 6 for f64, 5 for f32.
+ * Code for one value, after the first: x = bits XOR previous bits; '0' if
+ * x is 0, else '1', L (leading zeros of x), M - 1 (M = significant length,
+ * from the first to the last set bit), then those M bits. */
 static size_t xor_bits(const cdb_tsb_float *s, uint64_t bits, unsigned width, unsigned lbits)
 {
     uint64_t x;
@@ -370,6 +400,7 @@ static cdb_status xor_decode(cdb_bitr *r, cdb_tsb_float *s, uint64_t *bits, unsi
             if (st != CDB_OK)
                 goto fail;
             m = (unsigned)m1 + 1u;
+            /* The significant bits must fit inside the word after L. */
             if (l + m > width) {
                 st = CDB_E_NOT_CANONICAL;
                 goto fail;
@@ -401,6 +432,7 @@ void cdb_tsb_float_init(cdb_tsb_float *s)
     s->started = 0;
 }
 
+/* A float's bit pattern, copied (not converted). */
 static uint64_t f64_bits(double v)
 {
     uint64_t b;
@@ -514,6 +546,8 @@ cdb_status cdb_tsb_bool_decode(cdb_bitr *r, int *v)
 
 /* ---- dictionary index ---------------------------------------------------- */
 
+/* The bit length of n: enough bits for any index 0..n. With no entries
+ * yet (n = 0) the width is 0, so the first string costs no index bits. */
 unsigned cdb_tsb_dict_width(uint64_t n)
 {
     unsigned w = 0;

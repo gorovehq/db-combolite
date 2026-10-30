@@ -1,4 +1,22 @@
-/* Ordered index: B+tree over pager pages (spec 14.8). */
+/* Ordered index: B+tree over pager pages (spec 14.8).
+ *
+ * How edits work: a node is never edited in its page bytes. Instead it is
+ * "expanded" into the caller's work memory: a list of cdb_index_entry
+ * descriptors (one per key, in key order) pointing into a byte "heap" that
+ * holds each full key followed by its value. Inserts and deletes change that
+ * list. The node is then encoded back into a fresh page image ("piece") and
+ * written through the pager, split into several pieces if it no longer fits.
+ * The heap only grows during one edit; replaced bytes are not reclaimed,
+ * which is why it is sized at more than twice a page.
+ *
+ * Child pointers and overflow-chain pointers are logical page IDs. On disk
+ * they take the file's address width (4 or 8 bytes); while expanded they are
+ * always held as 8 big-endian bytes, so the code can treat them uniformly.
+ *
+ * Work memory layout (ix->w.bytes, see cdb_index_work_size):
+ *   [node image: page_size][read page: page_size][heap][separators]
+ * The node image is where pieces are built; the read page receives pages
+ * read from the pager; separators hold the first keys of split pieces. */
 #include <string.h>
 
 #include "cdb_endian.h"
@@ -15,26 +33,38 @@
 
 /* -------------------------------------------------------- sizing */
 
+/* Payload bytes in one page: the node payload must fit in this. */
 static size_t capacity_of(const cdb_pager *p)
 {
     return cdb_page_capacity(p->fmt, p->page_size);
 }
 
+/* Upper bound on the entries one node can hold (plus slack for an edit
+ * that adds entries before the node is split). */
 static size_t max_entries(size_t cap)
 {
     return cap / 3u + 2u; /* the smallest entry is three bytes */
 }
 
+/* Heap bytes needed for one expanded node: room for the node's bytes twice
+ * over (edits append without reclaiming), plus the shared prefix that
+ * expansion copies back onto every key. */
 static size_t heap_size(size_t cap)
 {
     return 2u * cap + max_entries(cap) * CDB_INDEX_MAX_PREFIX;
 }
 
+/* Longest key, and longest inline value, allowed (spec 14.8.7). Keeping
+ * items this small guarantees that any four entries fit in one node, so a
+ * split always makes progress. */
 static size_t max_item(size_t cap)
 {
     return (cap - NODE_HDR) / 8u - 4u; /* any four entries fit in one node */
 }
 
+/* The two sizing functions are public so callers can size the work memory.
+ * They use page_size in place of the (smaller) capacity, which can only
+ * over-estimate. */
 size_t cdb_index_entries_needed(size_t page_size)
 {
     return max_entries(page_size);
@@ -48,12 +78,16 @@ size_t cdb_index_work_size(size_t page_size)
 
 /* -------------------------------------------------------- work memory */
 
+/* The node currently expanded into work memory. Its entries are
+ * ix->w.entries[0 .. count). */
 typedef struct node {
-    unsigned level;
-    size_t count;
-    size_t heap_used;
+    unsigned level;     /* 0 = leaf */
+    size_t count;       /* number of entries */
+    size_t heap_used;   /* bytes of the heap taken so far */
 } node;
 
+/* Accessors for the four regions of the work memory (see the top of the
+ * file). */
 static uint8_t *w_image(cdb_index *ix) { return ix->w.bytes; }
 static uint8_t *w_page(cdb_index *ix) { return ix->w.bytes + ix->pager->page_size; }
 static uint8_t *w_heap(cdb_index *ix) { return ix->w.bytes + 2u * ix->pager->page_size; }
@@ -62,6 +96,7 @@ static uint8_t *w_seps(cdb_index *ix)
     return w_heap(ix) + heap_size(capacity_of(ix->pager));
 }
 
+/* An expanded entry's full key, in the heap. */
 static uint8_t *ent_key(cdb_index *ix, const cdb_index_entry *e) { return w_heap(ix) + e->off; }
 
 /* Drops an entry's key but keeps its value: the value sits right after the key. */
@@ -70,8 +105,15 @@ static void clear_key(cdb_index_entry *e)
     e->off += e->klen;
     e->klen = 0;
 }
+/* An expanded entry's value bytes (or 8-byte big-endian child/chain ID). */
 static uint8_t *ent_val(cdb_index *ix, const cdb_index_entry *e) { return w_heap(ix) + e->off + e->klen; }
 
+/* Appends a new entry to the heap and fills in descriptor *e. The key is
+ * the concatenation k1 + k2 (used to glue a node's shared prefix back onto
+ * a stored suffix); either part may be empty. Sets tlen = vl; callers fix
+ * tlen for leaf values held in an overflow chain. CDB_E_BUFFER_TOO_SMALL if
+ * the heap is full. The value is copied with memmove, so it may already lie
+ * in the heap. */
 static cdb_status heap_add(cdb_index *ix, node *n, const uint8_t *k1, size_t l1, const uint8_t *k2, size_t l2,
                            const uint8_t *v, size_t vl, cdb_index_entry *e)
 {
@@ -94,15 +136,21 @@ static cdb_status heap_add(cdb_index *ix, node *n, const uint8_t *k1, size_t l1,
 
 /* -------------------------------------------------------- node pages */
 
+/* A read-only look at a node page's payload, without expanding it. Used by
+ * lookups and cursors, which do not need the work heap. */
 typedef struct node_view {
-    const uint8_t *pl;
-    size_t cap;
+    const uint8_t *pl;     /* the payload (just past the page header) */
+    size_t cap;            /* payload capacity */
     unsigned level;
     unsigned flags;
-    size_t count;
-    size_t prefix_len;
+    size_t count;          /* number of entries */
+    size_t prefix_len;     /* shared prefix length; the prefix sits at pl + NODE_HDR */
 } node_view;
 
+/* Decodes and sanity-checks the node header at pl (spec 14.8.7): the level
+ * must be below the depth limit, the prefix within its limit, and the
+ * header, prefix and slot directory must all end before the entry heap,
+ * which must lie inside the payload. CDB_E_CORRUPT otherwise. */
 static cdb_status view_node(const cdb_index *ix, const uint8_t *pl, node_view *v)
 {
     size_t heap;
@@ -121,10 +169,17 @@ static cdb_status view_node(const cdb_index *ix, const uint8_t *pl, node_view *v
 
 /* Decodes entry i: its key suffix and its value (or child) bytes, and the
  * value's length (*tlen). A leaf value longer than the inline limit is
- * stored as its overflow chain's first page, at the address width. */
+ * stored as its overflow chain's first page, at the address width.
+ *
+ * The returned pointers point into the page buffer behind v; *vlen is the
+ * number of bytes at *val (for a chained value or an interior child, the
+ * address width). Every length is checked against the end of the payload,
+ * so a damaged page gives CDB_E_CORRUPT and never a read out of bounds.
+ * The caller must keep i < v->count. */
 static cdb_status view_entry(const cdb_index *ix, const node_view *v, size_t i,
                              const uint8_t **suffix, size_t *slen, const uint8_t **val, size_t *vlen, size_t *tlen)
 {
+    /* Slot i of the directory gives the entry's offset from the payload start. */
     size_t off = cdb_load_u16(v->pl + NODE_HDR + v->prefix_len + 2u * i, ix->pager->order);
     const uint8_t *p;
     size_t avail, n;
@@ -134,6 +189,7 @@ static cdb_status view_entry(const cdb_index *ix, const node_view *v, size_t i,
         return CDB_E_CORRUPT;
     p = v->pl + off;
     avail = v->cap - off;
+    /* Key suffix: varint length, then the bytes. */
     if (cdb_varint_decode(p, avail, &len, &n) != CDB_OK || len > avail - n)
         return CDB_E_CORRUPT;
     p += n;
@@ -142,6 +198,9 @@ static cdb_status view_entry(const cdb_index *ix, const node_view *v, size_t i,
     *slen = (size_t)len;
     p += len;
     avail -= (size_t)len;
+    /* Leaf: varint value length, then either the value itself or (when the
+     * length is above the inline limit) the chain's first logical ID.
+     * Interior: just the child's logical ID. */
     if (v->level == 0) {
         if (cdb_varint_decode(p, avail, &len, &n) != CDB_OK || len > UINT32_MAX)
             return CDB_E_CORRUPT;
@@ -165,11 +224,15 @@ static cdb_status view_entry(const cdb_index *ix, const node_view *v, size_t i,
     return CDB_OK;
 }
 
+/* Reads an on-disk logical ID (child or chain start) at the address width. */
 static uint64_t child_of(const cdb_index *ix, const uint8_t *val)
 {
     return ix->pager->addr_width == 8 ? cdb_load_u64(val, ix->pager->order) : cdb_load_u32(val, ix->pager->order);
 }
 
+/* Reads node lid into page (page_size bytes) and views it. A missing page
+ * or one of the wrong type is reported as CDB_E_CORRUPT: some node pointed
+ * at it, so the tree is damaged. */
 static cdb_status read_node(cdb_index *ix, uint64_t lid, uint8_t *page, node_view *v)
 {
     cdb_page_header h;
@@ -182,7 +245,9 @@ static cdb_status read_node(cdb_index *ix, uint64_t lid, uint8_t *page, node_vie
 }
 
 /* Loads node lid into the work entries, with full keys. Interior children,
- * and the chains of overflow values, become 8 big-endian bytes. */
+ * and the chains of overflow values, become 8 big-endian bytes.
+ * Replaces whatever was in the work entries and heap before. Uses the read
+ * page region. */
 static cdb_status expand(cdb_index *ix, uint64_t lid, node *n)
 {
     node_view v;
@@ -202,12 +267,14 @@ static cdb_status expand(cdb_index *ix, uint64_t lid, node *n)
         int chained;
         if ((s = view_entry(ix, &v, i, &suffix, &slen, &val, &vlen, &tlen)) != CDB_OK)
             return s;
+        /* Widen on-disk IDs to the 8-byte big-endian form used in memory. */
         chained = v.level > 0 || tlen > ix->max_value;
         if (chained) {
             cdb_store_u64(child, child_of(ix, val), CDB_ORDER_BIG);
             val = child;
             vlen = CHILD_BYTES;
         }
+        /* Full key = the node's shared prefix + this entry's suffix. */
         if ((s = heap_add(ix, n, v.pl + NODE_HDR, v.prefix_len, suffix, slen, val, vlen,
                           &ix->w.entries[n->count])) != CDB_OK)
             return s;
@@ -233,7 +300,9 @@ static size_t lower_bound(cdb_index *ix, const node *n, const uint8_t *key, size
     return lo;
 }
 
-/* Interior: the child whose range holds key (last entry with key <= key). */
+/* Interior: the child whose range holds key (last entry with key <= key).
+ * Entry 0 has an empty key, which sorts before every key, so a key smaller
+ * than every separator still lands in child 0. */
 static size_t child_slot(cdb_index *ix, const node *n, const uint8_t *key, size_t klen)
 {
     size_t lb = lower_bound(ix, n, key, klen);
@@ -245,6 +314,10 @@ static size_t child_slot(cdb_index *ix, const node *n, const uint8_t *key, size_
     return lb == 0 ? 0 : lb - 1;
 }
 
+/* Length of the prefix that all keys in entries [a, b) share, capped at
+ * CDB_INDEX_MAX_PREFIX. 0 unless this is a leaf of an index with prefix
+ * compression on (spec 14.8.7). Since the keys are sorted, the prefix shared
+ * by the first and last key is shared by every key between them. */
 static size_t common_prefix(cdb_index *ix, unsigned level, size_t a, size_t b)
 {
     const cdb_index_entry *first = &ix->w.entries[a], *last = &ix->w.entries[b - 1];
@@ -265,6 +338,8 @@ static int in_chain(const cdb_index *ix, const cdb_index_entry *e)
     return e->tlen > ix->max_value;
 }
 
+/* Bytes entry e takes in a node's entry heap on disk, given the node's
+ * shared prefix length (the slot-directory slot is not included). */
 static size_t entry_bytes(cdb_index *ix, unsigned level, const cdb_index_entry *e, size_t prefix)
 {
     size_t slen = e->klen - prefix;
@@ -276,6 +351,8 @@ static size_t entry_bytes(cdb_index *ix, unsigned level, const cdb_index_entry *
     return size;
 }
 
+/* Payload bytes a node made of entries [a, b) would need: header, prefix,
+ * and per entry a 2-byte slot plus the entry itself. */
 static size_t piece_size(cdb_index *ix, unsigned level, size_t a, size_t b)
 {
     size_t prefix = common_prefix(ix, level, a, b), size = NODE_HDR + prefix, i;
@@ -284,18 +361,23 @@ static size_t piece_size(cdb_index *ix, unsigned level, size_t a, size_t b)
     return size;
 }
 
-/* Builds the node image for entries [a, b) and writes it to lid. */
+/* Builds the node image for entries [a, b) and writes it to lid.
+ * Layout (spec 14.8.7): the header and prefix at the front, then the slot
+ * directory growing upward, and the entries packed downward from the end
+ * of the payload, so the free space is in the middle. CDB_E_OVERFLOW if the
+ * entries do not fit in one page. Uses the node image region. */
 static cdb_status write_piece(cdb_index *ix, uint64_t lid, unsigned level, size_t a, size_t b)
 {
     size_t cap = capacity_of(ix->pager);
     size_t prefix = common_prefix(ix, level, a, b);
     uint8_t *pl = w_image(ix);
-    size_t top = cap, i;
+    size_t top = cap, i;   /* top = start of the entries written so far */
     cdb_page_header t;
     cdb_byte_order o = ix->pager->order;
 
     if (piece_size(ix, level, a, b) > cap)
         return CDB_E_OVERFLOW;
+    /* Node header and shared prefix. */
     memset(pl, 0, cap);
     pl[0] = (uint8_t)level;
     pl[1] = ix->flags;
@@ -303,6 +385,8 @@ static cdb_status write_piece(cdb_index *ix, uint64_t lid, unsigned level, size_
     cdb_store_u16(pl + 4, (uint16_t)prefix, o);
     if (prefix)
         memcpy(pl + NODE_HDR, ent_key(ix, &ix->w.entries[a]), prefix);
+    /* Each entry: place it just below the previous one, encode it, and
+     * record its offset in the slot directory. */
     for (i = a; i < b; i++) {
         const cdb_index_entry *e = &ix->w.entries[i];
         size_t size = entry_bytes(ix, level, e, prefix), slen = e->klen - prefix;
@@ -313,10 +397,14 @@ static cdb_status write_piece(cdb_index *ix, uint64_t lid, unsigned level, size_
         memcpy(p, ent_key(ix, e) + prefix, slen);
         p += slen;
         if (level == 0 && !in_chain(ix, e)) {
+            /* Inline leaf value: its length, then its bytes. */
             p += cdb_varint_encode(e->vlen, p);
             if (e->vlen)
                 memcpy(p, ent_val(ix, e), e->vlen);
         } else {
+            /* A child ID, or a chained leaf value (the full length, then the
+             * chain's first ID). Narrow the in-memory 8-byte form back to
+             * the file's address width. */
             if (level == 0)
                 p += cdb_varint_encode(e->tlen, p);
             uint64_t child = cdb_load_u64(ent_val(ix, e), CDB_ORDER_BIG);
@@ -329,6 +417,8 @@ static cdb_status write_piece(cdb_index *ix, uint64_t lid, unsigned level, size_
     }
     cdb_store_u16(pl + 6, (uint16_t)top, o);
 
+    /* Write through the pager, which does the copy-on-write. The node is
+     * tagged with the owning store's ID. */
     memset(&t, 0, sizeof t);
     t.type = CDB_PAGE_TYPE_INDEX_NODE;
     t.store_id = ix->store_id;
@@ -337,12 +427,15 @@ static cdb_status write_piece(cdb_index *ix, uint64_t lid, unsigned level, size_
 
 /* -------------------------------------------------------- writes */
 
+/* Result of writing a node that split: the logical IDs of the new nodes to
+ * its right, and the key that separates each from the one before. */
 typedef struct split_out {
     size_t count;                         /* new right-hand nodes */
     uint64_t lid[CDB_INDEX_MAX_SPLIT];
     size_t sep_len[CDB_INDEX_MAX_SPLIT];  /* separators live in the seps area */
 } split_out;
 
+/* Separator i's bytes in the separators region (max_key bytes per slot). */
 static uint8_t *sep_at(cdb_index *ix, size_t i)
 {
     return w_seps(ix) + i * ix->max_key;
@@ -350,7 +443,9 @@ static uint8_t *sep_at(cdb_index *ix, size_t i)
 
 /* Writes the expanded node to lid, splitting it into several nodes if it no
  * longer fits. The new right-hand nodes and their first keys come back in
- * out, for the parent to record. */
+ * out, for the parent to record. The first piece stays at lid, so the
+ * parent's existing pointer remains correct. CDB_E_OVERFLOW if more than
+ * CDB_INDEX_MAX_SPLIT pieces would be needed. */
 static cdb_status write_node(cdb_index *ix, uint64_t lid, const node *n, split_out *out)
 {
     size_t cap = capacity_of(ix->pager), target = cap * 3u / 4u;
@@ -358,6 +453,7 @@ static cdb_status write_node(cdb_index *ix, uint64_t lid, const node *n, split_o
     cdb_status s;
 
     out->count = 0;
+    /* Common case: it still fits in one page. */
     if (n->count == 0 || piece_size(ix, n->level, 0, n->count) <= cap)
         return write_piece(ix, lid, n->level, 0, n->count);
 
@@ -385,6 +481,7 @@ static cdb_status write_node(cdb_index *ix, uint64_t lid, const node *n, split_o
         if (n->level > 0)
             clear_key(first); /* the lowest child of a node has no lower bound */
     }
+    /* Piece 0 overwrites the original node; the others get new IDs. */
     if ((s = write_piece(ix, lid, n->level, starts[0], starts[1])) != CDB_OK)
         return s;
     for (i = 1; i < pieces; i++) {
@@ -398,7 +495,12 @@ static cdb_status write_node(cdb_index *ix, uint64_t lid, const node *n, split_o
 }
 
 /* The root keeps its logical ID: when it splits, its pieces move to new
- * nodes and the root becomes their parent, one level up. */
+ * nodes and the root becomes their parent, one level up.
+ *
+ * Called after write_node has already written the root's first piece at
+ * the root's ID; level is that piece's level. That page is copied as is to
+ * a new ID, and the root is rewritten as an interior node whose children
+ * are the copy plus the pieces in out. This adds one level to the tree. */
 static cdb_status split_root(cdb_index *ix, unsigned level, const split_out *out)
 {
     uint64_t first;
@@ -422,6 +524,8 @@ static cdb_status split_root(cdb_index *ix, unsigned level, const split_out *out
         if ((s = cdb_pager_write(ix->pager, first, &t, w_image(ix), v.cap)) != CDB_OK)
             return s;
     }
+    /* Build the new root in the work memory: an empty-key entry for the
+     * moved first piece, then one entry per separator. */
     n.level = level + 1;
     n.count = 0;
     n.heap_used = 0;
@@ -437,13 +541,20 @@ static cdb_status split_root(cdb_index *ix, unsigned level, const split_out *out
     return write_piece(ix, ix->root, n.level, 0, n.count);
 }
 
+/* The route from the root down to a leaf: lid[0] is the root, lid[depth-1]
+ * the leaf, and slot[i] the entry followed out of interior node lid[i].
+ * Needed because nodes have no parent pointers. */
 typedef struct path {
     unsigned depth;
     uint64_t lid[CDB_INDEX_MAX_DEPTH];
     size_t slot[CDB_INDEX_MAX_DEPTH]; /* child taken at each interior level */
 } path;
 
-/* Descends to the leaf for key; on return the leaf is expanded in work. */
+/* Descends to the leaf for key; on return the leaf is expanded in work.
+ * Each level is expanded in turn (overwriting the previous one), so only
+ * the leaf is left in work memory; the path records how to get back up. An
+ * empty interior node or a tree deeper than CDB_INDEX_MAX_DEPTH (a cycle,
+ * for instance) is CDB_E_CORRUPT. */
 static cdb_status descend(cdb_index *ix, const uint8_t *key, size_t klen, path *pt, node *leaf)
 {
     uint64_t lid = ix->root;
@@ -468,7 +579,10 @@ static cdb_status descend(cdb_index *ix, const uint8_t *key, size_t klen, path *
     }
 }
 
-/* Records a child's split in its ancestors, splitting them in turn. */
+/* Records a child's split in its ancestors, splitting them in turn.
+ * at is the path index of the node that split. Each round inserts the new
+ * children into the parent right after the slot the descent took, then
+ * rewrites the parent, which may split and pass new pieces further up. */
 static cdb_status propagate(cdb_index *ix, const path *pt, unsigned at, split_out *out)
 {
     while (out->count > 0) {
@@ -503,6 +617,10 @@ static cdb_status propagate(cdb_index *ix, const path *pt, unsigned at, split_ou
     return CDB_OK;
 }
 
+/* Insert or replace. Steps: find the leaf, store a long value in an
+ * overflow chain first, insert or overwrite the entry in the expanded leaf,
+ * release a replaced value's chain, then write the leaf back, splitting it
+ * and its ancestors as needed. */
 cdb_status cdb_index_put(cdb_index *ix, const uint8_t *key, size_t klen, const void *val, size_t vlen)
 {
     path pt;
@@ -529,6 +647,9 @@ cdb_status cdb_index_put(cdb_index *ix, const uint8_t *key, size_t klen, const v
         stored = chain;
         slen = CHILD_BYTES;
     }
+    /* Key already present: overwrite the descriptor in place (the old key
+     * and value bytes stay unused in the heap). Remember the old chain, if
+     * any, so it can be released. */
     if (pos < leaf.count && cdb_key_compare(ent_key(ix, &ix->w.entries[pos]), ix->w.entries[pos].klen, key, klen) == 0) {
         if (in_chain(ix, &ix->w.entries[pos])) {
             old_chain = cdb_load_u64(ent_val(ix, &ix->w.entries[pos]), CDB_ORDER_BIG);
@@ -537,6 +658,7 @@ cdb_status cdb_index_put(cdb_index *ix, const uint8_t *key, size_t klen, const v
         if ((s = heap_add(ix, &leaf, key, klen, NULL, 0, stored, slen, &ix->w.entries[pos])) != CDB_OK)
             return s;
     } else {
+        /* New key: open a gap at pos to keep the entries sorted. */
         if (leaf.count >= ix->w.entries_cap)
             return CDB_E_BUFFER_TOO_SMALL;
         memmove(&ix->w.entries[pos + 1], &ix->w.entries[pos], (leaf.count - pos) * sizeof(cdb_index_entry));
@@ -544,12 +666,15 @@ cdb_status cdb_index_put(cdb_index *ix, const uint8_t *key, size_t klen, const v
             return s;
         leaf.count++;
     }
+    /* tlen is always the real value length; it is what marks a chained value. */
     ix->w.entries[pos].tlen = (uint32_t)vlen;
     /* The replaced value's chain is released (its pages stay until commit). */
     if (old_chain && (s = cdb_overflow_free(ix->pager, old_chain, ix->store_id, (size_t)old_len, w_page(ix))) != CDB_OK)
         return s;
     if ((s = write_node(ix, pt.lid[pt.depth - 1], &leaf, &out)) != CDB_OK)
         return s;
+    /* The leaf split: if it is also the root, grow the tree; otherwise tell
+     * the parents. */
     if (out.count == 0)
         return CDB_OK;
     if (pt.depth == 1)
@@ -557,6 +682,9 @@ cdb_status cdb_index_put(cdb_index *ix, const uint8_t *key, size_t klen, const v
     return propagate(ix, &pt, (unsigned)(pt.depth - 1u), &out);
 }
 
+/* Exact-match lookup. Note that *found is set to 1 even when the value then
+ * turns out too long for vcap (CDB_E_BUFFER_TOO_SMALL); *vlen tells the
+ * caller how much room is needed. */
 cdb_status cdb_index_get(cdb_index *ix, const uint8_t *key, size_t klen,
                          void *val, size_t vcap, size_t *vlen, int *found)
 {
@@ -599,6 +727,8 @@ static cdb_status collapse_root(cdb_index *ix)
         if (n.level == 0 || n.count != 1)
             return CDB_OK;
         only = cdb_load_u64(ent_val(ix, &ix->w.entries[0]), CDB_ORDER_BIG);
+        /* Copy the only child's contents into the root's page (the root's ID
+         * never changes), then release the child. */
         if ((s = expand(ix, only, &n)) != CDB_OK)
             return s;
         if ((s = write_piece(ix, ix->root, n.level, 0, n.count)) != CDB_OK)
@@ -608,6 +738,9 @@ static cdb_status collapse_root(cdb_index *ix)
     }
 }
 
+/* Removes key. Underfull nodes are not merged (spec 14.8.7); only nodes
+ * that become empty are removed, which may cascade up the path. A missing
+ * key is not an error: *found is 0 and nothing changes. */
 cdb_status cdb_index_delete(cdb_index *ix, const uint8_t *key, size_t klen, int *found)
 {
     path pt;
@@ -623,14 +756,18 @@ cdb_status cdb_index_delete(cdb_index *ix, const uint8_t *key, size_t klen, int 
     if (pos >= n.count || cdb_key_compare(ent_key(ix, &ix->w.entries[pos]), ix->w.entries[pos].klen, key, klen) != 0)
         return CDB_OK;
     *found = 1;
+    /* A chained value's pages are released along with the entry. */
     if (in_chain(ix, &ix->w.entries[pos])
         && (s = cdb_overflow_free(ix->pager, cdb_load_u64(ent_val(ix, &ix->w.entries[pos]), CDB_ORDER_BIG),
                                   ix->store_id, ix->w.entries[pos].tlen, w_page(ix))) != CDB_OK)
         return s;
 
+    /* Remove entry pos from the node at path index `at`, starting at the
+     * leaf. If that leaves a non-root node empty, free it and repeat one
+     * level up, removing the parent's entry for it. */
     at = (unsigned)(pt.depth - 1u);
     for (;;) {
-        split_out none;
+        split_out none; /* removing never splits, so this stays empty */
         memmove(&ix->w.entries[pos], &ix->w.entries[pos + 1], (n.count - pos - 1) * sizeof(cdb_index_entry));
         n.count--;
         if (n.level > 0 && pos == 0 && n.count > 0)
@@ -650,11 +787,15 @@ cdb_status cdb_index_delete(cdb_index *ix, const uint8_t *key, size_t klen, int 
             return s;
         pos = pt.slot[at];
     }
+    /* Removing children may have left the root with a single child. */
     return collapse_root(ix);
 }
 
 /* -------------------------------------------------------- open/create */
 
+/* Checks the caller's work memory against the page size and fixes the size
+ * limits. CDB_E_INVALID_ARG when work memory is missing or too small, or
+ * when pages are too small to hold an index node (under 64 payload bytes). */
 static cdb_status setup(cdb_index *ix, cdb_pager *p, const cdb_index_work *w)
 {
     size_t cap = capacity_of(p);
@@ -682,11 +823,14 @@ cdb_status cdb_index_create(cdb_index *ix, cdb_pager *p, uint64_t store_id, unsi
         return s;
     ix->flags = (uint8_t)flags;
     ix->store_id = store_id;
+    /* An empty index is a single empty leaf, which is also the root. */
     if ((s = cdb_pager_alloc(p, &ix->root)) != CDB_OK)
         return s;
     return write_piece(ix, ix->root, 0, 0, 0);
 }
 
+/* The flags and store ID are read back from the root page, so the caller
+ * only needs to remember the root's logical ID. */
 cdb_status cdb_index_open(cdb_index *ix, cdb_pager *p, uint64_t root, const cdb_index_work *w)
 {
     node_view v;
@@ -710,7 +854,9 @@ cdb_status cdb_index_open(cdb_index *ix, cdb_pager *p, uint64_t root, const cdb_
 /* -------------------------------------------------------- cursors */
 
 /* Descends from the node at the cursor's current depth to a leaf, taking
- * the leftmost child each time. */
+ * the leftmost child each time. (At the starting node it follows the child
+ * at the slot already set there; below that, always slot 0.) Cursors read
+ * nodes straight from pages into c->page and never use the work memory. */
 static cdb_status leftmost(cdb_index_cursor *c)
 {
     for (;;) {
@@ -749,10 +895,17 @@ cdb_status cdb_index_seek(cdb_index_cursor *c, cdb_index *ix, uint8_t *page, con
         c->lid[i] = pt.lid[i];
         c->slot[i] = (uint32_t)pt.slot[i];
     }
+    /* In the leaf, start at the first key >= key. This may be one past the
+     * last entry, in which case the first next() moves on to the next leaf. */
     c->slot[pt.depth - 1] = (uint32_t)lower_bound(ix, &leaf, key, klen);
     return CDB_OK;
 }
 
+/* Each call re-reads the current leaf from the pager (the cursor holds only
+ * IDs and slot numbers, not page contents). If the key or value does not
+ * fit the caller's buffer, CDB_E_BUFFER_TOO_SMALL is returned with *klen and
+ * *vlen set, and the cursor does not advance, so the call can be retried
+ * with bigger buffers. */
 cdb_status cdb_index_next(cdb_index_cursor *c, uint8_t *key, size_t kcap, size_t *klen,
                           void *val, size_t vcap, size_t *vlen, int *done)
 {
@@ -769,6 +922,7 @@ cdb_status cdb_index_next(cdb_index_cursor *c, uint8_t *key, size_t kcap, size_t
         }
         if ((s = read_node(c->ix, c->lid[c->depth - 1], c->page, &v)) != CDB_OK)
             return s;
+        /* An entry left in this leaf: copy out prefix + suffix and the value. */
         if (c->slot[c->depth - 1] < v.count) {
             if ((s = view_entry(c->ix, &v, c->slot[c->depth - 1], &suffix, &slen, &value, &vl, &tl)) != CDB_OK)
                 return s;

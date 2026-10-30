@@ -36,35 +36,41 @@
 #define CDB_OP_LINK 5u
 #define CDB_OP_UNLINK 6u
 
+/* The companion file header, decoded (spec 14.4.1). */
 typedef struct cdb_journal_header {
-    uint16_t type_id;
-    uint16_t slot;
-    uint8_t db_id[16];
+    uint16_t type_id;      /* companion type, e.g. CDB_COMPANION_MAIN_JOURNAL */
+    uint16_t slot;         /* slot number of the owning coordinator */
+    uint8_t db_id[16];     /* must match the archive's database ID */
     uint64_t unsealed_seq; /* archive committed sequence at creation */
-    uint64_t first_seq;
-    uint64_t domain_id;
+    uint64_t first_seq;    /* delta sequence of the first record in this file */
+    uint64_t domain_id;    /* encryption domain; 0 = public */
 } cdb_journal_header;
 
+/* One delta record (spec 14.4.2). On append the caller fills every field
+ * except seq; on read every field is filled and payload points into the
+ * caller's buffer. */
 typedef struct cdb_record {
-    uint8_t kind;
-    uint8_t flags;
-    uint64_t seq;
-    uint64_t tx_id;
-    uint64_t store_id;
-    uint64_t entry_id;
+    uint8_t kind;          /* CDB_RECORD_* */
+    uint8_t flags;         /* encrypted, compressed (none used yet) */
+    uint64_t seq;          /* delta sequence number, assigned by append */
+    uint64_t tx_id;        /* owning transaction (spec 14.4.3) */
+    uint64_t store_id;     /* target store */
+    uint64_t entry_id;     /* target entry, or 0 */
     uint32_t key_version;
     const uint8_t *payload;
     uint32_t payload_len;
 } cdb_record;
 
+/* Commit record payload, decoded (spec 14.4.4). */
 typedef struct cdb_commit_info {
-    uint64_t commit_number;
-    uint64_t timestamp;
-    uint64_t principal;
-    uint32_t delta_count;
-    uint32_t track_mask;
+    uint64_t commit_number; /* global commit number, from 1 */
+    uint64_t timestamp;     /* ns since the Unix epoch; 0 if the platform has no clock */
+    uint64_t principal;     /* identity that committed */
+    uint32_t delta_count;   /* data records in the transaction */
+    uint32_t track_mask;    /* companion types the transaction touched */
 } cdb_commit_info;
 
+/* An open journal file. The storage handle is copied by value. */
 typedef struct cdb_journal {
     cdb_storage st;
     cdb_byte_order order;
@@ -77,19 +83,27 @@ typedef struct cdb_journal {
 cdb_status cdb_journal_create(cdb_journal *j, const cdb_storage *st, cdb_byte_order order,
                               const cdb_journal_header *hdr);
 
-/* Reads and verifies the header. The caller scans the records. */
+/* Reads and verifies the header. The caller scans the records.
+ * CDB_E_CORRUPT for a damaged or foreign header (wrong magic, byte order
+ * or CRC), CDB_E_UNSUPPORTED for an unknown epoch. */
 cdb_status cdb_journal_open(cdb_journal *j, const cdb_storage *st, cdb_byte_order order);
 
 /* Appends one record at the end, using buf (at least the record's size) to
- * assemble it. Sets r->seq. No barrier. */
+ * assemble it. Sets r->seq. No barrier. r->payload may point inside buf at
+ * offset CDB_RECORD_HEADER_SIZE, to avoid a copy. CDB_E_BUFFER_TOO_SMALL
+ * when buf cannot hold header + payload + trailer. */
 cdb_status cdb_journal_append(cdb_journal *j, cdb_record *r, uint8_t *buf, size_t buf_size);
 
 /* Reads the record at offset into buf and verifies it. On success *next is
  * the offset of the following record. A torn or damaged record returns
- * CDB_E_CORRUPT or CDB_E_TRUNCATED: it marks the end of the journal. */
+ * CDB_E_CORRUPT or CDB_E_TRUNCATED: it marks the end of the journal.
+ * A record bigger than buf_size is also reported as CDB_E_CORRUPT, so buf
+ * must be as big as the largest record the writer could produce.
+ * r->payload points into buf and is valid until buf is reused. */
 cdb_status cdb_journal_read(cdb_journal *j, uint64_t offset, uint8_t *buf, size_t buf_size,
                             cdb_record *r, uint64_t *next);
 
+/* Encode and decode a commit record's payload (spec 14.4.4). */
 void cdb_commit_encode(const cdb_commit_info *c, uint8_t out[CDB_COMMIT_PAYLOAD_SIZE], cdb_byte_order order);
 cdb_status cdb_commit_decode(const cdb_record *r, cdb_commit_info *c, cdb_byte_order order);
 

@@ -1,4 +1,23 @@
-/* Catalog (spec 4, 14.3). */
+/* Catalog (spec 4, 14.3).
+ *
+ * Storage, in short (spec 14.3.3):
+ * - The catalog body is a B+tree (cdb_index) kept twice, "body" and
+ *   "mirror". Every write goes to both; reads use the body and fall back to
+ *   the mirror when the body reports corruption.
+ * - Object records (stores, link types) and schema texts are not stored in
+ *   the tree itself. Each lives in its own page of type CATALOG_RECORD,
+ *   written twice; the tree holds a 16-byte "record reference" naming the
+ *   two logical pages (both IDs as 8 big-endian bytes).
+ * - The two tree roots and the object-ID counter are kept in the catalog
+ *   root slot at location 0 (cdb_catroot), which the pager writes as part of
+ *   its commit.
+ * - Every catalog change ends in finish(), which commits the pager at once.
+ *   The "stage" functions are the exception: they change records but leave
+ *   the commit to the caller's next reconciliation.
+ *
+ * All functions use cat->page as scratch (records are encoded and read
+ * there), so a payload pointer obtained from it is valid only until the
+ * next catalog call. */
 #include <string.h>
 
 #include "combolite/cdb_value.h"
@@ -6,6 +25,8 @@
 #include "cdb_endian.h"
 #include "cdb_key.h"
 
+/* First byte of every key in the body, which keeps each kind of entry in
+ * its own key range (spec 14.3.3). */
 #define KEY_OBJECT 0x01u
 #define KEY_NAME 0x02u
 #define KEY_SCHEMA 0x03u
@@ -13,7 +34,7 @@
 #define KEY_FIELD_BY_ID 0x05u
 #define KEY_NEXT_ID 0x06u /* the object-ID counter, also kept in the body */
 
-#define KEY_MAX 128u
+#define KEY_MAX 128u /* longest key built here */
 #define REF_SIZE 16u /* two record page IDs: primary and mirror */
 
 /* Field IDs of a store record (the catalog's own field dictionary). */
@@ -27,6 +48,9 @@ enum {
 
 /* -------------------------------------------------------- keys */
 
+/* A body key: the kind byte, then order-preserving encoded parts (cdb_key).
+ * The k_* builders return the key builder's sticky error, which is set if a
+ * part does not fit in KEY_MAX bytes. */
 typedef struct key {
     uint8_t b[KEY_MAX];
     size_t n;
@@ -44,6 +68,7 @@ static void key_end(key *k, const cdb_key_builder *kb)
     k->n = 1 + kb->len;
 }
 
+/* 01 + object ID -> record reference. */
 static cdb_status k_object(key *k, uint64_t id)
 {
     cdb_key_builder kb;
@@ -53,6 +78,8 @@ static cdb_status k_object(key *k, uint64_t id)
     return kb.error;
 }
 
+/* 02 + object kind + name -> object ID. Including the kind lets a store and
+ * a link type share a name. */
 static cdb_status k_name(key *k, unsigned kind, const char *name, size_t len)
 {
     cdb_key_builder kb;
@@ -63,6 +90,7 @@ static cdb_status k_name(key *k, unsigned kind, const char *name, size_t len)
     return kb.error;
 }
 
+/* kind + two numbers: 03 + store + schema version, or 05 + store + field ID. */
 static cdb_status k_pair(key *k, unsigned kind, uint64_t a, uint64_t b)
 {
     cdb_key_builder kb;
@@ -73,6 +101,7 @@ static cdb_status k_pair(key *k, unsigned kind, uint64_t a, uint64_t b)
     return kb.error;
 }
 
+/* 04 + store + field name -> field ID. */
 static cdb_status k_field_name(key *k, uint64_t store, const char *name, size_t len)
 {
     cdb_key_builder kb;
@@ -85,6 +114,8 @@ static cdb_status k_field_name(key *k, uint64_t store, const char *name, size_t 
 
 /* -------------------------------------------------------- mirrored body */
 
+/* A new file has no catalog until the first change: create both trees then.
+ * Store ID 0 tags the tree pages as the catalog's own. */
 static cdb_status ensure_created(cdb_catalog *cat)
 {
     cdb_status s;
@@ -99,6 +130,7 @@ static cdb_status ensure_created(cdb_catalog *cat)
     return CDB_OK;
 }
 
+/* Every body change is made to both trees, so they hold the same entries. */
 static cdb_status put_both(cdb_catalog *cat, const key *k, const void *v, size_t vlen)
 {
     cdb_status s = cdb_index_put(&cat->body, k->b, k->n, v, vlen);
@@ -116,7 +148,8 @@ static cdb_status delete_both(cdb_catalog *cat, const key *k)
     return cdb_index_delete(&cat->mirror, k->b, k->n, &found);
 }
 
-/* Reads from the primary body, falling back to the mirror (spec 3.5). */
+/* Reads from the primary body, falling back to the mirror (spec 3.5).
+ * With no catalog yet, every lookup simply finds nothing. */
 static cdb_status get_either(cdb_catalog *cat, const key *k, void *v, size_t cap, size_t *vlen, int *found)
 {
     cdb_status s;
@@ -131,6 +164,11 @@ static cdb_status get_either(cdb_catalog *cat, const key *k, void *v, size_t cap
 
 /* -------------------------------------------------------- record pages */
 
+/* Writes a record's payload to both of its pages. A new record (is_new)
+ * first gets two fresh logical pages, and ref is filled in; otherwise ref
+ * names the existing pages, which the pager rewrites copy-on-write, so the
+ * reference never changes. payload may be cat->page: the pager copies it
+ * into its own scratch page and does not touch cat->page. */
 static cdb_status write_record(cdb_catalog *cat, uint8_t ref[REF_SIZE], int is_new,
                                const void *payload, size_t len)
 {
@@ -157,7 +195,9 @@ static cdb_status write_record(cdb_catalog *cat, uint8_t ref[REF_SIZE], int is_n
     return CDB_OK;
 }
 
-/* Reads the record named by ref into cat->page; *payload points into it. */
+/* Reads the record named by ref into cat->page; *payload points into it.
+ * Tries the first copy, then the second if the first is missing, damaged or
+ * of the wrong type. */
 static cdb_status read_record(cdb_catalog *cat, const uint8_t ref[REF_SIZE], const uint8_t **payload, size_t *len)
 {
     cdb_page_header h;
@@ -177,6 +217,10 @@ static cdb_status read_record(cdb_catalog *cat, const uint8_t ref[REF_SIZE], con
 
 /* -------------------------------------------------------- store records */
 
+/* Encodes a store record into cat->page as one object in the shared value
+ * encoding (spec 14.3.3 lists the fields). Fields 1 to 14 are always
+ * written; full-text and vector settings only when present. The value
+ * writer's error is sticky, so it is checked once at the end. */
 static cdb_status encode_store(cdb_catalog *cat, const cdb_store_info *in, size_t *len)
 {
     cdb_value_writer w;
@@ -211,6 +255,8 @@ static cdb_status encode_store(cdb_catalog *cat, const cdb_store_info *in, size_
     return w.error;
 }
 
+/* Reads required integer field f of a record object. A missing field or one
+ * of another type is CDB_E_CORRUPT. */
 static cdb_status field_int(const cdb_value *obj, cdb_byte_order o, uint64_t f, int64_t *out)
 {
     cdb_value v;
@@ -224,11 +270,15 @@ static cdb_status field_int(const cdb_value *obj, cdb_byte_order o, uint64_t f, 
     return CDB_OK;
 }
 
+/* Decodes a store record. The whole record is validated first, so the
+ * field reads below cannot run past it. CDB_E_NOT_FOUND when the object is
+ * not a store (an ID can name a link type); CDB_E_CORRUPT for anything
+ * malformed. */
 static cdb_status decode_store(cdb_catalog *cat, const uint8_t *p, size_t len, cdb_store_info *out)
 {
     cdb_byte_order o = cat->pager->order;
     cdb_value obj, name;
-    int64_t v[11];
+    int64_t v[11];    /* v[f - 1] holds required field f, 1..11 */
     int found, i;
     cdb_status s;
 
@@ -239,6 +289,8 @@ static cdb_status decode_store(cdb_catalog *cat, const uint8_t *p, size_t len, c
         return s;
     if (v[F_KIND - 1] != CDB_OBJ_STORE)
         return CDB_E_NOT_FOUND; /* another kind of object: not a store */
+    /* Required integer fields 1..11; the name (field 3) is a string and is
+     * read separately. */
     for (i = 0; i < 11; i++) {
         if (i + 1 == F_NAME)
             continue;
@@ -279,6 +331,8 @@ static cdb_status decode_store(cdb_catalog *cat, const uint8_t *p, size_t len, c
             else
                 out->next_entry_id = (uint64_t)fv.as.i64;
         }
+        /* Settings objects are kept in their encoded form, copied whole.
+         * (`name` is reused here as a scratch value.) */
         if ((s = cdb_value_object_get(&obj, o, F_FULL_TEXT, &name, &found)) != CDB_OK)
             return s;
         if (found) {
@@ -299,6 +353,10 @@ static cdb_status decode_store(cdb_catalog *cat, const uint8_t *p, size_t len, c
     return CDB_OK;
 }
 
+/* Finds store id: its record reference (returned in ref, for a later
+ * save_store) and its decoded record. Dropped stores are returned too, with
+ * CDB_STORE_DROPPED set; callers check. A record whose ID field differs from
+ * the key it was found under is CDB_E_CORRUPT. */
 static cdb_status load_store(cdb_catalog *cat, uint64_t id, cdb_store_info *info, uint8_t ref[REF_SIZE])
 {
     const uint8_t *p;
@@ -322,6 +380,7 @@ static cdb_status load_store(cdb_catalog *cat, uint64_t id, cdb_store_info *info
     return info->id == id ? CDB_OK : CDB_E_CORRUPT;
 }
 
+/* Encodes and writes a store record (to new pages if is_new). */
 static cdb_status save_store(cdb_catalog *cat, const cdb_store_info *info, uint8_t ref[REF_SIZE], int is_new)
 {
     size_t len;
@@ -331,7 +390,8 @@ static cdb_status save_store(cdb_catalog *cat, const cdb_store_info *info, uint8
     return write_record(cat, ref, is_new, cat->page, len);
 }
 
-/* Every change ends here: record the roots and commit (spec 3.2 step 3). */
+/* Every change ends here: record the roots and commit (spec 3.2 step 3).
+ * next_id is the object-ID counter after this change. */
 static cdb_status finish(cdb_catalog *cat, uint64_t next_id)
 {
     cdb_catroot r = cat->pager->catroot;
@@ -355,6 +415,8 @@ static cdb_status finish(cdb_catalog *cat, uint64_t next_id)
     return cdb_pager_commit(cat->pager);
 }
 
+/* Names are 1..64 bytes of valid UTF-8 (spec 14.3.3). CDB_E_INVALID_ARG
+ * otherwise, or when a key built from the name might not fit the index. */
 static cdb_status check_name(const cdb_catalog *cat, const char *name, size_t len)
 {
     uint8_t probe[8 + 2u * CDB_CATALOG_NAME_MAX + 16];
@@ -365,7 +427,9 @@ static cdb_status check_name(const cdb_catalog *cat, const char *name, size_t le
     cdb_value_writer_init(&w, probe, sizeof probe, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
     if (cdb_value_write_string(&w, name, len) != CDB_OK)
         return CDB_E_INVALID_ARG;
-    /* The longest key built from a name must fit in the index (spec 14.8.7). */
+    /* The longest key built from a name must fit in the index (spec 14.8.7).
+     * 2 * len allows for the key encoding escaping every byte; 16 covers the
+     * kind byte and the other key parts. */
     if (cat->open && 2u * len + 16u > cat->body.max_key)
         return CDB_E_INVALID_ARG;
     return CDB_OK;
@@ -387,11 +451,15 @@ cdb_status cdb_catalog_open(cdb_catalog *cat, cdb_pager *p, const cdb_index_work
     /* One copy damaged: the other serves for both (spec 3.5). */
     s = cdb_index_open(&cat->body, p, p->catroot.body_root, work);
     if (s == CDB_E_CORRUPT) {
+        /* The body root is damaged: open the mirror, and let both handles
+         * point at the mirror tree. */
         if (cdb_index_open(&cat->body, p, p->catroot.mirror_root, work) != CDB_OK)
             return CDB_E_CORRUPT;
         cat->mirror = cat->body;
         s = CDB_OK;
     } else if (s == CDB_OK) {
+        /* The body opened: open the mirror too; if the mirror root is the
+         * damaged one, the body serves for both. */
         s = cdb_index_open(&cat->mirror, p, p->catroot.mirror_root, work);
         if (s == CDB_E_CORRUPT) {
             cat->mirror = cat->body;
@@ -401,6 +469,9 @@ cdb_status cdb_catalog_open(cdb_catalog *cat, cdb_pager *p, const cdb_index_work
     if (s != CDB_OK)
         return s;
     cat->open = 1;
+    /* The next object ID is the larger of the root slot's counter and the
+     * body's copy, so falling back to an older root slot never reuses an ID
+     * (spec 14.3.3). */
     {
         uint8_t v[8];
         size_t vlen;
@@ -445,6 +516,10 @@ cdb_status cdb_catalog_create_store(cdb_catalog *cat, const char *name, size_t l
     return cdb_catalog_create_store_ex(cat, name, len, model, NULL, 0, id);
 }
 
+/* Steps: validate; create the catalog trees if this is the first change;
+ * refuse a duplicate name; write the new record to two fresh pages; add the
+ * 01 (ID -> record) and 02 (name -> ID) keys; commit with the counter
+ * raised by one. */
 cdb_status cdb_catalog_create_store_ex(cdb_catalog *cat, const char *name, size_t len, uint32_t model,
                                        const void *vector, size_t vector_len, uint64_t *id)
 {
@@ -478,6 +553,7 @@ cdb_status cdb_catalog_create_store_ex(cdb_catalog *cat, const char *name, size_
     info.model = model;
     info.page_log2 = cat->pager->hs.record.default_page_log2;
     info.next_field_id = 1;
+    /* The archive commit sequence that finish() below will produce. */
     info.created_commit = cat->pager->hs.record.committed_seq + 1;
     if (vector_len) {
         memcpy(info.vector, vector, vector_len);
@@ -502,6 +578,9 @@ cdb_status cdb_catalog_get_store(cdb_catalog *cat, uint64_t id, cdb_store_info *
     return load_store(cat, id, info, ref);
 }
 
+/* Renaming to the current name is a no-op; to another store's name is
+ * CDB_E_EXISTS; to a reserved '$' name, or renaming the link store, is
+ * CDB_E_INVALID_ARG. The old 02 key is removed and the new one added. */
 cdb_status cdb_catalog_rename_store(cdb_catalog *cat, uint64_t id, const char *name, size_t len)
 {
     cdb_store_info info;
@@ -537,6 +616,9 @@ cdb_status cdb_catalog_rename_store(cdb_catalog *cat, uint64_t id, const char *n
     return finish(cat, cat->pager->catroot.next_object_id);
 }
 
+/* Dropping removes the name (so it can be reused) and sets the dropped
+ * flag; the record and its ID stay. The store's data pages are not touched
+ * here. */
 cdb_status cdb_catalog_drop_store(cdb_catalog *cat, uint64_t id)
 {
     cdb_store_info info;
@@ -571,6 +653,8 @@ cdb_status cdb_catalog_stage_pool(cdb_catalog *cat, uint64_t store_id, uint64_t 
     info.next_entry_id = next_entry_id;
     if ((s = save_store(cat, &info, ref, 0)) != CDB_OK)
         return s;
+    /* No commit here. Re-setting the unchanged root marks it dirty, so the
+     * caller's next pager commit also writes a catalog root slot. */
     cdb_pager_set_catroot(cat->pager, &cat->pager->catroot);
     return CDB_OK;
 }
@@ -628,6 +712,10 @@ cdb_status cdb_catalog_set_full_text(cdb_catalog *cat, uint64_t store_id, const 
     return finish(cat, cat->pager->catroot.next_object_id);
 }
 
+/* The schema text goes in a new record of its own (so it must fit in one
+ * page), keyed 03 + store + version; the store record's current version is
+ * raised. Old versions are kept: each document revision records the schema
+ * version it was written under (spec 14.9.1). */
 cdb_status cdb_catalog_add_schema(cdb_catalog *cat, uint64_t store_id, const void *schema, size_t len,
                                   uint32_t *version)
 {
@@ -682,6 +770,10 @@ cdb_status cdb_catalog_get_schema(cdb_catalog *cat, uint64_t store_id, uint32_t 
     return CDB_OK;
 }
 
+/* Looks the name up in the store's field dictionary; if absent, assigns the
+ * store's next field ID, records both directions (04 name -> ID and
+ * 05 ID -> name) and commits. Field IDs are per store. The name is stored
+ * as an index value, so it must also fit the inline value limit. */
 cdb_status cdb_catalog_field_id(cdb_catalog *cat, uint64_t store_id, const char *name, size_t len,
                                 uint64_t *field_id)
 {
@@ -737,7 +829,8 @@ cdb_status cdb_catalog_field_name(cdb_catalog *cat, uint64_t store_id, uint64_t 
 
 /* -------------------------------------------------------- link types */
 
-/* Link-type record (spec 14.13): kind, ID, name, then these fields. */
+/* Link-type record (spec 14.13): kind, ID, name, then these fields. Link
+ * types share the object-ID counter and the 01/02 keys with stores. */
 enum { LT_CARDINALITY = 4, LT_ENFORCED, LT_ON_DELETE };
 
 cdb_status cdb_catalog_find_link_type(cdb_catalog *cat, const char *name, size_t len, uint64_t *id, int *found)
@@ -812,7 +905,7 @@ cdb_status cdb_catalog_get_link_type(cdb_catalog *cat, uint64_t id, cdb_link_typ
     int found;
     cdb_byte_order o = cat->pager->order;
     cdb_value obj, name;
-    int64_t v[6];
+    int64_t v[6];     /* v[f - 1] holds integer field f; v[2] (the name) is unused */
     unsigned f;
     key k;
     cdb_status s;
@@ -837,6 +930,7 @@ cdb_status cdb_catalog_get_link_type(cdb_catalog *cat, uint64_t id, cdb_link_typ
             return s;
     if ((s = cdb_value_object_get(&obj, o, F_NAME, &name, &found)) != CDB_OK)
         return s;
+    /* Range checks keep the narrowing casts below safe. */
     if (!found || name.type != CDB_TYPE_STRING || name.payload_len > CDB_CATALOG_NAME_MAX || (uint64_t)v[1] != id
         || v[3] < 0 || v[3] > 255 || v[4] < 0 || v[4] > 1 || v[5] < 0 || v[5] > 255)
         return CDB_E_CORRUPT;

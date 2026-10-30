@@ -12,12 +12,17 @@
 
 #include "combolite/cdb_common.h"
 
+/* Physical properties of a storage medium. */
 typedef struct cdb_storage_geometry {
     uint32_t erase_block_size; /* 0 when the medium has no erase step (host files) */
     uint32_t program_unit;     /* smallest writable unit, in bytes */
     uint64_t capacity;         /* fixed size in bytes; 0 when the medium can grow */
 } cdb_storage_geometry;
 
+/* What a storage backend implements. ctx is the backend's own state. A
+ * write ("program") is not durable until a later sync returns: after a
+ * power loss it may be missing, partly written or torn. The engine's crash
+ * safety rests entirely on sync being an honest barrier. */
 typedef struct cdb_storage_ops {
     /* Reads exactly len bytes. Reading past the end returns CDB_E_TRUNCATED. */
     cdb_status (*read)(void *ctx, uint64_t offset, void *buf, size_t len);
@@ -30,17 +35,23 @@ typedef struct cdb_storage_ops {
     cdb_status (*geometry)(void *ctx, cdb_storage_geometry *out);
     /* Current size in bytes: the end of the furthest byte ever written. */
     cdb_status (*size)(void *ctx, uint64_t *out);
+    /* Releases the backend. Does not imply a sync. */
     void (*close)(void *ctx);
     /* Optional: shrinks the medium to size bytes; durable after the next sync.
      * NULL on media that cannot shrink (raw flash partitions). */
     cdb_status (*truncate)(void *ctx, uint64_t size);
 } cdb_storage_ops;
 
+/* A storage handle: an operation table plus its state. Small, and copied
+ * by value throughout the engine; ctx must outlive every copy. */
 typedef struct cdb_storage {
     const cdb_storage_ops *ops;
     void *ctx;
 } cdb_storage;
 
+/* Convenience wrappers that call through the table. truncate reports
+ * CDB_E_UNSUPPORTED when the backend has none; close does nothing on an
+ * unbound handle. */
 static inline cdb_status cdb_storage_read(const cdb_storage *s, uint64_t offset, void *buf, size_t len)
 {
     return s->ops->read(s->ctx, offset, buf, len);

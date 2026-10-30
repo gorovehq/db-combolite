@@ -1,4 +1,7 @@
-/* Host-file storage backend (spec 1.11.1), using POSIX positional I/O. */
+/* Host-file storage backend (spec 1.11.1), using POSIX positional I/O.
+ * pread and pwrite are looped because they may transfer fewer bytes than
+ * asked, and every call is retried on EINTR. sync is fsync, the barrier
+ * the engine's crash safety relies on. */
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
@@ -88,6 +91,7 @@ static cdb_status hf_sync(void *ctx)
     return CDB_OK;
 }
 
+/* A file: no erase step, byte-addressable, grows as needed. */
 static cdb_status hf_geometry(void *ctx, cdb_storage_geometry *out)
 {
     (void)ctx;
@@ -134,6 +138,8 @@ static const cdb_storage_ops hostfile_ops = {
     hf_read, hf_program, hf_erase, hf_sync, hf_geometry, hf_size, hf_close, hf_truncate
 };
 
+/* Read-only together with create is refused (CDB_E_INVALID_ARG). A missing
+ * file without create is CDB_E_NOT_FOUND. */
 cdb_status cdb_hostfile_open(cdb_hostfile *hf, const char *path, unsigned flags, cdb_storage *out)
 {
     int oflags;

@@ -1,10 +1,17 @@
-/* Catalog root slot, epoch 1 (spec 14.3.2). */
+/* Catalog root slot, epoch 1 (spec 14.3.2).
+ *
+ * A 512-byte record with a start magic, an end magic and a CRC32C over
+ * bytes 0..507. The two magics let a torn write be recognised (a slot cut
+ * short keeps an old or missing end magic), and let a recovery tool find
+ * slots by scanning. Logical IDs are always 8 bytes here, whatever the
+ * file's address width. */
 #include <string.h>
 
 #include "cdb_catroot.h"
 #include "cdb_crc32c.h"
 #include "cdb_endian.h"
 
+/* "\x89CDBCAT\n", and the same bytes reversed. */
 static const uint8_t start_magic[8] = { 0x89, 0x43, 0x44, 0x42, 0x43, 0x41, 0x54, 0x0A };
 static const uint8_t end_magic[8] = { 0x0A, 0x54, 0x41, 0x43, 0x42, 0x44, 0x43, 0x89 };
 
@@ -12,9 +19,11 @@ static const uint8_t end_magic[8] = { 0x0A, 0x54, 0x41, 0x43, 0x42, 0x44, 0x43, 
 #define OFF_RESERVED 96u
 #define RESERVED_LEN 388u
 #define OFF_END_MAGIC 484u
-#define OFF_TAG 492u
+#define OFF_TAG 492u   /* tamper-evident tag: left zero, not checked yet */
 #define OFF_CRC 508u
 
+/* Writes every field in the file's byte order; reserved bytes and the tag
+ * are zero. */
 void cdb_catroot_encode(const cdb_catroot *r, uint8_t out[CDB_CATROOT_SLOT_SIZE], cdb_byte_order o)
 {
     memset(out, 0, CDB_CATROOT_SLOT_SIZE);
@@ -36,6 +45,9 @@ void cdb_catroot_encode(const cdb_catroot *r, uint8_t out[CDB_CATROOT_SLOT_SIZE]
     cdb_store_u32(out + OFF_CRC, cdb_crc32c(out, OFF_CRC), o);
 }
 
+/* Checks in this order: start magic (absent: never written), CRC and end
+ * magic (damaged), epoch and format (a newer layout: CDB_E_UNSUPPORTED),
+ * then that reserved bytes are zero (CDB_E_MALFORMED). */
 cdb_status cdb_catroot_decode(const uint8_t in[CDB_CATROOT_SLOT_SIZE], cdb_catroot *r, cdb_byte_order o)
 {
     size_t i;

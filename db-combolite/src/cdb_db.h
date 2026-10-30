@@ -17,8 +17,8 @@
 #include "cdb_pager.h"
 #include "cdb_slots.h"
 
-#define CDB_DB_PATH_MAX 200
-#define CDB_COMMIT_RESERVE_BLOCK 1024u
+#define CDB_DB_PATH_MAX 200         /* longest path, including the terminating zero */
+#define CDB_COMMIT_RESERVE_BLOCK 1024u /* commit numbers reserved per header checkpoint */
 
 /* Durability levels (spec 3.1). */
 typedef enum cdb_durability {
@@ -32,11 +32,13 @@ typedef enum cdb_durability {
  * have been lost (spec 1.12.5). The operator accepts the loss. */
 #define CDB_DB_ACCEPT_LOSS 0x1u
 
+/* One committed change, as handed to the apply hook. data points into the
+ * database's record buffer and is valid only during the call. */
 typedef struct cdb_delta {
     uint64_t store_id;
     uint64_t entry_id;
     uint8_t op;          /* CDB_OP_* */
-    const uint8_t *data;
+    const uint8_t *data; /* the model-specific payload after the op byte */
     size_t len;
     uint64_t commit_number; /* of the transaction this change belongs to */
 } cdb_delta;
@@ -45,6 +47,8 @@ typedef struct cdb_delta {
 #define CDB_FTS_MAX_PATHS 8u
 #define CDB_FTS_MAX_DEPTH 8u
 
+/* Which field of a document to index, given as the chain of field IDs from
+ * the top-level object down through nested objects. */
 typedef struct cdb_fts_path {
     uint64_t ids[CDB_FTS_MAX_DEPTH]; /* field IDs through nested objects */
     unsigned depth;
@@ -64,9 +68,15 @@ typedef struct cdb_fts_token {
 } cdb_fts_token;
 
 /* Applies one committed change to the pages. It must be deterministic:
- * recovery replays the same changes in the same order. */
+ * recovery replays the same changes in the same order. It must also not
+ * fail for logical reasons (a missing entry, a schema mismatch): those must
+ * be caught before the change is journaled. A failure here marks the
+ * database failed until it is reopened. */
 typedef cdb_status (*cdb_apply_fn)(void *ctx, cdb_pager *pager, const cdb_delta *d);
 
+/* Everything the database needs from the caller. All buffers are owned by
+ * the caller and must stay valid, and unused by anything else, until
+ * cdb_db_close returns. The struct itself is copied at open. */
 typedef struct cdb_db_config {
     cdb_pager_config pager;
     uint8_t *record_buf;          /* largest record: 64 bytes + payload */
@@ -75,7 +85,7 @@ typedef struct cdb_db_config {
     void *apply_ctx;
     cdb_durability durability;    /* default level; DEFAULT means NORMAL (spec 3.1) */
     unsigned normal_sync_every;   /* 0 means 32 */
-    unsigned flags;
+    unsigned flags;               /* CDB_DB_ACCEPT_LOSS */
     cdb_index_work catalog_work;  /* optional: the catalog is available when set */
     uint8_t *catalog_page;        /* page_size bytes, with catalog_work */
     uint8_t *doc_buffers;         /* documents: cdb_doc_buffers_size() bytes (cdb_doc.h) */
@@ -175,14 +185,15 @@ struct cdb_ts_store {
 /* Caller memory for n open stores of each kind, without an allocator. */
 size_t cdb_db_slot_mem_size(unsigned n);
 
+/* An open database. All fields are internal to the engine. */
 typedef struct cdb_db {
     cdb_env env;
     cdb_db_config cfg;
-    char parent[CDB_DB_PATH_MAX];
-    char archive[CDB_DB_PATH_MAX];
-    char workdir[CDB_DB_PATH_MAX];
-    char journal_path[CDB_DB_PATH_MAX];
-    char journal_tmp[CDB_DB_PATH_MAX];
+    char parent[CDB_DB_PATH_MAX];       /* directory holding the archive */
+    char archive[CDB_DB_PATH_MAX];      /* <base>.cdbarch */
+    char workdir[CDB_DB_PATH_MAX];      /* <base>.cdbwork */
+    char journal_path[CDB_DB_PATH_MAX]; /* <base>.cdbwork/main.0.cdb */
+    char journal_tmp[CDB_DB_PATH_MAX];  /* the same with .new, used while rotating */
     cdb_storage archive_st;
     cdb_storage journal_st;
     cdb_pager pager;
@@ -190,16 +201,16 @@ typedef struct cdb_db {
     uint64_t next_commit; /* next global commit number to hand out */
     uint64_t commit_hwm;  /* numbers below this are reserved durably */
     uint64_t applied;     /* highest commit number applied to the pager */
-    uint64_t next_tx;
-    int in_tx;
+    uint64_t next_tx;     /* counter part of the next transaction ID */
+    int in_tx;            /* a transaction is open */
     uint64_t tx_id;
-    uint64_t tx_start;
-    uint32_t tx_deltas;
+    uint64_t tx_start;    /* journal offset of the open transaction's first record */
+    uint32_t tx_deltas;   /* data records the open transaction has written */
     cdb_durability tx_durability;
-    unsigned unsynced;
+    unsigned unsynced;    /* commits since the journal was last synced */
     int failed;           /* an apply failed: the database must be reopened */
     cdb_catalog catalog;
-    int has_catalog;
+    int has_catalog;      /* catalog_page was configured */
     /* Open stores, one set per model (cdb_slots.h): struct cdb_doc_pool,
      * struct cdb_vec_coll and struct cdb_ts_store. */
     cdb_slots pool_slots;
@@ -229,11 +240,17 @@ typedef struct cdb_db {
 
 /* Opens <base>.cdbarch, recovering if needed, and starts a session. If the
  * archive does not exist and create is non-NULL, a new database is created
- * with those settings; otherwise CDB_E_NOT_FOUND. */
+ * with those settings; otherwise CDB_E_NOT_FOUND.
+ * Other errors: CDB_E_INVALID_ARG for missing buffers or a path too long;
+ * CDB_E_READ_ONLY for a file this build may only read (not supported yet);
+ * CDB_E_CORRUPT when a journal marked in use is missing or had to be set
+ * aside, unless cfg->flags has CDB_DB_ACCEPT_LOSS. */
 cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const cdb_db_config *cfg,
                        const cdb_header *create);
 
-/* Reconciles everything and leaves the database as one file at rest. */
+/* Reconciles everything and leaves the database as one file at rest.
+ * CDB_E_STATE if an apply failed earlier: the journal is then kept so the
+ * next open can replay it. */
 cdb_status cdb_db_close(cdb_db *db);
 
 /* An operation scope: every store opened inside it stays open until the
@@ -244,9 +261,17 @@ cdb_status cdb_db_close(cdb_db *db);
 void cdb_db_op_begin(cdb_db *db);
 void cdb_db_op_end(cdb_db *db);
 
+/* Transactions. One at a time; CDB_E_STATE when the call does not fit the
+ * current state (begin while open, put/commit/abort while none is open) or
+ * after a failed apply. durability: CDB_DURABILITY_DEFAULT uses the
+ * database's level. */
 cdb_status cdb_tx_begin(cdb_db *db, cdb_durability durability);
+/* Journals one change for the open transaction. op is CDB_OP_*; data is
+ * copied. CDB_E_INVALID_ARG when the record would not fit record_buf. */
 cdb_status cdb_tx_put(cdb_db *db, uint64_t store_id, uint64_t entry_id, uint8_t op,
                       const void *data, size_t len);
+/* Writes the commit record, syncs per the durability level, and applies
+ * the changes to the pages. */
 cdb_status cdb_tx_commit(cdb_db *db);
 cdb_status cdb_tx_abort(cdb_db *db);
 

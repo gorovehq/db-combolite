@@ -1,22 +1,35 @@
-/* Delta journal (spec 14.4). */
+/* Delta journal (spec 14.4).
+ *
+ * This module only reads and writes the bytes of one journal file. It does
+ * not decide when to sync, which journal to replay, or what a record means;
+ * cdb_db does that. Records are written with storage "program" calls
+ * (write without a barrier), so a record is durable only after the caller's
+ * next sync. A crash can therefore leave a torn last record, which readers
+ * detect by its marker, length or CRC and treat as the end of the journal. */
 #include <string.h>
 
 #include "cdb_crc32c.h"
 #include "cdb_endian.h"
 #include "cdb_journal.h"
 
+/* "\x89CDBCMP\n", the companion-file magic (spec 14.4.1). */
 static const uint8_t journal_magic[8] = { 0x89, 0x43, 0x44, 0x42, 0x43, 0x4D, 0x50, 0x0A };
 
+/* Every record starts with the marker C0 DE (spec 14.4.2). */
 #define RECORD_MARKER_0 0xC0u
 #define RECORD_MARKER_1 0xDEu
 #define JOURNAL_EPOCH 1u
 
+/* Encodes the 64-byte companion header (spec 14.4.1) and writes it at
+ * offset 0. The handle starts with no records: the first record goes right
+ * after the header and gets sequence hdr->first_seq. */
 cdb_status cdb_journal_create(cdb_journal *j, const cdb_storage *st, cdb_byte_order order,
                               const cdb_journal_header *hdr)
 {
     uint8_t h[CDB_JOURNAL_HEADER_SIZE];
     cdb_status s;
 
+    /* Reserved bytes (14..15 and 56..59) stay zero. */
     memset(h, 0, sizeof h);
     memcpy(h, journal_magic, sizeof journal_magic);
     h[8] = (uint8_t)order;
@@ -39,6 +52,12 @@ cdb_status cdb_journal_create(cdb_journal *j, const cdb_storage *st, cdb_byte_or
     return CDB_OK;
 }
 
+/* Reads and checks the companion header. Errors: CDB_E_CORRUPT for a short
+ * file, wrong magic, a byte order different from the archive's, or a bad
+ * CRC; CDB_E_UNSUPPORTED for another epoch; CDB_E_MALFORMED when reserved
+ * bytes 14..15 are not zero. Matching the database ID and the unsealed
+ * sequence is left to the caller. j->end is set to just after the header:
+ * the caller finds the true end by reading records until one fails. */
 cdb_status cdb_journal_open(cdb_journal *j, const cdb_storage *st, cdb_byte_order order)
 {
     uint8_t h[CDB_JOURNAL_HEADER_SIZE];
@@ -47,6 +66,8 @@ cdb_status cdb_journal_open(cdb_journal *j, const cdb_storage *st, cdb_byte_orde
 
     if ((s = cdb_storage_read(st, 0, h, sizeof h)) != CDB_OK)
         return s == CDB_E_TRUNCATED ? CDB_E_CORRUPT : s;
+    /* The CRC is checked after magic and byte order, so the CRC is read in
+     * the right byte order. */
     if (memcmp(h, journal_magic, sizeof journal_magic) != 0 || h[8] != (uint8_t)order)
         return CDB_E_CORRUPT;
     if (cdb_load_u32(h + 60, order) != cdb_crc32c(h, 60))
@@ -70,11 +91,17 @@ cdb_status cdb_journal_open(cdb_journal *j, const cdb_storage *st, cdb_byte_orde
     return CDB_OK;
 }
 
+/* Total bytes of a record on disk: header, payload, trailer. */
 static size_t record_size(uint32_t payload_len)
 {
     return CDB_RECORD_HEADER_SIZE + (size_t)payload_len + CDB_RECORD_TRAILER_SIZE;
 }
 
+/* Builds the record in buf (header at offset 0, payload at offset 48, then
+ * the trailer) and writes it at the journal's end. The trailer is the
+ * CRC32C over header and payload, padded with 12 zero bytes; the space is
+ * sized for a future AEAD tag (spec 14.4.2). The handle's end and sequence
+ * advance only if the write succeeds. */
 cdb_status cdb_journal_append(cdb_journal *j, cdb_record *r, uint8_t *buf, size_t buf_size)
 {
     size_t size = record_size(r->payload_len);
@@ -84,6 +111,7 @@ cdb_status cdb_journal_append(cdb_journal *j, cdb_record *r, uint8_t *buf, size_
     if (size > buf_size)
         return CDB_E_BUFFER_TOO_SMALL;
     r->seq = j->next_seq;
+    /* 48-byte header (spec 14.4.2); bytes 44..47 are reserved, left zero. */
     memset(p, 0, CDB_RECORD_HEADER_SIZE);
     p[0] = RECORD_MARKER_0;
     p[1] = RECORD_MARKER_1;
@@ -107,6 +135,9 @@ cdb_status cdb_journal_append(cdb_journal *j, cdb_record *r, uint8_t *buf, size_
     return CDB_OK;
 }
 
+/* Two reads: the fixed header first (to learn the payload length), then the
+ * payload and trailer. Nothing in the header is trusted until the CRC over
+ * the whole record has been checked. */
 cdb_status cdb_journal_read(cdb_journal *j, uint64_t offset, uint8_t *buf, size_t buf_size,
                             cdb_record *r, uint64_t *next)
 {
@@ -116,10 +147,13 @@ cdb_status cdb_journal_read(cdb_journal *j, uint64_t offset, uint8_t *buf, size_
 
     if (buf_size < CDB_RECORD_HEADER_SIZE + CDB_RECORD_TRAILER_SIZE)
         return CDB_E_BUFFER_TOO_SMALL;
+    /* Past the end of the file this gives CDB_E_TRUNCATED: the clean end. */
     if ((s = cdb_storage_read(&j->st, offset, buf, CDB_RECORD_HEADER_SIZE)) != CDB_OK)
         return s;
     if (buf[0] != RECORD_MARKER_0 || buf[1] != RECORD_MARKER_1)
         return CDB_E_CORRUPT;
+    /* A garbage length cannot make us read past buf: anything bigger than
+     * the buffer is rejected before the second read. */
     payload_len = cdb_load_u32(buf + 4, j->order);
     size = record_size(payload_len);
     if (size > buf_size)
@@ -130,9 +164,11 @@ cdb_status cdb_journal_read(cdb_journal *j, uint64_t offset, uint8_t *buf, size_
     if (cdb_load_u32(buf + size - CDB_RECORD_TRAILER_SIZE, j->order)
         != cdb_crc32c(buf, size - CDB_RECORD_TRAILER_SIZE))
         return CDB_E_CORRUPT;
+    /* The 12 padding bytes after the CRC must be zero. */
     for (i = size - CDB_RECORD_TRAILER_SIZE + 4; i < size; i++)
         if (buf[i])
             return CDB_E_CORRUPT;
+    /* Verified: decode the header. r->payload points into buf. */
     memset(r, 0, sizeof *r);
     r->kind = buf[2];
     r->flags = buf[3];
@@ -147,6 +183,9 @@ cdb_status cdb_journal_read(cdb_journal *j, uint64_t offset, uint8_t *buf, size_
     return CDB_OK;
 }
 
+/* Commit record payload (spec 14.4.4): commit number, timestamp, principal,
+ * delta count, track mask, then the signature length. Signatures are not
+ * implemented yet, so the length is always 0 and no signature follows. */
 void cdb_commit_encode(const cdb_commit_info *c, uint8_t out[CDB_COMMIT_PAYLOAD_SIZE], cdb_byte_order order)
 {
     cdb_store_u64(out, c->commit_number, order);
@@ -157,6 +196,9 @@ void cdb_commit_encode(const cdb_commit_info *c, uint8_t out[CDB_COMMIT_PAYLOAD_
     cdb_store_u16(out + 32, 0, order); /* unsigned (spec 12.5) */
 }
 
+/* Decodes a commit record's payload. CDB_E_MALFORMED if r is not a commit
+ * record, or if the payload length does not equal 34 plus the signature
+ * length it declares. A signature, if present, is accepted but not checked. */
 cdb_status cdb_commit_decode(const cdb_record *r, cdb_commit_info *c, cdb_byte_order order)
 {
     uint16_t sig_len;

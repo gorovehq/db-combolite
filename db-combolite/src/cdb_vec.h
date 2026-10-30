@@ -60,6 +60,9 @@
 #define CDB_VEC_EXACT 1u
 #define CDB_VEC_APPROX 2u
 
+/* A collection's fixed settings. The model strings are the caller's
+ * (copied at create; filled with pointers to the caller's buffers by
+ * describe). */
 typedef struct cdb_vec_config {
     cdb_vector_elem elem;
     uint32_t dims;
@@ -77,9 +80,10 @@ typedef struct cdb_vec_config {
 #define CDB_VEC_SOURCE_DELETED 3u   /* the document, or its pool, is gone */
 #define CDB_VEC_SOURCE_UNCHECKED 4u /* the source is not a document */
 
+/* One search result (or one stored neighbour). */
 typedef struct cdb_vec_hit {
     uint64_t entry;
-    double distance;
+    double distance;           /* under the measure searched with; smaller is closer */
     uint64_t source_store;
     uint64_t source_entry;
     unsigned source_state;     /* CDB_VEC_SOURCE_* */
@@ -96,7 +100,12 @@ cdb_status cdb_vec_describe(cdb_db *db, uint64_t store, cdb_vec_config *cfg,
 
 /* Inside a transaction. vec is an encoded vector value (spec 14.6) with the
  * collection's element type and dimensions. source_store 0: no source.
- * replace keeps the source and records its current revision (re-embedding). */
+ * replace keeps the source and records its current revision (re-embedding).
+ * Errors as for documents: CDB_E_STATE outside a transaction,
+ * CDB_E_INVALID_ARG for a vector of the wrong shape, CDB_E_NOT_FOUND for
+ * replace or delete of an entry that is not live as the transaction sees
+ * it; delete also refuses (CDB_E_STATE) while a refuse-type link points at
+ * the entry. */
 cdb_status cdb_vec_insert(cdb_db *db, uint64_t store, const void *vec, size_t len,
                           uint64_t source_store, uint64_t source_entry, uint64_t *entry);
 cdb_status cdb_vec_replace(cdb_db *db, uint64_t store, uint64_t entry, const void *vec, size_t len);

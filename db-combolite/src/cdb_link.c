@@ -1,4 +1,16 @@
-/* Links between entries (spec 6, 14.13). */
+/* Links between entries (spec 6, 14.13).
+ *
+ * Layout reminder: the forward index is keyed (source, type, target) and
+ * holds the link's value; the reverse index is keyed (target, type, source)
+ * and holds nothing. So "links out of X" is a prefix scan of the forward
+ * index, and "links into X" is a prefix scan of the reverse index followed
+ * by a lookup of each row in the forward index. Every key part is fixed
+ * width and big-endian, so byte order is sort order.
+ *
+ * As with documents, the public calls check everything inside the open
+ * transaction and journal a record; cdb_link_apply writes the rows at
+ * commit and must never fail for logical reasons. Journal records go to the
+ * link store with entry ID 0; the payload names the link. */
 #include <string.h>
 
 #include "cdb_doc.h"
@@ -10,11 +22,13 @@
 #define VAL_LEN 17u        /* weight (f32 bits, 4), time (8), flags (1), removed count (4) */
 #define LINK_PAYLOAD 53u   /* mode (1), type, source, target, weight, time */
 #define UNLINK_PAYLOAD 40u /* type, source, target */
-#define MODE_CREATE 1u
-#define MODE_REINFORCE 2u
+#define MODE_CREATE 1u     /* LINK record: add (or revive) the link */
+#define MODE_REINFORCE 2u  /* LINK record: update a live link's weight and time */
 
 /* -------------------------------------------------------- the store */
 
+/* Whether store is the link store. The catalog is asked once per session
+ * (by name); the answer is cached in db->links. */
 int cdb_link_is_store(cdb_db *db, uint64_t store)
 {
     struct cdb_link_store *ls = &db->links;
@@ -59,7 +73,10 @@ static cdb_status open_store(cdb_db *db, int create)
             || (s = cdb_index_open(&ls->rev, &db->pager, info.rev_root, &db->cfg.catalog_work)) != CDB_OK)
             return s;
     } else {
-        /* A crash between the store's commit and its first type's. */
+        /* The store exists but has no index roots yet: either it was just
+         * created above, or a crash came between the store's commit and its
+         * first type's. The roots are kept in the store record's document
+         * pool fields (12 and 13, spec 14.3.3). */
         if (!create)
             return CDB_E_NOT_FOUND;
         if ((s = cdb_index_create(&ls->fwd, &db->pager, ls->store_id, CDB_INDEX_FLAG_UNIQUE | CDB_INDEX_FLAG_PREFIX,
@@ -73,6 +90,9 @@ static cdb_status open_store(cdb_db *db, int create)
     return CDB_OK;
 }
 
+/* Looks up a link type, reusing *t when it already holds that type (so a
+ * scan over many links of one type reads the catalog once).
+ * CDB_E_NOT_FOUND for an ID that is not a link type. */
 static cdb_status type_of(cdb_db *db, uint64_t type, cdb_link_type_info *t)
 {
     if (t->id == type && type != 0)
@@ -82,6 +102,7 @@ static cdb_status type_of(cdb_db *db, uint64_t type, cdb_link_type_info *t)
 
 /* -------------------------------------------------------- rows */
 
+/* A reference as 16 bytes: store ID then entry ID, big-endian. */
 static void put_ref(uint8_t *p, cdb_ref r)
 {
     cdb_store_u64(p, r.store, CDB_ORDER_BIG);
@@ -110,6 +131,8 @@ static void k_rev(uint8_t *k, uint64_t type, cdb_ref s, cdb_ref t)
     put_ref(k + 24, s);
 }
 
+/* Forward-index value: the weight's IEEE-754 bits, the time, the flags and
+ * the removal count (VAL_LEN bytes, big-endian). */
 static void encode_val(uint8_t *v, const cdb_link *l)
 {
     uint32_t bits;
@@ -129,6 +152,9 @@ static void decode_val(const uint8_t *v, cdb_link *l)
     l->removed = cdb_load_u32(v + 13, CDB_ORDER_BIG);
 }
 
+/* Row helpers. row_get reads a committed link (live or tombstoned);
+ * row_put updates the forward row only (the reverse row never changes);
+ * row_insert adds both rows; row_erase deletes both. */
 static cdb_status row_get(struct cdb_link_store *ls, uint64_t type, cdb_ref s, cdb_ref t, cdb_link *l, int *found)
 {
     uint8_t k[KEY_LEN], v[VAL_LEN];
@@ -196,7 +222,8 @@ static cdb_status scan_at(cdb_db *db, cdb_index *ix, const uint8_t *prefix, size
     return CDB_OK;
 }
 
-/* The key right after k, as a big-endian number; 0 at the very end. */
+/* The key right after k, as a big-endian number; 0 at the very end.
+ * Scans use it to step past the row they just handled. */
 static int key_succ(uint8_t *k)
 {
     size_t i = KEY_LEN;
@@ -215,8 +242,13 @@ static cdb_status row_at(struct cdb_link_store *ls, int reverse, const uint8_t *
     return reverse ? row_get(ls, type, b, a, l, found) : row_get(ls, type, a, b, l, found);
 }
 
-/* -------------------------------------------------------- the open transaction */
+/* -------------------------------------------------------- the open transaction
+ *
+ * Links have no staging cache: to see things as the open transaction does,
+ * the code reads the transaction's own link records back from the journal
+ * (from tx_start to the journal's end). */
 
+/* A decoded LINK or UNLINK payload. */
 typedef struct txrec {
     uint8_t op, mode;
     uint64_t type;
@@ -225,6 +257,8 @@ typedef struct txrec {
     int64_t time;
 } txrec;
 
+/* Decodes a payload (without its op byte). Returns 0 for anything that is
+ * not an exactly sized LINK or UNLINK payload; callers then ignore it. */
 static int parse(const uint8_t op, const uint8_t *p, size_t len, txrec *r)
 {
     memset(r, 0, sizeof *r);
@@ -279,6 +313,8 @@ static int same_pair(const txrec *r, uint64_t type, cdb_ref s, cdb_ref t)
  * tombstoned because an end went, for good. */
 enum { NONE = 0, LIVE = 1, TOMB = 2, REMOVED = 3 };
 
+/* A stored row's state: tombstoned rows are TOMB if an end-gone flag is
+ * set, else REMOVED. */
 static int state_of(const cdb_link *l)
 {
     if (!(l->flags & CDB_LINK_TOMBSTONE))
@@ -287,7 +323,9 @@ static int state_of(const cdb_link *l)
 }
 
 /* A link as the open transaction sees it: the committed row, then the
- * transaction's own records for the pair, in order. */
+ * transaction's own records for the pair, in order. The state changes
+ * mirror cdb_link_apply: a create makes a never-linked or removed pair live,
+ * an unlink makes a live pair removed; reinforce changes no state. */
 static cdb_status tx_state(cdb_db *db, uint64_t type, cdb_ref s, cdb_ref t, int *state)
 {
     cdb_link l;
@@ -311,7 +349,11 @@ static cdb_status tx_state(cdb_db *db, uint64_t type, cdb_ref s, cdb_ref t, int 
 }
 
 /* Whether an entry has a live link of the type in one direction, as the
- * open transaction sees it; with refuse_only, of any refuse type (type 0). */
+ * open transaction sees it; with refuse_only, of any refuse type (type 0).
+ * Two passes: committed rows with e at the chosen end (each checked with
+ * tx_state, since this transaction may have removed it), then links this
+ * transaction created (which are not in the indexes yet). Used for the
+ * cardinality checks and for refuse-on-delete. */
 static cdb_status any_live(cdb_db *db, int direction, cdb_ref e, uint64_t type, int refuse_only, int *any)
 {
     struct cdb_link_store *ls = &db->links;
@@ -326,10 +368,13 @@ static cdb_status any_live(cdb_db *db, int direction, cdb_ref e, uint64_t type, 
 
     *any = 0;
     memset(&ti, 0, sizeof ti);
+    /* Prefix: the entry, plus the type when one is given. The scan starts
+     * at the smallest key with that prefix. */
     put_ref(prefix, e);
     cdb_store_u64(prefix + 16, type, CDB_ORDER_BIG);
     memset(pos, 0, sizeof pos);
     memcpy(pos, prefix, plen);
+    /* Pass 1: committed links. */
     for (;;) {
         cdb_link l;
         if ((s = scan_at(db, ix, prefix, plen, pos, &done)) != CDB_OK || done)
@@ -355,7 +400,7 @@ static cdb_status any_live(cdb_db *db, int direction, cdb_ref e, uint64_t type, 
     }
     if (s != CDB_OK)
         return s;
-    /* Links this transaction made. */
+    /* Pass 2: links this transaction made. */
     for (;;) {
         cdb_ref end;
         if ((s = tx_next(db, &off, &r, &done)) != CDB_OK || done)
@@ -379,7 +424,9 @@ static cdb_status any_live(cdb_db *db, int direction, cdb_ref e, uint64_t type, 
     }
 }
 
-/* Whether an entry exists as the open transaction sees it. */
+/* Whether an entry exists as the open transaction sees it. Asks the
+ * document model, then the vector model; an entry of any other model (or
+ * of an unknown store) counts as not existing. */
 static cdb_status ref_live(cdb_db *db, cdb_ref r, int *live)
 {
     cdb_status s = cdb_doc_live_in_tx(db, r.store, r.entry, live);
@@ -394,6 +441,8 @@ static cdb_status ref_live(cdb_db *db, cdb_ref r, int *live)
 
 /* -------------------------------------------------------- types */
 
+/* A catalog change (reconcile, change, rotate the journal). The first type
+ * also creates the link store and its indexes. */
 cdb_status cdb_link_define_type(cdb_db *db, const char *name, size_t len, unsigned cardinality, int enforced,
                                 unsigned on_delete, uint64_t *type)
 {
@@ -425,6 +474,8 @@ cdb_status cdb_link_find_type(cdb_db *db, const char *name, size_t len, uint64_t
 
 /* -------------------------------------------------------- changes */
 
+/* Common checks for every link change: an open, healthy transaction, a
+ * link store, and a known link type (loaded into *ti). */
 static cdb_status tx_ready(cdb_db *db, uint64_t type, cdb_link_type_info *ti)
 {
     cdb_status s;
@@ -436,6 +487,9 @@ static cdb_status tx_ready(cdb_db *db, uint64_t type, cdb_link_type_info *ti)
     return type_of(db, type, ti);
 }
 
+/* Journals a LINK record. The time is fixed here, when the change is made
+ * (the environment's clock, else the caller's value), so replay writes the
+ * same time again. */
 static cdb_status put_link(cdb_db *db, uint8_t mode, uint64_t type, cdb_ref source, cdb_ref target, float weight,
                            int64_t time)
 {
@@ -477,6 +531,8 @@ cdb_status cdb_link_add(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref targe
         return s;
     if (state == LIVE || state == TOMB)
         return CDB_E_EXISTS; /* linked, or tombstoned with an end gone; a removed link is revived */
+    /* Enforced cardinality: 1:N and 1:1 allow the target only one live
+     * source; 1:1 also allows the source only one live target. */
     if (ti.enforced && ti.cardinality != CDB_CARD_N_M) {
         if ((s = any_live(db, CDB_LINK_IN, target, type, 0, &any)) != CDB_OK)
             return s;
@@ -527,6 +583,8 @@ cdb_status cdb_link_remove(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref ta
     return cdb_tx_put(db, db->links.store_id, 0, CDB_OP_UNLINK, p, sizeof p);
 }
 
+/* Only incoming links are checked: a refuse type protects the target of a
+ * link from being deleted while something points at it. */
 cdb_status cdb_link_check_delete(cdb_db *db, uint64_t store, uint64_t entry)
 {
     cdb_ref e;
@@ -545,7 +603,10 @@ cdb_status cdb_link_check_delete(cdb_db *db, uint64_t store, uint64_t entry)
 
 /* -------------------------------------------------------- apply */
 
-/* Never fails for logical reasons: it runs again during recovery. */
+/* Never fails for logical reasons: it runs again during recovery.
+ * Any record that no longer makes sense (an unreadable payload, a create
+ * for a pair that is live or gone for good, a reinforce or unlink of a link
+ * that is not live) is skipped. */
 cdb_status cdb_link_apply(cdb_db *db, const cdb_delta *d)
 {
     struct cdb_link_store *ls = &db->links;
@@ -605,6 +666,8 @@ static cdb_status ends_gone(cdb_db *db, const uint8_t *prefix, size_t plen, int 
     if (s != CDB_OK)
         return s;
     memset(&ti, 0, sizeof ti);
+    /* Pass 0 walks the forward index (the gone entry is the source);
+     * pass 1 the reverse index (the gone entry is the target). */
     for (reverse = 0; reverse < 2; reverse++) {
         uint8_t pos[KEY_LEN];
         memset(pos, 0, sizeof pos);
@@ -637,6 +700,7 @@ static cdb_status ends_gone(cdb_db *db, const uint8_t *prefix, size_t plen, int 
     return CDB_OK;
 }
 
+/* One entry is gone: prefix = its 16-byte reference. */
 cdb_status cdb_link_on_delete(cdb_db *db, uint64_t store, uint64_t entry)
 {
     uint8_t prefix[16];
@@ -647,6 +711,8 @@ cdb_status cdb_link_on_delete(cdb_db *db, uint64_t store, uint64_t entry)
     return ends_gone(db, prefix, sizeof prefix, 0);
 }
 
+/* A whole store is gone: prefix = its 8-byte ID, matching every entry.
+ * Links are always tombstoned here, never cascaded. */
 cdb_status cdb_link_on_drop(cdb_db *db, uint64_t store)
 {
     uint8_t prefix[8];
@@ -686,6 +752,7 @@ cdb_status cdb_link_list(cdb_db *db, cdb_ref entry, int direction, uint64_t type
     cdb_store_u64(prefix + 16, type, CDB_ORDER_BIG);
     memset(pos, 0, sizeof pos);
     memcpy(pos, prefix, plen);
+    /* Paging: resume just after the key of the last link returned. */
     if (after) {
         if (reverse)
             k_rev(pos, after->type, after->source, after->target);

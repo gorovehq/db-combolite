@@ -12,6 +12,8 @@ void cdb_key_init(cdb_key_builder *k, uint8_t *buf, size_t cap)
     k->error = buf == NULL && cap ? CDB_E_INVALID_ARG : CDB_OK;
 }
 
+/* Checks n more bytes fit; sets the sticky error if not, so a key that did
+ * not fit is never used half-built. */
 static cdb_status room(cdb_key_builder *k, size_t n)
 {
     if (k->error != CDB_OK)
@@ -23,6 +25,9 @@ static cdb_status room(cdb_key_builder *k, size_t n)
     return CDB_OK;
 }
 
+/* Writes the type-rank byte after reserving room for it and the `more`
+ * bytes the component will add, so a component is written whole or not
+ * at all. */
 static cdb_status put_rank(cdb_key_builder *k, unsigned rank, size_t more)
 {
     cdb_status s = room(k, 1 + more);
@@ -31,7 +36,9 @@ static cdb_status put_rank(cdb_key_builder *k, unsigned rank, size_t more)
     return s;
 }
 
-/* Big-endian with the sign bit flipped: signed order becomes unsigned order. */
+/* Writes 8 bytes big-endian. Room must already be reserved. Signed values
+ * are passed with their sign bit flipped by the caller, which turns signed
+ * order into unsigned (memcmp) order. */
 static void put_u64(cdb_key_builder *k, uint64_t v)
 {
     cdb_store_u64(k->buf + k->len, v, CDB_ORDER_BIG);
@@ -83,6 +90,11 @@ cdb_status cdb_key_timestamp(cdb_key_builder *k, int64_t ticks)
     return s;
 }
 
+/* Strings and binary: each 00 byte becomes 00 FF, then 00 00 ends the
+ * component. Since 00 00 sorts below 00 FF and below any other byte, a
+ * shorter string sorts before a longer one it prefixes, and the end of the
+ * component cannot be confused with its contents. Zeros are counted first
+ * so the exact size can be reserved. */
 static cdb_status put_escaped(cdb_key_builder *k, unsigned rank, const uint8_t *p, size_t len)
 {
     size_t zeros = 0, i;

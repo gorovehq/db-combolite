@@ -48,6 +48,7 @@ typedef struct cdb_region_anchor {
     uint64_t anchor;
 } cdb_region_anchor;
 
+/* One header slot, decoded. Field meanings and offsets are in spec 14.1.4. */
 typedef struct cdb_header {
     cdb_byte_order order;
     uint8_t epoch;

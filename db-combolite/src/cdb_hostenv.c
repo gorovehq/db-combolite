@@ -1,4 +1,9 @@
-/* Host environment over POSIX files and directories. */
+/* Host environment over POSIX files and directories.
+ *
+ * Each operation is a thin wrapper over the POSIX call, mapping errno to a
+ * status: ENOENT to CDB_E_NOT_FOUND, anything else to CDB_E_IO (rmdir adds
+ * CDB_E_STATE for "not empty"). This is outside the core, so it may use the
+ * C library's malloc for the optional alloc hooks. */
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
@@ -17,6 +22,7 @@ static cdb_status errno_status(void)
     return errno == ENOENT ? CDB_E_NOT_FOUND : CDB_E_IO;
 }
 
+/* Opens path into a free cdb_hostfile slot of the caller's cdb_hostenv. */
 static cdb_status he_open(void *ctx, const char *path, unsigned flags, cdb_storage *out)
 {
     cdb_hostenv *he = (cdb_hostenv *)ctx;
@@ -52,6 +58,8 @@ static cdb_status he_rename(void *ctx, const char *from, const char *to)
     return rename(from, to) == 0 ? CDB_OK : errno_status();
 }
 
+/* Owner-only permissions, like the files (a database may hold sensitive
+ * data). An existing directory counts as success. */
 static cdb_status he_mkdir(void *ctx, const char *path)
 {
     (void)ctx;
@@ -106,6 +114,7 @@ static cdb_status he_sync_dir(void *ctx, const char *path)
     return s;
 }
 
+/* Wall-clock time (CLOCK_REALTIME) in ns since the Unix epoch. */
 static cdb_status he_now(void *ctx, int64_t *ns)
 {
     struct timespec ts;

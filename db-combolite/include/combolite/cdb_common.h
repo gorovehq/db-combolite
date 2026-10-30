@@ -1,4 +1,9 @@
-/* Common definitions shared by every db-combolite module. */
+/* Common definitions shared by every db-combolite module.
+ *
+ * Every fallible function returns a cdb_status: CDB_OK (0) on success, or
+ * one of the negative error codes below. Output parameters are only
+ * meaningful on CDB_OK unless a function's comment says otherwise (several
+ * report a needed size alongside CDB_E_BUFFER_TOO_SMALL). */
 #ifndef COMBOLITE_CDB_COMMON_H
 #define COMBOLITE_CDB_COMMON_H
 
@@ -25,6 +30,8 @@ typedef enum cdb_status {
     CDB_E_SCHEMA = -15           /* a document does not satisfy its pool's schema */
 } cdb_status;
 
+/* A short English name for a status, for logs and messages. The string is
+ * static: do not free or modify it. */
 const char *cdb_status_str(cdb_status status);
 
 /* Byte order of a file (spec 14.1.2). The values are the on-disk flag bytes. */

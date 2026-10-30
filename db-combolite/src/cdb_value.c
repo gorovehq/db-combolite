@@ -1,4 +1,11 @@
-/* Shared value encoding (spec 14.6): writer, reader and canonical validator. */
+/* Shared value encoding (spec 14.6): writer, reader and canonical validator.
+ *
+ * Three parts. The writer builds one value into a caller buffer, checking
+ * room before every write so a failure never leaves a partial item; its
+ * error is sticky. The reader decodes one value's header and gives views
+ * into the buffer, checking only that value's bounds. The validator walks a
+ * whole value recursively and rejects anything that is not the single
+ * canonical encoding (spec 14.6.5), which content hashing depends on. */
 #include <string.h>
 
 #include "combolite/cdb_value.h"
@@ -36,6 +43,8 @@ static int f32_is_nan(uint32_t bits)
         && (bits & UINT32_C(0x007FFFFF)) != 0;
 }
 
+/* Canonical float bit patterns: every NaN becomes the one quiet NaN, and
+ * -0 becomes +0 (spec 14.6.5). */
 static uint64_t f64_canonical(uint64_t bits)
 {
     if (f64_is_nan(bits))
@@ -54,6 +63,8 @@ static uint32_t f32_canonical(uint32_t bits)
     return bits;
 }
 
+/* The same for 16-bit vector elements; f16 and bf16 differ in where the
+ * exponent and mantissa sit. */
 static uint16_t half_canonical(uint16_t bits, cdb_vector_elem elem)
 {
     if (elem == CDB_VEC_F16) {
@@ -68,6 +79,9 @@ static uint16_t half_canonical(uint16_t bits, cdb_vector_elem elem)
     return bits;
 }
 
+/* Strict UTF-8: sequences of 1 to 4 bytes with correct continuation bytes,
+ * no overlong forms (each length has a minimum code point), nothing above
+ * U+10FFFF, and no surrogates (U+D800..U+DFFF). Returns 1 if valid. */
 int cdb_value_utf8_valid(const uint8_t *s, size_t len)
 {
     size_t i = 0;
@@ -147,6 +161,7 @@ static int decimal_fits_compact(const uint8_t *b, size_t len)
     return memcmp(mag, ten_pow_38, sizeof mag) < 0;
 }
 
+/* Bits per vector element; 0 for an unknown element type. */
 static size_t vector_elem_size_bits(cdb_vector_elem elem)
 {
     switch (elem) {
@@ -185,6 +200,8 @@ static unsigned width_for(uint64_t v)
     return 8;
 }
 
+/* Width in bytes to its 2-bit code, and fixed-width loads and stores in
+ * the file's byte order. */
 static uint8_t width_code(unsigned width)
 {
     return (uint8_t)(width == 1 ? 0 : width == 2 ? 1 : width == 4 ? 2 : 3);
@@ -210,8 +227,14 @@ static uint64_t load_width(const uint8_t *p, unsigned width, cdb_byte_order orde
     }
 }
 
-/* ------------------------------------------------------------- writer */
+/* ------------------------------------------------------------- writer
+ *
+ * Buffer layout while writing: encoded bytes grow up from the start
+ * (w->len); open objects' directory entries are staged at the end, growing
+ * down from w->cap (w->scratch_top). The free space is between the two, so
+ * w_room measures against scratch_top, not cap. */
 
+/* Records the first error (later ones are not recorded) and returns it. */
 static cdb_status w_fail(cdb_value_writer *w, cdb_status status)
 {
     if (w->error == CDB_OK)
@@ -226,6 +249,8 @@ static cdb_status w_room(cdb_value_writer *w, size_t n)
     return CDB_OK;
 }
 
+/* Whether a value may be written now: no earlier error; at the top level
+ * only one root value; inside an object, only right after a field ID. */
 static cdb_status w_begin_value(cdb_value_writer *w)
 {
     if (w->error != CDB_OK)
@@ -241,6 +266,7 @@ static cdb_status w_begin_value(cdb_value_writer *w)
     return CDB_OK;
 }
 
+/* Counts a finished value in its container (or marks the root done). */
 static void w_end_value(cdb_value_writer *w)
 {
     if (w->depth == 0) {
@@ -385,6 +411,7 @@ cdb_status cdb_value_write_ref(cdb_value_writer *w, uint64_t store_id, uint64_t 
     return CDB_OK;
 }
 
+/* Tag, varint length, bytes: strings and binary. */
 static cdb_status w_bytes(cdb_value_writer *w, uint8_t tag, const void *data, size_t len)
 {
     cdb_status s;
@@ -445,6 +472,8 @@ cdb_status cdb_value_write_decimal(cdb_value_writer *w, uint64_t scale,
     return CDB_OK;
 }
 
+/* Writes the int64 as 8 big-endian bytes, then drops leading bytes that
+ * only repeat the sign until the form is the shortest. */
 cdb_status cdb_value_write_decimal_i64(cdb_value_writer *w, uint64_t scale, int64_t unscaled)
 {
     uint8_t be[8];
@@ -521,6 +550,7 @@ cdb_status cdb_value_write_vector(cdb_value_writer *w, cdb_vector_elem elem,
         memcpy(out, elems, data_len);
         break;
     case CDB_VEC_BINARY:
+        /* Unused bits of the last byte are cleared (canonical form). */
         memcpy(out, elems, data_len);
         if (dims % 8u)
             out[data_len - 1] &= (uint8_t)((1u << (unsigned)(dims % 8u)) - 1u);
@@ -547,6 +577,9 @@ cdb_status cdb_value_write_encoded(cdb_value_writer *w, const void *value, size_
     return CDB_OK;
 }
 
+/* Opens an array or object: writes only its tag for now. Its length and
+ * count are not known until it ends, so the end functions slide the body
+ * up to make room for them. */
 static cdb_status w_begin_container(cdb_value_writer *w, uint8_t tag)
 {
     cdb_value_frame *f;
@@ -583,6 +616,9 @@ static cdb_value_frame *w_top(cdb_value_writer *w, uint8_t kind)
     return &w->frames[w->depth - 1];
 }
 
+/* Closes the innermost array: the body (the elements, already written
+ * after the tag) moves up to make room for the byte length and element
+ * count varints, which are written in the gap. */
 cdb_status cdb_value_end_array(cdb_value_writer *w)
 {
     cdb_value_frame *f;
@@ -606,6 +642,9 @@ cdb_status cdb_value_end_array(cdb_value_writer *w)
     return CDB_OK;
 }
 
+/* Staged directory entry i of an open object: 16 bytes at the top of the
+ * buffer (field ID, value offset, both in host order: scratch only). Entry
+ * 0 is nearest the object's scratch_base; later entries lie below it. */
 static void scratch_entry(const cdb_value_writer *w, const cdb_value_frame *f, uint64_t i,
                           uint64_t *field_id, uint64_t *offset)
 {
@@ -614,6 +653,8 @@ static void scratch_entry(const cdb_value_writer *w, const cdb_value_frame *f, u
     memcpy(offset, e + 8, 8);
 }
 
+/* Starts a field: stages (field ID, offset of its value within the
+ * object's values area) for the directory. */
 cdb_status cdb_value_field(cdb_value_writer *w, uint64_t field_id)
 {
     cdb_value_frame *f;
@@ -635,6 +676,10 @@ cdb_status cdb_value_field(cdb_value_writer *w, uint64_t field_id)
     return CDB_OK;
 }
 
+/* Closes the innermost object: picks the smallest directory widths, slides
+ * the values up past the room for byte length, field count, width byte and
+ * directory, fills those in from the staged entries, and releases the
+ * staging space. */
 cdb_status cdb_value_end_object(cdb_value_writer *w)
 {
     cdb_value_frame *f;
@@ -682,6 +727,7 @@ cdb_status cdb_value_end_object(cdb_value_writer *w)
 
 /* ------------------------------------------------------------- reader */
 
+/* Reads a varint at *p (bounded by end) and advances *p past it. */
 static cdb_status read_varint(const uint8_t **p, const uint8_t *end, uint64_t *v)
 {
     size_t n;
@@ -770,6 +816,9 @@ cdb_status cdb_value_read(const uint8_t *buf, size_t len, cdb_byte_order order, 
     if (buf[0] < CDB_TAG_FIRST_VARIABLE)
         return CDB_E_MALFORMED; /* unassigned fixed-shape tag: cannot be skipped */
 
+    /* Variable-size types (0x40 and up) all start with a byte length, so
+     * the extent of the value is known before its type is examined; an
+     * unknown tag is reported as CDB_TYPE_UNKNOWN and can be skipped. */
     if ((s = read_varint(&p, end, &v)) != CDB_OK)
         return s;
     if (v > (uint64_t)(end - p))
@@ -889,6 +938,8 @@ cdb_status cdb_value_object_iter(const cdb_value *object, cdb_byte_order order, 
     return CDB_OK;
 }
 
+/* Reads the value at a directory offset; an offset outside the values
+ * area is CDB_E_MALFORMED. */
 static cdb_status object_value_at(const cdb_value_iter *it, uint64_t offset, cdb_value *value)
 {
     if (offset >= (uint64_t)(it->end - it->pos))
@@ -953,7 +1004,11 @@ cdb_status cdb_value_vector_f32(const cdb_value *vec, cdb_byte_order order, uint
     return CDB_OK;
 }
 
-/* ---------------------------------------------------------- validator */
+/* ---------------------------------------------------------- validator
+ *
+ * validate_at reads one value, checks the canonical rules that apply to
+ * its type, and recurses into containers. *consumed reports its encoded
+ * length so a container can walk to the next element. */
 
 typedef struct validate_ctx {
     cdb_byte_order order;
@@ -964,6 +1019,8 @@ typedef struct validate_ctx {
 static cdb_status validate_at(const validate_ctx *c, const uint8_t *buf, size_t len,
                               unsigned depth, size_t *consumed);
 
+/* Float elements must already be canonical; binary vectors must have zero
+ * unused bits. (Length was checked by the reader.) */
 static cdb_status validate_vector(const validate_ctx *c, const cdb_value *v)
 {
     const uint8_t *d = v->as.vector.data;
@@ -998,6 +1055,7 @@ static cdb_status validate_vector(const validate_ctx *c, const cdb_value *v)
     return CDB_OK;
 }
 
+/* The elements must fill the body exactly and number exactly `count`. */
 static cdb_status validate_array(const validate_ctx *c, const cdb_value *v, unsigned depth)
 {
     const uint8_t *p = v->as.array.items;
@@ -1114,6 +1172,9 @@ static cdb_status validate_at(const validate_ctx *c, const uint8_t *buf, size_t 
     return CDB_OK;
 }
 
+/* The whole buffer must be exactly one value: trailing bytes are
+ * CDB_E_MALFORMED. Unknown variable-size types are CDB_E_UNSUPPORTED
+ * unless CDB_VALIDATE_ALLOW_UNKNOWN is given. */
 cdb_status cdb_value_validate(const uint8_t *buf, size_t len, cdb_byte_order order,
                               cdb_decimal_mode decimal_mode, unsigned flags)
 {

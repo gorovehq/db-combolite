@@ -1,4 +1,22 @@
-/* Vector collections (spec 7, 14.12). */
+/* Vector collections (spec 7, 14.12).
+ *
+ * Map of this file, top to bottom:
+ * - layout and settings: block geometry and the settings object kept in the
+ *   store record (field 16);
+ * - collections: opening a collection into a slot, creating one;
+ * - elements and distances: reading elements of any type as numbers, and
+ *   the four measures;
+ * - blocks and entries: where each vector lives (block, slot) and the
+ *   indexes that record it;
+ * - the transaction side (insert, replace, delete: checked and journaled)
+ *   and the apply side (writing blocks at commit, never failing for
+ *   logical reasons);
+ * - search: exact (measure every vector) and approximate (walk the
+ *   neighbour graph);
+ * - the neighbour graph: queueing work at commit, refreshing pending
+ *   entries in batches, and choosing entry points.
+ * Block pages are written in the file's byte order; every index key and
+ * value is big-endian. */
 #include <math.h>
 #include <string.h>
 
@@ -41,15 +59,20 @@ enum { S_ELEM = 1, S_DIMS, S_MEASURE, S_MODEL, S_VERSION, S_ENTRIES, S_BLOCKS, S
 
 typedef struct cdb_vec_coll coll;
 
+/* The three page buffers of cfg.vec_buffers. */
 static uint8_t *vbuf(cdb_db *db, unsigned i)
 {
     return db->cfg.vec_buffers + (size_t)i * db->pager.page_size;
 }
 
+/* V_BLOCK: a block page read for searching or editing; V_BUILD: a block
+ * payload being assembled for writing; V_CURSOR: an index cursor's page. */
 enum { V_BLOCK = 0, V_BUILD = 1, V_CURSOR = 2 };
 
 /* -------------------------------------------------------- layout */
 
+/* Bytes one vector takes in a block: binary vectors pack 8 dimensions per
+ * byte. 0 for an unknown element type. */
 static size_t vector_bytes(unsigned elem, uint32_t dims)
 {
     switch (elem) {
@@ -71,11 +94,15 @@ static size_t data_off(const cdb_db *db, const coll *c, uint32_t count)
     return ((end + 15u) & ~(size_t)15u) - h;
 }
 
+/* Payload bytes of a block holding count vectors. */
 static size_t block_len(const cdb_db *db, const coll *c, uint32_t count)
 {
     return data_off(db, c, count) + (size_t)count * c->vec_bytes;
 }
 
+/* Most vectors one block page can hold (capped at 2^24 - 1): start from
+ * an upper bound and step down until header, IDs, norms, padding and data
+ * fit. 0 means a single vector does not fit a page. */
 static uint32_t block_slots(const cdb_db *db, const coll *c)
 {
     size_t cap = cdb_page_capacity(db->pager.fmt, db->pager.page_size);
@@ -87,6 +114,8 @@ static uint32_t block_slots(const cdb_db *db, const coll *c)
     return (uint32_t)n;
 }
 
+/* Binary vectors support only Hamming; the others cosine, dot or
+ * Euclidean (spec 14.12.3). */
 static int measure_fits(unsigned elem, unsigned measure)
 {
     if (elem == CDB_VEC_BINARY)
@@ -96,6 +125,8 @@ static int measure_fits(unsigned elem, unsigned measure)
 
 /* -------------------------------------------------------- settings */
 
+/* Encodes the settings object (spec 14.12.3). Fields 10-13 are written
+ * only once the collection has a graph. */
 static cdb_status encode_settings(const cdb_db *db, const cdb_vec_config *cfg, const coll *c,
                                   uint8_t *out, size_t cap, size_t *len)
 {
@@ -135,6 +166,7 @@ static cdb_status encode_settings(const cdb_db *db, const cdb_vec_config *cfg, c
     return w.error;
 }
 
+/* Required integer field f in [lo, hi], or CDB_E_CORRUPT. */
 static cdb_status get_int(const cdb_value *obj, cdb_byte_order o, uint64_t f, int64_t lo, int64_t hi, int64_t *out)
 {
     cdb_value v;
@@ -146,6 +178,8 @@ static cdb_status get_int(const cdb_value *obj, cdb_byte_order o, uint64_t f, in
     return CDB_OK;
 }
 
+/* Required string field f of at most CDB_VEC_MODEL_MAX bytes, copied to
+ * out when out is not NULL. */
 static cdb_status get_text(const cdb_value *obj, cdb_byte_order o, uint64_t f, char *out, size_t *len)
 {
     cdb_value v;
@@ -223,12 +257,16 @@ static cdb_status decode_settings(const cdb_db *db, const uint8_t *in, size_t le
 
 /* -------------------------------------------------------- collections */
 
+/* Whether the collection is in a slot now (the apply's fast path). */
 int cdb_vec_is_open(const cdb_db *db, uint64_t store)
 {
     return cdb_slots_find(&db->vec_slots, store) != NULL;
 }
 
-/* Records the entry counter, staged for reconciliation. */
+/* Records the entry counter, staged for reconciliation. The index roots
+ * never change (an index's root ID is fixed), so the counter is the only
+ * in-memory state the catalog lacks. Also the slot code's save hook, run
+ * before an eviction. */
 static cdb_status save_coll(cdb_db *db, void *slot)
 {
     coll *c = (coll *)slot;
@@ -243,8 +281,12 @@ static cdb_status save_coll(cdb_db *db, void *slot)
 
 const cdb_slot_ops cdb_vec_slot_ops = { NULL, save_coll };
 
-/* CDB_E_INVALID_ARG: not a vector collection; CDB_E_NOT_FOUND: no such
- * store, or it was dropped. */
+/* Finds an open collection, or opens it from its catalog record into a
+ * slot: decodes the settings, works out the block geometry and opens the
+ * indexes (and the graph's, when it has one). Records a use of the slot.
+ * CDB_E_INVALID_ARG: not a vector collection; CDB_E_NOT_FOUND: no such
+ * store, or it was dropped. CDB_E_UNSUPPORTED without the vector buffers,
+ * or for a graph without enough vec_work. */
 static cdb_status coll_get(cdb_db *db, uint64_t store, coll **out)
 {
     coll *free_slot = (coll *)cdb_slots_find(&db->vec_slots, store);
@@ -322,6 +364,9 @@ cdb_status cdb_vec_flush(cdb_db *db)
     return CDB_OK;
 }
 
+/* Validates the settings, checks one vector fits a page, then (as a
+ * catalog change) creates the three indexes and the store record in one
+ * commit. Norms are cached only for cosine. */
 cdb_status cdb_vec_create(cdb_db *db, const char *name, size_t len, const cdb_vec_config *cfg, uint64_t *id)
 {
     uint8_t settings[CDB_CATALOG_SETTINGS_MAX];
@@ -388,6 +433,9 @@ cdb_status cdb_vec_describe(cdb_db *db, uint64_t store, cdb_vec_config *cfg, cha
 
 /* -------------------------------------------------------- elements */
 
+/* IEEE 754 half precision to float: 1 sign bit, 5 exponent bits (bias 15),
+ * 10 mantissa bits. Exponent 0 is a subnormal (m * 2^-24), 31 is infinity
+ * or NaN; otherwise (1024 + m) * 2^(e - 25). */
 static float half_to_float(uint16_t h)
 {
     unsigned e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
@@ -401,6 +449,8 @@ static float half_to_float(uint16_t h)
     return (h & 0x8000u) ? -v : v;
 }
 
+/* Element i of a stored vector as a double. bf16 is the top 16 bits of an
+ * f32, so it widens by a shift. */
 static double elem_at(const uint8_t *d, size_t i, unsigned elem, cdb_byte_order o)
 {
     switch (elem) {
@@ -423,6 +473,7 @@ static double elem_at(const uint8_t *d, size_t i, unsigned elem, cdb_byte_order 
     }
 }
 
+/* Euclidean length of a stored vector (used for cosine). */
 static double norm_of(const coll *c, const uint8_t *v, cdb_byte_order o)
 {
     double sum = 0.0;
@@ -434,6 +485,7 @@ static double norm_of(const coll *c, const uint8_t *v, cdb_byte_order o)
     return sqrt(sum);
 }
 
+/* Set bits in a byte (each step clears the lowest set bit). */
 static unsigned popcount8(uint8_t b)
 {
     unsigned n = 0;
@@ -445,11 +497,15 @@ static unsigned popcount8(uint8_t b)
 }
 
 /* Distance between query q (norm qn) and stored vector v (norm vn, or a
- * negative value when not cached). */
+ * negative value when not cached). Smaller is closer for every measure
+ * (spec 14.12.3). Both vectors are in stored form, in byte order o.
+ * The arithmetic is done in double. */
 static double distance(const coll *c, unsigned measure, const uint8_t *q, double qn, const uint8_t *v, double vn,
                        cdb_byte_order o)
 {
     uint32_t i;
+    /* Hamming: count differing bits, ignoring the unused high bits of the
+     * last byte when dims is not a multiple of 8. */
     if (measure == CDB_VEC_HAMMING) {
         size_t n = c->vec_bytes;
         unsigned bits = 0;
@@ -469,6 +525,7 @@ static double distance(const coll *c, unsigned measure, const uint8_t *q, double
         }
         return sqrt(sum);
     }
+    /* Dot product: -dot; cosine: 1 - dot / (|q| |v|). */
     {
         double dot = 0.0;
         for (i = 0; i < c->dims; i++)
@@ -484,7 +541,9 @@ static double distance(const coll *c, unsigned measure, const uint8_t *q, double
 }
 
 /* Checks that an encoded value is a vector of the collection's shape; *data
- * points at its elements. */
+ * points at its elements. With full, the encoding is also validated as
+ * canonical (done for caller input; journaled payloads were validated when
+ * they were made). Anything else is CDB_E_INVALID_ARG. */
 static cdb_status vector_of(const cdb_db *db, const coll *c, const uint8_t *in, size_t len, int full,
                             const uint8_t **data)
 {
@@ -503,6 +562,7 @@ static cdb_status vector_of(const cdb_db *db, const coll *c, const uint8_t *in, 
 
 /* -------------------------------------------------------- index records */
 
+/* An entries-index value (spec 14.12.3), decoded. */
 typedef struct entry_rec {
     uint64_t block;
     uint32_t slot;
@@ -511,6 +571,9 @@ typedef struct entry_rec {
     uint64_t source_rev;   /* the document's revision when the vector was written */
 } entry_rec;
 
+/* Keys: one big-endian u64 (entries, blocks, graph, pending), or the
+ * sources key (source store, source entry, vector entry). Big-endian
+ * integers sort as numbers under memcmp. */
 static size_t k_u64(uint8_t *k, uint64_t a)
 {
     cdb_store_u64(k, a, CDB_ORDER_BIG);
@@ -525,6 +588,8 @@ static size_t k_source(uint8_t *k, uint64_t store, uint64_t entry, uint64_t vec_
     return 24;
 }
 
+/* Entries and blocks index rows. blocks_get treats a missing block as
+ * corruption: callers only ask about blocks an entry points to. */
 static cdb_status entry_get(coll *c, uint64_t entry, entry_rec *r, int *found)
 {
     uint8_t k[8], v[ENTRY_VAL];
@@ -578,11 +643,16 @@ static cdb_status blocks_get(coll *c, uint64_t block, uint32_t *used, uint32_t *
 
 /* -------------------------------------------------------- blocks */
 
+/* A block page read into V_BLOCK. count is its number of slots (used or
+ * empty). */
 typedef struct block {
     const uint8_t *p;   /* payload */
     uint32_t count;
 } block;
 
+/* Reads a block and checks its header against the collection: owner,
+ * element type, dimensions, a slot count within the block size, and a
+ * payload length that matches that count exactly. */
 static cdb_status block_read(cdb_db *db, const coll *c, uint64_t lid, block *b)
 {
     cdb_page_header h;
@@ -600,6 +670,8 @@ static cdb_status block_read(cdb_db *db, const coll *c, uint64_t lid, block *b)
     return CDB_OK;
 }
 
+/* Slot i's entry ID (0: empty), its vector data, and its cached norm (-1
+ * when the collection caches none). */
 static uint64_t slot_entry(const cdb_db *db, const block *b, uint32_t i)
 {
     return cdb_load_u64(b->p + BLOCK_HDR + (size_t)i * 8u, db->pager.order);
@@ -622,7 +694,10 @@ static double slot_norm(const cdb_db *db, const coll *c, const block *b, uint32_
 }
 
 /* Writes block lid with count slots: the slots of old (NULL: none) that
- * remain, with slot set to (entry, data) or emptied when data is NULL. */
+ * remain, with slot set to (entry, data) or emptied when data is NULL.
+ * The block is rebuilt in V_BUILD rather than edited in place because the
+ * data offset depends on the slot count, so changing the count moves the
+ * vector data. Slots of old beyond count are dropped. */
 static cdb_status block_write(cdb_db *db, const coll *c, uint64_t lid, const block *old, uint32_t count,
                               uint32_t slot, uint64_t entry, const uint8_t *data)
 {
@@ -664,7 +739,11 @@ static cdb_status block_write(cdb_db *db, const coll *c, uint64_t lid, const blo
     return cdb_pager_write(&db->pager, lid, &t, nb, len);
 }
 
-/* Puts a new vector in the first block with a free slot, or a new block. */
+/* Puts a new vector in the first block with a free slot, or a new block.
+ * The free slot is the first empty one, or a new slot at the end. The
+ * blocks index says how full each block is, so full blocks are skipped
+ * without reading them; free_from (a hint kept in memory only) moves past
+ * them. Fills r->block and r->slot. */
 static cdb_status place(cdb_db *db, coll *c, uint64_t entry, const uint8_t *data, entry_rec *r)
 {
     cdb_index_cursor cur;
@@ -705,6 +784,7 @@ static cdb_status place(cdb_db *db, coll *c, uint64_t entry, const uint8_t *data
             return s;
         return blocks_put(c, r->block, used + 1u, count);
     }
+    /* Every block is full: start a new one-slot block. */
     if ((s = cdb_pager_alloc(&db->pager, &r->block)) != CDB_OK)
         return s;
     r->slot = 0;
@@ -713,7 +793,8 @@ static cdb_status place(cdb_db *db, coll *c, uint64_t entry, const uint8_t *data
     return blocks_put(c, r->block, 1, 1);
 }
 
-/* Empties the entry's slot; a block left empty is released. */
+/* Empties the entry's slot; a block left empty is released (its page freed
+ * and its blocks row deleted). Checks the slot really holds this entry. */
 static cdb_status unplace(cdb_db *db, coll *c, uint64_t entry, const entry_rec *r)
 {
     uint32_t used, count;
@@ -748,9 +829,11 @@ static cdb_status unplace(cdb_db *db, coll *c, uint64_t entry, const entry_rec *
  * Record (spec 14.12.2, 14.12.4): entry ID (8), count (2), flags (1), measure
  * version (1), then per neighbour its entry ID (8) and distance (f32, 4),
  * nearest first; equal distances: lower entry ID first. Key 0 of the graph
- * index holds the live vector count (8), the entry-point count (2) and the
- * entry points (8 each). Index values are big-endian. */
+ * index holds the live vector count (8 bytes, META_LEN). The entry points
+ * are rows (0, entry) of the reverse index, whose 1-byte value is their
+ * kind (spec 14.12.4). Index values are big-endian. */
 
+/* One neighbour in a list, and a whole list. */
 typedef struct nb {
     uint64_t entry;
     float dist;
@@ -770,11 +853,13 @@ typedef struct bitem {
     grec rec;
 } bitem;
 
+/* A search candidate. */
 typedef struct cand {
     uint64_t entry;
     double dist;
 } cand;
 
+/* The list order: by distance, ties to the lower entry ID. */
 static int nb_less(float d1, uint64_t e1, float d2, uint64_t e2)
 {
     return d1 < d2 || (d1 == d2 && e1 < e2);
@@ -803,6 +888,7 @@ static int rec_offer(grec *r, uint32_t k, uint64_t e, float d, uint64_t *dropped
     return 1;
 }
 
+/* Removes e from a list; returns whether it was there. */
 static int rec_remove(grec *r, uint64_t e)
 {
     uint32_t i;
@@ -816,6 +902,8 @@ static int rec_remove(grec *r, uint64_t e)
     return 0;
 }
 
+/* Reads and writes an entry's graph record (layout above). rec_get checks
+ * the stored entry ID, the count against K and the exact length. */
 static cdb_status rec_get(coll *c, uint64_t entry, grec *r, int *found)
 {
     uint8_t k[8], v[REC_HDR + NB_SIZE * CDB_VEC_MAX_K];
@@ -854,6 +942,7 @@ static cdb_status rec_put(coll *c, uint64_t entry, const grec *r)
     return cdb_index_put(&c->graph, k, k_u64(k, entry), v, REC_HDR + (size_t)r->count * NB_SIZE);
 }
 
+/* A 16-byte key of two big-endian u64s: reverse rows (neighbour, entry). */
 static size_t k_pair(uint8_t *k, uint64_t a, uint64_t b)
 {
     cdb_store_u64(k, a, CDB_ORDER_BIG);
@@ -875,6 +964,7 @@ static cdb_status rev_del(coll *c, uint64_t neighbour, uint64_t entry)
     return cdb_index_delete(&c->reverse, k, k_pair(k, neighbour, entry), &found);
 }
 
+/* The pending set: entries whose list must be worked out again. */
 static cdb_status pending_put(coll *c, uint64_t entry)
 {
     uint8_t k[8];
@@ -895,6 +985,8 @@ static cdb_status pending_has(coll *c, uint64_t entry, int *found)
     return cdb_index_get(&c->pending, k, k_u64(k, entry), v, sizeof v, &vlen, found);
 }
 
+/* The live vector count under graph key 0 (missing reads as 0), and
+ * meta_live to move it by one; going below 0 is CDB_E_CORRUPT. */
 static cdb_status meta_get(coll *c, uint64_t *live)
 {
     uint8_t k[8], v[META_LEN];
@@ -964,6 +1056,7 @@ static cdb_status ep_get(coll *c, uint64_t e, unsigned *kind)
     return CDB_OK;
 }
 
+/* Makes e an entry point of the given kind (replacing any earlier kind). */
 static cdb_status ep_put(coll *c, uint64_t e, unsigned kind)
 {
     uint8_t k[16], v[1];
@@ -990,6 +1083,9 @@ static cdb_status graph_detach(cdb_db *db, coll *c, uint64_t entry)
         if ((s = cdb_index_delete(&c->graph, k, k_u64(k, entry), &found)) != CDB_OK)
             return s;
     }
+    /* Every lister: the reverse rows (entry, lister). Each round seeks
+     * afresh to the first remaining row, because the row is deleted (and
+     * other indexes written) before the next one is read. */
     for (;;) {
         cdb_index_cursor cur;
         uint8_t k[16], got[16], none[1];
@@ -1021,6 +1117,8 @@ static uint8_t *work_base(const cdb_db *db, size_t *avail)
     return db->cfg.vec_work + skip;
 }
 
+/* Bytes one refresh batch item takes in vec_work: the bitem, then its
+ * vector, rounded up to 8. */
 static size_t item_stride(size_t vec_bytes)
 {
     return (sizeof(bitem) + vec_bytes + 7u) & ~(size_t)7u;
@@ -1032,6 +1130,9 @@ static size_t ep_stride(size_t vec_bytes)
     return (8u + vec_bytes + 7u) & ~(size_t)7u;
 }
 
+/* The smallest vec_work that serves every use: a refresh batch of one,
+ * MIN_EP + 1 entry points being chosen, or one approximate search with the
+ * default ef. More memory gives bigger refresh batches. */
 size_t cdb_vec_work_size(cdb_vector_elem elem, uint32_t dims, uint32_t k)
 {
     size_t vb = vector_bytes(elem, dims), need = item_stride(vb) + 8u, ep = (MIN_EP + 1u) * ep_stride(vb) + 8u;
@@ -1062,6 +1163,8 @@ static cdb_status fetch_vector(cdb_db *db, coll *c, uint64_t entry, uint8_t *out
     return CDB_OK;
 }
 
+/* The ID of chosen entry point i (stored in host order: this array is
+ * scratch memory, never written to disk). */
 static uint64_t ep_id(const uint8_t *w, size_t stride, size_t i)
 {
     uint64_t e;
@@ -1116,6 +1219,8 @@ static cdb_status choose_entry_points(cdb_db *db, coll *c, uint8_t *w, size_t av
     int done;
     cdb_status s;
 
+    /* How many: sqrt(live), clamped, and leaving room for one more than
+     * wanted in vec_work (the newcomer that triggers a thinning). */
     if ((s = meta_get(c, &live)) != CDB_OK)
         return s;
     want = (size_t)ceil(sqrt((double)live));
@@ -1127,6 +1232,8 @@ static cdb_status choose_entry_points(cdb_db *db, coll *c, uint8_t *w, size_t av
         want = avail / stride > 1u ? avail / stride - 1u : 0;
     if (want == 0)
         return CDB_E_UNSUPPORTED;
+    /* One pass over every block, in block order. r starts at 0, so the
+     * first vectors are all kept until the first thinning. */
     if ((s = cdb_index_seek(&cur, &c->blocks, vbuf(db, V_CURSOR), NULL, 0)) != CDB_OK)
         return s;
     for (;;) {
@@ -1155,6 +1262,8 @@ static cdb_status choose_entry_points(cdb_db *db, coll *c, uint8_t *w, size_t av
                 n = ep_thin(c, spread, w, stride, n, &r, o);
         }
     }
+    /* Make the stored rows match: drop spread rows no longer chosen (reach
+     * rows are left alone), then mark every chosen entry as spread. */
     for (from = 1;; from = e + 1u) {
         if ((s = ep_next(db, c, from, &e, &kind)) != CDB_OK)
             return s;
@@ -1190,7 +1299,9 @@ typedef struct walk {
 } walk;
 
 /* Marks e visited; 0 if it already was. When the set is full, nothing is
- * marked and 1 is returned: the walk then stops expanding (see full). */
+ * marked and 1 is returned: the walk then stops expanding (see full).
+ * The set is an open-addressing hash table of entry IDs (0 marks an empty
+ * cell, which is safe since entry ID 0 is never used), probed linearly. */
 static int visit(walk *w, uint64_t e)
 {
     size_t h = (size_t)((e * 0x9E3779B97F4A7C15ull) % w->seen_cap);
@@ -1211,7 +1322,11 @@ static int full(const walk *w)
     return w->seen_n + 1u >= w->seen_cap;
 }
 
-/* Offers a found vector to the best list and the candidates. */
+/* Offers a found vector to the best list and the candidates.
+ * best holds at most ef vectors, sorted by (distance, entry). With expand,
+ * a vector that made it into best is also queued as a candidate whose
+ * list will be followed; when the queue is full it replaces the farthest
+ * candidate, if it is nearer. */
 static void consider(walk *w, uint64_t e, double d, int expand)
 {
     size_t i, pos;
@@ -1244,7 +1359,9 @@ static void consider(walk *w, uint64_t e, double d, int expand)
     }
 }
 
-/* Measures a vector by entry and offers it. */
+/* Measures a vector by entry and offers it. Always under the base measure:
+ * the graph's lists are ordered by it. An entry that no longer exists is
+ * skipped. */
 static cdb_status reach(cdb_db *db, coll *c, walk *w, const uint8_t *q, double qn, uint64_t e, int expand)
 {
     entry_rec r;
@@ -1264,6 +1381,7 @@ static cdb_status reach(cdb_db *db, coll *c, walk *w, const uint8_t *q, double q
     return CDB_OK;
 }
 
+/* Whether the walk visited e (same hash as visit, without inserting). */
 static int seen_has(const walk *w, uint64_t e)
 {
     size_t h = (size_t)((e * 0x9E3779B97F4A7C15ull) % w->seen_cap);
@@ -1301,6 +1419,7 @@ static cdb_status walk_run(cdb_db *db, coll *c, walk *w, const uint8_t *q, doubl
     uint64_t e, from;
     unsigned kind;
     cdb_status s;
+    /* Measure every entry point; the nearest become the first candidates. */
     for (from = 1;; from = e + 1u) {
         if ((s = ep_next(db, c, from, &e, &kind)) != CDB_OK)
             return s;
@@ -1309,6 +1428,9 @@ static cdb_status walk_run(cdb_db *db, coll *c, walk *w, const uint8_t *q, doubl
         if (e != skip && visit(w, e) && (s = reach(db, c, w, q, qn, e, 1)) != CDB_OK)
             return s;
     }
+    /* Best first: take the nearest candidate and measure the neighbours its
+     * list names, until no candidate can improve the best list or the
+     * visited set fills up. */
     while (w->ncand > 0 && !full(w)) {
         size_t m = 0, j;
         cand next;
@@ -1342,6 +1464,7 @@ typedef struct checks {
     int overflow;    /* too many: every listed entry is checked */
 } checks;
 
+/* Max-heap sift-down, for sort_ids. */
 static void sift_down(uint64_t *a, size_t i, size_t n)
 {
     for (;;) {
@@ -1374,6 +1497,7 @@ static void sort_ids(uint64_t *a, size_t n)
     }
 }
 
+/* Sorts and removes duplicates in place; returns the new count. */
 static size_t unique_ids(uint64_t *a, size_t n)
 {
     size_t i, m = 0;
@@ -1384,6 +1508,9 @@ static size_t unique_ids(uint64_t *a, size_t n)
     return m;
 }
 
+/* Lists e to be checked. When the list is full it is deduplicated first;
+ * if it is still more than half full, the list gives up (overflow) and the
+ * check falls back to checking everything. */
 static void check_add(checks *k, uint64_t e)
 {
     if (k->overflow || e == 0)
@@ -1400,7 +1527,9 @@ static void check_add(checks *k, uint64_t e)
 
 /* Checks that a walk from the other entry points reaches e, with e's own
  * vector as the query. An entry it can't reach becomes an entry point; one
- * added that way stops being one once it is reached. */
+ * added that way stops being one once it is reached. Pending entries,
+ * spread entry points and entries that no longer exist are skipped.
+ * Uses V_BUILD for e's vector. */
 static cdb_status check_entry(cdb_db *db, coll *c, uint64_t e, uint8_t *mem, size_t avail)
 {
     uint8_t *v = vbuf(db, V_BUILD);
@@ -1475,6 +1604,7 @@ static cdb_status check_coverage(cdb_db *db, coll *c, checks *k, uint8_t *mem, s
     return CDB_OK;
 }
 
+/* Whether e is one of the n batch items. */
 static int in_batch(const uint8_t *items, size_t stride, size_t n, uint64_t e)
 {
     size_t i;
@@ -1532,6 +1662,8 @@ static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *proce
         n = i;
         if (n == 0)
             break;
+        /* Load each batch entry's vector (it may have been deleted since it
+         * was queued; then it is just taken off the pending list below). */
         for (i = 0; i < n; i++) {
             bitem *it = (bitem *)(void *)(items + i * stride);
             if ((s = fetch_vector(db, c, it->entry, (uint8_t *)(it + 1), &it->norm, &it->live)) != CDB_OK)
@@ -1559,6 +1691,8 @@ static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *proce
                 grec ur;
                 if (u == 0)
                     continue;
+                /* Offer u to every batch list, remembering each distance
+                 * in it->d for the reverse offer below. */
                 for (i = 0; i < n; i++) {
                     bitem *it = (bitem *)(void *)(items + i * stride);
                     if (!it->live || it->entry == u)
@@ -1591,7 +1725,9 @@ static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *proce
             }
         }
 
-        /* Store the batch's lists. */
+        /* Store the batch's lists, replacing the reverse rows of each old
+         * list with those of the new one. Every entry touched is listed for
+         * the coverage check. */
         for (i = 0; i < n; i++) {
             bitem *it = (bitem *)(void *)(items + i * stride);
             if (it->live) {
@@ -1622,6 +1758,9 @@ static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *proce
 
 /* -------------------------------------------------------- apply */
 
+/* Splits an insert/replace payload (spec 14.12.3): flags, an optional
+ * source (two varints), then the encoded vector. CDB_E_MALFORMED if any
+ * part is missing or the vector has the wrong shape. */
 static cdb_status parse_payload(const cdb_db *db, const coll *c, const cdb_delta *d, int *has_source,
                                 uint64_t *ss, uint64_t *se, const uint8_t **data)
 {
@@ -1692,6 +1831,8 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
         int has_source;
         if (parse_payload(db, c, d, &has_source, &ss, &se, &data) != CDB_OK)
             return CDB_OK;
+        /* Insert: place the vector, record its source (and the source
+         * document's revision now), and queue it for the graph. */
         if (!found) {
             if (d->op == CDB_OP_REPLACE)
                 return CDB_OK; /* nothing to replace */
@@ -1711,6 +1852,9 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
                 return s;
             return CDB_OK;
         } else {
+            /* Replace (an insert of an existing entry also lands here):
+             * overwrite the vector in its slot. Any source in the payload
+             * is ignored; the recorded source is kept. */
             uint32_t used, count;
             block b;
             if ((s = blocks_get(c, r.block, &used, &count)) != CDB_OK || (s = block_read(db, c, r.block, &b)) != CDB_OK)
@@ -1732,6 +1876,8 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
         }
     }
     case CDB_OP_DELETE:
+        /* Remove it from the graph (and as an entry point), its slot, its
+         * source row and its entries row; then tell the links. */
         if (!found)
             return CDB_OK;
         if (c->graph_on && ((s = graph_detach(db, c, d->entry_id)) != CDB_OK
@@ -1754,6 +1900,8 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
 
 /* -------------------------------------------------------- transactions */
 
+/* Common checks for every vector change: an open, healthy transaction, the
+ * built-in apply (which knows vector records), and a vector collection. */
 static cdb_status tx_coll(cdb_db *db, uint64_t store, coll **c)
 {
     if (!db->in_tx || db->failed)
@@ -1764,7 +1912,9 @@ static cdb_status tx_coll(cdb_db *db, uint64_t store, coll **c)
 }
 
 /* Whether the entry exists as the open transaction sees it: committed, then
- * the transaction's own changes to this collection, if it made any. */
+ * the transaction's own changes to this collection, if it made any.
+ * touched_tx avoids reading the journal back when this transaction has not
+ * changed the collection. Only inserts and deletes change liveness. */
 static cdb_status live_in_tx(cdb_db *db, coll *c, uint64_t entry, int *live)
 {
     entry_rec r;
@@ -1789,6 +1939,9 @@ static cdb_status live_in_tx(cdb_db *db, coll *c, uint64_t entry, int *live)
     return CDB_OK;
 }
 
+/* Validates the vector fully, builds the payload in V_BUILD (flags,
+ * optional source varints, the vector) and journals it. The size check
+ * keeps the payload within the one page buffer. */
 static cdb_status put_vector(cdb_db *db, coll *c, uint64_t entry, uint8_t op, const void *vec, size_t len,
                              uint64_t ss, uint64_t se)
 {
@@ -1813,6 +1966,8 @@ static cdb_status put_vector(cdb_db *db, coll *c, uint64_t entry, uint8_t op, co
     return CDB_OK;
 }
 
+/* The entry ID comes from the collection's counter, which advances only
+ * after the change is journaled. The source is not checked to exist. */
 cdb_status cdb_vec_insert(cdb_db *db, uint64_t store, const void *vec, size_t len,
                           uint64_t source_store, uint64_t source_entry, uint64_t *entry)
 {
@@ -1881,6 +2036,8 @@ cdb_status cdb_vec_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *l
 
 /* -------------------------------------------------------- reading */
 
+/* Re-encodes the stored elements as a vector value in out. A small out
+ * gives the value writer's CDB_E_BUFFER_TOO_SMALL. */
 cdb_status cdb_vec_get(cdb_db *db, uint64_t store, uint64_t entry, void *out, size_t cap, size_t *len,
                        uint64_t *source_store, uint64_t *source_entry)
 {
@@ -1926,6 +2083,7 @@ cdb_status cdb_vec_by_source(cdb_db *db, uint64_t store, uint64_t source_store, 
         return s;
     if (entries == NULL && max)
         return CDB_E_INVALID_ARG;
+    /* A prefix scan: rows (source store, source entry, *) in entry order. */
     if ((s = cdb_index_seek(&cur, &c->sources, vbuf(db, V_CURSOR), k, k_source(k, source_store, source_entry, 0)))
         != CDB_OK)
         return s;
@@ -1940,7 +2098,9 @@ cdb_status cdb_vec_by_source(cdb_db *db, uint64_t store, uint64_t source_store, 
     return CDB_OK;
 }
 
-/* Keeps hits ordered by distance, then by entry ID, at most k of them. */
+/* Keeps hits ordered by distance, then by entry ID, at most k of them.
+ * An insertion sort into a list of at most k: fine for the small k a
+ * search asks for. */
 static void add_hit(cdb_vec_hit *hits, size_t k, size_t *n, uint64_t entry, double dist)
 {
     size_t pos = *n;
@@ -1957,7 +2117,9 @@ static void add_hit(cdb_vec_hit *hits, size_t k, size_t *n, uint64_t entry, doub
     hits[pos].source_state = CDB_VEC_SOURCE_NONE;
 }
 
-/* Fills in each hit's source and whether the vector still describes it. */
+/* Fills in each hit's source and whether the vector still describes it:
+ * the source document's head revision is compared with the one recorded
+ * when the vector was written (spec 14.12.3). */
 static cdb_status source_states(cdb_db *db, coll *c, cdb_vec_hit *hits, size_t n)
 {
     size_t i;
@@ -1991,7 +2153,8 @@ static cdb_status source_states(cdb_db *db, coll *c, cdb_vec_hit *hits, size_t n
     return CDB_OK;
 }
 
-/* The exact path: every vector is compared with the query. */
+/* The exact path: every vector is compared with the query, block by
+ * block. Cached norms are used for cosine. */
 static cdb_status search_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned measure, cdb_vec_hit *hits,
                                size_t k, size_t *n)
 {
@@ -2080,6 +2243,8 @@ static cdb_status search_approx(cdb_db *db, coll *c, const uint8_t *q, unsigned 
     return CDB_OK;
 }
 
+/* Validates the query, picks the path (see cdb_vec.h), searches, then
+ * fills in each hit's source state. Searches see committed vectors only. */
 cdb_status cdb_vec_search_mode(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
                                unsigned mode, cdb_vec_hit *hits, size_t k, size_t *n)
 {
@@ -2099,6 +2264,9 @@ cdb_status cdb_vec_search_mode(cdb_db *db, uint64_t store, const void *query, si
         return s;
     if (k == 0)
         return CDB_OK;
+    /* The caller's mode, else the operator's, else the automatic rule:
+     * approximate only with a graph, under the base measure, and with at
+     * least vec_exact_below live vectors. */
     if (mode == CDB_VEC_AUTO)
         mode = db->cfg.vec_mode;
     if (c->graph_on && mode == CDB_VEC_APPROX) {
@@ -2121,6 +2289,9 @@ cdb_status cdb_vec_search(cdb_db *db, uint64_t store, const void *query, size_t 
 
 /* -------------------------------------------------------- graph upkeep */
 
+/* A catalog change: checks K and the working memory, creates the graph,
+ * reverse and pending indexes, queues every existing entry, sets the live
+ * count, and rewrites the settings with fields 10-13 (spec 14.12.4). */
 cdb_status cdb_vec_create_graph(cdb_db *db, uint64_t store, uint32_t k)
 {
     char model[CDB_VEC_MODEL_MAX], version[CDB_VEC_MODEL_MAX];
@@ -2185,6 +2356,7 @@ cdb_status cdb_vec_create_graph(cdb_db *db, uint64_t store, uint32_t k)
     return cdb_db_catalog_end(db, s);
 }
 
+/* Counts the pending set by walking it. */
 static cdb_status count_pending(cdb_db *db, coll *c, size_t *n)
 {
     cdb_index_cursor cur;
@@ -2202,6 +2374,8 @@ static cdb_status count_pending(cdb_db *db, coll *c, size_t *n)
     }
 }
 
+/* Run like a catalog change: reconcile first, refresh, commit the pages,
+ * then rotate the journal. */
 cdb_status cdb_vec_refresh(cdb_db *db, uint64_t store, size_t budget, size_t *remaining)
 {
     size_t done;
@@ -2223,6 +2397,8 @@ cdb_status cdb_vec_refresh(cdb_db *db, uint64_t store, size_t budget, size_t *re
     return remaining ? count_pending(db, c, remaining) : CDB_OK;
 }
 
+/* Copies the stored list (base-measure distances, as stored in f32) and
+ * the neighbours' source states. CDB_E_STATE without a graph. */
 cdb_status cdb_vec_neighbours(cdb_db *db, uint64_t store, uint64_t entry, cdb_vec_hit *hits, size_t max,
                               size_t *n, int *fresh)
 {
