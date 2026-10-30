@@ -4,6 +4,7 @@
 #include "cdb_endian.h"
 #include "cdb_index.h"
 #include "cdb_key.h"
+#include "cdb_overflow.h"
 #include "cdb_varint.h"
 
 /* Node payload (spec 14.8.2): level, flags, key count, prefix length, offset
@@ -80,6 +81,7 @@ static cdb_status heap_add(cdb_index *ix, node *n, const uint8_t *k1, size_t l1,
     e->off = (uint32_t)n->heap_used;
     e->klen = (uint32_t)(l1 + l2);
     e->vlen = (uint32_t)vl;
+    e->tlen = (uint32_t)vl;
     if (l1)
         memcpy(w_heap(ix) + n->heap_used, k1, l1);
     if (l2)
@@ -117,9 +119,11 @@ static cdb_status view_node(const cdb_index *ix, const uint8_t *pl, node_view *v
     return CDB_OK;
 }
 
-/* Decodes entry i: its key suffix and its value (or child) bytes. */
+/* Decodes entry i: its key suffix and its value (or child) bytes, and the
+ * value's length (*tlen). A leaf value longer than the inline limit is
+ * stored as its overflow chain's first page, at the address width. */
 static cdb_status view_entry(const cdb_index *ix, const node_view *v, size_t i,
-                             const uint8_t **suffix, size_t *slen, const uint8_t **val, size_t *vlen)
+                             const uint8_t **suffix, size_t *slen, const uint8_t **val, size_t *vlen, size_t *tlen)
 {
     size_t off = cdb_load_u16(v->pl + NODE_HDR + v->prefix_len + 2u * i, ix->pager->order);
     const uint8_t *p;
@@ -139,15 +143,24 @@ static cdb_status view_entry(const cdb_index *ix, const node_view *v, size_t i,
     p += len;
     avail -= (size_t)len;
     if (v->level == 0) {
-        if (cdb_varint_decode(p, avail, &len, &n) != CDB_OK || len > avail - n)
+        if (cdb_varint_decode(p, avail, &len, &n) != CDB_OK || len > UINT32_MAX)
             return CDB_E_CORRUPT;
         *val = p + n;
-        *vlen = (size_t)len;
+        *tlen = (size_t)len;
+        if (len > ix->max_value) {
+            if (avail - n < ix->pager->addr_width)
+                return CDB_E_CORRUPT;
+            *vlen = ix->pager->addr_width;
+        } else {
+            if (len > avail - n)
+                return CDB_E_CORRUPT;
+            *vlen = (size_t)len;
+        }
     } else {
         if (avail < ix->pager->addr_width)
             return CDB_E_CORRUPT;
         *val = p;
-        *vlen = ix->pager->addr_width;
+        *vlen = *tlen = ix->pager->addr_width;
     }
     return CDB_OK;
 }
@@ -168,8 +181,8 @@ static cdb_status read_node(cdb_index *ix, uint64_t lid, uint8_t *page, node_vie
     return view_node(ix, page + cdb_page_header_size(ix->pager->fmt), v);
 }
 
-/* Loads node lid into the work entries, with full keys. Interior children
- * become 8 big-endian bytes. */
+/* Loads node lid into the work entries, with full keys. Interior children,
+ * and the chains of overflow values, become 8 big-endian bytes. */
 static cdb_status expand(cdb_index *ix, uint64_t lid, node *n)
 {
     node_view v;
@@ -184,11 +197,13 @@ static cdb_status expand(cdb_index *ix, uint64_t lid, node *n)
     n->heap_used = 0;
     for (i = 0; i < v.count; i++) {
         const uint8_t *suffix, *val;
-        size_t slen, vlen;
+        size_t slen, vlen, tlen;
         uint8_t child[CHILD_BYTES];
-        if ((s = view_entry(ix, &v, i, &suffix, &slen, &val, &vlen)) != CDB_OK)
+        int chained;
+        if ((s = view_entry(ix, &v, i, &suffix, &slen, &val, &vlen, &tlen)) != CDB_OK)
             return s;
-        if (v.level > 0) {
+        chained = v.level > 0 || tlen > ix->max_value;
+        if (chained) {
             cdb_store_u64(child, child_of(ix, val), CDB_ORDER_BIG);
             val = child;
             vlen = CHILD_BYTES;
@@ -196,6 +211,8 @@ static cdb_status expand(cdb_index *ix, uint64_t lid, node *n)
         if ((s = heap_add(ix, n, v.pl + NODE_HDR, v.prefix_len, suffix, slen, val, vlen,
                           &ix->w.entries[n->count])) != CDB_OK)
             return s;
+        if (v.level == 0)
+            ix->w.entries[n->count].tlen = (uint32_t)tlen;
         n->count++;
     }
     return CDB_OK;
@@ -242,12 +259,18 @@ static size_t common_prefix(cdb_index *ix, unsigned level, size_t a, size_t b)
     return n;
 }
 
+/* A leaf value kept in an overflow chain. */
+static int in_chain(const cdb_index *ix, const cdb_index_entry *e)
+{
+    return e->tlen > ix->max_value;
+}
+
 static size_t entry_bytes(cdb_index *ix, unsigned level, const cdb_index_entry *e, size_t prefix)
 {
     size_t slen = e->klen - prefix;
     size_t size = cdb_varint_size(slen) + slen;
     if (level == 0)
-        size += cdb_varint_size(e->vlen) + e->vlen;
+        size += cdb_varint_size(e->tlen) + (in_chain(ix, e) ? ix->pager->addr_width : e->vlen);
     else
         size += ix->pager->addr_width;
     return size;
@@ -289,11 +312,13 @@ static cdb_status write_piece(cdb_index *ix, uint64_t lid, unsigned level, size_
         p += cdb_varint_encode(slen, p);
         memcpy(p, ent_key(ix, e) + prefix, slen);
         p += slen;
-        if (level == 0) {
+        if (level == 0 && !in_chain(ix, e)) {
             p += cdb_varint_encode(e->vlen, p);
             if (e->vlen)
                 memcpy(p, ent_val(ix, e), e->vlen);
         } else {
+            if (level == 0)
+                p += cdb_varint_encode(e->tlen, p);
             uint64_t child = cdb_load_u64(ent_val(ix, e), CDB_ORDER_BIG);
             if (ix->pager->addr_width == 8)
                 cdb_store_u64(p, child, o);
@@ -484,24 +509,45 @@ cdb_status cdb_index_put(cdb_index *ix, const uint8_t *key, size_t klen, const v
     node leaf;
     split_out out;
     size_t pos;
+    uint64_t old_chain = 0, old_len = 0;
+    const uint8_t *stored = (const uint8_t *)val;
+    size_t slen = vlen;
+    uint8_t chain[CHILD_BYTES];
     cdb_status s;
 
-    if (klen > ix->max_key || vlen > ix->max_value || (key == NULL && klen) || (val == NULL && vlen))
+    if (klen > ix->max_key || vlen > UINT32_MAX || (key == NULL && klen) || (val == NULL && vlen))
         return CDB_E_INVALID_ARG;
     if ((s = descend(ix, key, klen, &pt, &leaf)) != CDB_OK)
         return s;
     pos = lower_bound(ix, &leaf, key, klen);
+    if (vlen > ix->max_value) {
+        /* The value goes to a chain of its own; the leaf keeps the first page. */
+        uint64_t first;
+        if ((s = cdb_overflow_write(ix->pager, ix->store_id, val, vlen, w_image(ix), &first)) != CDB_OK)
+            return s;
+        cdb_store_u64(chain, first, CDB_ORDER_BIG);
+        stored = chain;
+        slen = CHILD_BYTES;
+    }
     if (pos < leaf.count && cdb_key_compare(ent_key(ix, &ix->w.entries[pos]), ix->w.entries[pos].klen, key, klen) == 0) {
-        if ((s = heap_add(ix, &leaf, key, klen, NULL, 0, (const uint8_t *)val, vlen, &ix->w.entries[pos])) != CDB_OK)
+        if (in_chain(ix, &ix->w.entries[pos])) {
+            old_chain = cdb_load_u64(ent_val(ix, &ix->w.entries[pos]), CDB_ORDER_BIG);
+            old_len = ix->w.entries[pos].tlen;
+        }
+        if ((s = heap_add(ix, &leaf, key, klen, NULL, 0, stored, slen, &ix->w.entries[pos])) != CDB_OK)
             return s;
     } else {
         if (leaf.count >= ix->w.entries_cap)
             return CDB_E_BUFFER_TOO_SMALL;
         memmove(&ix->w.entries[pos + 1], &ix->w.entries[pos], (leaf.count - pos) * sizeof(cdb_index_entry));
-        if ((s = heap_add(ix, &leaf, key, klen, NULL, 0, (const uint8_t *)val, vlen, &ix->w.entries[pos])) != CDB_OK)
+        if ((s = heap_add(ix, &leaf, key, klen, NULL, 0, stored, slen, &ix->w.entries[pos])) != CDB_OK)
             return s;
         leaf.count++;
     }
+    ix->w.entries[pos].tlen = (uint32_t)vlen;
+    /* The replaced value's chain is released (its pages stay until commit). */
+    if (old_chain && (s = cdb_overflow_free(ix->pager, old_chain, ix->store_id, (size_t)old_len, w_page(ix))) != CDB_OK)
+        return s;
     if ((s = write_node(ix, pt.lid[pt.depth - 1], &leaf, &out)) != CDB_OK)
         return s;
     if (out.count == 0)
@@ -527,9 +573,12 @@ cdb_status cdb_index_get(cdb_index *ix, const uint8_t *key, size_t klen,
         const cdb_index_entry *e = &ix->w.entries[pos];
         if (cdb_key_compare(ent_key(ix, e), e->klen, key, klen) == 0) {
             *found = 1;
-            *vlen = e->vlen;
-            if (e->vlen > vcap)
+            *vlen = e->tlen;
+            if (e->tlen > vcap)
                 return CDB_E_BUFFER_TOO_SMALL;
+            if (in_chain(ix, e))
+                return cdb_overflow_read(ix->pager, cdb_load_u64(ent_val(ix, e), CDB_ORDER_BIG), ix->store_id, val,
+                                         e->tlen, w_page(ix));
             if (e->vlen)
                 memcpy(val, ent_val(ix, e), e->vlen);
         }
@@ -574,6 +623,10 @@ cdb_status cdb_index_delete(cdb_index *ix, const uint8_t *key, size_t klen, int 
     if (pos >= n.count || cdb_key_compare(ent_key(ix, &ix->w.entries[pos]), ix->w.entries[pos].klen, key, klen) != 0)
         return CDB_OK;
     *found = 1;
+    if (in_chain(ix, &ix->w.entries[pos])
+        && (s = cdb_overflow_free(ix->pager, cdb_load_u64(ent_val(ix, &ix->w.entries[pos]), CDB_ORDER_BIG),
+                                  ix->store_id, ix->w.entries[pos].tlen, w_page(ix))) != CDB_OK)
+        return s;
 
     at = (unsigned)(pt.depth - 1u);
     for (;;) {
@@ -663,7 +716,7 @@ static cdb_status leftmost(cdb_index_cursor *c)
     for (;;) {
         node_view v;
         const uint8_t *suffix, *val;
-        size_t slen, vlen;
+        size_t slen, vlen, tlen;
         cdb_status s = read_node(c->ix, c->lid[c->depth - 1], c->page, &v);
         if (s != CDB_OK)
             return s;
@@ -671,7 +724,7 @@ static cdb_status leftmost(cdb_index_cursor *c)
             return CDB_OK;
         if (v.count == 0 || c->depth >= CDB_INDEX_MAX_DEPTH)
             return CDB_E_CORRUPT;
-        if ((s = view_entry(c->ix, &v, c->slot[c->depth - 1], &suffix, &slen, &val, &vlen)) != CDB_OK)
+        if ((s = view_entry(c->ix, &v, c->slot[c->depth - 1], &suffix, &slen, &val, &vlen, &tlen)) != CDB_OK)
             return s;
         c->lid[c->depth] = child_of(c->ix, val);
         c->slot[c->depth] = 0;
@@ -706,7 +759,7 @@ cdb_status cdb_index_next(cdb_index_cursor *c, uint8_t *key, size_t kcap, size_t
     for (;;) {
         node_view v;
         const uint8_t *suffix, *value;
-        size_t slen, vl;
+        size_t slen, vl, tl;
         cdb_status s;
 
         *done = 0;
@@ -717,16 +770,23 @@ cdb_status cdb_index_next(cdb_index_cursor *c, uint8_t *key, size_t kcap, size_t
         if ((s = read_node(c->ix, c->lid[c->depth - 1], c->page, &v)) != CDB_OK)
             return s;
         if (c->slot[c->depth - 1] < v.count) {
-            if ((s = view_entry(c->ix, &v, c->slot[c->depth - 1], &suffix, &slen, &value, &vl)) != CDB_OK)
+            if ((s = view_entry(c->ix, &v, c->slot[c->depth - 1], &suffix, &slen, &value, &vl, &tl)) != CDB_OK)
                 return s;
             *klen = v.prefix_len + slen;
-            *vlen = vl;
-            if (*klen > kcap || vl > vcap)
+            *vlen = tl;
+            if (*klen > kcap || tl > vcap)
                 return CDB_E_BUFFER_TOO_SMALL;
             memcpy(key, v.pl + NODE_HDR, v.prefix_len);
             memcpy(key + v.prefix_len, suffix, slen);
-            if (vl)
+            if (tl > c->ix->max_value) {
+                /* The chain is read through the cursor's page, which the
+                 * next call reads again. */
+                if ((s = cdb_overflow_read(c->ix->pager, child_of(c->ix, value), c->ix->store_id, val, tl, c->page))
+                    != CDB_OK)
+                    return s;
+            } else if (vl) {
                 memcpy(val, value, vl);
+            }
             c->slot[c->depth - 1]++;
             return CDB_OK;
         }
