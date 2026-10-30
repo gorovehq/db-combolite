@@ -4,6 +4,13 @@ db-combolite/build/
 *.a
 .claude/
 db-combolite/build-rel/
+db-combolite/build-demo/
+db-combolite/build-demo-rel/
+db-combolite/build*/
+# Databases and models are never committed: anyone can build their own.
+*.cdbarch
+*.cdbwork/
+*.gguf
 # Test data pools: fetched, not committed (Project Gutenberg index and books).
 db-combolite/datastore/gutenberg/
 # Sub-agent activity log, tailed by the user.
