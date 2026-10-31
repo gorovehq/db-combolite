@@ -91,6 +91,9 @@ static cdb_status set_paths(cdb_db *db, const char *base)
     n = snprintf(db->journal_tmp, sizeof db->journal_tmp, "%s.new", db->journal_path);
     if (n < 0 || (size_t)n >= sizeof db->journal_tmp)
         return CDB_E_INVALID_ARG;
+    n = snprintf(db->coorddir, sizeof db->coorddir, "%s/coord", db->workdir);
+    if (n < 0 || (size_t)n >= sizeof db->coorddir)
+        return CDB_E_INVALID_ARG;
     return CDB_OK;
 }
 
@@ -391,8 +394,10 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
     cdb_slots_init(&db->vec_slots, sizeof(struct cdb_vec_coll), &cdb_vec_slot_ops);
     cdb_slots_init(&db->ts_slots, sizeof(struct cdb_ts_store), &cdb_ts_slot_ops);
     cdb_slots_init(&db->table_slots, sizeof(struct cdb_table_store), &cdb_table_slot_ops);
-    if ((s = open_db(db, base, cfg, create)) != CDB_OK)
+    if ((s = open_db(db, base, cfg, create)) != CDB_OK) {
         release_slots(db); /* recovery may have opened stores */
+        (void)cdb_coord_leave(&db->coord); /* so the next opener need not wait it out */
+    }
     return s;
 }
 
@@ -430,6 +435,20 @@ static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg
     if (db->pager.read_only)
         return CDB_E_READ_ONLY; /* read-only sessions come with the coordinator milestone */
 
+    /* Join the coordinators before deciding whether the working directory
+     * is a crashed session's (spec 1.12.1): only with no other live
+     * coordinator may recovery replay and remove its journal. Until
+     * processes can share a database, a live one means busy. */
+    if ((s = db->env.ops->mkdir(db->env.ctx, db->workdir)) != CDB_OK)
+        return s;
+    if ((s = env_sync_dir(db, db->parent)) != CDB_OK)
+        return s;
+    if ((s = cdb_coord_join(&db->coord, &db->env, db->coorddir, db->pager.hs.record.db_id, db->pager.order,
+                            &cfg->coord)) != CDB_OK)
+        return s;
+    if (db->coord.live_others > 0)
+        return CDB_E_BUSY;
+
     /* Commit numbers resume at the durable reservation mark: any number
      * below it may already have been used before a crash (spec 14.4.6
      * rule 5). Commit numbers start at 1. */
@@ -458,14 +477,35 @@ static cdb_status usable(const cdb_db *db)
     return db->failed ? CDB_E_STATE : CDB_OK;
 }
 
+/* A heartbeat if one is due (spec 5.9.6). Losing the slot to another
+ * process means this session's journal may already have been taken over:
+ * nothing more may be written. */
+static cdb_status heartbeat(cdb_db *db)
+{
+    cdb_status s = cdb_coord_beat(&db->coord, 0);
+    if (s == CDB_E_BUSY)
+        db->failed = 1;
+    return s;
+}
+
+cdb_status cdb_db_tick(cdb_db *db)
+{
+    cdb_status s = usable(db);
+    return s == CDB_OK ? heartbeat(db) : s;
+}
+
 /* Operation scopes (see cdb_db.h). Only the outermost begin takes a new ID;
  * nested scopes share it, so the whole outer scope counts as one operation
  * when the slot code decides which stores it may evict. An unmatched end is
- * ignored. */
+ * ignored. The outermost begin is also a heartbeat point; a failed beat
+ * shows up at the next call that can report it. */
 void cdb_db_op_begin(cdb_db *db)
 {
-    if (db->op_depth++ == 0)
+    if (db->op_depth++ == 0) {
         db->op_id = ++db->op_seq;
+        if (!db->failed)
+            (void)heartbeat(db);
+    }
 }
 
 void cdb_db_op_end(cdb_db *db)
@@ -479,8 +519,11 @@ void cdb_db_op_end(cdb_db *db)
  * the low 48 (spec 14.4.3). */
 cdb_status cdb_tx_begin(cdb_db *db, cdb_durability durability)
 {
+    cdb_status s;
     if (usable(db) != CDB_OK || db->in_tx)
         return CDB_E_STATE;
+    if ((s = heartbeat(db)) != CDB_OK)
+        return s;
     db->in_tx = 1;
     db->tx_id = ((uint64_t)JOURNAL_SLOT << 48) | db->next_tx++;
     /* Remember where this transaction's records start in the journal; the
@@ -678,6 +721,8 @@ cdb_status cdb_db_reconcile(cdb_db *db)
 
     if (usable(db) != CDB_OK || db->in_tx)
         return CDB_E_STATE;
+    if ((s = heartbeat(db)) != CDB_OK)
+        return s;
     if (db->applied == watermark_of(db) && !db->pager.dirty)
         return CDB_OK;
     /* Document pools, vector collections and time-series stores keep some
@@ -795,6 +840,7 @@ cdb_status cdb_db_close(cdb_db *db)
 
     if (db->failed) {
         release_slots(db); /* their state is lost with the session anyway */
+        (void)cdb_coord_leave(&db->coord); /* the journal stays for the next open */
         return CDB_E_STATE;
     }
     if (db->in_tx && (s = cdb_tx_abort(db)) != CDB_OK)
@@ -810,6 +856,11 @@ cdb_status cdb_db_close(cdb_db *db)
     if ((s = env_remove(db, db->journal_path)) != CDB_OK)
         return s;
     if ((s = env_sync_dir(db, db->workdir)) != CDB_OK)
+        return s;
+    if ((s = cdb_coord_leave(&db->coord)) != CDB_OK)
+        return s;
+    s = db->env.ops->rmdir(db->env.ctx, db->coorddir);
+    if (s != CDB_OK && s != CDB_E_STATE && s != CDB_E_NOT_FOUND) /* a leftover lobby file keeps it */
         return s;
     s = db->env.ops->rmdir(db->env.ctx, db->workdir);
     if (s != CDB_OK && s != CDB_E_STATE) /* a set-aside companion keeps it */

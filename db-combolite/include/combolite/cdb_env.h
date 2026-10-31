@@ -41,6 +41,22 @@ typedef struct cdb_env_ops {
      * NULL hooks mean the engine uses only memory the caller supplied. */
     void *(*alloc)(void *ctx, size_t size);
     void (*free)(void *ctx, void *p);
+    /* The hooks below are what coordination between processes needs (spec
+     * 5.9). Each is optional; without mono and sleep a database can still
+     * be used, but cannot tell whether another process is alive, so it
+     * treats every other coordinator as dead.
+     *
+     * Optional: calls fn once for each file or directory name directly in
+     * dir (the name alone, without dir), in any order. A nonzero return from
+     * fn stops the listing early; list then returns CDB_OK. */
+    cdb_status (*list)(void *ctx, const char *dir, int (*fn)(void *arg, const char *name), void *arg);
+    /* Optional: a monotonic clock in nanoseconds from an arbitrary start.
+     * It never goes backwards while the process runs. */
+    cdb_status (*mono)(void *ctx, int64_t *ns);
+    /* Optional: fills buf with n unpredictable bytes (session identities). */
+    cdb_status (*random)(void *ctx, void *buf, size_t n);
+    /* Optional: waits at least ns nanoseconds. */
+    void (*sleep)(void *ctx, int64_t ns);
 } cdb_env_ops;
 
 /* An environment handle: an operation table plus its state. Copied by

@@ -15,7 +15,7 @@
 #include "combolite/cdb_env.h"
 #include "cdb_faultdev.h"
 
-#define CDB_FAULTENV_MAX_FILES 6
+#define CDB_FAULTENV_MAX_FILES 10
 #define CDB_FAULTENV_MAX_DIRS 4
 #define CDB_FAULTENV_NAME 160
 #define CDB_FAULTENV_MAX_ALLOCS 256
@@ -48,6 +48,11 @@ typedef struct cdb_faultenv {
     cdb_faultenv_dir dirs[CDB_FAULTENV_MAX_DIRS];
     int has_time;     /* the clock: off after init */
     int64_t time_ns;
+    int64_t mono_ns;  /* the monotonic clock: moves only by sleep and cdb_faultenv_advance */
+    uint64_t rng;     /* the random source: xorshift64*, the same sequence on every run */
+    void (*on_sleep)(void *arg); /* runs after each sleep, not nested */
+    void *on_sleep_arg;
+    int in_sleep_hook;
     int no_alloc;     /* the allocator refuses: on after init is off */
     void *allocs[CDB_FAULTENV_MAX_ALLOCS]; /* live blocks */
     unsigned live;    /* how many */
@@ -56,6 +61,16 @@ typedef struct cdb_faultenv {
 /* Sets the environment's clock: on, and the time it reports (ns since the
  * Unix epoch); off, the environment has no clock. Survives reboots. */
 void cdb_faultenv_set_time(cdb_faultenv *fe, int on, int64_t ns);
+
+/* Moves the monotonic clock forward by ns, as time passing would. The
+ * environment's sleep does the same, so waits in tests take no real time.
+ * Survives reboots. */
+void cdb_faultenv_advance(cdb_faultenv *fe, int64_t ns);
+
+/* Calls fn(arg) after each sleep, so a test can let other coordinators run
+ * (beat) while one waits, as other processes would. A sleep inside fn does
+ * not call it again. NULL turns it off. */
+void cdb_faultenv_on_sleep(cdb_faultenv *fe, void (*fn)(void *arg), void *arg);
 
 /* Turns the allocator on (the default) or off: off, it returns NULL, as a
  * host with no allocator would, so the engine uses caller memory only.

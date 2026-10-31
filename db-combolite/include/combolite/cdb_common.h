@@ -27,7 +27,8 @@ typedef enum cdb_status {
     CDB_E_READ_ONLY = -12,       /* write attempted on read-only storage */
     CDB_E_CORRUPT = -13,         /* a checksum or integrity check failed */
     CDB_E_EXISTS = -14,          /* the name or key is already in use */
-    CDB_E_SCHEMA = -15           /* a document does not satisfy its pool's schema */
+    CDB_E_SCHEMA = -15,          /* a document does not satisfy its pool's schema */
+    CDB_E_BUSY = -16             /* another process holds what is needed (spec 5) */
 } cdb_status;
 
 /* A short English name for a status, for logs and messages. The string is

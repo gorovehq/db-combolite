@@ -6,6 +6,7 @@
  * C library's malloc for the optional alloc hooks. */
 #define _POSIX_C_SOURCE 200809L
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -137,8 +138,75 @@ static void he_free(void *ctx, void *p)
     free(p);
 }
 
+/* readdir, skipping "." and "..". */
+static cdb_status he_list(void *ctx, const char *dir, int (*fn)(void *arg, const char *name), void *arg)
+{
+    DIR *d;
+    struct dirent *e;
+    (void)ctx;
+    if ((d = opendir(dir)) == NULL)
+        return errno_status();
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        if (fn(arg, e->d_name))
+            break;
+    }
+    closedir(d);
+    return CDB_OK;
+}
+
+static cdb_status he_mono(void *ctx, int64_t *ns)
+{
+    struct timespec ts;
+    (void)ctx;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return CDB_E_UNSUPPORTED;
+    *ns = (int64_t)ts.tv_sec * 1000000000 + (int64_t)ts.tv_nsec;
+    return CDB_OK;
+}
+
+/* /dev/urandom: POSIX enough, and no feature macros beyond the ones above. */
+static cdb_status he_random(void *ctx, void *buf, size_t n)
+{
+    uint8_t *p = (uint8_t *)buf;
+    int fd;
+    (void)ctx;
+    do {
+        fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0)
+        return CDB_E_UNSUPPORTED;
+    while (n > 0) {
+        ssize_t r = read(fd, p, n);
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0) {
+            close(fd);
+            return CDB_E_IO;
+        }
+        p += r;
+        n -= (size_t)r;
+    }
+    close(fd);
+    return CDB_OK;
+}
+
+static void he_sleep(void *ctx, int64_t ns)
+{
+    struct timespec ts;
+    (void)ctx;
+    if (ns <= 0)
+        return;
+    ts.tv_sec = (time_t)(ns / 1000000000);
+    ts.tv_nsec = (long)(ns % 1000000000);
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR)
+        ;
+}
+
 static const cdb_env_ops hostenv_ops = {
-    he_open, he_remove, he_rename, he_mkdir, he_rmdir, he_exists, he_sync_dir, he_now, he_alloc, he_free
+    he_open, he_remove, he_rename, he_mkdir, he_rmdir, he_exists, he_sync_dir, he_now, he_alloc, he_free,
+    he_list, he_mono, he_random, he_sleep
 };
 
 void cdb_hostenv_init(cdb_hostenv *he, cdb_env *out)

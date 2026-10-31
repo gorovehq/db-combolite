@@ -287,9 +287,82 @@ static void free_all(cdb_faultenv *fe)
         free(fe->allocs[--fe->live]);
 }
 
+/* The files and directories whose parent is dir, as the running process
+ * sees them. */
+static cdb_status fe_list(void *ctx, const char *dir, int (*fn)(void *arg, const char *name), void *arg)
+{
+    cdb_faultenv *fe = (cdb_faultenv *)ctx;
+    char parent[CDB_FAULTENV_NAME];
+    size_t n = strlen(dir);
+    int i;
+    if (fe->clock.crashed)
+        return CDB_E_IO;
+    if (!dir_present(fe, dir))
+        return CDB_E_NOT_FOUND;
+    for (i = 0; i < CDB_FAULTENV_MAX_FILES; i++) {
+        if (!fe->files[i].exists)
+            continue;
+        parent_of(fe->files[i].name, parent);
+        if (strcmp(parent, dir) == 0 && fn(arg, fe->files[i].name + n + 1))
+            return CDB_OK;
+    }
+    for (i = 0; i < CDB_FAULTENV_MAX_DIRS; i++) {
+        if (!fe->dirs[i].exists)
+            continue;
+        parent_of(fe->dirs[i].name, parent);
+        if (strcmp(parent, dir) == 0 && fn(arg, fe->dirs[i].name + n + 1))
+            return CDB_OK;
+    }
+    return CDB_OK;
+}
+
+static cdb_status fe_mono(void *ctx, int64_t *ns)
+{
+    cdb_faultenv *fe = (cdb_faultenv *)ctx;
+    *ns = fe->mono_ns;
+    return CDB_OK;
+}
+
+static cdb_status fe_random(void *ctx, void *buf, size_t n)
+{
+    cdb_faultenv *fe = (cdb_faultenv *)ctx;
+    uint8_t *p = (uint8_t *)buf;
+    while (n--) {
+        fe->rng ^= fe->rng >> 12;
+        fe->rng ^= fe->rng << 25;
+        fe->rng ^= fe->rng >> 27;
+        *p++ = (uint8_t)((fe->rng * 0x2545F4914F6CDD1Dull) >> 56);
+    }
+    return CDB_OK;
+}
+
+static void fe_sleep(void *ctx, int64_t ns)
+{
+    cdb_faultenv *fe = (cdb_faultenv *)ctx;
+    cdb_faultenv_advance(fe, ns);
+    if (fe->on_sleep != NULL && !fe->in_sleep_hook) {
+        fe->in_sleep_hook = 1;
+        fe->on_sleep(fe->on_sleep_arg);
+        fe->in_sleep_hook = 0;
+    }
+}
+
+void cdb_faultenv_on_sleep(cdb_faultenv *fe, void (*fn)(void *arg), void *arg)
+{
+    fe->on_sleep = fn;
+    fe->on_sleep_arg = arg;
+}
+
 static const cdb_env_ops faultenv_ops = {
-    fe_open, fe_remove, fe_rename, fe_mkdir, fe_rmdir, fe_exists, fe_sync_dir, fe_now, fe_alloc, fe_free
+    fe_open, fe_remove, fe_rename, fe_mkdir, fe_rmdir, fe_exists, fe_sync_dir, fe_now, fe_alloc, fe_free,
+    fe_list, fe_mono, fe_random, fe_sleep
 };
+
+void cdb_faultenv_advance(cdb_faultenv *fe, int64_t ns)
+{
+    if (ns > 0)
+        fe->mono_ns += ns;
+}
 
 void cdb_faultenv_set_time(cdb_faultenv *fe, int on, int64_t ns)
 {
@@ -313,6 +386,8 @@ cdb_status cdb_faultenv_init(cdb_faultenv *fe, const cdb_faultenv_config *cfg, c
         return CDB_E_INVALID_ARG;
     memset(fe, 0, sizeof *fe);
     fe->cfg = *cfg;
+    fe->mono_ns = 1000000000;
+    fe->rng = 0x9E3779B97F4A7C15ull;
     out->ops = &faultenv_ops;
     out->ctx = fe;
     return CDB_OK;

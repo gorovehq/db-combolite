@@ -57,7 +57,8 @@ The magic number is `89 43 44 42 0D 0A 1A 0A` (`\x89CDB\r\n\x1A\n`). The `\r\n` 
 | 464 | 8 | Commit-number high-water mark | global commit numbers are reserved durably in blocks, in the same way as page sequences (Section 12.1, 14.1.8) |
 | 472 | 8 | Anchor-map mirror root | the mirrored copy of the anchor map (Section 3.5, 14.7) |
 | 480 | 1 | Content-hash algorithm ID | Section 14.15: SHA-256 by default |
-| 481 | 11 | Reserved | zero |
+| 481 | 3 | Reserved | zero |
+| 484 | 8 | Reconciliation-marks root | logical ID of the per-slot marks index (14.4.8); 0 until a second slot's journal is first reconciled (5.9) |
 | 492 | 16 | Tamper-evident tag | keyed tag in tamper-evident mode (Section 12.7), otherwise zero |
 | 508 | 4 | CRC32C | covers bytes 0–507 |
 
@@ -92,6 +93,8 @@ Raising any of these limits requires a new epoch.
 ### 14.1.8 Watermarks count global commit numbers
 
 Delta tracks belong to individual processes (Section 1.3), so the header can't hold a watermark for every track of every process. Instead, every transaction receives a **global commit number** when it commits. The number is assigned through the primary coordinator (Section 5.2). Commit numbers are reserved durably in blocks. The high-water mark at offset 464 is persisted before any number in a block is used, so no commit number is ever issued twice, even across crashes. Each companion slot's watermark then means "reconciled through commit number X". After a crash, replay applies every committed transaction whose number is above the watermark, taking it from whichever process's tracks hold it, in commit-number order.
+
+**More than one process (5.9.2).** With more than one process, the reconciling baton holder assigns commit numbers, not the primary. It assigns them contiguously, in merge order, as it merges, so the watermark keeps the meaning above. Whether a journaled transaction is already in the archive is decided by its slot's mark in the reconciliation-marks index (14.4.8), not by its commit number, which the writer leaves at 0.
 
 ### 14.1.9 Header integrity
 
@@ -299,7 +302,7 @@ A delta record is a 48-byte header, followed by the payload, followed by the tra
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 2 | Record marker: `C0 DE` |
-| 2 | 1 | Record kind: 0 = data change · 1 = commit record · 2 = abort · 3 = neuron-weight update (Section 6.10) |
+| 2 | 1 | Record kind: 0 = data change · 1 = commit record · 2 = abort · 3 = neuron-weight update (Section 6.10) · 4 = write-set key · 5 = prepare (both 5.9.4) |
 | 3 | 1 | Flags: encrypted, compressed |
 | 4 | 4 | Payload length |
 | 8 | 8 | Delta sequence number, which is the nonce source (14.2.5) |
@@ -330,8 +333,8 @@ Commit record payload:
 
 | Size | Field |
 |---|---|
-| 8 | Global commit number (14.1.8) |
-| 8 | Commit timestamp from the primary coordinator's clock: ns since the Unix epoch. Until the coordinator exists, the environment's clock; 0 when the platform has none |
+| 8 | Global commit number (14.1.8). Written as 0 (5.9.2); the number is assigned at reconciliation |
+| 8 | Commit timestamp from the primary coordinator's clock: ns since the Unix epoch. Until the coordinator exists, the environment's clock; 0 when the platform has none. When a prepare record was written, the same stamp as that record. This is the stamp used for merge order (5.9.4) |
 | 8 | Principal identity ID (Section 5.1) |
 | 4 | Number of deltas in the transaction |
 | 4 | Bitmask of the companion types the transaction touched |
@@ -369,11 +372,29 @@ The exact encoding of each operation, per data model, is defined with the data-m
 6. **Durability.** The default is *normal*, with a barrier every 32 commits (configurable). *Off* has barriers only at reconciliation and close.
 7. **Visibility.** A transaction's changes are applied, and become visible, when it commits. A transaction cannot read its own changes before it commits.
 
+### 14.4.7 Multi-process rules (5.9)
+
+1. **One journal per slot.** Slot *s* writes `main.<s>.cdb`. Rules 2–4 of 14.4.6 apply per slot. The slot's coordinator file (14.5) records *journal in use*, because the header's companion slot can't record one flag per process.
+2. **Rotation.** A process rotates its own journal after it sees a new archive. The new journal keeps the transactions above its slot's mark, copied in their original order. The baton holder never rotates another slot's journal.
+3. **Write-set key record (kind 4).** Target store: the table. Target entry: 0. Payload: index number (4 bytes), then the CRC32C of the encoded key (4 bytes). A hash collision can only cause a needless collision, never a missed one.
+4. **Prepare record (kind 5).** Payload: the stamp (8 bytes), from the primary's clock in ns.
+5. **Replay after a crash.** For every slot's journal, the committed transactions above the slot's mark are merged in (stamp, slot, counter) order.
+
+### 14.4.8 Reconciliation-marks index (5.9.2)
+
+A B+tree (14.8) whose root logical ID is at header offset 484.
+
+| Part | Content |
+|---|---|
+| Key | Coordinator slot number, encoded as an unsigned integer key (14.8) |
+| Value | 8 bytes: the transaction counter (the 6-byte counter of 14.4.3, widened) through which this slot's journal is reconciled |
+
 ## 14.5 Coordinator slot
 
 ### 14.5.1 Placement
 
-- **Host files:** each coordinator slot is the file `coord/<slot>`.
+- **Host files:** each coordinator slot is the file `coord/<slot>`, the slot number in decimal.
+- **Lobby files (5.9.5):** `coord/join.<session>`, the session identity as 32 lowercase hex digits. One 512-byte half in the layout below: request kind 4, the wanted slot at offset 10 and the wanted priority at offset 14. Times are µs of the primary's clock, as in the slot.
 - **Raw flash:** each slot is a region.
 - **Two halves.** Every slot has two 512-byte halves, A and B. Writes alternate between them. The valid half with the higher heartbeat counter wins. A torn heartbeat write therefore never makes a live coordinator look dead.
 - **Maximum number of coordinators.** It can be configured. The default comes from the device-class table (Section 2.8): about 1–2 on microcontrollers and 64 on desktop and server hosts. On raw flash, the coordinator region is sized for this maximum.
@@ -387,7 +408,7 @@ The exact encoding of each operation, per data model, is defined with the data-m
 | 9 | 1 | Epoch |
 | 10 | 2 | Slot number |
 | 12 | 1 | Role: 0 = free · 1 = subordinate · 2 = primary |
-| 13 | 1 | State flags: alive · unfinished baton session pending |
+| 13 | 1 | State flags: bit 0 alive · bit 1 unfinished baton session pending · bit 2 journal in use (14.4.7) |
 | 14 | 2 | Priority value (Section 5.5) |
 | 16 | 16 | Database ID |
 | 32 | 16 | Session identity: a random 128-bit value (Section 5.1) |
@@ -396,7 +417,7 @@ The exact encoding of each operation, per data model, is defined with the data-m
 | 64 | 8 | Heartbeat timestamp, from the primary's clock (µs) |
 | 72 | 8 | Delta-sequence high-water mark (Section 12.1) |
 | 80 | 8 | Transaction-counter high-water mark (14.4.3) |
-| 88 | 1 | Current request kind: 0 = none · 1 = baton · 2 = claim primary · 3 = priority value |
+| 88 | 1 | Current request kind: 0 = none · 1 = baton · 2 = claim primary · 3 = priority value · 4 = join, only in a lobby file (5.9.5) · 5 = entry-ID block (5.9.3) |
 | 89 | 1 | Reserved, zero |
 | 90 | 2 | Heat ID: which baton is meant when several heats exist (Section 5.3) |
 | 92 | 4 | Reserved, zero |
@@ -406,8 +427,11 @@ The exact encoding of each operation, per data model, is defined with the data-m
 | 120 | 8 | Progress *x* |
 | 128 | 8 | Time the baton was issued |
 | 136 | 8 | Published clock. Written only by the primary. |
-| 144 | 8 | The last global commit number this session has seen reconciled |
-| 152 | 356 | Reserved, zero |
+| 144 | 8 | The last global commit number this session has seen reconciled. With M19 (5.9.7): the archive's committed sequence that this session's readers use; freed pages are reused only below it |
+| 152 | 1 | Number of held entry-ID blocks, at most 21 (5.9.3) |
+| 153 | 7 | Reserved, zero |
+| 160 | 336 | Held entry-ID blocks (5.9.3): 21 × 16 bytes: store ID (8), first ID of the 1024-ID block (8) |
+| 496 | 12 | Reserved, zero |
 | 508 | 4 | CRC32C over bytes 0–507 |
 
 ### 14.5.3 How the primary's clock is shared

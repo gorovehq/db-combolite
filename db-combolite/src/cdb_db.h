@@ -13,6 +13,7 @@
 
 #include "combolite/cdb_env.h"
 #include "cdb_catalog.h"
+#include "cdb_coord.h"
 #include "cdb_journal.h"
 #include "cdb_pager.h"
 #include "cdb_slots.h"
@@ -130,6 +131,7 @@ typedef struct cdb_db_config {
     unsigned max_open;
     cdb_slot_align *slot_mem;     /* optional caller memory for slots */
     size_t slot_mem_size;         /* in bytes */
+    cdb_coord_config coord;       /* coordinators (spec 5.9): zeros take the defaults */
 } cdb_db_config;
 
 /* An open document pool (cdb_doc.h). */
@@ -243,6 +245,8 @@ typedef struct cdb_db {
     char workdir[CDB_DB_PATH_MAX];      /* <base>.cdbwork */
     char journal_path[CDB_DB_PATH_MAX]; /* <base>.cdbwork/main.0.cdb */
     char journal_tmp[CDB_DB_PATH_MAX];  /* the same with .new, used while rotating */
+    char coorddir[CDB_DB_PATH_MAX];     /* <base>.cdbwork/coord */
+    cdb_coord coord;                    /* this process's coordinator (spec 5) */
     cdb_storage archive_st;
     cdb_storage journal_st;
     cdb_pager pager;
@@ -295,9 +299,18 @@ typedef struct cdb_db {
  * Other errors: CDB_E_INVALID_ARG for missing buffers or a path too long;
  * CDB_E_READ_ONLY for a file this build may only read (not supported yet);
  * CDB_E_CORRUPT when a journal marked in use is missing or had to be set
- * aside, unless cfg->flags has CDB_DB_ACCEPT_LOSS. */
+ * aside, unless cfg->flags has CDB_DB_ACCEPT_LOSS; CDB_E_BUSY when another
+ * live process has the database open (until processes can share one, M19).
+ * Opening may wait: see cdb_coord_join. */
 cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const cdb_db_config *cfg,
                        const cdb_header *create);
+
+/* Keeps this process's coordinator alive (spec 5.9.6). Every engine entry
+ * point that starts work writes a heartbeat when one is due; an application
+ * that may sit idle longer than the dead timeout (3 s by default) calls this
+ * from its own loop. CDB_E_BUSY if another process took this coordinator's
+ * slot while it was silent; the database is then failed and must be closed. */
+cdb_status cdb_db_tick(cdb_db *db);
 
 /* Reconciles everything and leaves the database as one file at rest.
  * CDB_E_STATE if an apply failed earlier: the journal is then kept so the

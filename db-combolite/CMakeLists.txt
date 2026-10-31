@@ -65,6 +65,7 @@ add_library(combolite
   src/cdb_overflow.c
   src/cdb_hostenv.c
   src/cdb_journal.c
+  src/cdb_coord.c
   src/cdb_db.c
   src/cdb_slots.c
   src/cdb_nib.c

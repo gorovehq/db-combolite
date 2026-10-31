@@ -364,11 +364,28 @@ int gf_key_diag(int ch)
     return 1;
 }
 
+/* Waits for a key with no jobs running. The engine has no threads, so an
+ * idle reader ticks its database itself; otherwise another process would
+ * take it for dead after the coordinator's dead timeout (spec 5.9.6). */
+static int read_key_idle(void)
+{
+    int ch;
+    timeout(500);
+    while ((ch = getch()) == ERR) {
+        if (app != NULL)
+            (void)cdb_db_tick(&app->g->db);
+        if (gf_jobs_active())
+            break;
+    }
+    timeout(-1);
+    return ch;
+}
+
 static int read_key(void)
 {
     int ch;
-    if (!gf_jobs_active())
-        return getch();
+    if (!gf_jobs_active() && (ch = read_key_idle()) != ERR)
+        return ch;
     for (;;) {
         timeout(100);
         ch = getch();
@@ -379,10 +396,8 @@ static int read_key(void)
         gf_jobs_tick(100.0);
         gf_status_refresh();
         refresh();
-        if (!gf_jobs_active()) {
-            timeout(-1);
-            return getch();
-        }
+        if (!gf_jobs_active() && (ch = read_key_idle()) != ERR)
+            return ch;
     }
 }
 
