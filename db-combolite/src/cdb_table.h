@@ -41,6 +41,7 @@
 #ifndef CDB_TABLE_H
 #define CDB_TABLE_H
 
+#include "combolite/cdb_value.h"
 #include "cdb_db.h"
 
 #define CDB_TABLE_KEY_MAX 512u        /* longest index key built (also capped by the index) */
