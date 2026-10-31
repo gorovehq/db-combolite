@@ -161,6 +161,10 @@ cdb_status cdb_coord_join(cdb_coord *c, const cdb_env *env, const char *dir, con
  * happens after this process was silent past the dead timeout. */
 cdb_status cdb_coord_beat(cdb_coord *c, int force);
 
+/* Raises the slot's transaction-counter high-water mark to hwm and makes it
+ * durable (spec 14.4.3): counters below it may then be used. */
+cdb_status cdb_coord_reserve_tx(cdb_coord *c, uint64_t hwm);
+
 /* Leaves cleanly: removes the slot file. */
 cdb_status cdb_coord_leave(cdb_coord *c);
 

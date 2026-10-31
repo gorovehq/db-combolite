@@ -28,13 +28,13 @@ enum {
     OFF_APP_ID = 104, OFF_CREATOR_VER = 108, OFF_WRITER_VER = 112, OFF_RESERVED_A = 116,
     OFF_CREATED = 120, OFF_KEY_REF = 128, OFF_COMPANIONS = 256, OFF_ANCHORS = 400,
     OFF_COMMIT_HWM = 464, OFF_ANCHOR_MIRROR = 472, OFF_CONTENT_HASH_ALG = 480,
-    OFF_RESERVED_B = 481, OFF_TAMPER_TAG = 492, OFF_CRC = 508
+    OFF_RESERVED_B = 481, OFF_MARKS_ROOT = 484, OFF_TAMPER_TAG = 492, OFF_CRC = 508
 };
 
 #define COMPANION_SIZE 12u
 #define ANCHOR_SIZE 16u
 #define RESERVED_A_LEN 4u
-#define RESERVED_B_LEN 11u
+#define RESERVED_B_LEN 3u
 #define MAX_PAGE_LOG2 30u /* largest page-size code a header may declare */
 
 /* Whether len bytes are all zero (reserved areas must be). */
@@ -100,6 +100,7 @@ cdb_status cdb_header_encode(const cdb_header *h, uint8_t out[CDB_HEADER_SLOT_SI
     cdb_store_u64(out + OFF_COMMIT_HWM, h->commit_hwm, o);
     cdb_store_u64(out + OFF_ANCHOR_MIRROR, h->anchor_mirror_root, o);
     out[OFF_CONTENT_HASH_ALG] = h->content_hash_alg;
+    cdb_store_u64(out + OFF_MARKS_ROOT, h->marks_root, o);
     memcpy(out + OFF_TAMPER_TAG, h->tamper_tag, sizeof h->tamper_tag);
     cdb_store_u32(out + OFF_CRC, cdb_crc32c(out, OFF_CRC), o);
     return CDB_OK;
@@ -185,6 +186,7 @@ cdb_status cdb_header_decode(const uint8_t in[CDB_HEADER_SLOT_SIZE], cdb_header 
     h->commit_hwm = cdb_load_u64(in + OFF_COMMIT_HWM, o);
     h->anchor_mirror_root = cdb_load_u64(in + OFF_ANCHOR_MIRROR, o);
     h->content_hash_alg = in[OFF_CONTENT_HASH_ALG];
+    h->marks_root = cdb_load_u64(in + OFF_MARKS_ROOT, o);
     memcpy(h->tamper_tag, in + OFF_TAMPER_TAG, sizeof h->tamper_tag);
 
     /* Semantic checks: known role and layout flags, zero reserved bytes,

@@ -19,7 +19,6 @@
 #include "cdb_slots.h"
 
 #define CDB_DB_PATH_MAX 200         /* longest path, including the terminating zero */
-#define CDB_COMMIT_RESERVE_BLOCK 1024u /* commit numbers reserved per header checkpoint */
 
 /* Durability levels (spec 3.1). */
 typedef enum cdb_durability {
@@ -87,7 +86,7 @@ typedef struct cdb_db_config {
     cdb_durability durability;    /* default level; DEFAULT means NORMAL (spec 3.1) */
     unsigned normal_sync_every;   /* 0 means 32 */
     unsigned flags;               /* CDB_DB_ACCEPT_LOSS */
-    cdb_index_work catalog_work;  /* optional: the catalog is available when set */
+    cdb_index_work catalog_work;  /* the catalog, and the reconciliation marks (spec 14.4.8) */
     uint8_t *catalog_page;        /* page_size bytes, with catalog_work */
     uint8_t *doc_buffers;         /* documents: cdb_doc_buffers_size() bytes (cdb_doc.h) */
     size_t doc_max;               /* documents: largest body in bytes, kept in overflow pages
@@ -251,10 +250,11 @@ typedef struct cdb_db {
     cdb_storage journal_st;
     cdb_pager pager;
     cdb_journal journal;
-    uint64_t next_commit; /* next global commit number to hand out */
-    uint64_t commit_hwm;  /* numbers below this are reserved durably */
     uint64_t applied;     /* highest commit number applied to the pager */
     uint64_t next_tx;     /* counter part of the next transaction ID */
+    uint64_t last_tx;     /* counter of this slot's last committed transaction */
+    uint64_t my_mark;     /* this slot's mark in the committed archive (spec 5.9.2) */
+    uint64_t last_stamp;  /* stamp of this journal's last commit */
     int in_tx;            /* a transaction is open */
     uint64_t tx_id;
     uint64_t tx_start;    /* journal offset of the open transaction's first record */

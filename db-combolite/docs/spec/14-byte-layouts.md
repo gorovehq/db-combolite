@@ -368,7 +368,7 @@ The exact encoding of each operation, per data model, is defined with the data-m
    - **Header sequence.** A journal created when a session opens records the sequence produced by the commit that marks it *in use*.
    - **Damaged or foreign journals.** A journal that is unreadable, belongs to another database, or would need replaying onto a different state is renamed `main.<slot>.cdb.stray` and is never applied.
 4. **Journal rotation.** Every commit of the archive starts a new, empty journal: reconciliation, and also commits made outside it (catalog changes, compaction), which reconcile first. Otherwise later transactions would be journaled against a state the archive has moved past, and rule 3 would set them aside after a crash. The new journal is written as `main.<slot>.cdb.new`, made durable, then renamed over the old one, and the directory is synced. A crash always leaves exactly one journal.
-5. **Commit numbers** start at 1. They are reserved in blocks of 1024, in the same way as page sequence numbers.
+5. **Commit numbers** start at 1. *Since M19 (5.9.2):* they are assigned at reconciliation, in the same archive commit as the watermark, so they need no reservation. The high-water mark at header offset 464 is kept as written and no longer advanced. Transaction counters are reserved instead, in blocks of 1024, in the coordinator slot (14.4.3).
 6. **Durability.** The default is *normal*, with a barrier every 32 commits (configurable). *Off* has barriers only at reconciliation and close.
 7. **Visibility.** A transaction's changes are applied, and become visible, when it commits. A transaction cannot read its own changes before it commits.
 
@@ -378,7 +378,8 @@ The exact encoding of each operation, per data model, is defined with the data-m
 2. **Rotation.** A process rotates its own journal after it sees a new archive. The new journal keeps the transactions above its slot's mark, copied in their original order. The baton holder never rotates another slot's journal.
 3. **Write-set key record (kind 4).** Target store: the table. Target entry: 0. Payload: index number (4 bytes), then the CRC32C of the encoded key (4 bytes). A hash collision can only cause a needless collision, never a missed one.
 4. **Prepare record (kind 5).** Payload: the stamp (8 bytes), from the primary's clock in ns.
-5. **Replay after a crash.** For every slot's journal, the committed transactions above the slot's mark are merged in (stamp, slot, counter) order.
+5. **Replay after a crash.** For every slot's journal, the committed transactions above the slot's mark are merged in (stamp, slot, counter) order and numbered on from the watermark. Rule 3 of 14.4.6 becomes: a journal with a transaction to replay must have been started from the archive's committed state or an earlier one; one started from a later state is set aside.
+6. **The marks index borrows the catalog's work memory,** so every database is opened with `catalog_work` and `catalog_page` configured.
 
 ### 14.4.8 Reconciliation-marks index (5.9.2)
 

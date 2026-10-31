@@ -676,6 +676,19 @@ cdb_status cdb_coord_beat(cdb_coord *c, int force)
     return CDB_OK;
 }
 
+cdb_status cdb_coord_reserve_tx(cdb_coord *c, uint64_t hwm)
+{
+    cdb_status s;
+    if (!c->joined)
+        return CDB_E_STATE;
+    if (hwm <= c->me.tx_hwm)
+        return CDB_OK;
+    c->me.tx_hwm = hwm;
+    if ((s = write_half(c)) != CDB_OK)
+        return s;
+    return cdb_storage_sync(&c->st);
+}
+
 cdb_status cdb_coord_leave(cdb_coord *c)
 {
     cdb_status s;

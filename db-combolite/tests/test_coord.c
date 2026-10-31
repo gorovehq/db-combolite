@@ -361,24 +361,60 @@ struct proc {
     cdb_pager_node nodes[NODES];
     cdb_free_extent free_list[1024];
     uint8_t record_buf[1024];
+    uint8_t cat_work[16384];
+    cdb_index_entry cat_entries[512];
+    uint8_t cat_page[PAGE];
     cdb_db_config cfg;
     cdb_db db;
 };
 static struct proc p1, p2;
 
+/* Entry N is logical page N; pages up to 64 are reserved on first use so
+ * the engine's own pages (the marks index) land above them. REPLACE sets the
+ * value; PATCH appends to it, so applying a change twice shows. */
 static cdb_status kv_apply(void *ctx, cdb_pager *p, const cdb_delta *d)
 {
+    uint8_t cur[PAGE], val[PAGE];
     cdb_page_header t;
+    size_t len = 0;
     uint64_t lid;
     cdb_status s;
     (void)ctx;
-    while (p->next_lid <= d->entry_id)
+    TEST_ASSERT_TRUE(d->entry_id < 64);
+    while (p->next_lid < 64)
         if ((s = cdb_pager_alloc(p, &lid)) != CDB_OK)
             return s;
+    if (d->op == CDB_OP_PATCH) {
+        s = cdb_pager_read(p, d->entry_id, cur, &t);
+        if (s == CDB_OK) {
+            len = t.payload_len;
+            memcpy(val, cur + cdb_page_header_size(p->fmt), len);
+        } else if (s != CDB_E_NOT_FOUND) {
+            return s;
+        }
+    }
+    TEST_ASSERT_TRUE(len + d->len < 64);
+    memcpy(val + len, d->data, d->len);
     memset(&t, 0, sizeof t);
     t.type = CDB_PAGE_TYPE_DATA_TEST;
     t.store_id = d->store_id;
-    return cdb_pager_write(p, d->entry_id, &t, d->data, d->len);
+    return cdb_pager_write(p, d->entry_id, &t, val, len + d->len);
+}
+
+/* The value of entry e in p's pages, as a string; "" when absent. */
+static const char *value_of(struct proc *p, uint64_t e)
+{
+    static char out[PAGE];
+    uint8_t buf[PAGE];
+    cdb_page_header h;
+    cdb_status s = cdb_pager_read(&p->db.pager, e, buf, &h);
+    out[0] = '\0';
+    if (s == CDB_E_NOT_FOUND)
+        return out;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, s);
+    memcpy(out, buf + cdb_page_header_size(p->db.pager.fmt), h.payload_len);
+    out[h.payload_len] = '\0';
+    return out;
 }
 
 static cdb_status open_proc(struct proc *p)
@@ -394,6 +430,11 @@ static cdb_status open_proc(struct proc *p)
     p->cfg.record_buf = p->record_buf;
     p->cfg.record_buf_size = sizeof p->record_buf;
     p->cfg.apply = kv_apply;
+    p->cfg.catalog_work.bytes = p->cat_work;
+    p->cfg.catalog_work.bytes_size = sizeof p->cat_work;
+    p->cfg.catalog_work.entries = p->cat_entries;
+    p->cfg.catalog_work.entries_cap = 512;
+    p->cfg.catalog_page = p->cat_page;
     p->cfg.durability = CDB_DURABILITY_FULL;
     memset(&h, 0, sizeof h);
     h.order = CDB_ORDER_LITTLE;
@@ -449,6 +490,184 @@ static void test_crashed_process_recovered(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&p2.db.pager, 3, buf, &h));
     TEST_ASSERT_EQUAL_UINT(5, h.payload_len);
     TEST_ASSERT_EQUAL_MEMORY("three", buf + cdb_page_header_size(p2.db.pager.fmt), 5);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+}
+
+/* -------------------------------------------------------- journals per slot */
+
+/* One transaction of a hand-written journal: append text to an entry. */
+struct jtx {
+    uint64_t counter;
+    uint64_t stamp;
+    uint64_t entry;
+    const char *text;
+};
+
+/* Writes main.<slot>.cdb as a crashed session of that slot would have left
+ * it (spec 14.4.7): committed transactions, commit numbers 0. */
+static void plant_journal(unsigned slot, uint64_t unsealed, const struct jtx *t, unsigned n)
+{
+    char path[64];
+    uint8_t buf[256], info[CDB_COMMIT_PAYLOAD_SIZE];
+    cdb_journal_header jh;
+    cdb_journal j;
+    cdb_storage st;
+    unsigned i;
+
+    snprintf(path, sizeof path, DIR "/db.cdbwork/main.%u.cdb", slot);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->mkdir(env.ctx, DIR "/db.cdbwork"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->sync_dir(env.ctx, DIR));
+    memset(&jh, 0, sizeof jh);
+    jh.type_id = CDB_COMPANION_MAIN_JOURNAL;
+    jh.slot = (uint16_t)slot;
+    memcpy(jh.db_id, db_id, 16);
+    jh.unsealed_seq = unsealed;
+    jh.first_seq = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->open(env.ctx, path, CDB_ENV_CREATE, &st));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_storage_truncate(&st, 0));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_journal_create(&j, &st, CDB_ORDER_LITTLE, &jh));
+    for (i = 0; i < n; i++) {
+        cdb_commit_info ci;
+        cdb_record r;
+        uint8_t payload[64];
+        size_t len = strlen(t[i].text);
+        payload[0] = CDB_OP_PATCH;
+        memcpy(payload + 1, t[i].text, len);
+        memset(&r, 0, sizeof r);
+        r.kind = CDB_RECORD_DATA;
+        r.tx_id = ((uint64_t)slot << 48) | t[i].counter;
+        r.store_id = 1;
+        r.entry_id = t[i].entry;
+        r.payload = payload;
+        r.payload_len = (uint32_t)(len + 1);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_journal_append(&j, &r, buf, sizeof buf));
+        memset(&ci, 0, sizeof ci);
+        ci.timestamp = t[i].stamp;
+        ci.delta_count = 1;
+        cdb_commit_encode(&ci, info, CDB_ORDER_LITTLE);
+        memset(&r, 0, sizeof r);
+        r.kind = CDB_RECORD_COMMIT;
+        r.tx_id = ((uint64_t)slot << 48) | t[i].counter;
+        r.payload = info;
+        r.payload_len = CDB_COMMIT_PAYLOAD_SIZE;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_journal_append(&j, &r, buf, sizeof buf));
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_storage_sync(&st));
+    cdb_storage_close(&st);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->sync_dir(env.ctx, DIR "/db.cdbwork"));
+}
+
+/* Two slots' journals, interleaved by stamp. */
+static const struct jtx slot0_txs[] = { { 1, 10, 1, "a" }, { 2, 30, 1, "c" } };
+static const struct jtx slot1_txs[] = { { 1, 20, 1, "b" }, { 2, 40, 2, "d" } };
+
+/* A database at rest, then two crashed sessions' journals beside it.
+ * Returns the archive's committed sequence they were started from. */
+static uint64_t two_crashed_journals(void)
+{
+    uint64_t seq;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    seq = p1.db.pager.hs.record.committed_seq;
+    plant_journal(0, seq, slot0_txs, 2);
+    plant_journal(1, seq, slot1_txs, 2);
+    return seq;
+}
+
+static void test_recovery_merges_slots_by_stamp(void)
+{
+    uint64_t seq = two_crashed_journals();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_STRING("abc", value_of(&p2, 1));
+    TEST_ASSERT_EQUAL_STRING("d", value_of(&p2, 2));
+    TEST_ASSERT_EQUAL_UINT64(4, p2.db.applied);
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork/main.1.cdb"));
+    /* This session took slot 0: its counters go on above the slot's mark. */
+    TEST_ASSERT_EQUAL_UINT(0, p2.db.coord.me.slot);
+    TEST_ASSERT_EQUAL_UINT64(2, p2.db.my_mark);
+    TEST_ASSERT_EQUAL_UINT64(3, p2.db.next_tx);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+
+    /* The same journals again, as a crash between the archive commit and
+     * their removal would leave them: the marks say they are in, so nothing
+     * is applied twice. */
+    plant_journal(0, seq, slot0_txs, 2);
+    plant_journal(1, seq, slot1_txs, 2);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_STRING("abc", value_of(&p2, 1));
+    TEST_ASSERT_EQUAL_STRING("d", value_of(&p2, 2));
+    TEST_ASSERT_EQUAL_UINT64(4, p2.db.applied);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+
+    /* Only what is above a mark is new. */
+    {
+        static const struct jtx more[] = { { 2, 30, 1, "c" }, { 3, 50, 1, "e" } };
+        plant_journal(1, seq, more, 2);
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_STRING("abce", value_of(&p2, 1));
+    TEST_ASSERT_EQUAL_UINT64(5, p2.db.applied);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+}
+
+/* A journal started from an archive state newer than the archive (an older
+ * copy of the archive was put back) is set aside, never applied. */
+static void test_journal_from_newer_archive_set_aside(void)
+{
+    uint64_t seq = two_crashed_journals();
+    plant_journal(1, seq + 5, slot1_txs, 2);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_STRING("ac", value_of(&p2, 1));
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/main.1.cdb.stray"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+}
+
+/* Crash at every operation of the recovering open, in every mode: the next
+ * open always ends with each transaction applied exactly once. */
+static void test_recovery_crash_sweep(void)
+{
+    static const cdb_crash_mode modes[] = { CDB_CRASH_DROP_UNSYNCED, CDB_CRASH_KEEP_PREFIX, CDB_CRASH_TORN,
+                                            CDB_CRASH_REORDER };
+    uint64_t ops, op;
+    unsigned m;
+
+    two_crashed_journals();
+    {
+        uint64_t before = fe.clock.ops;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+        ops = fe.clock.ops - before;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    }
+    for (m = 0; m < sizeof modes / sizeof modes[0]; m++) {
+        for (op = 1; op <= ops; op++) {
+            init_env();
+            two_crashed_journals();
+            cdb_faultenv_arm(&fe, op, modes[m], 1, 100);
+            (void)open_proc(&p2);
+            cdb_faultenv_crash_now(&fe, modes[m], 1, 100);
+            cdb_faultenv_reboot(&fe);
+            TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+            TEST_ASSERT_EQUAL_STRING("abc", value_of(&p2, 1));
+            TEST_ASSERT_EQUAL_STRING("d", value_of(&p2, 2));
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+        }
+    }
+}
+
+/* Transaction counters are reserved in the slot before use, so after a
+ * crash the slot's next owner starts above anything the old one used. */
+static void test_counters_survive_crash(void)
+{
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 1, CDB_OP_REPLACE, "x", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+    TEST_ASSERT_EQUAL_UINT64(1 + 1024, p1.db.coord.me.tx_hwm);
+    cdb_faultenv_crash_now(&fe, CDB_CRASH_DROP_UNSYNCED, 0, 0);
+    cdb_faultenv_reboot(&fe);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_UINT(0, p2.db.coord.me.slot);
+    TEST_ASSERT_EQUAL_UINT64(1 + 1024, p2.db.next_tx);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
 }
 
@@ -527,6 +746,10 @@ int main(void)
     RUN_TEST(test_second_process_is_busy);
     RUN_TEST(test_crashed_process_recovered);
     RUN_TEST(test_idle_process_loses_slot);
+    RUN_TEST(test_recovery_merges_slots_by_stamp);
+    RUN_TEST(test_journal_from_newer_archive_set_aside);
+    RUN_TEST(test_recovery_crash_sweep);
+    RUN_TEST(test_counters_survive_crash);
     RUN_TEST(test_host_hooks);
     return UNITY_END();
 }
