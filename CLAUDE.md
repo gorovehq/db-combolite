@@ -30,7 +30,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M15 | Links: link types, the link store, delete and drop rules; the environment clock (spec 6, 14.4, 14.13) | done |
 | M16 | Time series: series, bit-level column blocks, late modes incl. hold-and-forward, collisions (spec 10, 14.11) | done |
 | M17 | Row-oriented tables on document pools, and nibblets (small records packed in shared pages) for document and table revisions and sparse time-series blocks: column schemas and schema changes, not-null/unique/primary keys, secondary indexes, history on or last-N (spec 9, 14.10.1, 16, 14.18) | done |
-| M18 | Column-oriented tables and compression: row groups (small column chunks as nibblets), automatic column encodings, pending rows folded at reconciliation; xz (LZMA2) for column chunks, large document bodies, journal records and in-page compression (spec 9.12, 14.10.2, 15) | parked after layer 1 of 4 (codec, column encodings, row-group storage); write path, history side store, reconciliation fold-in and table wiring remain |
+| M18 | Column-oriented tables and compression: row groups (small column chunks as nibblets), automatic column encodings, pending rows folded at reconciliation; xz (LZMA2) for column chunks, large document bodies, journal records and in-page compression (spec 9.12, 14.10.2, 15) | layer 1 of 4 merged into main (codec, column encodings, row-group storage), then parked; write path, history side store, reconciliation fold-in and table wiring remain |
 | M19 | Coordinator: the in-process coordinator, primary/subordinate election, heartbeats, the append/settle/choose baton protocol for reconciliation and compaction, per-process delta tracks and single-writer coordinator slots, multi-process recovery; completes M5 beyond the single-process case (spec 5, 14.4, 14.5) | planned |
 | M20 | Structured query core: operator-tree execution (Scan/Filter/Project/Join/Sort/Limit/Union/Aggregate/Traverse/TextSearch/VectorSearch/HybridRank), the expression grammar, the binary wire form, and the stored-procedure bytecode engine (spec 11.1, 11.2, 11.7, 11.10) | planned |
 | M21 | Text query language: db-combolite's own human-readable language, compiling into the M20 structured core, including the dotted-field-path question left open in spec 11.10 | planned |
@@ -47,7 +47,10 @@ ctest --test-dir build --output-on-failure   # run every test
 ctest --test-dir build -R test_value         # run one test executable
 ./build/tests/test_value                     # run one executable directly (Unity output)
 cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release   # optimised build, sanitizers off
+cmake --preset noxz                          # micro-controller test build: Debug, xz off, in build-noxz/
 ```
+
+The demo is built separately; see `demo/gutenfree/README.md`.
 
 ## Git workflow
 
@@ -132,6 +135,10 @@ These were agreed with the user:
   - **Crash modes:** drop every unsynced write, keep an in-order prefix of them, tear a write partway, or reorder (only the latest write survives, the way a real disk can land writes out of order).
   - **Crash sweeps.** A test counts a workload's mutating operations, then crashes at each one in every mode, calls `cdb_faultdev_reboot()`, and checks what recovery sees. Every new write sequence needs a sweep, and the reorder mode is what catches a missing barrier.
 - `tests/`: one Unity executable per module. Scratch files go in `CDB_TEST_TMPDIR`, which is the build's `tests/` directory.
+- `demo/gutenfree/`: **GutenFree Diet**, an ncurses e-reader on Project Gutenberg data that exercises every model and stresses the engine. It is built only with `-DCDB_BUILD_DEMO=ON` and runs from its own folder, with its data in `data/` (git-ignored).
+  - **Dependencies:** llama.cpp (embeddings) is vendored in `demo/third-party/llama.cpp`; see `VENDORED.md`.
+  - **API:** it uses the internal headers in `src/`, as the tests do.
+  - **Findings:** engine problems it turns up go in `docs/BACKLOG.md`.
 
 ## What db-combolite is
 
