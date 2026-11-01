@@ -102,6 +102,7 @@ Status: **confirmed by the project owner on 2026-10-30.** The four choices marke
 ### 5.9.1 Applying and merging
 
 - **Private pages.** Each process applies its own committed transactions to private copy-on-write pages over the archive. That is how a writer sees its own unreconciled changes (5.6). No other process ever sees those pages.
+- **Only the baton holder writes the archive (confirmed).** Free space, the append point and the header are shared, so a process that does not hold the baton (5.9.8) writes its private pages to its **overlay file**, `pages.<slot>.cdb` in the working directory, and never commits. The overlay is emptied at every rebase and removed at close. A process that holds the baton writes its private pages into the archive, as a single process always has.
 - **Merging is logical (confirmed).** At reconciliation, the baton holder replays the committed transactions of **every** slot's journal onto the archive, in merge order (5.9.2), through the same apply hook as recovery. Pages are never merged.
 - **Rebase.** When a process sees that the archive has moved (its committed sequence changed), it drops its private pages and re-applies its own committed transactions that are not yet reconciled (5.9.2) on top of the new archive. It checks at transaction begin, at the start of an operation scope and at every heartbeat.
 - **Journals belong to slots, not sessions.** The baton holder also merges the journals of dead coordinators. A process that later takes over a dead slot adopts its journal.
@@ -154,12 +155,19 @@ This implements the default policy of 11.3, where the later write is rejected. C
 
 - Each coordinator publishes in its slot the archive's committed sequence that its readers are using (14.5.2, offset 144).
 - A page freed by the commit with sequence *f* is reused only when *f* is below the committed sequence (3.4) **and** below the sequence published by every live coordinator. That way, no process reading an older archive state has a page overwritten under it.
+- **Publishing is checked.** A process reads the header, publishes its committed sequence *P*, then reads the header again. If the sequence is no longer *P*, it starts over. The baton holder reads every slot's published sequence before each archive commit it prepares, so a page that state *P* uses, freed at *P* + 1 or later, is never reused while *P* is published.
 
 ### 5.9.8 The baton (first version)
 
 - **One heat, round-robin.** Requests are served in merge order of their request stamps. The congestion-detecting queue and multiple heats come later.
 - **What needs the baton.** Reconciliation, compaction and catalog changes. Catalog changes and compaction already reconcile first (14.4.6, rule 4), so each of them runs as one baton session.
 - **Fencing.** Each baton's ID (CTS) is one above the previous baton's, which is published in the holder's slot (offset 112). Before committing the archive, the holder checks that its CTS is still the highest one published by any slot.
+- **Request and grant.** A requester writes request kind 1, its request stamp and *x-total* into its slot. When no live slot holds a baton, the request that is first by the rule of 5.5 takes it: it publishes the next CTS and the time it was issued (offset 128), waits the settle interval and checks again that no other slot published the same or a higher CTS. A slot holds the baton while its issue time is not 0. Releasing sets the issue time to 0 and keeps the CTS.
+- **Standing baton (confirmed).** A process that is the only live coordinator takes the baton without a settle wait and keeps it between reconciliations. When another process requests the baton, the holder reconciles what it has applied at its next library call or `cdb_db_tick`, then releases.
+- **Service window and timeout.** The window is the dead timeout plus a share sized from *x-total*. The holder publishes its progress *x* with every heartbeat. A holder that is dead, or that has gone a whole window without progress, has lost the baton: the next requester takes a CTS above it.
+- **Lease margin (confirmed).** Before each archive page write and before its commit, the holder checks on its own monotonic clock how long it has gone without a heartbeat. Past half the dead timeout, it gives the session up, releases and rebases. Others wait the whole timeout, so a stalled holder that wakes up stops writing before anyone else starts. What remains is a stall that falls between that check and the write itself.
+- **Waiting (confirmed).** A call that needs the baton while another live process holds it waits: it sleeps through the environment, heartbeats, and checks again, until it is granted or the holder times out. After a configurable cap (default: the service window plus the dead timeout), it returns `CDB_E_BUSY`.
+- **Renew and resume are the same.** A reconciliation is one atomic archive commit, so a session that crashes leaves nothing to resume: its process starts over from the archive state. Compaction commits at each step and simply continues from the last one.
 
 ## Open questions (do not specify until answered)
 

@@ -540,6 +540,178 @@ static void prepare_holes(void)
     make_holes(&p, 120, 4);
 }
 
+/* ------------------------------------------------------------ sharing (spec 5.9) */
+
+/* A second process's pager: its own memory, the same archive, and an
+ * overlay device of its own. */
+static uint8_t ov_current[CAP], ov_durable[CAP], ov_log_data[CAP];
+static cdb_fault_record ov_log[1024];
+static cdb_faultdev ov_dev;
+static cdb_storage ov_st;
+static uint8_t arena2[NODES * 2u * PAGE + 2u * PAGE];
+static cdb_pager_node nodes2[NODES];
+static cdb_free_extent free_list2[4096];
+
+static void open_second(cdb_pager *p, int private_mode)
+{
+    cdb_pager_config c2 = cfg;
+    c2.arena = arena2;
+    c2.nodes = nodes2;
+    c2.free_list = free_list2;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_open(p, &st, &c2));
+    if (private_mode) {
+        cdb_faultdev_config fc;
+        memset(&fc, 0, sizeof fc);
+        fc.current = ov_current;
+        fc.durable = ov_durable;
+        fc.capacity = CAP;
+        fc.log = ov_log;
+        fc.log_cap = sizeof ov_log / sizeof ov_log[0];
+        fc.log_data = ov_log_data;
+        fc.log_data_cap = CAP;
+        fc.geometry.program_unit = 1;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_faultdev_init(&ov_dev, &fc, &ov_st));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_set_private(p, &ov_st));
+    }
+}
+
+/* A private pager's writes land in its overlay: it reads them back, the
+ * archive file does not change, it cannot commit, and a reload forgets
+ * them. */
+static void test_private_writes_stay_in_overlay(void)
+{
+    cdb_pager a, b;
+    uint64_t lid, lid2, size_before, size_after;
+    create(&a);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_alloc(&a, &lid));
+    write_text(&a, lid, "base");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_storage_size(&st, &size_before));
+
+    open_second(&b, 1);
+    write_text(&b, lid, "mine");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_alloc(&b, &lid2));
+    write_text(&b, lid2, "new page");
+    write_text(&b, lid2, "new page, again"); /* in place */
+    expect_text(&b, lid, "mine");
+    expect_text(&b, lid2, "new page, again");
+    TEST_ASSERT_EQUAL_UINT64(3, b.ov_next);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_storage_size(&st, &size_after));
+    TEST_ASSERT_EQUAL_UINT64(size_before, size_after);
+    expect_text(&a, lid, "base");
+    TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_pager_commit(&b));
+    TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_pager_set_private(&b, NULL)); /* changes pending */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_free(&b, lid2));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_reload(&b));
+    TEST_ASSERT_TRUE(b.private_mode);
+    expect_text(&b, lid, "base");
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_pager_read(&b, lid2, page, &(cdb_page_header){0}));
+}
+
+/* A pager keeps reading the state it loaded while another commits, and sees
+ * the new state after a reload. */
+static void test_reload_sees_other_commits(void)
+{
+    cdb_pager a, b;
+    uint64_t lid;
+    create(&a);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_alloc(&a, &lid));
+    write_text(&a, lid, "one");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&a));
+    open_second(&b, 1);
+    expect_text(&b, lid, "one");
+    write_text(&a, lid, "two");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&a));
+    expect_text(&b, lid, "one");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_reload(&b));
+    expect_text(&b, lid, "two");
+}
+
+/* While another pager reads an older state, space that state may use is not
+ * reused, however many commits follow; once the limit is lifted, it is. */
+static void test_reuse_waits_for_reader(void)
+{
+    cdb_pager a, b;
+    uint64_t lid, before;
+    char text[32];
+    int i;
+    create(&a);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_alloc(&a, &lid));
+    for (i = 0; i < 10; i++) {
+        snprintf(text, sizeof text, "v%d", i);
+        write_text(&a, lid, text);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&a));
+    }
+    open_second(&b, 1);
+    cdb_pager_set_reuse_below(&a, b.hs.record.committed_seq); /* b's published sequence */
+    before = a.append_point;
+    for (i = 10; i < 60; i++) {
+        snprintf(text, sizeof text, "v%d", i);
+        write_text(&a, lid, text);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&a));
+        expect_text(&b, lid, "v9");
+    }
+    TEST_ASSERT_TRUE(a.append_point > before + 50u * 4u); /* every commit took new space */
+
+    cdb_pager_set_reuse_below(&a, 0);
+    for (i = 60; i < 70; i++) { /* the held space is free for reuse again */
+        snprintf(text, sizeof text, "v%d", i);
+        write_text(&a, lid, text);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&a));
+    }
+    before = a.append_point;
+    for (i = 70; i < 120; i++) {
+        snprintf(text, sizeof text, "v%d", i);
+        write_text(&a, lid, text);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&a));
+    }
+    TEST_ASSERT_EQUAL_UINT64(before, a.append_point);
+}
+
+static unsigned guard_left;
+
+static cdb_status count_down(void *ctx)
+{
+    (void)ctx;
+    if (guard_left == 0)
+        return CDB_E_BUSY;
+    guard_left--;
+    return CDB_OK;
+}
+
+/* The guard runs before every archive write, the header's too: once it
+ * refuses, nothing more is written, and the file keeps its last commit. */
+static void test_guard_stops_archive_writes(void)
+{
+    cdb_pager a;
+    uint64_t lid;
+    unsigned budget;
+    create(&a);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_alloc(&a, &lid));
+    write_text(&a, lid, "kept");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&a));
+    for (budget = 0; budget < 12; budget++) {
+        cdb_page_header t = data_tmpl();
+        cdb_status s;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_reload(&a));
+        guard_left = budget;
+        cdb_pager_set_guard(&a, count_down, NULL);
+        s = cdb_pager_write(&a, lid, &t, "lost", 4);
+        if (s == CDB_OK)
+            s = cdb_pager_commit(&a);
+        cdb_pager_set_guard(&a, NULL, NULL);
+        if (s == CDB_OK) {
+            TEST_ASSERT_TRUE(budget > 0);
+            break; /* enough budget for the whole commit */
+        }
+        TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, s);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_reload(&a));
+        expect_text(&a, lid, "kept");
+    }
+    TEST_ASSERT_TRUE(budget < 12);
+}
+
 static void test_compaction_crash_sweep(void)
 {
     const cdb_crash_mode modes[4] = { CDB_CRASH_DROP_UNSYNCED, CDB_CRASH_KEEP_PREFIX, CDB_CRASH_TORN,
@@ -716,6 +888,10 @@ int main(void)
     RUN_TEST(test_compaction_requires_committed_state);
     RUN_TEST(test_reclaim_trims_crash_leftovers);
     RUN_TEST(test_previous_state_survives_reuse);
+    RUN_TEST(test_private_writes_stay_in_overlay);
+    RUN_TEST(test_reload_sees_other_commits);
+    RUN_TEST(test_reuse_waits_for_reader);
+    RUN_TEST(test_guard_stops_archive_writes);
     RUN_TEST(test_compaction_crash_sweep);
     RUN_TEST(test_crash_sweep);
     return UNITY_END();

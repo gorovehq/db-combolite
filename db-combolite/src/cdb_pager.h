@@ -24,6 +24,8 @@
 #define CDB_ANCHOR_LIVE 1u
 #define CDB_ANCHOR_RESERVED 2u
 #define CDB_ANCHOR_RELEASED 3u
+/* Only in memory, never written: the page is in the overlay (spec 5.9.1). */
+#define CDB_ANCHOR_PRIVATE 4u
 
 /* Most pages one free-space chain may use; a longer list needs compaction. */
 #define CDB_PAGER_CHAIN_MAX 128u
@@ -112,6 +114,14 @@ typedef struct cdb_pager {
     int cat_exists;       /* a catalog root has been committed */
     int cat_dirty;        /* catroot changed; the next commit writes a slot */
     unsigned cat_next_slot; /* catalog root slot (0 or 1) the next write goes to */
+    /* Sharing the archive with other processes (spec 5.9). Kept by
+     * cdb_pager_reload; cleared by open and create. */
+    int private_mode;     /* writes go to the overlay; commits are refused */
+    cdb_storage overlay;  /* the overlay file, while private_mode */
+    uint64_t ov_next;     /* next overlay page number; 0 means "none" */
+    uint64_t reuse_below; /* space freed at this sequence or later is not reused; 0: no limit */
+    cdb_status (*guard)(void *ctx); /* checked before every archive write; NULL: none */
+    void *guard_ctx;
 } cdb_pager;
 
 /* Creates a new database on empty storage. h supplies the file settings:
@@ -181,5 +191,30 @@ cdb_status cdb_pager_reclaim_tail(cdb_pager *p, uint64_t *reclaimed);
  * max_moves live pages down into reusable holes, commits twice (so the
  * vacated pages become reusable), then reclaims the tail. */
 cdb_status cdb_pager_compact(cdb_pager *p, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed);
+
+/* Sharing the archive (spec 5.9). Only the baton holder writes the archive
+ * file; any other process keeps its changes private. */
+
+/* With overlay non-NULL, later writes go to that file as pages in state
+ * CDB_ANCHOR_PRIVATE, freed pages are not tracked, and commit, compaction
+ * and tail reclaim return CDB_E_STATE. NULL writes to the archive again.
+ * CDB_E_STATE with uncommitted changes: switch after a commit or a reload. */
+cdb_status cdb_pager_set_private(cdb_pager *p, const cdb_storage *overlay);
+
+/* Drops every uncommitted change, private or not, and loads the committed
+ * state the archive holds now, which another process may have moved on.
+ * Keeps the private mode, overlay, reuse limit and guard; the overlay starts
+ * over from its first page. */
+cdb_status cdb_pager_reload(cdb_pager *p);
+
+/* Space freed by the commit with sequence f is reused only when f is below
+ * seq as well as below the committed sequence: seq is the lowest committed
+ * sequence another process is reading (spec 5.9.7). 0 lifts the limit. */
+void cdb_pager_set_reuse_below(cdb_pager *p, uint64_t seq);
+
+/* guard(ctx) runs before every write to the archive file, the header
+ * included; an error from it stops the write and is returned (the lease
+ * margin of spec 5.9.8). NULL removes it. */
+void cdb_pager_set_guard(cdb_pager *p, cdb_status (*guard)(void *ctx), void *ctx);
 
 #endif

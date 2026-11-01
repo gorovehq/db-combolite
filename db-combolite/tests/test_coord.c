@@ -251,6 +251,135 @@ static void test_two_then_primary_dies(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&b));
 }
 
+/* -------------------------------------------------------- the baton */
+
+/* Alone, the baton is granted at once, with no settle wait; each new baton
+ * takes the next CTS. */
+static void test_baton_alone(void)
+{
+    cdb_coord a;
+    int64_t t0;
+    int granted;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, join(&a));
+    t0 = fe.mono_ns;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_take(&a, 10, &granted));
+    TEST_ASSERT_TRUE(granted);
+    TEST_ASSERT_EQUAL_INT64(t0, fe.mono_ns);
+    TEST_ASSERT_EQUAL_UINT64(1, a.me.cts);
+    TEST_ASSERT_TRUE(cdb_coord_baton_held(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_fence(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_guard(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_take(&a, 10, &granted)); /* held: a grant */
+    TEST_ASSERT_TRUE(granted);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_release(&a));
+    TEST_ASSERT_FALSE(cdb_coord_baton_held(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, cdb_coord_guard(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_take(&a, 10, &granted));
+    TEST_ASSERT_EQUAL_UINT64(2, a.me.cts);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&a));
+}
+
+/* A request waits while another holds the baton; the holder sees that it
+ * is wanted, and its release lets the request through with the next CTS.
+ * The old holder's fence then fails. */
+static void test_baton_passes_on_release(void)
+{
+    static cdb_coord a, b;
+    int granted;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, join(&a));
+    beating[nbeating++] = &a;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, join(&b));
+    beating[nbeating++] = &b;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_try(&a, 0, &granted));
+    TEST_ASSERT_TRUE(granted);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_try(&b, 0, &granted));
+    TEST_ASSERT_FALSE(granted);
+    TEST_ASSERT_EQUAL_UINT(CDB_COORD_REQ_BATON, b.me.req_kind);
+    run_for(2 * (int64_t)SEC);
+    TEST_ASSERT_TRUE(cdb_coord_baton_wanted(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_try(&b, 0, &granted));
+    TEST_ASSERT_FALSE(granted); /* a is alive and within its window */
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_release(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_try(&b, 0, &granted));
+    TEST_ASSERT_TRUE(granted);
+    TEST_ASSERT_EQUAL_UINT64(a.me.cts + 1u, b.me.cts);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_fence(&b));
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, cdb_coord_baton_fence(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&b));
+}
+
+/* A holder that goes silent loses the baton once it is dead; when it wakes,
+ * its guard and its fence both refuse further writes. */
+static void test_baton_dead_holder(void)
+{
+    static cdb_coord a, b;
+    int64_t t0;
+    int granted;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, join(&a));
+    beating[nbeating++] = &a;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, join(&b));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_take(&a, 0, &granted));
+    TEST_ASSERT_TRUE(granted);
+    beating[0] = &b; /* a goes silent */
+    t0 = fe.mono_ns;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_take(&b, 0, &granted));
+    TEST_ASSERT_TRUE(granted);
+    TEST_ASSERT_TRUE(fe.mono_ns - t0 >= 3 * (int64_t)SEC);
+    TEST_ASSERT_TRUE(b.me.cts > a.me.cts);
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, cdb_coord_guard(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, cdb_coord_baton_fence(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&b));
+}
+
+/* A holder that stays alive but neither progresses nor releases loses the
+ * baton after its service window. The new holder waits one more heartbeat
+ * interval, by which time the old holder's guard has seen the higher CTS. */
+static void test_baton_window_passes(void)
+{
+    static cdb_coord a, b;
+    int64_t t0;
+    int granted;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, join(&a));
+    beating[nbeating++] = &a;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, join(&b));
+    beating[nbeating++] = &b;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_take(&a, 0, &granted));
+    TEST_ASSERT_TRUE(granted);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_guard(&a));
+    t0 = fe.mono_ns;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_take(&b, 0, &granted));
+    TEST_ASSERT_TRUE(granted);
+    TEST_ASSERT_TRUE(fe.mono_ns - t0 >= 4 * (int64_t)SEC); /* window, then one interval */
+    TEST_ASSERT_TRUE(a.max_cts > a.me.cts);               /* a's own beats have seen it */
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, cdb_coord_guard(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&b));
+}
+
+/* A wait longer than the configured cap gives up and withdraws the
+ * request. */
+static void test_baton_wait_cap(void)
+{
+    static cdb_coord a, b;
+    cdb_coord_config cfg;
+    int granted;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.baton_wait_ns = SEC / 2;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, join(&a));
+    beating[nbeating++] = &a;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_join(&b, &env, DIR "/coord", db_id, CDB_ORDER_LITTLE, &cfg));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_take(&a, 0, &granted));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_take(&b, 0, &granted));
+    TEST_ASSERT_FALSE(granted);
+    TEST_ASSERT_EQUAL_UINT(CDB_COORD_REQ_NONE, b.me.req_kind);
+    TEST_ASSERT_TRUE(cdb_coord_baton_held(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&b));
+}
+
 /* A coordinator that stopped without leaving (a crash) holds its slot only
  * until it has been watched for the dead timeout; the next joiner takes the
  * slot over, counters included, and the silent one learns it lost it. */
@@ -739,6 +868,11 @@ int main(void)
     RUN_TEST(test_choose_rule);
     RUN_TEST(test_alone);
     RUN_TEST(test_two_then_primary_dies);
+    RUN_TEST(test_baton_alone);
+    RUN_TEST(test_baton_passes_on_release);
+    RUN_TEST(test_baton_dead_holder);
+    RUN_TEST(test_baton_window_passes);
+    RUN_TEST(test_baton_wait_cap);
     RUN_TEST(test_dead_slot_taken_over);
     RUN_TEST(test_lobby_race_lost);
     RUN_TEST(test_full);

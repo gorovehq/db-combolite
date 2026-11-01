@@ -380,6 +380,9 @@ The exact encoding of each operation, per data model, is defined with the data-m
 4. **Prepare record (kind 5).** Payload: the stamp (8 bytes), from the primary's clock in ns.
 5. **Replay after a crash.** For every slot's journal, the committed transactions above the slot's mark are merged in (stamp, slot, counter) order and numbered on from the watermark. Rule 3 of 14.4.6 becomes: a journal with a transaction to replay must have been started from the archive's committed state or an earlier one; one started from a later state is set aside.
 6. **The marks index borrows the catalog's work memory,** so every database is opened with `catalog_work` and `catalog_page` configured.
+7. **Journal in use, two places.** The slot's flag (14.5.2, bit 2) is what counts for each process: it is set once the slot's journal and its directory entry are durable, and cleared before the journal is removed. The header's companion slot 0 says that some session may hold changes: the first session to open sets it, and only a coordinator that closes while no other is alive clears it. A slot whose flag is set but whose journal is missing means possible loss. Recovery then refuses to open, and a baton holder's reconciliation returns `CDB_E_CORRUPT`, unless the operator accepts the loss (1.12.5).
+8. **Overlay file (5.9.1).** `pages.<slot>.cdb` holds whole pages in the archive's page format, at physical page numbers of its own. Nothing ever refers to it from the archive, it is never replayed, and recovery removes it.
+9. **Recovery only when alone.** Opening replays journals (rule 5) only when no other coordinator is alive. Otherwise the baton holder merges the dead slots' journals at its next reconciliation. A process that takes over a dead slot whose journal still holds transactions reconciles once before it starts its own journal.
 
 ### 14.4.8 Reconciliation-marks index (5.9.2)
 

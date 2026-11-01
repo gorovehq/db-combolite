@@ -257,14 +257,14 @@ static cdb_status new_journal(cdb_db *db, const char *path, uint64_t unsealed_se
  * (CDB_OP_*) followed by the model-specific data (spec 14.4.5). Reads into
  * cfg.record_buf, so the delta's data pointer is only valid during the apply
  * call. */
-static cdb_status apply_range(cdb_db *db, uint64_t tx_id, uint64_t start, uint64_t end, uint64_t commit_number)
+static cdb_status apply_range(cdb_db *db, cdb_journal *j, uint64_t tx_id, uint64_t start, uint64_t end,
+                              uint64_t commit_number)
 {
     uint64_t off = start;
     while (off < end) {
         cdb_record r;
         uint64_t next;
-        cdb_status s = cdb_journal_read(&db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size,
-                                        &r, &next);
+        cdb_status s = cdb_journal_read(j, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
         if (s != CDB_OK)
             return s;
         if (r.kind == CDB_RECORD_DATA && r.tx_id == tx_id) {
@@ -469,7 +469,7 @@ static cdb_status recover(cdb_db *db)
             break;
         if ((s = open_journal(db, best->slot)) != CDB_OK)
             return s;
-        s = apply_range(db, best->tx_id, best->start, best->commit_at, db->applied + 1u);
+        s = apply_range(db, &db->journal, best->tx_id, best->start, best->commit_at, db->applied + 1u);
         cdb_storage_close(&db->journal_st);
         if (s != CDB_OK)
             return s;
@@ -852,7 +852,7 @@ cdb_status cdb_tx_commit(cdb_db *db)
     /* The transaction is committed; make it visible through the pager. Its
      * commit number is the one reconciliation will give it while this
      * session is the only one contributing (spec 5.9.2). */
-    if ((s = apply_range(db, db->tx_id, db->tx_start, record_at, db->applied + 1u)) != CDB_OK) {
+    if ((s = apply_range(db, &db->journal, db->tx_id, db->tx_start, record_at, db->applied + 1u)) != CDB_OK) {
         db->failed = 1; /* the journal holds it; reopening replays it */
         return s;
     }

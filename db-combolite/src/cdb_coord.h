@@ -93,6 +93,8 @@ typedef struct cdb_coord_config {
     int64_t beat_ns;             /* heartbeat interval; 0: 1 s */
     unsigned dead_after;         /* heartbeat intervals before a coordinator is dead; 0: 3 */
     int64_t settle_ns;           /* settle interval (spec 5.5); 0: 2 ms */
+    int64_t baton_wait_ns;       /* longest wait for the baton; 0: the holder's service
+                                    window plus the dead timeout (spec 5.9.8) */
 } cdb_coord_config;
 
 /* The parts of another coordinator's record that the choices here use. */
@@ -105,6 +107,9 @@ typedef struct cdb_coord_brief {
     uint64_t req_time;
     uint64_t clock;
     uint64_t pinned;
+    uint64_t cts;
+    uint64_t issued;             /* nonzero while it holds the baton */
+    uint64_t x, x_total;
 } cdb_coord_brief;
 
 /* What one observer knows about another coordinator: when its counter last
@@ -115,6 +120,7 @@ typedef struct cdb_coord_peer {
     int live;
     uint64_t beat;
     int64_t changed_at;
+    int64_t moved_at;            /* when its baton or progress last changed */
     cdb_coord_brief b;
 } cdb_coord_peer;
 
@@ -143,6 +149,11 @@ typedef struct cdb_coord {
     unsigned nlobby;
     unsigned live_others;        /* other live coordinators at the last scan */
     int primary;                 /* slot of the live primary at the last scan; -1 none */
+    uint64_t max_cts;            /* highest CTS any other slot file shows, live or not */
+    unsigned journals_others;    /* other slot files whose journal is in use, live or not */
+    uint64_t min_pin;            /* lowest sequence a live other publishes (spec 5.9.7); 0 none */
+    int64_t scanned_at;          /* monotonic time of the last scan */
+    int64_t req_at;              /* monotonic time of this coordinator's baton request */
 } cdb_coord;
 
 /* Joins the coordinators of the database in dir (created if missing; its
@@ -164,6 +175,57 @@ cdb_status cdb_coord_beat(cdb_coord *c, int force);
 /* Raises the slot's transaction-counter high-water mark to hwm and makes it
  * durable (spec 14.4.3): counters below it may then be used. */
 cdb_status cdb_coord_reserve_tx(cdb_coord *c, uint64_t hwm);
+
+/* The baton (spec 5.3, 5.4, 5.9.8): the right to write the archive. A slot
+ * holds it while its issue time is nonzero.
+ *
+ * cdb_coord_baton_take requests it, declaring x_total units of work, and
+ * waits: it sleeps through the environment and heartbeats, until the baton
+ * is granted or the holder times out. *granted is 0 when the wait cap
+ * passed; the request is then withdrawn. With no other live coordinator it
+ * is granted at once, with no settle. Holding it already is a grant. */
+cdb_status cdb_coord_baton_take(cdb_coord *c, uint64_t x_total, int *granted);
+
+/* One attempt, without waiting; leaves the request in place on a miss. */
+cdb_status cdb_coord_baton_try(cdb_coord *c, uint64_t x_total, int *granted);
+
+/* Publishes progress x of the work declared; written with the next
+ * heartbeat. */
+void cdb_coord_baton_progress(cdb_coord *c, uint64_t x);
+
+/* Gives the baton up and withdraws any request. */
+cdb_status cdb_coord_baton_release(cdb_coord *c);
+
+/* Nonzero while this coordinator holds the baton. */
+int cdb_coord_baton_held(const cdb_coord *c);
+
+/* Nonzero if another live coordinator was requesting the baton at the last
+ * scan. */
+int cdb_coord_baton_wanted(const cdb_coord *c);
+
+/* Before an archive commit: scans, and CDB_E_BUSY if this coordinator no
+ * longer holds the highest CTS (spec 5.9.8, fencing). */
+cdb_status cdb_coord_baton_fence(cdb_coord *c);
+
+/* Before every archive write: CDB_E_BUSY once this coordinator has gone
+ * half the dead timeout without a heartbeat (the lease margin), else writes
+ * a heartbeat if one is due. */
+cdb_status cdb_coord_guard(cdb_coord *c);
+
+/* Sets or clears the slot's "journal in use" flag and makes it durable
+ * (spec 14.4.7 rule 7). */
+cdb_status cdb_coord_set_journal(cdb_coord *c, int in_use);
+
+/* Publishes the archive committed sequence this process reads (spec 5.9.7). */
+cdb_status cdb_coord_publish_pin(cdb_coord *c, uint64_t seq);
+
+/* Reads slot s's file: *valid is 0 when there is none, or none of this
+ * database. */
+cdb_status cdb_coord_read_slot(cdb_coord *c, unsigned s, cdb_coord_rec *r, int *valid);
+
+/* Removes slot s's file, once a merge has taken in everything it stood for.
+ * CDB_E_STATE for this coordinator's own slot or a live one. */
+cdb_status cdb_coord_remove_slot(cdb_coord *c, unsigned s);
 
 /* Leaves cleanly: removes the slot file. */
 cdb_status cdb_coord_leave(cdb_coord *c);

@@ -143,20 +143,26 @@ static cdb_status next_seq(cdb_pager *p, uint64_t *seq)
     return CDB_OK;
 }
 
-/* Physical page for a new write: the lowest free page whose freeing commit is
- * older than the latest commit, else the append point. Pages freed by the
- * latest commit stay untouched: the previous header slot's state may still
- * reference them (spec 1.9, 3.5). */
+/* Whether space freed by the commit with sequence freed may be written now.
+ * Pages freed by the latest commit stay untouched: the previous header
+ * slot's state may still reference them (spec 1.9, 3.5). Nor is space reused
+ * that a state another process still reads may reference (spec 5.9.7). */
+static int reusable(const cdb_pager *p, uint64_t freed)
+{
+    return freed < p->hs.record.committed_seq && (p->reuse_below == 0 || freed < p->reuse_below);
+}
+
+/* Physical page for a new write: the lowest reusable free page, else the
+ * append point. */
 static uint64_t alloc_phys(cdb_pager *p)
 {
-    uint64_t committed = p->hs.record.committed_seq;
     size_t i;
     /* The list is sorted by start, so the first eligible extent holds the
      * lowest reusable page. Take its first page and shrink it (or drop it
      * when it becomes empty). */
     for (i = 0; i < p->free_len; i++) {
         cdb_free_extent *x = &p->cfg.free_list[i];
-        if (x->freed_seq < committed) {
+        if (reusable(p, x->freed_seq)) {
             uint64_t phys = x->start;
             x->start++;
             if (--x->len == 0) {
@@ -176,11 +182,25 @@ static uint64_t alloc_phys(cdb_pager *p)
 static cdb_status write_page_at(cdb_pager *p, uint8_t *buf, cdb_page_header *h, uint64_t phys)
 {
     cdb_status s;
+    if (p->guard != NULL && (s = p->guard(p->guard_ctx)) != CDB_OK)
+        return s;
     if ((s = next_seq(p, &h->write_seq)) != CDB_OK)
         return s;
     if ((s = cdb_page_seal(buf, p->page_size, p->fmt, p->order, p->checksum_alg, h)) != CDB_OK)
         return s;
     return cdb_storage_program(&p->st, phys_offset(p, phys), buf, p->page_size);
+}
+
+/* Seals buf and writes it at page phys of the overlay (spec 5.9.1). The
+ * sequence number is taken without reserving it: overlay pages never reach
+ * the archive, and the pager reloads before it writes the archive again. */
+static cdb_status write_overlay(cdb_pager *p, uint8_t *buf, cdb_page_header *h, uint64_t phys)
+{
+    cdb_status s;
+    h->write_seq = p->next_seq++;
+    if ((s = cdb_page_seal(buf, p->page_size, p->fmt, p->order, p->checksum_alg, h)) != CDB_OK)
+        return s;
+    return cdb_storage_program(&p->overlay, phys_offset(p, phys), buf, p->page_size);
 }
 
 /* Writes buf to a newly allocated physical page and reports where in *phys. */
@@ -260,7 +280,7 @@ static cdb_status free_push(cdb_pager *p, uint64_t start, uint64_t len)
     return CDB_OK;
 }
 
-/* Extents freed before the latest commit are reusable for good: mark them 0
+/* Extents that are reusable now are reusable for good: mark them 0
  * ("reusable") and merge touching extents that share a sequence
  * (spec 14.7.4). This keeps the list short. Compacts the list in place. */
 static void free_normalize(cdb_pager *p)
@@ -269,7 +289,7 @@ static void free_normalize(cdb_pager *p)
     size_t i, out = 0;
     for (i = 0; i < p->free_len; i++) {
         cdb_free_extent x = list[i];
-        if (x.freed_seq < p->hs.record.committed_seq)
+        if (reusable(p, x.freed_seq))
             x.freed_seq = 0;
         if (out > 0 && list[out - 1].freed_seq == x.freed_seq
             && list[out - 1].start + list[out - 1].len == x.start)
@@ -1027,6 +1047,27 @@ static cdb_status pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header 
     if (e.state == CDB_ANCHOR_RELEASED)
         return CDB_E_NOT_FOUND;
     leaf->dirty = 1; /* pin the leaf while the page is written */
+    /* Private mode (spec 5.9.1): the new version goes to the overlay, in
+     * place if it is there already. The archive page is left alone and not
+     * put on the free list, since this pager never commits. */
+    if (p->private_mode) {
+        memset(p->scratch, 0, p->page_size);
+        if (len)
+            memcpy(p->scratch + payload_off(p), payload, len);
+        h = *tmpl;
+        h.logical_id = lid;
+        h.payload_len = (uint32_t)len;
+        if (e.state == CDB_ANCHOR_PRIVATE)
+            return write_overlay(p, p->scratch, &h, e.phys);
+        phys = p->ov_next++;
+        if ((s = write_overlay(p, p->scratch, &h, phys)) != CDB_OK)
+            return s;
+        e.phys = phys;
+        e.size_log2 = (uint8_t)p->hs.record.default_page_log2;
+        e.state = CDB_ANCHOR_PRIVATE;
+        e.extent_len = 0;
+        return entry_set(p, leaf, slot, &e);
+    }
     /* Case 1: the current page is already a private, uncommitted copy.
      * Overwrite it where it is; the anchor entry does not change. */
     if (may_rewrite && e.state == CDB_ANCHOR_LIVE && written_since_commit(p, e.phys, lid)) {
@@ -1077,9 +1118,10 @@ cdb_status cdb_pager_read(cdb_pager *p, uint64_t lid, uint8_t *page, cdb_page_he
 
     if ((s = entry_get(p, lid, &leaf, &slot, &e)) != CDB_OK)
         return s;
-    if (e.state != CDB_ANCHOR_LIVE)
+    if (e.state != CDB_ANCHOR_LIVE && e.state != CDB_ANCHOR_PRIVATE)
         return CDB_E_NOT_FOUND;
-    if ((s = cdb_storage_read(&p->st, phys_offset(p, e.phys), page, p->page_size)) != CDB_OK)
+    if ((s = cdb_storage_read(e.state == CDB_ANCHOR_PRIVATE ? &p->overlay : &p->st, phys_offset(p, e.phys), page,
+                              p->page_size)) != CDB_OK)
         return s == CDB_E_TRUNCATED ? CDB_E_CORRUPT : s;
     if ((s = cdb_page_open(page, p->page_size, p->fmt, p->order, p->checksum_alg, h)) != CDB_OK)
         return s;
@@ -1100,10 +1142,10 @@ cdb_status cdb_pager_free(cdb_pager *p, uint64_t lid)
         return CDB_E_READ_ONLY;
     if ((s = entry_get(p, lid, &leaf, &slot, &e)) != CDB_OK)
         return s;
-    if (e.state != CDB_ANCHOR_LIVE)
+    if (e.state != CDB_ANCHOR_LIVE && e.state != CDB_ANCHOR_PRIVATE)
         return CDB_E_NOT_FOUND;
     leaf->dirty = 1; /* pin the leaf so free_push cannot evict it */
-    if ((s = free_push(p, e.phys, 1)) != CDB_OK)
+    if (!p->private_mode && (s = free_push(p, e.phys, 1)) != CDB_OK)
         return s;
     e.phys = 0;
     e.state = CDB_ANCHOR_RELEASED;
@@ -1192,6 +1234,8 @@ cdb_status cdb_pager_commit(cdb_pager *p)
         return CDB_E_READ_ONLY;
     if (!p->dirty)
         return CDB_OK;
+    if (p->private_mode)
+        return CDB_E_STATE; /* only the baton holder commits (spec 5.9.1) */
 
     /* Step 1 barrier: data pages written since the last commit are durable. */
     if ((s = cdb_storage_sync(&p->st)) != CDB_OK)
@@ -1263,6 +1307,8 @@ cdb_status cdb_pager_commit(cdb_pager *p)
     rec.anchor_mirror_root = p->root_mirror;
     rec.append_point = p->append_point;
     rec.page_seq_hwm = p->seq_hwm;
+    if (p->guard != NULL && (s = p->guard(p->guard_ctx)) != CDB_OK)
+        return s;
     if ((s = cdb_header_commit(&p->st, &p->hs, &rec)) != CDB_OK)
         return s;
     /* Pages written from now on are newer than this commit, so they may be
@@ -1283,7 +1329,7 @@ static uint64_t lowest_reusable(const cdb_pager *p)
 {
     size_t i;
     for (i = 0; i < p->free_len; i++)
-        if (p->cfg.free_list[i].freed_seq < p->hs.record.committed_seq)
+        if (reusable(p, p->cfg.free_list[i].freed_seq))
             return p->cfg.free_list[i].start;
     return 0;
 }
@@ -1293,19 +1339,18 @@ static uint64_t lowest_reusable(const cdb_pager *p)
  * the two leaves a slightly longer file, which is harmless. */
 cdb_status cdb_pager_reclaim_tail(cdb_pager *p, uint64_t *reclaimed)
 {
-    uint64_t committed = p->hs.record.committed_seq;
     uint64_t end = p->append_point, size;
     cdb_status s;
 
     *reclaimed = 0;
     if (p->read_only)
         return CDB_E_READ_ONLY;
-    if (p->dirty)
-        return CDB_E_STATE; /* commit first */
+    if (p->dirty || p->private_mode)
+        return CDB_E_STATE; /* commit first; only the baton holder writes */
     /* The free tail: extents that reach the append point and may be reused. */
     while (p->free_len > 0) {
         cdb_free_extent *last = &p->cfg.free_list[p->free_len - 1];
-        if (last->start + last->len != end || last->freed_seq >= committed)
+        if (last->start + last->len != end || !reusable(p, last->freed_seq))
             break;
         end = last->start;
         p->free_len--;
@@ -1384,8 +1429,8 @@ cdb_status cdb_pager_compact(cdb_pager *p, uint64_t max_moves, uint64_t *moved, 
     *reclaimed = 0;
     if (p->read_only)
         return CDB_E_READ_ONLY;
-    if (p->dirty)
-        return CDB_E_STATE; /* commit first */
+    if (p->dirty || p->private_mode)
+        return CDB_E_STATE; /* commit first; only the baton holder writes */
 
     /* Space freed by the latest commit is not reusable yet. A fence commit
      * makes everything freed so far eligible. */
@@ -1407,12 +1452,12 @@ cdb_status cdb_pager_compact(cdb_pager *p, uint64_t max_moves, uint64_t *moved, 
      * (spec 3.4 step 1). Pages already below it stay where they are, so
      * compacting a compact file moves nothing. */
     {
-        uint64_t reusable = 0;
+        uint64_t free_pages = 0;
         size_t i;
         for (i = 0; i < p->free_len; i++)
-            if (p->cfg.free_list[i].freed_seq < p->hs.record.committed_seq)
-                reusable += p->cfg.free_list[i].len;
-        target = p->append_point - reusable;
+            if (reusable(p, p->cfg.free_list[i].freed_seq))
+                free_pages += p->cfg.free_list[i].len;
+        target = p->append_point - free_pages;
     }
     for (lid = 1; lid < p->next_lid && *moved < max_moves; lid++) {
         cdb_anchor_entry e;
@@ -1448,4 +1493,51 @@ cdb_status cdb_pager_compact(cdb_pager *p, uint64_t max_moves, uint64_t *moved, 
     }
     /* Step 4: release the freed tail. */
     return cdb_pager_reclaim_tail(p, reclaimed);
+}
+
+/* -------------------------------------------------------- sharing */
+
+cdb_status cdb_pager_set_private(cdb_pager *p, const cdb_storage *overlay)
+{
+    if (p->dirty)
+        return CDB_E_STATE;
+    if (overlay == NULL) {
+        p->private_mode = 0;
+        return CDB_OK;
+    }
+    p->overlay = *overlay;
+    p->private_mode = 1;
+    p->ov_next = 1;
+    return CDB_OK;
+}
+
+/* Opening again is exactly "load the committed state"; the settings for
+ * sharing are the only things that outlive it. */
+cdb_status cdb_pager_reload(cdb_pager *p)
+{
+    cdb_storage st = p->st, overlay = p->overlay;
+    cdb_pager_config cfg = p->cfg;
+    int private_mode = p->private_mode;
+    uint64_t reuse_below = p->reuse_below;
+    cdb_status (*guard)(void *) = p->guard;
+    void *guard_ctx = p->guard_ctx;
+    cdb_status s = cdb_pager_open(p, &st, &cfg);
+    p->private_mode = private_mode;
+    p->overlay = overlay;
+    p->ov_next = 1;
+    p->reuse_below = reuse_below;
+    p->guard = guard;
+    p->guard_ctx = guard_ctx;
+    return s;
+}
+
+void cdb_pager_set_reuse_below(cdb_pager *p, uint64_t seq)
+{
+    p->reuse_below = seq;
+}
+
+void cdb_pager_set_guard(cdb_pager *p, cdb_status (*guard)(void *ctx), void *ctx)
+{
+    p->guard = guard;
+    p->guard_ctx = ctx;
 }

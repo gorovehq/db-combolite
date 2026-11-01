@@ -250,6 +250,15 @@ typedef struct cdb_db {
     cdb_storage journal_st;
     cdb_pager pager;
     cdb_journal journal;
+    /* Sharing the archive with other processes (spec 5.9). */
+    char overlay_path[CDB_DB_PATH_MAX]; /* <base>.cdbwork/pages.<slot>.cdb (spec 5.9.1) */
+    cdb_storage overlay_st;
+    int have_overlay;     /* overlay_st is open */
+    cdb_storage rj_st;    /* reads journals while recovering or merging */
+    cdb_journal rj;
+    int fresh;            /* the pager holds the archive's last commit plus only this
+                             process's own transactions, so it may be committed as is */
+    uint64_t pins_seq;    /* committed sequence at which the others' pins were last read */
     uint64_t applied;     /* highest commit number applied to the pager */
     uint64_t next_tx;     /* counter part of the next transaction ID */
     uint64_t last_tx;     /* counter of this slot's last committed transaction */
@@ -299,9 +308,13 @@ typedef struct cdb_db {
  * Other errors: CDB_E_INVALID_ARG for missing buffers or a path too long;
  * CDB_E_READ_ONLY for a file this build may only read (not supported yet);
  * CDB_E_CORRUPT when a journal marked in use is missing or had to be set
- * aside, unless cfg->flags has CDB_DB_ACCEPT_LOSS; CDB_E_BUSY when another
- * live process has the database open (until processes can share one, M19).
- * Opening may wait: see cdb_coord_join. */
+ * aside, unless cfg->flags has CDB_DB_ACCEPT_LOSS; CDB_E_BUSY when every
+ * coordinator slot is held by a live process.
+ *
+ * Several processes may have one database open (spec 5.9). Only the one
+ * holding the baton writes the archive; the others keep their changes in
+ * an overlay file until they reconcile, and see the others' changes once
+ * those are reconciled. Opening may wait: see cdb_coord_join. */
 cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const cdb_db_config *cfg,
                        const cdb_header *create);
 
@@ -312,9 +325,11 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
  * slot while it was silent; the database is then failed and must be closed. */
 cdb_status cdb_db_tick(cdb_db *db);
 
-/* Reconciles everything and leaves the database as one file at rest.
- * CDB_E_STATE if an apply failed earlier: the journal is then kept so the
- * next open can replay it. */
+/* Reconciles everything and, if no other process has the database open,
+ * leaves it as one file at rest. CDB_E_STATE if an apply failed earlier:
+ * the journal is then kept so the next open can replay it. CDB_E_BUSY when
+ * the baton could not be had (spec 5.9.8); the database stays open and the
+ * call may be repeated. */
 cdb_status cdb_db_close(cdb_db *db);
 
 /* An operation scope: every store opened inside it stays open until the
@@ -339,7 +354,10 @@ cdb_status cdb_tx_put(cdb_db *db, uint64_t store_id, uint64_t entry_id, uint8_t 
 cdb_status cdb_tx_commit(cdb_db *db);
 cdb_status cdb_tx_abort(cdb_db *db);
 
-/* Folds every applied change into the archive (spec 3.2) and starts a new journal. */
+/* Folds every applied change into the archive (spec 3.2) and starts a new
+ * journal. With other processes open it takes the baton, waiting for it if
+ * need be, and merges every process's committed transactions (spec 5.9.1);
+ * CDB_E_BUSY when the wait passes its cap. */
 cdb_status cdb_db_reconcile(cdb_db *db);
 
 /* The environment's clock, in nanoseconds since the Unix epoch. *have is 0
