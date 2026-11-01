@@ -355,7 +355,10 @@ void cdb_faultenv_on_sleep(cdb_faultenv *fe, void (*fn)(void *arg), void *arg)
 
 static const cdb_env_ops faultenv_ops = {
     fe_open, fe_remove, fe_rename, fe_mkdir, fe_rmdir, fe_exists, fe_sync_dir, fe_now, fe_alloc, fe_free,
-    fe_list, fe_mono, fe_random, fe_sleep
+    fe_list, fe_mono, fe_random, fe_sleep,
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL
 };
 
 void cdb_faultenv_advance(cdb_faultenv *fe, int64_t ns)

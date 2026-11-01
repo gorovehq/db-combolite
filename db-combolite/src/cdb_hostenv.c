@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -204,9 +205,184 @@ static void he_sleep(void *ctx, int64_t ns)
         ;
 }
 
+struct cdb_mutex {
+    pthread_mutex_t m;
+};
+
+struct cdb_cond {
+    pthread_cond_t c;
+};
+
+struct cdb_thread {
+    pthread_t thread;
+    void (*fn)(void *arg);
+    void *arg;
+};
+
+static cdb_status he_mutex_create(void *ctx, cdb_mutex **out)
+{
+    cdb_mutex *m;
+    (void)ctx;
+    if (out == NULL)
+        return CDB_E_INVALID_ARG;
+    m = (cdb_mutex *)malloc(sizeof *m);
+    if (m == NULL)
+        return CDB_E_BUFFER_TOO_SMALL;
+    if (pthread_mutex_init(&m->m, NULL) != 0) {
+        free(m);
+        return CDB_E_IO;
+    }
+    *out = m;
+    return CDB_OK;
+}
+
+static cdb_status he_mutex_lock(void *ctx, cdb_mutex *m)
+{
+    (void)ctx;
+    if (m == NULL)
+        return CDB_E_INVALID_ARG;
+    return pthread_mutex_lock(&m->m) == 0 ? CDB_OK : CDB_E_IO;
+}
+
+static cdb_status he_mutex_unlock(void *ctx, cdb_mutex *m)
+{
+    (void)ctx;
+    if (m == NULL)
+        return CDB_E_INVALID_ARG;
+    return pthread_mutex_unlock(&m->m) == 0 ? CDB_OK : CDB_E_IO;
+}
+
+static void he_mutex_destroy(void *ctx, cdb_mutex *m)
+{
+    (void)ctx;
+    if (m == NULL)
+        return;
+    pthread_mutex_destroy(&m->m);
+    free(m);
+}
+
+static cdb_status he_cond_create(void *ctx, cdb_cond **out)
+{
+    cdb_cond *c;
+    pthread_condattr_t attr;
+    (void)ctx;
+    if (out == NULL)
+        return CDB_E_INVALID_ARG;
+    c = (cdb_cond *)malloc(sizeof *c);
+    if (c == NULL)
+        return CDB_E_BUFFER_TOO_SMALL;
+    if (pthread_condattr_init(&attr) != 0) {
+        free(c);
+        return CDB_E_IO;
+    }
+    if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) != 0) {
+        pthread_condattr_destroy(&attr);
+        free(c);
+        return CDB_E_IO;
+    }
+    if (pthread_cond_init(&c->c, &attr) != 0) {
+        pthread_condattr_destroy(&attr);
+        free(c);
+        return CDB_E_IO;
+    }
+    pthread_condattr_destroy(&attr);
+    *out = c;
+    return CDB_OK;
+}
+
+static cdb_status he_cond_signal(void *ctx, cdb_cond *c)
+{
+    (void)ctx;
+    if (c == NULL)
+        return CDB_E_INVALID_ARG;
+    return pthread_cond_signal(&c->c) == 0 ? CDB_OK : CDB_E_IO;
+}
+
+static cdb_status he_cond_broadcast(void *ctx, cdb_cond *c)
+{
+    (void)ctx;
+    if (c == NULL)
+        return CDB_E_INVALID_ARG;
+    return pthread_cond_broadcast(&c->c) == 0 ? CDB_OK : CDB_E_IO;
+}
+
+static cdb_status he_cond_wait(void *ctx, cdb_cond *c, cdb_mutex *m, int64_t timeout_ns)
+{
+    (void)ctx;
+    if (c == NULL || m == NULL)
+        return CDB_E_INVALID_ARG;
+    if (timeout_ns <= 0)
+        return pthread_cond_wait(&c->c, &m->m) == 0 ? CDB_OK : CDB_E_IO;
+    {
+        struct timespec ts;
+        int rc;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+            return CDB_E_UNSUPPORTED;
+        ts.tv_sec += (time_t)(timeout_ns / 1000000000);
+        ts.tv_nsec += (long)(timeout_ns % 1000000000);
+        if (ts.tv_nsec >= 1000000000) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000;
+        }
+        rc = pthread_cond_timedwait(&c->c, &m->m, &ts);
+        if (rc == ETIMEDOUT)
+            return CDB_E_TIMEOUT;
+        return rc == 0 ? CDB_OK : CDB_E_IO;
+    }
+}
+
+static void he_cond_destroy(void *ctx, cdb_cond *c)
+{
+    (void)ctx;
+    if (c == NULL)
+        return;
+    pthread_cond_destroy(&c->c);
+    free(c);
+}
+
+static void *he_thread_trampoline(void *arg)
+{
+    cdb_thread *t = (cdb_thread *)arg;
+    t->fn(t->arg);
+    return NULL;
+}
+
+static cdb_status he_thread_create(void *ctx, cdb_thread **out, void (*fn)(void *arg), void *arg)
+{
+    cdb_thread *t;
+    (void)ctx;
+    if (out == NULL || fn == NULL)
+        return CDB_E_INVALID_ARG;
+    t = (cdb_thread *)malloc(sizeof *t);
+    if (t == NULL)
+        return CDB_E_BUFFER_TOO_SMALL;
+    t->fn = fn;
+    t->arg = arg;
+    if (pthread_create(&t->thread, NULL, he_thread_trampoline, t) != 0) {
+        free(t);
+        return CDB_E_IO;
+    }
+    *out = t;
+    return CDB_OK;
+}
+
+static cdb_status he_thread_join(void *ctx, cdb_thread *t)
+{
+    int rc;
+    (void)ctx;
+    if (t == NULL)
+        return CDB_E_INVALID_ARG;
+    rc = pthread_join(t->thread, NULL);
+    free(t);
+    return rc == 0 ? CDB_OK : CDB_E_IO;
+}
+
 static const cdb_env_ops hostenv_ops = {
     he_open, he_remove, he_rename, he_mkdir, he_rmdir, he_exists, he_sync_dir, he_now, he_alloc, he_free,
-    he_list, he_mono, he_random, he_sleep
+    he_list, he_mono, he_random, he_sleep,
+    he_mutex_create, he_mutex_lock, he_mutex_unlock, he_mutex_destroy,
+    he_cond_create, he_cond_signal, he_cond_broadcast, he_cond_wait, he_cond_destroy,
+    he_thread_create, he_thread_join
 };
 
 void cdb_hostenv_init(cdb_hostenv *he, cdb_env *out)

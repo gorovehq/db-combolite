@@ -42,6 +42,8 @@ if(CDB_WITH_XZ)
   add_subdirectory(third-party/xz EXCLUDE_FROM_ALL)
 endif()
 
+find_package(Threads REQUIRED)
+
 set(CDB_WARNINGS
   -Wall -Wextra -Wpedantic
   -Wshadow -Wconversion -Wsign-conversion
@@ -89,6 +91,7 @@ target_include_directories(combolite
   PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(combolite PRIVATE ${CDB_WARNINGS})
+target_link_libraries(combolite PUBLIC Threads::Threads)
 if(UNIX)
   target_link_libraries(combolite PUBLIC m) # log() for BM25 ranking
 endif()
