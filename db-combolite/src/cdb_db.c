@@ -111,6 +111,14 @@ static void journal_paths(const cdb_db *db, unsigned slot, char *path, char *tmp
     }
 }
 
+/* The private page overlay of a slot (spec 5.9.1, 14.4.7 rule 8). */
+static void overlay_path_of(const cdb_db *db, unsigned slot, char *path)
+{
+    int n = snprintf(path, CDB_DB_PATH_MAX, "%s/pages.%u.cdb", db->workdir, slot);
+    if (n < 0 || n >= (int)CDB_DB_PATH_MAX)
+        path[0] = '\0';
+}
+
 /* -------------------------------------------------------- companion slot */
 
 /* Companion slot 0 in the file header describes the main journal
@@ -302,22 +310,26 @@ static cdb_status set_aside(cdb_db *db, const char *path)
     return env_sync_dir(db, db->workdir);
 }
 
-/* Opens slot's journal as db->journal and checks its header. */
+/* Opens slot's journal as db->rj and checks its header. */
 static cdb_status open_journal(cdb_db *db, unsigned slot)
 {
     char path[CDB_DB_PATH_MAX];
     cdb_status s;
     journal_paths(db, slot, path, NULL);
-    if ((s = env_open(db, path, 0, &db->journal_st)) != CDB_OK)
+    if ((s = env_open(db, path, 0, &db->rj_st)) != CDB_OK)
         return s;
-    if ((s = cdb_journal_open(&db->journal, &db->journal_st, db->pager.order)) != CDB_OK)
-        cdb_storage_close(&db->journal_st);
+    if ((s = cdb_journal_open(&db->rj, &db->rj_st, db->pager.order)) != CDB_OK)
+        cdb_storage_close(&db->rj_st);
     return s;
 }
 
-/* One slot's journal while recovery merges them (spec 14.4.7 rule 5). */
+/* One slot's journal while recovery or reconciliation merges them (spec
+ * 5.9.1, 14.4.7 rule 5). */
 struct jcursor {
     unsigned slot;
+    int dead_slot;      /* a dead peer's slot file exists and should be removed */
+    int has_journal;    /* main.<slot>.cdb exists */
+    uint64_t dead_hwm;  /* tx_hwm from a dead peer's slot file */
     uint64_t mark;      /* the slot's transactions through this counter are in the archive */
     uint64_t off;       /* where the scan resumes */
     uint64_t top;       /* highest counter of a committed transaction seen */
@@ -357,7 +369,7 @@ static cdb_status scan_next(cdb_db *db, struct jcursor *c)
     for (;;) {
         cdb_record r;
         uint64_t next;
-        if (cdb_journal_read(&db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next) != CDB_OK)
+        if (cdb_journal_read(&db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next) != CDB_OK)
             break;
         if (r.kind == CDB_RECORD_DATA && r.tx_id != cur) {
             cur = r.tx_id;
@@ -387,7 +399,7 @@ static cdb_status scan_next(cdb_db *db, struct jcursor *c)
         off = next;
     }
     c->off = off;
-    cdb_storage_close(&db->journal_st);
+    cdb_storage_close(&db->rj_st);
     return CDB_OK;
 }
 
@@ -402,13 +414,18 @@ static cdb_status cursor_open(cdb_db *db, unsigned slot, struct jcursor *c, int 
     cdb_status s;
 
     *usable = 0;
+    memset(c, 0, sizeof *c);
+    c->slot = slot;
     journal_paths(db, slot, path, tmp);
-    /* A .new journal is left only by a crash during rotation, before the
-     * rename; the old journal was still the real one, so it is discarded. */
-    if ((s = env_exists(db, tmp, &exists)) != CDB_OK)
-        return s;
-    if (exists && (s = env_remove(db, tmp)) != CDB_OK)
-        return s;
+    /* A .new journal on a slot with no live writer is left only by a crash
+     * during rotation, before the rename; the old journal was still the real
+     * one, so it is discarded. */
+    if (!db->coord.peers[slot].live && (slot != db->coord.me.slot || db->journal_st.ops == NULL)) {
+        if ((s = env_exists(db, tmp, &exists)) != CDB_OK)
+            return s;
+        if (exists && (s = env_remove(db, tmp)) != CDB_OK)
+            return s;
+    }
     if ((s = env_exists(db, path, &exists)) != CDB_OK || !exists)
         return s;
     s = open_journal(db, slot);
@@ -416,12 +433,10 @@ static cdb_status cursor_open(cdb_db *db, unsigned slot, struct jcursor *c, int 
         return set_aside(db, path); /* unreadable (spec 1.12.2) */
     if (s != CDB_OK)
         return s;
-    foreign = memcmp(db->journal.hdr.db_id, db->pager.hs.record.db_id, 16) != 0 || db->journal.hdr.slot != slot;
-    memset(c, 0, sizeof *c);
-    c->slot = slot;
-    c->unsealed = db->journal.hdr.unsealed_seq;
+    foreign = memcmp(db->rj.hdr.db_id, db->pager.hs.record.db_id, 16) != 0 || db->rj.hdr.slot != slot;
+    c->unsealed = db->rj.hdr.unsealed_seq;
     c->off = CDB_JOURNAL_HEADER_SIZE;
-    cdb_storage_close(&db->journal_st);
+    cdb_storage_close(&db->rj_st);
     if (foreign)
         return set_aside(db, path); /* another database's, or another slot's */
     if ((s = mark_get(db, slot, &c->mark)) != CDB_OK || (s = scan_next(db, c)) != CDB_OK)
@@ -431,31 +446,91 @@ static cdb_status cursor_open(cdb_db *db, unsigned slot, struct jcursor *c, int 
      * 14.4.6 rule 3, 14.4.7). Nothing to apply: no state is needed. */
     if (c->have && c->unsealed > db->pager.hs.record.committed_seq)
         return set_aside(db, path);
+    c->has_journal = 1;
     *usable = 1;
     return CDB_OK;
 }
 
-/* Brings the archive up to date with whatever journals earlier sessions
- * left, then removes them (spec 14.4.7 rule 5). Steps: ready a cursor on
- * every slot's journal; refuse to open if a journal marked in use is
- * missing or unusable (unless the operator accepts the loss); apply the
- * committed transactions above each slot's mark, merged in stamp order and
- * numbered on from the watermark; commit them with the new marks and the
- * journals marked not in use; delete the journals. After this, the archive
- * alone holds the whole database. */
-static cdb_status recover(cdb_db *db)
+/* Publishes the archive commit the pager is reading from (spec 5.9.7),
+ * then re-reads the header to be sure no commit moved past it before the
+ * pin was visible. */
+static cdb_status pin_archive(cdb_db *db)
+{
+    for (;;) {
+        cdb_header_state hs;
+        uint64_t seq;
+        cdb_status s;
+        if ((s = cdb_header_open(&db->archive_st, &hs)) != CDB_OK)
+            return s;
+        if (hs.record.committed_seq != db->pager.hs.record.committed_seq
+            && (s = cdb_pager_reload(&db->pager)) != CDB_OK)
+            return s;
+        seq = db->pager.hs.record.committed_seq;
+        if ((s = cdb_coord_publish_pin(&db->coord, seq)) != CDB_OK)
+            return s;
+        if ((s = cdb_header_open(&db->archive_st, &hs)) != CDB_OK)
+            return s;
+        if (hs.record.committed_seq == seq)
+            return CDB_OK;
+    }
+}
+
+/* Checks the baton fence and updates the pager's reuse floor from the
+ * others' published reader pins (spec 5.9.7, 5.9.8). */
+static cdb_status fence_and_pins(cdb_db *db)
+{
+    cdb_status s;
+    if ((s = cdb_coord_baton_fence(&db->coord)) != CDB_OK)
+        return s;
+    cdb_pager_set_reuse_below(&db->pager, db->coord.min_pin);
+    db->pins_seq = db->pager.hs.record.committed_seq;
+    return CDB_OK;
+}
+
+/* Merges every slot's committed transactions above its mark onto the
+ * archive in (stamp, slot, counter) order, commits them with the new marks,
+ * and cleans up any dead slots whose journals are now folded in (spec 5.9.1,
+ * 5.9.2, 14.4.7 rules 5 and 7). keep_in_use is 0 at recovery and when the
+ * last live process closes, 1 otherwise. */
+static cdb_status merge_journals(cdb_db *db, int keep_in_use)
 {
     struct jcursor cur[CDB_COORD_MAX];
     int in_use = (journal_slot(db)->state & COMPANION_IN_USE) != 0;
-    int exists, usable, marks_moved = 0;
+    int recovering = !keep_in_use && db->journal_st.ops == NULL;
+    int exists, usable, marks_moved = 0, removed = 0;
+    uint64_t base_wm = watermark_of(db);
     unsigned n = 0, slot, i;
     cdb_status s;
 
-    db->applied = watermark_of(db);
+    db->applied = base_wm;
     for (slot = 0; slot < db->coord.cfg.max_coords; slot++) {
+        cdb_coord_rec srec;
+        int svalid = 0, slot_in_use = 0;
+        int dead = slot != db->coord.me.slot && !db->coord.peers[slot].live;
+        if (slot == db->coord.me.slot) {
+            srec = db->coord.me;
+            svalid = 1;
+            slot_in_use = db->journal_st.ops != NULL || (!recovering && (srec.flags & CDB_COORD_JOURNAL) != 0);
+        } else {
+            if ((s = cdb_coord_read_slot(&db->coord, slot, &srec, &svalid)) != CDB_OK)
+                return s;
+            slot_in_use = svalid && (srec.flags & CDB_COORD_JOURNAL) != 0;
+        }
         if ((s = cursor_open(db, slot, &cur[n], &usable)) != CDB_OK)
             return s;
-        n += usable ? 1u : 0u;
+        if (slot_in_use && (!usable || db->set_aside) && !(db->cfg.flags & CDB_DB_ACCEPT_LOSS))
+            return CDB_E_CORRUPT; /* changes may have been lost (spec 1.12.5, 14.4.7 rule 7) */
+        if (!usable && dead && svalid) {
+            memset(&cur[n], 0, sizeof cur[n]);
+            cur[n].slot = slot;
+            if ((s = mark_get(db, slot, &cur[n].mark)) != CDB_OK)
+                return s;
+        }
+        if (usable || (dead && svalid)) {
+            cur[n].dead_slot = dead && svalid;
+            cur[n].dead_hwm = dead && svalid ? srec.tx_hwm : 0;
+            n++;
+        }
     }
     if (in_use && (n == 0 || db->set_aside) && !(db->cfg.flags & CDB_DB_ACCEPT_LOSS))
         return CDB_E_CORRUPT; /* changes may have been lost (spec 1.12.5) */
@@ -469,48 +544,99 @@ static cdb_status recover(cdb_db *db)
             break;
         if ((s = open_journal(db, best->slot)) != CDB_OK)
             return s;
-        s = apply_range(db, &db->journal, best->tx_id, best->start, best->commit_at, db->applied + 1u);
-        cdb_storage_close(&db->journal_st);
+        s = apply_range(db, &db->rj, best->tx_id, best->start, best->commit_at, db->applied + 1u);
+        cdb_storage_close(&db->rj_st);
         if (s != CDB_OK)
             return s;
         db->applied++;
+        cdb_coord_baton_progress(&db->coord, db->applied - base_wm);
         if ((s = scan_next(db, best)) != CDB_OK)
             return s;
     }
 
     /* Fold whatever was replayed into the archive, with the marks that
-     * say so, before discarding the journals. */
-    for (i = 0; i < n; i++)
+     * say so, before discarding dead slots' journals. */
+    for (i = 0; i < n; i++) {
+        if (cur[i].dead_hwm > cur[i].top)
+            cur[i].top = cur[i].dead_hwm;
         marks_moved |= cur[i].top > cur[i].mark;
-    if (db->applied != watermark_of(db) || in_use || marks_moved) {
+    }
+    if (db->last_tx > db->my_mark)
+        marks_moved = 1;
+    if (db->applied != base_wm || in_use != keep_in_use || marks_moved || db->pager.dirty) {
         if ((s = cdb_doc_flush_pools(db)) != CDB_OK)
             return s;
         for (i = 0; i < n; i++)
             if (cur[i].top > cur[i].mark && (s = mark_set(db, cur[i].slot, cur[i].top)) != CDB_OK)
                 return s;
-        set_journal_slot(db, 0, db->applied);
-        if ((s = cdb_pager_commit(&db->pager)) != CDB_OK)
+        if ((s = stage_own_mark(db)) != CDB_OK)
             return s;
+        set_journal_slot(db, keep_in_use, db->applied);
+        if ((s = fence_and_pins(db)) != CDB_OK || (s = cdb_pager_commit(&db->pager)) != CDB_OK)
+            return s;
+        for (i = 0; i < n; i++)
+            if (cur[i].slot == db->coord.me.slot && cur[i].top > db->my_mark)
+                db->my_mark = cur[i].top;
+        if (db->last_tx > db->my_mark)
+            own_mark_committed(db);
+    }
+
+    if (recovering && (db->coord.me.flags & CDB_COORD_JOURNAL)
+        && (s = cdb_coord_set_journal(&db->coord, 0)) != CDB_OK)
+        return s;
+    if (recovering) {
+        if ((s = env_exists(db, db->overlay_path, &exists)) != CDB_OK)
+            return s;
+        if (exists && (s = env_remove(db, db->overlay_path)) != CDB_OK)
+            return s;
+        removed |= exists;
     }
     for (i = 0; i < n; i++) {
-        char path[CDB_DB_PATH_MAX];
-        journal_paths(db, cur[i].slot, path, NULL);
-        if ((s = env_remove(db, path)) != CDB_OK)
-            return s;
+        char path[CDB_DB_PATH_MAX], opath[CDB_DB_PATH_MAX];
+        unsigned sl = cur[i].slot;
+        if (sl == db->coord.me.slot) {
+            if (recovering && cur[i].has_journal) {
+                journal_paths(db, sl, path, NULL);
+                if ((s = env_remove(db, path)) != CDB_OK)
+                    return s;
+                removed = 1;
+            }
+        } else if (!db->coord.peers[sl].live) {
+            if (cur[i].dead_slot && (s = cdb_coord_remove_slot(&db->coord, sl)) != CDB_OK)
+                return s;
+            overlay_path_of(db, sl, opath);
+            if ((s = env_exists(db, opath, &exists)) != CDB_OK)
+                return s;
+            if (exists && (s = env_remove(db, opath)) != CDB_OK)
+                return s;
+            removed |= exists;
+            if (cur[i].has_journal) {
+                journal_paths(db, sl, path, NULL);
+                if ((s = env_remove(db, path)) != CDB_OK)
+                    return s;
+                removed = 1;
+            }
+        }
     }
-    /* Make the removals durable. */
+    if (!removed)
+        return CDB_OK;
     if ((s = env_exists(db, db->workdir, &exists)) != CDB_OK)
         return s;
     return exists ? env_sync_dir(db, db->workdir) : CDB_OK;
 }
 
+static cdb_status recover(cdb_db *db)
+{
+    return merge_journals(db, 0);
+}
+
 /* -------------------------------------------------------- session */
 
 /* Creates the working directory and a fresh journal, then records the
- * journal as in use in the header. The order matters for crash safety
- * (spec 14.4.6 rule 2): the slot says "in use" only once the journal and its
- * directory entry are durable, so a missing journal marked in use can only
- * mean real loss. */
+ * journal as in use in the slot and the header. The order matters for crash
+ * safety (spec 14.4.6 rule 2, 14.4.7 rule 7): "in use" is set only once the
+ * journal and its directory entry are durable, so a missing journal marked
+ * in use can only mean real loss. */
 static cdb_status start_session(cdb_db *db)
 {
     cdb_status s;
@@ -524,9 +650,13 @@ static cdb_status start_session(cdb_db *db)
         return s;
     if ((s = env_sync_dir(db, db->workdir)) != CDB_OK)
         return s;
+    if ((s = cdb_coord_set_journal(&db->coord, 1)) != CDB_OK)
+        return s;
     /* Only now, with the journal durable, record it as in use. */
     set_journal_slot(db, 1, db->applied);
-    return cdb_pager_commit(&db->pager);
+    if ((s = fence_and_pins(db)) != CDB_OK || (s = cdb_pager_commit(&db->pager)) != CDB_OK)
+        return s;
+    return pin_archive(db);
 }
 
 /* Caller memory for n slots of each kind, laid out the way the slot code
@@ -549,14 +679,160 @@ size_t cdb_db_slot_mem_size(unsigned n)
     return total;
 }
 
-/* Gives every slot chunk of all three sets back (allocator memory is
- * freed). Used at close and when an open fails partway. */
+/* Gives every slot chunk of all four sets back (allocator memory is freed)
+ * and forgets cached link and schema state. Used at close, on rebase or
+ * reload, and when an open fails partway. */
 static void release_slots(cdb_db *db)
 {
     cdb_slots_release(db, &db->pool_slots);
     cdb_slots_release(db, &db->vec_slots);
     cdb_slots_release(db, &db->ts_slots);
     cdb_slots_release(db, &db->table_slots);
+    db->slot_mem_used = 0;
+    memset(&db->links, 0, sizeof db->links);
+    db->schema_store = 0;
+}
+
+/* Empties this slot's overlay file and directs the pager's private writes to
+ * it (spec 5.9.1). The pager must be clean. */
+static cdb_status enter_overlay(cdb_db *db)
+{
+    cdb_status s;
+    if (!db->have_overlay) {
+        if ((s = env_open(db, db->overlay_path, CDB_ENV_CREATE, &db->overlay_st)) != CDB_OK)
+            return s;
+        db->have_overlay = 1;
+    }
+    if ((s = cdb_storage_truncate(&db->overlay_st, 0)) != CDB_OK)
+        return s;
+    cdb_pager_set_guard(&db->pager, NULL, NULL);
+    db->fresh = 0;
+    return cdb_pager_set_private(&db->pager, &db->overlay_st);
+}
+
+static cdb_status rotate_journal(cdb_db *db);
+
+/* Drops this process's private pages, reloads the latest archive state, and
+ * re-applies its own committed transactions above its mark onto a fresh
+ * overlay while rotating its journal to the new committed sequence (spec
+ * 5.9.1, 14.4.7 rule 2). */
+static cdb_status rebase(cdb_db *db)
+{
+    cdb_header_state hs;
+    cdb_status s;
+
+    if ((s = cdb_header_open(&db->archive_st, &hs)) != CDB_OK)
+        return s;
+    if (db->pager.dirty || hs.record.committed_seq != db->pager.hs.record.committed_seq) {
+        if ((s = cdb_pager_reload(&db->pager)) != CDB_OK)
+            return s;
+    }
+    if ((s = pin_archive(db)) != CDB_OK || (s = enter_overlay(db)) != CDB_OK)
+        return s;
+    release_slots(db);
+    if ((s = cdb_catalog_open(&db->catalog, &db->pager, &db->cfg.catalog_work, db->cfg.catalog_page)) != CDB_OK)
+        return s;
+    db->applied = watermark_of(db);
+    if ((s = mark_get(db, db->coord.me.slot, &db->my_mark)) != CDB_OK)
+        return s;
+
+    if (db->last_tx <= db->my_mark) {
+        if (db->journal_st.ops != NULL)
+            return rotate_journal(db);
+        if ((s = new_journal(db, db->journal_path, db->pager.hs.record.committed_seq)) != CDB_OK)
+            return s;
+        return env_sync_dir(db, db->workdir);
+    }
+
+    if (db->journal_st.ops != NULL) {
+        cdb_storage_close(&db->journal_st);
+        memset(&db->journal_st, 0, sizeof db->journal_st);
+    }
+    if ((s = new_journal(db, db->journal_tmp, db->pager.hs.record.committed_seq)) != CDB_OK)
+        return s;
+    {
+        struct jcursor c;
+        memset(&c, 0, sizeof c);
+        c.slot = db->coord.me.slot;
+        c.mark = db->my_mark;
+        c.off = CDB_JOURNAL_HEADER_SIZE;
+        while ((s = scan_next(db, &c)) == CDB_OK && c.have) {
+            uint64_t off = c.start;
+            if ((s = open_journal(db, c.slot)) != CDB_OK)
+                return s;
+            while (off < c.off) {
+                cdb_record r;
+                uint64_t next;
+                if ((s = cdb_journal_read(&db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next))
+                    != CDB_OK)
+                    break;
+                if ((r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_COMMIT) && r.tx_id == c.tx_id) {
+                    if ((s = cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size))
+                        != CDB_OK)
+                        break;
+                    if (r.kind == CDB_RECORD_DATA) {
+                        cdb_delta d;
+                        if (r.payload_len < 1) {
+                            s = CDB_E_MALFORMED;
+                            break;
+                        }
+                        d.store_id = r.store_id;
+                        d.entry_id = r.entry_id;
+                        d.op = r.payload[0];
+                        d.data = r.payload + 1;
+                        d.len = r.payload_len - 1u;
+                        d.commit_number = 0; /* assigned at reconciliation (spec 5.9.2) */
+                        if ((s = db->cfg.apply(db->cfg.apply_ctx, &db->pager, &d)) != CDB_OK) {
+                            db->failed = 1;
+                            break;
+                        }
+                    }
+                }
+                off = next;
+            }
+            cdb_storage_close(&db->rj_st);
+            if (s != CDB_OK)
+                return s;
+        }
+        if (s != CDB_OK)
+            return s;
+    }
+    if ((s = cdb_storage_sync(&db->journal_st)) != CDB_OK)
+        return s;
+    if ((s = db->env.ops->rename(db->env.ctx, db->journal_tmp, db->journal_path)) != CDB_OK)
+        return s;
+    db->unsynced = 0;
+    return env_sync_dir(db, db->workdir);
+}
+
+static cdb_status maybe_rebase(cdb_db *db)
+{
+    cdb_header_state hs;
+    cdb_status s;
+    if (db->in_tx || cdb_coord_baton_held(&db->coord))
+        return CDB_OK;
+    if ((s = cdb_header_open(&db->archive_st, &hs)) != CDB_OK)
+        return s;
+    if (hs.record.committed_seq == db->pager.hs.record.committed_seq)
+        return CDB_OK;
+    return rebase(db);
+}
+
+/* After a baton operation (reconciliation, catalog change, compaction):
+ * keep a standing baton while alone and uncontested, otherwise release
+ * it and switch back to the overlay (spec 5.9.8). */
+static cdb_status finish_baton(cdb_db *db)
+{
+    cdb_status s;
+    if (db->coord.live_others == 0 && !cdb_coord_baton_wanted(&db->coord)) {
+        db->fresh = 1;
+        if (db->have_overlay && (s = cdb_storage_truncate(&db->overlay_st, 0)) != CDB_OK)
+            return s;
+        return CDB_OK;
+    }
+    if ((s = cdb_coord_baton_release(&db->coord)) != CDB_OK)
+        return s;
+    return enter_overlay(db);
 }
 
 static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg, const cdb_header *create);
@@ -589,6 +865,14 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
     cdb_slots_init(&db->ts_slots, sizeof(struct cdb_ts_store), &cdb_ts_slot_ops);
     cdb_slots_init(&db->table_slots, sizeof(struct cdb_table_store), &cdb_table_slot_ops);
     if ((s = open_db(db, base, cfg, create)) != CDB_OK) {
+        if (db->have_overlay) {
+            cdb_storage_close(&db->overlay_st);
+            (void)env_remove(db, db->overlay_path);
+        }
+        if (db->journal_st.ops != NULL)
+            cdb_storage_close(&db->journal_st);
+        if (db->archive_st.ops != NULL)
+            cdb_storage_close(&db->archive_st);
         release_slots(db); /* recovery may have opened stores */
         (void)cdb_coord_leave(&db->coord); /* so the next opener need not wait it out */
     }
@@ -596,9 +880,9 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
 }
 
 /* The body of cdb_db_open, after the configuration is copied and the slot
- * sets are set up: open or create the archive, open the catalog, recover,
- * start the session. Split out so that any failure in here lets
- * cdb_db_open release the slots in one place. */
+ * sets are set up: open or create the archive, join the coordinators, and
+ * either recover and take a standing baton (when alone) or start in private
+ * overlay mode (when other processes are already live). */
 static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg, const cdb_header *create)
 {
     int exists;
@@ -630,9 +914,8 @@ static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg
         return CDB_E_READ_ONLY; /* read-only sessions come with the coordinator milestone */
 
     /* Join the coordinators before deciding whether the working directory
-     * is a crashed session's (spec 1.12.1): only with no other live
-     * coordinator may recovery replay and remove its journal. Until
-     * processes can share a database, a live one means busy. */
+     * is a crashed session's (spec 1.12.1, 14.4.7 rule 9): only with no
+     * other live coordinator may recovery replay and remove journals. */
     if ((s = db->env.ops->mkdir(db->env.ctx, db->workdir)) != CDB_OK)
         return s;
     if ((s = env_sync_dir(db, db->parent)) != CDB_OK)
@@ -640,24 +923,61 @@ static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg
     if ((s = cdb_coord_join(&db->coord, &db->env, db->coorddir, db->pager.hs.record.db_id, db->pager.order,
                             &cfg->coord)) != CDB_OK)
         return s;
-    if (db->coord.live_others > 0)
-        return CDB_E_BUSY;
     journal_paths(db, db->coord.me.slot, db->journal_path, db->journal_tmp);
-
-    /* The catalog first: replaying document changes needs it. */
+    overlay_path_of(db, db->coord.me.slot, db->overlay_path);
+    if ((s = pin_archive(db)) != CDB_OK)
+        return s;
     if ((s = cdb_catalog_open(&db->catalog, &db->pager, &cfg->catalog_work, cfg->catalog_page)) != CDB_OK)
         return s;
     db->has_catalog = 1;
-    if ((s = recover(db)) != CDB_OK)
-        return s;
-    /* This slot's counters go on above everything it may have used before:
-     * its mark in the archive, and the high-water mark a previous owner of
-     * the slot reserved (spec 5.9.2). */
-    if ((s = mark_get(db, db->coord.me.slot, &db->my_mark)) != CDB_OK)
-        return s;
-    db->last_tx = db->my_mark;
-    db->next_tx = db->coord.me.tx_hwm > db->my_mark ? db->coord.me.tx_hwm : db->my_mark + 1u;
-    return start_session(db);
+
+    if (db->coord.live_others == 0) {
+        int granted = 0;
+        if ((s = cdb_coord_baton_take(&db->coord, 0, &granted)) != CDB_OK)
+            return s;
+        if (!granted)
+            return CDB_E_BUSY;
+        cdb_pager_set_guard(&db->pager, (cdb_status (*)(void *))cdb_coord_guard, &db->coord);
+        if ((s = recover(db)) != CDB_OK)
+            return s;
+        /* This slot's counters go on above everything it may have used before:
+         * its mark in the archive, and the high-water mark a previous owner of
+         * the slot reserved (spec 5.9.2). */
+        if ((s = mark_get(db, db->coord.me.slot, &db->my_mark)) != CDB_OK)
+            return s;
+        db->last_tx = db->my_mark;
+        db->next_tx = db->coord.me.tx_hwm > db->my_mark ? db->coord.me.tx_hwm : db->my_mark + 1u;
+        if ((s = start_session(db)) != CDB_OK)
+            return s;
+        return finish_baton(db);
+    }
+
+    {
+        struct jcursor c;
+        int usable = 0;
+        db->applied = watermark_of(db);
+        if ((s = mark_get(db, db->coord.me.slot, &db->my_mark)) != CDB_OK)
+            return s;
+        db->last_tx = db->my_mark;
+        /* A dead slot taken over while others are live adopts its journal
+         * (spec 5.9.1, 14.4.7 rule 9). */
+        if ((s = cursor_open(db, db->coord.me.slot, &c, &usable)) != CDB_OK)
+            return s;
+        if ((db->coord.me.flags & CDB_COORD_JOURNAL) && (!usable || db->set_aside)
+            && !(db->cfg.flags & CDB_DB_ACCEPT_LOSS))
+            return CDB_E_CORRUPT;
+        if (usable) {
+            while (c.have)
+                if ((s = scan_next(db, &c)) != CDB_OK)
+                    return s;
+            if (c.top > db->last_tx)
+                db->last_tx = c.top;
+        }
+        db->next_tx = db->coord.me.tx_hwm > db->last_tx ? db->coord.me.tx_hwm : db->last_tx + 1u;
+        if ((s = rebase(db)) != CDB_OK)
+            return s;
+        return cdb_coord_set_journal(&db->coord, 1);
+    }
 }
 
 /* -------------------------------------------------------- transactions */
@@ -669,15 +989,42 @@ static cdb_status usable(const cdb_db *db)
     return db->failed ? CDB_E_STATE : CDB_OK;
 }
 
-/* A heartbeat if one is due (spec 5.9.6). Losing the slot to another
- * process means this session's journal may already have been taken over:
- * nothing more may be written. */
-static cdb_status heartbeat(cdb_db *db)
+/* Writes a heartbeat if one is due (spec 5.9.6), updates the reuse floor,
+ * and drops a baton that another coordinator has overridden. Losing the
+ * slot to another process means this session's journal may already have
+ * been taken over: nothing more may be written. */
+static cdb_status beat_only(cdb_db *db)
 {
     cdb_status s = cdb_coord_beat(&db->coord, 0);
-    if (s == CDB_E_BUSY)
+    if (s == CDB_E_BUSY) {
         db->failed = 1;
-    return s;
+        return s;
+    }
+    if (s != CDB_OK)
+        return s;
+    cdb_pager_set_reuse_below(&db->pager, db->coord.min_pin);
+    if (cdb_coord_baton_held(&db->coord) && db->coord.max_cts > db->coord.me.cts) {
+        if ((s = cdb_coord_baton_release(&db->coord)) != CDB_OK)
+            return s;
+        if (!db->in_tx && db->op_depth <= 1)
+            return rebase(db);
+    }
+    return CDB_OK;
+}
+
+static cdb_status heartbeat(cdb_db *db)
+{
+    cdb_status s = beat_only(db);
+    if (s != CDB_OK)
+        return s;
+    if (!db->in_tx && db->op_depth <= 1) {
+        /* A standing baton is reconciled and released as soon as another
+         * live process asks for it (spec 5.9.8). */
+        if (cdb_coord_baton_held(&db->coord) && cdb_coord_baton_wanted(&db->coord))
+            return cdb_db_reconcile(db);
+        return maybe_rebase(db);
+    }
+    return CDB_OK;
 }
 
 cdb_status cdb_db_tick(cdb_db *db)
@@ -689,8 +1036,8 @@ cdb_status cdb_db_tick(cdb_db *db)
 /* Operation scopes (see cdb_db.h). Only the outermost begin takes a new ID;
  * nested scopes share it, so the whole outer scope counts as one operation
  * when the slot code decides which stores it may evict. An unmatched end is
- * ignored. The outermost begin is also a heartbeat point; a failed beat
- * shows up at the next call that can report it. */
+ * ignored. The outermost begin is also a heartbeat and rebase point; a
+ * failed beat shows up at the next call that can report it. */
 void cdb_db_op_begin(cdb_db *db)
 {
     if (db->op_depth++ == 0) {
@@ -717,6 +1064,16 @@ cdb_status cdb_tx_begin(cdb_db *db, cdb_durability durability)
         return CDB_E_STATE;
     if ((s = heartbeat(db)) != CDB_OK)
         return s;
+    if (cdb_coord_baton_held(&db->coord)
+        && (db->pins_seq != db->pager.hs.record.committed_seq || db->pager.reuse_below != 0)) {
+        s = fence_and_pins(db);
+        if (s == CDB_E_BUSY) {
+            if ((s = cdb_coord_baton_release(&db->coord)) != CDB_OK || (s = rebase(db)) != CDB_OK)
+                return s;
+        } else if (s != CDB_OK) {
+            return s;
+        }
+    }
     if (db->next_tx >= db->coord.me.tx_hwm
         && (s = cdb_coord_reserve_tx(&db->coord, db->next_tx + TX_RESERVE_BLOCK)) != CDB_OK)
         return s;
@@ -800,7 +1157,7 @@ cdb_status cdb_tx_commit(cdb_db *db)
     uint8_t info[CDB_COMMIT_PAYLOAD_SIZE];
     cdb_commit_info ci;
     cdb_record r;
-    uint64_t record_at;
+    uint64_t record_at, counter;
     cdb_status s;
 
     if (usable(db) != CDB_OK || !db->in_tx)
@@ -849,15 +1206,28 @@ cdb_status cdb_tx_commit(cdb_db *db)
         break;
     }
 
+    counter = db->tx_id & TX_COUNTER_MASK;
     /* The transaction is committed; make it visible through the pager. Its
      * commit number is the one reconciliation will give it while this
-     * session is the only one contributing (spec 5.9.2). */
-    if ((s = apply_range(db, &db->journal, db->tx_id, db->tx_start, record_at, db->applied + 1u)) != CDB_OK) {
+     * session is the only one contributing, and 0 on an overlay (spec 5.9.2). */
+    s = apply_range(db, &db->journal, db->tx_id, db->tx_start, record_at, db->fresh ? db->applied + 1u : 0u);
+    if (s == CDB_E_BUSY && cdb_coord_baton_held(&db->coord)) {
+        /* A standing baton expired while applying: give it up and replay
+         * onto the overlay instead (spec 5.9.8). */
+        db->last_tx = counter;
+        if ((s = cdb_coord_baton_release(&db->coord)) == CDB_OK)
+            s = rebase(db);
+        if (s != CDB_OK)
+            db->failed = 1;
+        return s;
+    }
+    if (s != CDB_OK) {
         db->failed = 1; /* the journal holds it; reopening replays it */
         return s;
     }
-    db->applied++;
-    db->last_tx = db->tx_id & TX_COUNTER_MASK;
+    if (db->fresh)
+        db->applied++;
+    db->last_tx = counter;
     return CDB_OK;
 }
 
@@ -900,65 +1270,150 @@ static cdb_status rotate_journal(cdb_db *db)
     return env_sync_dir(db, db->workdir);
 }
 
-/* Commits every applied change to the archive (spec 3.2). Not allowed with
- * a transaction open. The new watermark is stored in the same header commit
- * as the pages, so the archive and the watermark always agree. */
-cdb_status cdb_db_reconcile(cdb_db *db)
+/* Releases the baton and rebases when an archive write or fence check fails
+ * because the baton was lost (spec 5.9.8). */
+static cdb_status on_baton_err(cdb_db *db, cdb_status s)
 {
+    if (s == CDB_E_BUSY) {
+        (void)cdb_coord_baton_release(&db->coord);
+        (void)rebase(db);
+    }
+    return s;
+}
+
+/* Takes the baton if needed, commits every slot's applied changes to the
+ * archive, and leaves the baton held so a caller (catalog change,
+ * compaction, close) can continue under the same baton session (spec 5.9.8).
+ * When closing is 0, the journal is rotated and the reader pin updated. */
+static cdb_status reconcile_hold(cdb_db *db, int closing)
+{
+    int keep_in_use;
     cdb_status s;
 
     if (usable(db) != CDB_OK || db->in_tx)
         return CDB_E_STATE;
-    if ((s = heartbeat(db)) != CDB_OK)
+    if ((s = beat_only(db)) != CDB_OK)
         return s;
-    if (db->applied == watermark_of(db) && !db->pager.dirty)
+    if (!cdb_coord_baton_held(&db->coord)) {
+        int granted = 0;
+        if ((s = cdb_coord_baton_take(&db->coord, 0, &granted)) != CDB_OK)
+            return s;
+        if (!granted)
+            return CDB_E_BUSY;
+    }
+    if ((s = fence_and_pins(db)) != CDB_OK)
+        return on_baton_err(db, s);
+    if (db->unsynced > 0) {
+        if ((s = cdb_storage_sync(&db->journal_st)) != CDB_OK)
+            return s;
+        db->unsynced = 0;
+    }
+    keep_in_use = !closing || db->coord.live_others > 0;
+
+    /* Fast path: this process held the baton from the last archive commit
+     * and no other slot has a journal, so its pager already holds the exact
+     * state to commit. */
+    if (db->fresh && db->coord.journals_others == 0) {
+        int in_use = (journal_slot(db)->state & COMPANION_IN_USE) != 0;
+        cdb_pager_set_guard(&db->pager, (cdb_status (*)(void *))cdb_coord_guard, &db->coord);
+        if (db->applied != watermark_of(db) || db->pager.dirty || in_use != keep_in_use || db->last_tx > db->my_mark) {
+            if ((s = cdb_doc_flush_pools(db)) != CDB_OK || (s = stage_own_mark(db)) != CDB_OK)
+                return on_baton_err(db, s);
+            set_journal_slot(db, keep_in_use, db->applied);
+            if ((s = fence_and_pins(db)) != CDB_OK || (s = cdb_pager_commit(&db->pager)) != CDB_OK)
+                return on_baton_err(db, s);
+            own_mark_committed(db);
+        }
+        if (!closing) {
+            cdb_slots_shrink(db, &db->pool_slots);
+            cdb_slots_shrink(db, &db->vec_slots);
+            cdb_slots_shrink(db, &db->ts_slots);
+            cdb_slots_shrink(db, &db->table_slots);
+            if (db->last_tx <= db->my_mark && db->journal.end > CDB_JOURNAL_HEADER_SIZE) {
+                if ((s = rotate_journal(db)) != CDB_OK)
+                    return s;
+            }
+            if ((s = pin_archive(db)) != CDB_OK)
+                return s;
+        }
         return CDB_OK;
-    /* Document pools, vector collections and time-series stores keep some
-     * state in memory (index roots, next entry IDs; held late points for
-     * time series); stage it into the catalog first so it is part of this
-     * commit. */
-    if ((s = cdb_doc_flush_pools(db)) != CDB_OK || (s = stage_own_mark(db)) != CDB_OK)
+    }
+
+    if ((s = cdb_pager_reload(&db->pager)) != CDB_OK || (s = cdb_pager_set_private(&db->pager, NULL)) != CDB_OK)
         return s;
-    set_journal_slot(db, 1, db->applied);
-    if ((s = cdb_pager_commit(&db->pager)) != CDB_OK)
+    cdb_pager_set_guard(&db->pager, (cdb_status (*)(void *))cdb_coord_guard, &db->coord);
+    cdb_pager_set_reuse_below(&db->pager, db->coord.min_pin);
+    release_slots(db);
+    if ((s = cdb_catalog_open(&db->catalog, &db->pager, &db->cfg.catalog_work, db->cfg.catalog_page)) != CDB_OK)
         return s;
-    own_mark_committed(db);
-    /* Stores idle since the last reconciliation give their slots back. */
-    cdb_slots_shrink(db, &db->pool_slots);
-    cdb_slots_shrink(db, &db->vec_slots);
-    cdb_slots_shrink(db, &db->ts_slots);
-    cdb_slots_shrink(db, &db->table_slots);
-    /* Every change in the journal is now in the archive. */
-    return rotate_journal(db);
+    if ((s = merge_journals(db, keep_in_use)) != CDB_OK)
+        return on_baton_err(db, s);
+    db->fresh = 1;
+    if (!closing) {
+        if ((s = rotate_journal(db)) != CDB_OK || (s = pin_archive(db)) != CDB_OK)
+            return s;
+    }
+    return CDB_OK;
+}
+
+/* Commits every applied change to the archive (spec 3.2, 5.9.1). Not allowed
+ * with a transaction open. The new watermark is stored in the same header
+ * commit as the pages, so the archive and the watermark always agree. */
+cdb_status cdb_db_reconcile(cdb_db *db)
+{
+    cdb_status s = reconcile_hold(db, 0);
+    return s == CDB_OK ? finish_baton(db) : s;
 }
 
 /* Common start of every catalog change: no transaction may be open, a
  * catalog must be configured (CDB_E_UNSUPPORTED otherwise), and everything
- * applied so far is reconciled first. The catalog change then commits on its
- * own, after which the journal is rotated: catalog changes are never
- * journaled, they go straight into the archive (spec 4). */
+ * applied so far is reconciled first under the baton. The catalog change
+ * then commits on its own, after which finish_archive_op rotates the journal
+ * and finishes the baton session (spec 4, 5.9.8). */
 static cdb_status catalog_ready(cdb_db *db)
 {
     if (usable(db) != CDB_OK || db->in_tx)
         return CDB_E_STATE;
     if (!db->has_catalog)
         return CDB_E_UNSUPPORTED;
-    return cdb_db_reconcile(db);
+    return reconcile_hold(db, 0);
+}
+
+static cdb_status finish_archive_op(cdb_db *db, cdb_status op_status)
+{
+    cdb_status s;
+    if (op_status != CDB_OK) {
+        if (cdb_coord_baton_held(&db->coord)
+            && (op_status == CDB_E_BUSY || db->coord.live_others > 0 || cdb_coord_baton_wanted(&db->coord)))
+            (void)cdb_coord_baton_release(&db->coord);
+        if (db->pager.dirty || !cdb_coord_baton_held(&db->coord))
+            (void)rebase(db);
+        return op_status;
+    }
+    if ((s = rotate_journal(db)) != CDB_OK || (s = pin_archive(db)) != CDB_OK)
+        return s;
+    return finish_baton(db);
 }
 
 cdb_status cdb_db_create_store(cdb_db *db, const char *name, size_t len, uint32_t model, uint64_t *id)
 {
     cdb_status s = catalog_ready(db);
-    if (s == CDB_OK)
-        s = cdb_catalog_create_store(&db->catalog, name, len, model, id);
-    return s == CDB_OK ? rotate_journal(db) : s;
+    if (s != CDB_OK)
+        return s;
+    return finish_archive_op(db, cdb_catalog_create_store(&db->catalog, name, len, model, id));
 }
 
-/* A read: no reconcile and no rotation needed. */
+/* A read: no reconcile and no rotation needed, but rebases if the archive
+ * has moved. */
 cdb_status cdb_db_find_store(cdb_db *db, const char *name, size_t len, uint64_t *id, int *found)
 {
+    cdb_status s;
+    if (usable(db) != CDB_OK)
+        return CDB_E_STATE;
     if (!db->has_catalog)
         return CDB_E_UNSUPPORTED;
+    if ((s = heartbeat(db)) != CDB_OK)
+        return s;
     return cdb_catalog_find_store(&db->catalog, name, len, id, found);
 }
 
@@ -966,15 +1421,15 @@ cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
 {
     cdb_status s = catalog_ready(db);
     cdb_slot *slot;
-    if (s == CDB_OK && cdb_link_is_store(db, id))
-        s = CDB_E_INVALID_ARG; /* the link store is the engine's own */
-    /* Its entries' links are tombstoned; the drop's commit carries that. */
-    if (s == CDB_OK)
-        s = cdb_link_on_drop(db, id);
-    if (s == CDB_OK)
-        s = cdb_catalog_drop_store(&db->catalog, id);
     if (s != CDB_OK)
         return s;
+    if (cdb_link_is_store(db, id))
+        return finish_archive_op(db, CDB_E_INVALID_ARG); /* the link store is the engine's own */
+    /* Its entries' links are tombstoned; the drop's commit carries that. */
+    if ((s = cdb_link_on_drop(db, id)) == CDB_OK)
+        s = cdb_catalog_drop_store(&db->catalog, id);
+    if (s != CDB_OK)
+        return finish_archive_op(db, s);
     /* Forget the store's open state, so it reads as dropped from now on. */
     if ((slot = cdb_slots_find(&db->pool_slots, id)) != NULL
         || (slot = cdb_slots_find(&db->vec_slots, id)) != NULL
@@ -982,7 +1437,7 @@ cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
         slot->in_use = 0;
     if ((slot = cdb_slots_find(&db->table_slots, id)) != NULL)
         slot->in_use = 0;
-    return rotate_journal(db);
+    return finish_archive_op(db, CDB_OK);
 }
 
 cdb_status cdb_db_catalog_begin(cdb_db *db)
@@ -992,56 +1447,68 @@ cdb_status cdb_db_catalog_begin(cdb_db *db)
 
 cdb_status cdb_db_catalog_end(cdb_db *db, cdb_status s)
 {
-    return s == CDB_OK ? rotate_journal(db) : s;
+    return finish_archive_op(db, s);
 }
 
 cdb_status cdb_db_add_schema(cdb_db *db, uint64_t store_id, const void *schema, size_t len, uint32_t *version)
 {
     cdb_status s = catalog_ready(db);
-    if (s == CDB_OK)
-        s = cdb_catalog_add_schema(&db->catalog, store_id, schema, len, version);
-    return s == CDB_OK ? rotate_journal(db) : s;
+    if (s != CDB_OK)
+        return s;
+    return finish_archive_op(db, cdb_catalog_add_schema(&db->catalog, store_id, schema, len, version));
 }
 
 /* Compaction requires a clean pager, hence the reconcile first. It makes
- * its own archive commits, so the journal is rotated afterwards to match the
- * new committed sequence. */
+ * its own archive commits under the same baton, so the journal is rotated
+ * afterwards to match the new committed sequence. */
 cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed)
 {
     cdb_status s;
     if (usable(db) != CDB_OK || db->in_tx)
         return CDB_E_STATE;
-    if ((s = cdb_db_reconcile(db)) != CDB_OK)
+    if ((s = reconcile_hold(db, 0)) != CDB_OK)
         return s;
-    if ((s = cdb_pager_compact(&db->pager, max_moves, moved, reclaimed)) != CDB_OK)
-        return s;
-    return rotate_journal(db);
+    return finish_archive_op(db, cdb_pager_compact(&db->pager, max_moves, moved, reclaimed));
 }
 
-/* Close is a final reconciliation that also marks the journal "not in use",
- * followed by removing the journal and the working directory. The order
- * follows spec 14.4.6 rule 2: "in use" is cleared (and committed) before the
- * journal is removed. A failed database is refused: its journal must stay
- * so the next open can replay it. An open transaction is aborted. */
+/* Close is a final reconciliation under the baton, followed by removing
+ * this slot's journal and overlay, and, when no other process is live,
+ * marking the header's companion slot "not in use" and removing the working
+ * directory (spec 14.4.6 rule 2, 14.4.7 rule 7). A failed database is
+ * refused: its journal must stay so the next open can replay it. An open
+ * transaction is aborted. */
 cdb_status cdb_db_close(cdb_db *db)
 {
+    int alone;
     cdb_status s;
 
     if (db->failed) {
+        if (db->have_overlay) {
+            cdb_storage_close(&db->overlay_st);
+            (void)env_remove(db, db->overlay_path);
+        }
+        if (db->journal_st.ops != NULL)
+            cdb_storage_close(&db->journal_st);
+        if (db->archive_st.ops != NULL)
+            cdb_storage_close(&db->archive_st);
         release_slots(db); /* their state is lost with the session anyway */
         (void)cdb_coord_leave(&db->coord); /* the journal stays for the next open */
         return CDB_E_STATE;
     }
     if (db->in_tx && (s = cdb_tx_abort(db)) != CDB_OK)
         return s;
-    if ((s = cdb_doc_flush_pools(db)) != CDB_OK || (s = stage_own_mark(db)) != CDB_OK)
+    if ((s = reconcile_hold(db, 1)) != CDB_OK)
         return s;
-    set_journal_slot(db, 0, db->applied);
-    if ((s = cdb_pager_commit(&db->pager)) != CDB_OK)
-        return s;
-    own_mark_committed(db);
+    alone = db->coord.live_others == 0;
     release_slots(db); /* everything they held is in the archive */
-    /* The archive no longer needs the working directory. */
+    if ((s = cdb_coord_set_journal(&db->coord, 0)) != CDB_OK)
+        return s;
+    if (db->have_overlay) {
+        cdb_storage_close(&db->overlay_st);
+        db->have_overlay = 0;
+        if ((s = env_remove(db, db->overlay_path)) != CDB_OK && s != CDB_E_NOT_FOUND)
+            return s;
+    }
     cdb_storage_close(&db->journal_st);
     if ((s = env_remove(db, db->journal_path)) != CDB_OK)
         return s;
@@ -1049,14 +1516,16 @@ cdb_status cdb_db_close(cdb_db *db)
         return s;
     if ((s = cdb_coord_leave(&db->coord)) != CDB_OK)
         return s;
-    s = db->env.ops->rmdir(db->env.ctx, db->coorddir);
-    if (s != CDB_OK && s != CDB_E_STATE && s != CDB_E_NOT_FOUND) /* a leftover lobby file keeps it */
-        return s;
-    s = db->env.ops->rmdir(db->env.ctx, db->workdir);
-    if (s != CDB_OK && s != CDB_E_STATE) /* a set-aside companion keeps it */
-        return s;
-    if ((s = env_sync_dir(db, db->parent)) != CDB_OK)
-        return s;
+    if (alone) {
+        s = db->env.ops->rmdir(db->env.ctx, db->coorddir);
+        if (s != CDB_OK && s != CDB_E_STATE && s != CDB_E_NOT_FOUND) /* a leftover lobby file keeps it */
+            return s;
+        s = db->env.ops->rmdir(db->env.ctx, db->workdir);
+        if (s != CDB_OK && s != CDB_E_STATE) /* a set-aside companion keeps it */
+            return s;
+        if ((s = env_sync_dir(db, db->parent)) != CDB_OK)
+            return s;
+    }
     cdb_storage_close(&db->archive_st);
     return CDB_OK;
 }

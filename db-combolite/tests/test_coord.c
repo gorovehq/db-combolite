@@ -1,8 +1,8 @@
 /* Coordinators (spec 5, 5.9, 14.5): the slot record, joining, the primary
- * role, liveness, and a second process refused while one has the database
- * open. Several coordinators run in this one thread on one fault
- * environment; its sleep hook lets the others beat while one waits, as other
- * processes would. */
+ * role, liveness, batons, reader pins, overlays, rebasing and multi-process
+ * reconciliation and recovery. Several coordinators run in this one thread
+ * on one fault environment; its sleep hook lets the others beat while one
+ * waits, as other processes would. */
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
@@ -500,7 +500,8 @@ static struct proc p1, p2;
 
 /* Entry N is logical page N; pages up to 64 are reserved on first use so
  * the engine's own pages (the marks index) land above them. REPLACE sets the
- * value; PATCH appends to it, so applying a change twice shows. */
+ * value; PATCH appends to it, so applying a change twice shows; DELETE frees
+ * the page. */
 static cdb_status kv_apply(void *ctx, cdb_pager *p, const cdb_delta *d)
 {
     uint8_t cur[PAGE], val[PAGE];
@@ -513,6 +514,8 @@ static cdb_status kv_apply(void *ctx, cdb_pager *p, const cdb_delta *d)
     while (p->next_lid < 64)
         if ((s = cdb_pager_alloc(p, &lid)) != CDB_OK)
             return s;
+    if (d->op == CDB_OP_DELETE)
+        return cdb_pager_free(p, d->entry_id);
     if (d->op == CDB_OP_PATCH) {
         s = cdb_pager_read(p, d->entry_id, cur, &t);
         if (s == CDB_OK) {
@@ -546,7 +549,7 @@ static const char *value_of(struct proc *p, uint64_t e)
     return out;
 }
 
-static cdb_status open_proc(struct proc *p)
+static cdb_status open_proc_max(struct proc *p, unsigned max_coords)
 {
     cdb_header h;
     memset(&p->cfg, 0, sizeof p->cfg);
@@ -565,6 +568,7 @@ static cdb_status open_proc(struct proc *p)
     p->cfg.catalog_work.entries_cap = 512;
     p->cfg.catalog_page = p->cat_page;
     p->cfg.durability = CDB_DURABILITY_FULL;
+    p->cfg.coord.max_coords = max_coords;
     memset(&h, 0, sizeof h);
     h.order = CDB_ORDER_LITTLE;
     h.layout_flags = CDB_LAYOUT_ADDR64;
@@ -573,22 +577,37 @@ static cdb_status open_proc(struct proc *p)
     return cdb_db_open(&p->db, &env, DIR "/db", &p->cfg, &h);
 }
 
+static cdb_status open_proc(struct proc *p)
+{
+    return open_proc_max(p, 0);
+}
+
 static void tick_p1(void *arg)
 {
     (void)arg;
     (void)cdb_db_tick(&p1.db);
 }
 
+static void tick_both(void *arg)
+{
+    (void)arg;
+    if (p1.db.coord.joined)
+        (void)cdb_db_tick(&p1.db);
+    if (p2.db.coord.joined)
+        (void)cdb_db_tick(&p2.db);
+}
+
+/* When max_coords is 1, a second opener finds every slot held and leaves. */
 static void test_second_process_is_busy(void)
 {
-    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_max(&p1, 1));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 1, CDB_OP_REPLACE, "one", 3));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
 
     /* The first process keeps ticking while the second tries to open. */
     cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
-    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, open_proc(&p2));
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, open_proc_max(&p2, 1));
     TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork/coord/1")); /* it left again */
 
     /* The first one is untouched and closes normally; then the second opens. */
@@ -598,8 +617,262 @@ static void test_second_process_is_busy(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
     cdb_faultenv_on_sleep(&fe, NULL, NULL);
     TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
-    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_max(&p2, 1));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+}
+
+/* Two processes open the same database: the second uses an overlay, and
+ * reconciliation under the baton merges both journals in stamp order. */
+static void test_two_processes_share_and_merge(void)
+{
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_TRUE(cdb_coord_baton_held(&p1.db.coord));
+    TEST_ASSERT_TRUE(p1.db.fresh);
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_UINT(1, p2.db.coord.me.slot);
+    TEST_ASSERT_FALSE(cdb_coord_baton_held(&p2.db.coord));
+    TEST_ASSERT_FALSE(p2.db.fresh);
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/pages.1.cdb"));
+
+    /* Interleaved commits: p1 at t, p2 at t+10ms, p1 at t+20ms. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 1, CDB_OP_PATCH, "a", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+
+    cdb_faultenv_advance(&fe, 10000000);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 1, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+
+    cdb_faultenv_advance(&fe, 10000000);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 1, CDB_OP_PATCH, "c", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+
+    /* Each process sees only its own unreconciled changes. */
+    TEST_ASSERT_EQUAL_STRING("ac", value_of(&p1, 1));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p2, 1));
+
+    /* p2 reconciles: p1 yields its standing baton on tick, and both journals
+     * merge in stamp order into "abc". */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p2.db));
+    TEST_ASSERT_EQUAL_STRING("abc", value_of(&p2, 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("abc", value_of(&p1, 1));
+
+    /* Closing p1 while p2 is still live keeps the working directory until p2
+     * closes too. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork"));
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork/main.0.cdb"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+}
+
+/* When the archive advances while a process has an unmerged transaction in
+ * its journal, rebasing reloads the archive and replays that transaction on
+ * top of it (spec 5.9.1, 14.4.7 rule 2). */
+static void test_rebase_replays_own_unmerged(void)
+{
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+
+    /* p2 opens a transaction before p1 reconciles, so it does not rebase yet. */
+    cdb_faultenv_advance(&fe, 10000000);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 1, CDB_OP_PATCH, "b", 1));
+
+    /* p1 commits "a" and reconciles into the archive while p2's tx is open. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 1, CDB_OP_PATCH, "a", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+
+    /* p2 commits "b" to its overlay and journal (not yet in the archive). */
+    cdb_faultenv_advance(&fe, 10000000);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p2, 1));
+
+    /* On tick, p2 sees the new archive commit, rebases, and replays "b" on
+     * top of "a". */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p2.db));
+    TEST_ASSERT_EQUAL_STRING("ab", value_of(&p2, 1));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("ab", value_of(&p1, 1));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+}
+
+/* A live reader's published pin keeps pages freed by later archive commits
+ * from being overwritten until the reader advances its pin (spec 5.9.7). */
+static void test_reader_pin_blocks_reuse(void)
+{
+    cdb_anchor_entry e1, e3;
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 1, CDB_OP_REPLACE, "first", 5));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 2, CDB_OP_REPLACE, "keep", 4));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_lookup(&p1.db.pager, 1, &e1));
+
+    /* p2 opens and pins the archive commit where entry 1 lives at e1.phys. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_UINT64(p1.db.pager.hs.record.committed_seq, p2.db.coord.me.pinned);
+
+    /* p1 frees entry 1 and reconciles, then allocates entry 3 while p2 still
+     * pins the old sequence (tick only p1 so p2 does not rebase yet). */
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 1, CDB_OP_DELETE, NULL, 0));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 3, CDB_OP_REPLACE, "third", 5));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_lookup(&p1.db.pager, 3, &e3));
+    TEST_ASSERT_TRUE(e3.phys != e1.phys); /* e1.phys is still pinned by p2 */
+    TEST_ASSERT_EQUAL_STRING("first", value_of(&p2, 1));
+
+    /* Once p2 ticks and rebases, its pin moves past the commit that freed e1. */
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p2.db));
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p2, 1));
+    TEST_ASSERT_EQUAL_STRING("third", value_of(&p2, 3));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+}
+
+/* When one of two open processes crashes, the survivor's next reconciliation
+ * merges the dead slot's journal and cleans up its files (spec 5.9.1,
+ * 14.4.7 rule 9). */
+static void test_live_peer_merges_crashed_peer(void)
+{
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 1, CDB_OP_PATCH, "a", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+
+    cdb_faultenv_advance(&fe, 10000000);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 1, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+
+    /* p2 crashes: close its handles without leaving or removing its files,
+     * then let the dead timeout pass while p1 keeps ticking. */
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
+    cdb_storage_close(&p2.db.overlay_st);
+    cdb_storage_close(&p2.db.journal_st);
+    cdb_storage_close(&p2.db.archive_st);
+    cdb_storage_close(&p2.db.coord.st);
+    p2.db.coord.joined = 0;
+    {
+        int64_t step = SEC / 4, rem = 4 * (int64_t)SEC;
+        while (rem > 0) {
+            cdb_faultenv_advance(&fe, step);
+            (void)cdb_db_tick(&p1.db);
+            rem -= step;
+        }
+    }
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("ab", value_of(&p1, 1));
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork/main.1.cdb"));
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork/pages.1.cdb"));
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork/coord/1"));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+}
+
+/* A newcomer that claims a dead slot while another process is still live
+ * adopts the dead slot's journal into its overlay (spec 5.9.1, 14.4.7
+ * rule 9). */
+static void test_take_over_dead_slot_while_peer_live(void)
+{
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_UINT(1, p2.db.coord.me.slot);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 1, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+
+    /* p2 crashes while p1 stays alive without reconciling. */
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
+    cdb_storage_close(&p2.db.overlay_st);
+    cdb_storage_close(&p2.db.journal_st);
+    cdb_storage_close(&p2.db.archive_st);
+    cdb_storage_close(&p2.db.coord.st);
+    p2.db.coord.joined = 0;
+
+    /* A new process opens, waits slot 1's dead timeout out, claims slot 1,
+     * and adopts main.1.cdb into its overlay. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_UINT(1, p2.db.coord.me.slot);
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p2, 1));
+    TEST_ASSERT_EQUAL_UINT64(1 + 1024, p2.db.next_tx);
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 1, CDB_OP_PATCH, "c", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("bc", value_of(&p1, 1));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+}
+
+/* A slot whose "journal in use" flag is set while its journal is missing
+ * causes reconciliation to return CDB_E_CORRUPT unless loss is accepted
+ * (spec 14.4.7 rule 7). */
+static void test_missing_peer_journal_refused(void)
+{
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 1, CDB_OP_PATCH, "a", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+
+    /* Remove p2's journal while p2's slot still says it is in use. */
+    cdb_storage_close(&p2.db.journal_st);
+    memset(&p2.db.journal_st, 0, sizeof p2.db.journal_st);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->remove(env.ctx, DIR "/db.cdbwork/main.1.cdb"));
+
+    TEST_ASSERT_EQUAL_INT(CDB_E_CORRUPT, cdb_db_reconcile(&p1.db));
+    p1.db.cfg.flags |= CDB_DB_ACCEPT_LOSS;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("a", value_of(&p1, 1));
+
+    /* Restore p2's journal so both close cleanly. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
 }
 
 /* A process that crashed with the database open: the next open waits the
@@ -878,6 +1151,12 @@ int main(void)
     RUN_TEST(test_full);
     RUN_TEST(test_join_crash_sweep);
     RUN_TEST(test_second_process_is_busy);
+    RUN_TEST(test_two_processes_share_and_merge);
+    RUN_TEST(test_rebase_replays_own_unmerged);
+    RUN_TEST(test_reader_pin_blocks_reuse);
+    RUN_TEST(test_live_peer_merges_crashed_peer);
+    RUN_TEST(test_take_over_dead_slot_while_peer_live);
+    RUN_TEST(test_missing_peer_journal_refused);
     RUN_TEST(test_crashed_process_recovered);
     RUN_TEST(test_idle_process_loses_slot);
     RUN_TEST(test_recovery_merges_slots_by_stamp);
