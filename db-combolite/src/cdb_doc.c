@@ -1539,25 +1539,56 @@ typedef struct tx_view {
     uint32_t schema;     /* with need_state: the schema version the state was written under */
 } tx_view;
 
-/* Linear scan of the staging records for (store, entry). Records are packed
- * back to back from the start of doc_stage. */
+/* Staging records are indexed in a hash table of CDB_STAGE_BUCKETS buckets.
+ * Buckets store the byte offset of the chain head in doc_stage, or CDB_STAGE_NIL.
+ * Bytes 28..31 of each record's STAGE_HDR store next_off in big-endian order. */
+static inline unsigned stage_bucket(uint64_t store, uint64_t entry)
+{
+    uint64_t h = (store * 0x517cc1b727220a95ULL) ^ (entry * 0x9e3779b97f4a7c15ULL);
+    return (unsigned)(((h ^ (h >> 32)) & (uint64_t)(CDB_STAGE_BUCKETS - 1u)));
+}
+
+/* Rebuilds the staging hash table over all records in doc_stage. */
+static void stage_reindex(cdb_db *db)
+{
+    size_t off = 0;
+    memset(db->stage_buckets, 0xFF, sizeof db->stage_buckets);
+    if (db->cfg.doc_stage == NULL)
+        return;
+    while (off < db->stage_used) {
+        uint8_t *r = db->cfg.doc_stage + off;
+        uint64_t store = cdb_load_u64(r, CDB_ORDER_BIG);
+        uint64_t entry = cdb_load_u64(r + 8, CDB_ORDER_BIG);
+        size_t len = cdb_load_u32(r + 16, CDB_ORDER_BIG);
+        unsigned b = stage_bucket(store, entry);
+        cdb_store_u32(r + 28, db->stage_buckets[b], CDB_ORDER_BIG);
+        db->stage_buckets[b] = (uint32_t)off;
+        off += STAGE_HDR + len;
+    }
+}
+
+/* Hash lookup of the staging record for (store, entry). */
 static void stage_find(const cdb_db *db, uint64_t store, uint64_t entry, staged *st)
 {
     const uint8_t *p = db->cfg.doc_stage;
-    size_t off = 0;
+    unsigned b;
+    uint32_t off;
     memset(st, 0, sizeof *st);
-    while (off < db->stage_used) {
+    if (p == NULL || db->stage_used == 0)
+        return;
+    b = stage_bucket(store, entry);
+    off = db->stage_buckets[b];
+    while (off != CDB_STAGE_NIL) {
         const uint8_t *r = p + off;
-        size_t len = cdb_load_u32(r + 16, CDB_ORDER_BIG);
         if (cdb_load_u64(r, CDB_ORDER_BIG) == store && cdb_load_u64(r + 8, CDB_ORDER_BIG) == entry) {
             st->found = 1;
             st->off = off;
-            st->len = len;
+            st->len = cdb_load_u32(r + 16, CDB_ORDER_BIG);
             st->summary_len = cdb_load_u32(r + 20, CDB_ORDER_BIG);
             st->flags = r[24];
             return;
         }
-        off += STAGE_HDR + len;
+        off = cdb_load_u32(r + 28, CDB_ORDER_BIG);
     }
 }
 
@@ -1573,6 +1604,7 @@ static void stage_put(cdb_db *db, uint64_t store, uint64_t entry, const staged *
 {
     uint8_t *p = db->cfg.doc_stage, *r;
     size_t avail, len = v->live ? v->len : 0u;
+    size_t rec_off;
     /* Remove the old record by closing the gap. */
     if (old->found) {
         size_t size = STAGE_HDR + old->len;
@@ -1582,10 +1614,13 @@ static void stage_put(cdb_db *db, uint64_t store, uint64_t entry, const staged *
     avail = p ? db->cfg.doc_stage_size - db->stage_used : 0u;
     if (avail < STAGE_HDR || len > avail - STAGE_HDR) {
         db->stage_overflow = 1;
+        if (old->found)
+            stage_reindex(db);
         return;
     }
     /* Append the new record at the end. */
-    r = p + db->stage_used;
+    rec_off = db->stage_used;
+    r = p + rec_off;
     memset(r, 0, STAGE_HDR);
     cdb_store_u64(r, store, CDB_ORDER_BIG);
     cdb_store_u64(r + 8, entry, CDB_ORDER_BIG);
@@ -1595,6 +1630,13 @@ static void stage_put(cdb_db *db, uint64_t store, uint64_t entry, const staged *
     if (len)
         memcpy(r + STAGE_HDR, state, len);
     db->stage_used += STAGE_HDR + len;
+    if (old->found) {
+        stage_reindex(db);
+    } else {
+        unsigned b = stage_bucket(store, entry);
+        cdb_store_u32(r + 28, db->stage_buckets[b], CDB_ORDER_BIG);
+        db->stage_buckets[b] = (uint32_t)rec_off;
+    }
 }
 
 /* The committed document with the open transaction's journaled changes to
@@ -1901,8 +1943,8 @@ cdb_status cdb_doc_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *l
     return CDB_OK;
 }
 
-cdb_status cdb_doc_get_in_tx(cdb_db *db, uint64_t store, uint64_t entry, void *body, size_t cap, size_t *len,
-                             int *live, uint32_t *schema)
+cdb_status cdb_doc_get_in_tx(cdb_db *db, uint64_t store, uint64_t entry, size_t staged_off, void *body,
+                             size_t cap, size_t *len, int *live, uint32_t *schema)
 {
     struct cdb_doc_pool *pool;
     staged st;
@@ -1914,7 +1956,31 @@ cdb_status cdb_doc_get_in_tx(cdb_db *db, uint64_t store, uint64_t entry, void *b
         return s;
     if (entry == 0 || entry >= pool->next_entry)
         return CDB_OK;
-    stage_find(db, store, entry, &st);
+    if (staged_off != CDB_STAGE_OFF_NONE && staged_off + STAGE_HDR <= db->stage_used
+        && db->cfg.doc_stage != NULL
+        && cdb_load_u64(db->cfg.doc_stage + staged_off, CDB_ORDER_BIG) == store
+        && cdb_load_u64(db->cfg.doc_stage + staged_off + 8, CDB_ORDER_BIG) == entry) {
+        const uint8_t *r = db->cfg.doc_stage + staged_off;
+        st.found = 1;
+        st.off = staged_off;
+        st.len = cdb_load_u32(r + 16, CDB_ORDER_BIG);
+        st.summary_len = cdb_load_u32(r + 20, CDB_ORDER_BIG);
+        st.flags = r[24];
+    } else {
+        stage_find(db, store, entry, &st);
+    }
+    if (st.found) {
+        *live = !(st.flags & STAGE_DELETED);
+        if (!*live)
+            return CDB_OK;
+        *len = st.len;
+        if (st.len > cap)
+            return CDB_E_BUFFER_TOO_SMALL;
+        memcpy(body, db->cfg.doc_stage + st.off + STAGE_HDR, st.len);
+        *live = 1;
+        *schema = pool->schema_version;
+        return CDB_OK;
+    }
     if ((s = tx_doc(db, pool, entry, &st, 1, &v)) != CDB_OK)
         return s;
     if (!v.live)
@@ -2014,10 +2080,11 @@ cdb_status cdb_doc_tx_entries(cdb_db *db, uint64_t store, cdb_doc_entry_fn fn, v
         return CDB_OK;
     while (off < db->stage_used) {
         const uint8_t *r = db->cfg.doc_stage + off;
+        size_t rec_off = off;
         uint64_t entry = cdb_load_u64(r + 8, CDB_ORDER_BIG);
         int mine = cdb_load_u64(r, CDB_ORDER_BIG) == store;
         off += STAGE_HDR + cdb_load_u32(r + 16, CDB_ORDER_BIG);
-        if (mine && (s = fn(ctx, entry)) != CDB_OK)
+        if (mine && (s = fn(ctx, entry, rec_off)) != CDB_OK)
             return s;
     }
     if (!db->stage_overflow)
@@ -2030,7 +2097,7 @@ cdb_status cdb_doc_tx_entries(cdb_db *db, uint64_t store, cdb_doc_entry_fn fn, v
             return s;
         joff = next;
         if (r.kind == CDB_RECORD_DATA && r.tx_id == db->tx_id && r.store_id == store && r.entry_id != 0
-            && (s = fn(ctx, r.entry_id)) != CDB_OK)
+            && (s = fn(ctx, r.entry_id, CDB_STAGE_OFF_NONE)) != CDB_OK)
             return s;
     }
     return CDB_OK;

@@ -118,14 +118,20 @@ cdb_status cdb_doc_head(cdb_db *db, uint64_t store, uint64_t entry, uint64_t *re
  * CDB_E_INVALID_ARG: not a document pool; CDB_E_NOT_FOUND: no such store. */
 cdb_status cdb_doc_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *live);
 
+/* Sentinel for unknown staged offset in cdb_doc_get_in_tx and cdb_doc_entry_fn. */
+#define CDB_STAGE_OFF_NONE SIZE_MAX
+
 /* For the table layer (cdb_table.h), which sets db->via_table around these.
  * get_in_tx copies a document's body as the open transaction sees it
  * (committed state outside a transaction); *live 0 when it does not exist or
- * is deleted. tx_entries calls fn with each entry of the store the open
- * transaction has changed, possibly more than once; nothing outside one. */
-typedef cdb_status (*cdb_doc_entry_fn)(void *ctx, uint64_t entry);
-cdb_status cdb_doc_get_in_tx(cdb_db *db, uint64_t store, uint64_t entry, void *body, size_t cap, size_t *len,
-                             int *live, uint32_t *schema);
+ * is deleted. If staged_off is not CDB_STAGE_OFF_NONE, it directly decodes the
+ * staged record at that offset in doc_stage without searching. tx_entries calls
+ * fn with each entry of the store the open transaction has changed (and its
+ * staged offset, or CDB_STAGE_OFF_NONE if read from the journal on overflow),
+ * possibly more than once; nothing outside one. */
+typedef cdb_status (*cdb_doc_entry_fn)(void *ctx, uint64_t entry, size_t staged_off);
+cdb_status cdb_doc_get_in_tx(cdb_db *db, uint64_t store, uint64_t entry, size_t staged_off, void *body,
+                             size_t cap, size_t *len, int *live, uint32_t *schema);
 cdb_status cdb_doc_tx_entries(cdb_db *db, uint64_t store, cdb_doc_entry_fn fn, void *ctx);
 /* The first committed live entry after `after`, in entry order; *done 1 at
  * the end. Uses the page buffer, so calls must not interleave with reads. */

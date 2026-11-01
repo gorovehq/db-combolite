@@ -561,6 +561,66 @@ static void test_secondary_index(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+/* Large batch of rows in one transaction, verifying O(1) staging lookups
+ * and duplicate detection within uncommitted staging records. */
+static void test_staging_unique_batch(void)
+{
+    uint64_t e, entries[200], got[8];
+    cdb_table_cursor cur;
+    size_t n;
+    enc e1;
+    int i;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_EQUAL_INT(CDB_OK, make_table(0));
+
+    begin();
+    for (i = 0; i < 200; i++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, insert(1000 + i, "batch", i, &entries[i]));
+    }
+    /* Duplicate key within the open transaction's staged rows is rejected. */
+    TEST_ASSERT_EQUAL_INT(CDB_E_EXISTS, insert(1050, "dupe", 999, &e));
+
+    /* Update a staged row within the open transaction: triggers stage_reindex. */
+    obj_begin(&e1);
+    put_str(&e1, F_NAME, "updated");
+    obj_end(&e1);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_update(&db, T, entries[50], e1.b, e1.n));
+
+    /* Staged row with unchanged unique key still rejects duplicates. */
+    TEST_ASSERT_EQUAL_INT(CDB_E_EXISTS, insert(1050, "dupe2", 999, &e));
+
+    /* Delete a staged row within the open transaction. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_delete(&db, T, entries[100]));
+
+    /* Deleted entry's key can now be re-inserted in the same transaction. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, insert(1100, "revived", 42, &e));
+
+    commit();
+
+    /* Verify committed state */
+    /* Scan by PK 1050 (entries[50]) */
+    {
+        enc k;
+        arr_begin(&k);
+        put_int(&k, 0, 1050);
+        arr_end(&k);
+        memset(&cur, 0, sizeof cur);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_scan(&db, T, 0, k.b, k.n, k.b, k.n, &cur, got, 8, &n));
+        TEST_ASSERT_EQUAL_size_t(1, n);
+        TEST_ASSERT_EQUAL_UINT64(entries[50], got[0]);
+    }
+    /* Entry 100 was deleted, but key 1100 was re-inserted as e */
+    {
+        uint8_t row[256];
+        size_t rlen;
+        TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_table_get(&db, T, entries[100], row, sizeof row, &rlen));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_get(&db, T, e, row, sizeof row, &rlen));
+    }
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 /* With keep 1, a row updated many times keeps one revision, so its pages
  * stay few; a delete removes the row. With history on they grow. */
 static unsigned live_pages(void)
@@ -740,6 +800,7 @@ int main(void)
     RUN_TEST(test_scans);
     RUN_TEST(test_schema_changes);
     RUN_TEST(test_secondary_index);
+    RUN_TEST(test_staging_unique_batch);
     RUN_TEST(test_revision_window);
     RUN_TEST(test_crash_sweep);
     return UNITY_END();
