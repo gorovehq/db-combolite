@@ -1261,6 +1261,53 @@ Every owner refers to a record by a page ID, and adds a 2-byte slot when the rec
 - **Keys** are big-endian: (domain ID 8, free bytes 2, page ID 8). The value is empty.
 - **Best fit** seeks to (domain, record size, 0) and takes the first key in that domain. Every placement, removal and merge updates the page's key.
 
+## 14.19 Structured query wire format (CMBQL core)
+
+A query is encoded as a compact binary tree of typed operator nodes and expressions (spec 11.7, 11.10). It is the canonical representation exchanged over the wire, prepared in the catalog, and executed by the streaming cursor engine.
+
+### 14.19.1 Header
+
+| Offset | Length | Description |
+|---|---|---|
+| 0 | 4 | Magic bytes: `0x43 0x4D 0x42 0x51` (`CMBQ`) |
+| 4 | 1 | Format version (`0x01`) |
+| 5 | 1 | Flags (reserved, `0x00`) |
+| 6 | var | Root plan node |
+
+### 14.19.2 Operator node tags (`0x01`–`0x1F`)
+
+Every operator node begins with a 1-byte kind tag, followed by its node-specific fields. Sub-nodes are embedded recursively.
+
+| Tag | Name | Fields |
+|---|---|---|
+| `0x01` | `Scan` | `store_name` (varint len + UTF-8 bytes) |
+| `0x02` | `Filter` | `input` (node), `predicate` (expression) |
+| `0x03` | `Project` | `passthrough` (uint8: 0 or 1), `count` (varint N), `input` (node), N outputs: `[alias` (varint len + UTF-8), `expr` (expression)`]` |
+| `0x04` | `Join` | `kind` (uint8: 1 = Inner, 2 = LeftOuter), `left` (node), `right` (node), `condition` (expression) |
+| `0x05` | `Sort` | `count` (varint N), `input` (node), N sort keys: `[expr` (expression), `dir` (uint8: 1 = ASC, 2 = DESC), `nulls` (uint8: 1 = First, 2 = Last)`]` |
+| `0x06` | `Limit` | `count` (varint), `offset` (varint), `input` (node) |
+| `0x07` | `Union` | `count` (varint N), N branches: `[node]` |
+| `0x08` | `Aggregate` | `groups_count` (varint G), `aggs_count` (varint A), `input` (node), G group expressions: `[expr]`, A aggregates: `[alias` (varint len + UTF-8), `fn` (uint8: 1 = COUNT, 2 = SUM, 3 = AVG, 4 = MIN, 5 = MAX), `arg` (expression)`]` |
+| `0x09` | `Traverse` | `link_type` (varint len + UTF-8), `dir` (uint8: 1 = Forward, 2 = Reverse, 3 = Both), `min_hops` (varint), `max_hops` (varint), `input` (node) |
+| `0x0A` | `TextSearch` | `mode` (uint8: 1 = ANY, 2 = ALL), `limit` (varint), `query` (varint len + UTF-8), `fields_count` (varint F), `input` (node), F field names: `[varint len + UTF-8]` |
+| `0x0B` | `VectorSearch` | `field` (varint len + UTF-8), `k` (varint), `metric` (uint8: 0 = Default, 1 = Euclidean, 2 = Cosine, 3 = Dot), `input` (node), `near` (expression) |
+| `0x0C` | `HybridRank` | `fuse` (uint8: 1 = RRF), `count` (varint N), N branches: `[node, weight` (uint32 scaled by 1000)`]` |
+| `0x0D` | `Window` | `type` (uint8: 1 = Tumbling, 2 = Sliding, 3 = Hopping), `time_field` (varint len + UTF-8), `size_ns` (varint uint64), `step_ns` (varint uint64), `input` (node) |
+| `0x0E` | `AsofJoin` | `kind` (uint8: 1 = Backward, 2 = Forward, 3 = Nearest), `tolerance_ns` (varint uint64), `left` (node), `right` (node), `left_time` (expression), `right_time` (expression), `match_cond` (expression) |
+| `0x0F` | `Unnest` | `item_alias` (varint len + UTF-8), `index_alias` (varint len + UTF-8, empty if omitted), `input` (node), `array_expr` (expression) |
+
+### 14.19.3 Expression tags (`0x20`–`0x3F`)
+
+Expressions are trees embedded within operator nodes.
+
+| Tag | Name | Fields |
+|---|---|---|
+| `0x20` | `Literal` | `len` (varint), encoded `cdb_value` bytes (14.6) |
+| `0x21` | `Field` | `path` (varint len + UTF-8; nested paths joined by `0x1F` Unit Separator) |
+| `0x22` | `Param` | `kind` (uint8: 1 = Index, 2 = Named), `index` (varint uint32) or `name` (varint len + UTF-8) |
+| `0x23` | `Unary` | `op` (uint8: 1 = NOT, 2 = NEG, 3 = IS_NULL, 4 = IS_NOT_NULL), `operand` (expression) |
+| `0x24` | `Binary` | `op` (uint8: 1 = AND, 2 = OR, 3 = EQ, 4 = NE, 5 = LT, 6 = LE, 7 = GT, 8 = GE, 9 = ADD, 10 = SUB, 11 = MUL, 12 = DIV, 13 = MOD, 14 = LIKE, 15 = CONTAINS), `left` (expression), `right` (expression) |
+
 ## Open questions (do not specify until answered)
 
 None at present.
