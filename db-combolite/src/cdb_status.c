@@ -24,6 +24,7 @@ const char *cdb_status_str(cdb_status status)
     case CDB_E_BUSY: return "busy";
     case CDB_E_COLLISION: return "write collision";
     case CDB_E_TIMEOUT: return "timeout";
+    case CDB_E_OUT_OF_BUDGET: return "out of budget";
     }
     return "unknown status";
 }

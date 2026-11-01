@@ -47,6 +47,7 @@
 #define CDB_QUERY_EXPR_PARAM 0x22u
 #define CDB_QUERY_EXPR_UNARY 0x23u
 #define CDB_QUERY_EXPR_BINARY 0x24u
+#define CDB_QUERY_EXPR_CALL 0x25u
 
 /* Join kinds. */
 #define CDB_JOIN_INNER 0x01u
@@ -119,6 +120,146 @@
 #define CDB_AGG_AVG 0x03u
 #define CDB_AGG_MIN 0x04u
 #define CDB_AGG_MAX 0x05u
+#define CDB_AGG_FIRST 0x06u
+#define CDB_AGG_LAST 0x07u
+#define CDB_AGG_STDDEV 0x08u
+#define CDB_AGG_VARIANCE 0x09u
+
+/* Math, Geometry, DSP and Linear Algebra function IDs (CDB_QUERY_EXPR_CALL). */
+/* Trigonometry & Hyperbolics */
+#define CDB_FN_SIN 0x0100u
+#define CDB_FN_COS 0x0101u
+#define CDB_FN_TAN 0x0102u
+#define CDB_FN_ASIN 0x0103u
+#define CDB_FN_ACOS 0x0104u
+#define CDB_FN_ATAN 0x0105u
+#define CDB_FN_ATAN2 0x0106u
+#define CDB_FN_SINH 0x0107u
+#define CDB_FN_COSH 0x0108u
+#define CDB_FN_TANH 0x0109u
+#define CDB_FN_DEGREES 0x010Au
+#define CDB_FN_RADIANS 0x010Bu
+
+/* Geometry & Spatial / Geodesic / Navigation & GIS Projections */
+#define CDB_FN_HYPOT 0x0200u
+#define CDB_FN_HYPOT3 0x0201u
+#define CDB_FN_HAVERSINE 0x0202u
+#define CDB_FN_BBOX_CONTAINS 0x0203u
+#define CDB_FN_BEARING 0x0204u
+#define CDB_FN_DESTINATION_LAT 0x0205u
+#define CDB_FN_DESTINATION_LON 0x0206u
+#define CDB_FN_CROSS_TRACK_DISTANCE 0x0207u
+#define CDB_FN_ALONG_TRACK_DISTANCE 0x0208u
+#define CDB_FN_POINT_IN_CIRCLE 0x0209u
+#define CDB_FN_POINT_IN_POLYGON 0x020Au
+#define CDB_FN_WGS84_TO_MERCATOR_X 0x020Bu
+#define CDB_FN_WGS84_TO_MERCATOR_Y 0x020Cu
+#define CDB_FN_MERCATOR_TO_WGS84_LAT 0x020Du
+#define CDB_FN_MERCATOR_TO_WGS84_LON 0x020Eu
+#define CDB_FN_TILE_X 0x020Fu
+#define CDB_FN_TILE_Y 0x0210u
+#define CDB_FN_MORTON2D 0x0211u
+#define CDB_FN_GEOHASH_ENCODE 0x0212u
+#define CDB_FN_GEOHASH_DECODE_LAT 0x0213u
+#define CDB_FN_GEOHASH_DECODE_LON 0x0214u
+
+/* Algebra, Roots, Powers, Logarithms & ML Activations */
+#define CDB_FN_SQRT 0x0300u
+#define CDB_FN_CBRT 0x0301u
+#define CDB_FN_POW 0x0302u
+#define CDB_FN_EXP 0x0303u
+#define CDB_FN_EXPM1 0x0304u
+#define CDB_FN_LN 0x0305u
+#define CDB_FN_LOG10 0x0306u
+#define CDB_FN_LOG2 0x0307u
+#define CDB_FN_LOG1P 0x0308u
+#define CDB_FN_ABS 0x0309u
+#define CDB_FN_SIGN 0x030Au
+#define CDB_FN_ROUND 0x030Bu
+#define CDB_FN_FLOOR 0x030Cu
+#define CDB_FN_CEIL 0x030Du
+#define CDB_FN_CLAMP 0x030Eu
+#define CDB_FN_LERP 0x030Fu
+#define CDB_FN_SIGMOID 0x0310u
+#define CDB_FN_RELU 0x0311u
+#define CDB_FN_GELU 0x0312u
+#define CDB_FN_ERF 0x0313u
+
+/* Calculus & Numerical Analysis */
+#define CDB_FN_DIFF 0x0400u
+#define CDB_FN_DERIVATIVE 0x0401u
+#define CDB_FN_TRAPEZOID 0x0402u
+
+/* Linear Algebra: Vectors & Matrices */
+#define CDB_FN_VEC_DOT 0x0500u
+#define CDB_FN_VEC_NORM 0x0501u
+#define CDB_FN_VEC_COSINE 0x0502u
+#define CDB_FN_VEC_DISTANCE 0x0503u
+#define CDB_FN_VEC_SCALE 0x0504u
+#define CDB_FN_VEC_ADD 0x0505u
+#define CDB_FN_VEC_SUB 0x0506u
+#define CDB_FN_MAT_VEC_MUL 0x0510u
+#define CDB_FN_MAT_MUL 0x0511u
+#define CDB_FN_MAT_TRANSPOSE 0x0512u
+#define CDB_FN_MAT_DET 0x0513u
+#define CDB_FN_MAT_TRACE 0x0514u
+
+/* Spectral & SDR / DSP */
+#define CDB_FN_FFT_MAGNITUDE 0x0600u
+#define CDB_FN_FFT_POWER 0x0601u
+#define CDB_FN_RFFT 0x0602u
+#define CDB_FN_IFFT 0x0603u
+#define CDB_FN_WINDOW_HANN 0x0604u
+#define CDB_FN_WINDOW_HAMMING 0x0605u
+#define CDB_FN_WINDOW_BLACKMAN 0x0606u
+#define CDB_FN_IQ_MAGNITUDE 0x0607u
+#define CDB_FN_IQ_PHASE 0x0608u
+#define CDB_FN_IQ_DEMOD_FM 0x0609u
+#define CDB_FN_DBFS 0x060Au
+#define CDB_FN_FIR_FILTER 0x060Bu
+
+/* Astronomy, Telescope Mount & Satellite Tracking (0x0700 - 0x071F) */
+#define CDB_FN_ASTRO_ALT 0x0700u
+#define CDB_FN_ASTRO_AZ 0x0701u
+#define CDB_FN_ASTRO_RANGE 0x0702u
+#define CDB_FN_ASTRO_ALTAZ_TO_RA 0x0703u
+#define CDB_FN_ASTRO_ALTAZ_TO_DEC 0x0704u
+#define CDB_FN_ASTRO_RADEC_TO_ALT 0x0705u
+#define CDB_FN_ASTRO_RADEC_TO_AZ 0x0706u
+#define CDB_FN_ASTRO_REFRACTION 0x0707u
+#define CDB_FN_ASTRO_ANGULAR_SEP 0x0708u
+
+/* Electronics & Circuit Engineering (0x0800 - 0x081F) */
+#define CDB_FN_ELEC_THERMISTOR_NTC 0x0800u
+#define CDB_FN_ELEC_STEINHART_HART 0x0801u
+#define CDB_FN_ELEC_ADC_VOLTS 0x0802u
+#define CDB_FN_ELEC_VOLTAGE_DIVIDER 0x0803u
+#define CDB_FN_ELEC_PARALLEL_R 0x0804u
+#define CDB_FN_ELEC_DBM_TO_WATTS 0x0805u
+#define CDB_FN_ELEC_WATTS_TO_DBM 0x0806u
+#define CDB_FN_ELEC_RC_CUTOFF 0x0807u
+#define CDB_FN_ELEC_LC_RESONANCE 0x0808u
+#define CDB_FN_ELEC_REACTANCE_C 0x0809u
+#define CDB_FN_ELEC_REACTANCE_L 0x080Au
+
+/* Atmospheric Science & Gas Body Modeling (0x0900 - 0x091F) */
+#define CDB_FN_ATMO_PRESSURE_TO_ALT 0x0900u
+#define CDB_FN_ATMO_ALT_TO_SEALEVEL_P 0x0901u
+#define CDB_FN_ATMO_DEW_POINT 0x0902u
+#define CDB_FN_ATMO_VAPOR_PRESSURE 0x0903u
+#define CDB_FN_ATMO_HEAT_INDEX 0x0904u
+#define CDB_FN_ATMO_WIND_CHILL 0x0905u
+#define CDB_FN_ATMO_AIR_DENSITY 0x0906u
+#define CDB_FN_GAS_IDEAL_PRESSURE 0x0907u
+
+/* Fluid Dynamics & Thermal Flow (0x0A00 - 0x0A1F) */
+#define CDB_FN_FLUID_DYNAMIC_PRESSURE 0x0A00u
+#define CDB_FN_FLUID_PITOT_AIRSPEED 0x0A01u
+#define CDB_FN_FLUID_REYNOLDS 0x0A02u
+#define CDB_FN_FLUID_HYDROSTATIC_PRESSURE 0x0A03u
+#define CDB_FN_FLUID_VENTURI_FLOW 0x0A04u
+#define CDB_FN_THERMAL_JUNCTION_TEMP 0x0A05u
+#define CDB_FN_THERMAL_RADIATION_POWER 0x0A06u
 
 /* In-memory zero-copy view of an expression. */
 typedef struct cdb_query_expr {
@@ -147,6 +288,11 @@ typedef struct cdb_query_expr {
             const uint8_t *left_wire;
             const uint8_t *right_wire;
         } binary;
+        struct {
+            uint16_t fn_id;
+            uint16_t n_args;
+            const uint8_t *args_wire;
+        } call;
     } as;
 } cdb_query_expr;
 
@@ -299,6 +445,7 @@ cdb_status cdb_query_write_expr_param_index(cdb_query_writer *w, uint32_t index)
 cdb_status cdb_query_write_expr_param_named(cdb_query_writer *w, const char *name, size_t name_len);
 cdb_status cdb_query_write_expr_unary(cdb_query_writer *w, uint8_t op);
 cdb_status cdb_query_write_expr_binary(cdb_query_writer *w, uint8_t op);
+cdb_status cdb_query_write_expr_call(cdb_query_writer *w, uint16_t fn_id, uint16_t n_args);
 
 /* Validates wire bytes and verifies structural integrity.
  * CDB_E_INVALID_ARG for malformed wire, bad magic, or invalid bounds.

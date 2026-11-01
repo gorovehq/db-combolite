@@ -1307,6 +1307,7 @@ Expressions are trees embedded within operator nodes.
 | `0x22` | `Param` | `kind` (uint8: 1 = Index, 2 = Named), `index` (varint uint32) or `name` (varint len + UTF-8) |
 | `0x23` | `Unary` | `op` (uint8: 1 = NOT, 2 = NEG, 3 = IS_NULL, 4 = IS_NOT_NULL), `operand` (expression) |
 | `0x24` | `Binary` | `op` (uint8: 1 = AND, 2 = OR, 3 = EQ, 4 = NE, 5 = LT, 6 = LE, 7 = GT, 8 = GE, 9 = ADD, 10 = SUB, 11 = MUL, 12 = DIV, 13 = MOD, 14 = LIKE, 15 = CONTAINS), `left` (expression), `right` (expression) |
+| `0x25` | `Call` | `fn_id` (varint uint16), `args_count` (varint N), N arguments: `[expression]` |
 
 ## Open questions (do not specify until answered)
 

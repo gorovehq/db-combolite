@@ -332,6 +332,16 @@ cdb_status cdb_query_write_expr_binary(cdb_query_writer *w, uint8_t op)
     return w_byte(w, op);
 }
 
+cdb_status cdb_query_write_expr_call(cdb_query_writer *w, uint16_t fn_id, uint16_t n_args)
+{
+    cdb_status s;
+    if ((s = w_byte(w, CDB_QUERY_EXPR_CALL)) != CDB_OK
+        || (s = w_u64(w, (uint64_t)fn_id)) != CDB_OK
+        || (s = w_u64(w, (uint64_t)n_args)) != CDB_OK)
+        return s;
+    return CDB_OK;
+}
+
 /* ------------------------------------------------------------- reader & validation */
 
 static cdb_status r_byte(const uint8_t **p, const uint8_t *end, uint8_t *b)
@@ -433,6 +443,21 @@ cdb_status cdb_query_skip_expr(const uint8_t **p, const uint8_t *end)
         if (s != CDB_OK)
             return s;
         return cdb_query_skip_expr(p, end);
+    }
+    case CDB_QUERY_EXPR_CALL: {
+        uint64_t fn_id, n_args, i;
+        s = r_u64(p, end, &fn_id);
+        if (s != CDB_OK)
+            return s;
+        s = r_u64(p, end, &n_args);
+        if (s != CDB_OK)
+            return s;
+        for (i = 0; i < n_args; i++) {
+            s = cdb_query_skip_expr(p, end);
+            if (s != CDB_OK)
+                return s;
+        }
+        return CDB_OK;
     }
     default:
         return CDB_E_INVALID_ARG;
@@ -809,6 +834,24 @@ cdb_status cdb_query_read_expr(const uint8_t **p, const uint8_t *end, cdb_query_
             return s;
         expr->as.binary.right_wire = *p;
         return cdb_query_skip_expr(p, end);
+    }
+    case CDB_QUERY_EXPR_CALL: {
+        uint64_t fn_id, n_args, i;
+        s = r_u64(p, end, &fn_id);
+        if (s != CDB_OK)
+            return s;
+        s = r_u64(p, end, &n_args);
+        if (s != CDB_OK)
+            return s;
+        expr->as.call.fn_id = (uint16_t)fn_id;
+        expr->as.call.n_args = (uint16_t)n_args;
+        expr->as.call.args_wire = *p;
+        for (i = 0; i < n_args; i++) {
+            s = cdb_query_skip_expr(p, end);
+            if (s != CDB_OK)
+                return s;
+        }
+        return CDB_OK;
     }
     default:
         return CDB_E_INVALID_ARG;
