@@ -607,7 +607,7 @@ typedef struct uctx {
 } uctx;
 
 /* Whether entry e, as the open transaction sees it, has key c->key. */
-static cdb_status has_key(uctx *c, uint64_t e)
+static cdb_status has_key(uctx *c, uint64_t e, size_t staged_off)
 {
     uint8_t k[CDB_TABLE_KEY_MAX + 8u];
     size_t len, klen;
@@ -616,8 +616,8 @@ static cdb_status has_key(uctx *c, uint64_t e)
     cdb_status s;
     if (e == c->self)
         return CDB_OK;
-    if ((s = cdb_doc_get_in_tx(c->db, c->t->slot.store_id, e, tbuf(c->db, T_OTHER), tbuf_size(c->db), &len, &live,
-                               &version)) != CDB_OK || !live)
+    if ((s = cdb_doc_get_in_tx(c->db, c->t->slot.store_id, e, staged_off, tbuf(c->db, T_OTHER), tbuf_size(c->db),
+                               &len, &live, &version)) != CDB_OK || !live)
         return s;
     if ((s = row_key(c->db, c->t, c->x, tbuf(c->db, T_OTHER), len, version, e, k, &klen, &null)) != CDB_OK)
         return s == CDB_E_OVERFLOW ? CDB_OK : s;
@@ -626,10 +626,10 @@ static cdb_status has_key(uctx *c, uint64_t e)
     return CDB_OK;
 }
 
-static cdb_status tx_entry(void *ctx, uint64_t e)
+static cdb_status tx_entry(void *ctx, uint64_t e, size_t staged_off)
 {
     uctx *c = (uctx *)ctx;
-    return c->clash ? CDB_OK : has_key(c, e);
+    return c->clash ? CDB_OK : has_key(c, e, staged_off);
 }
 
 /* The row in T_ROW (for entry self) must not repeat a non-null key of a
@@ -659,7 +659,7 @@ static cdb_status check_keys(cdb_db *db, const table *t, uint64_t self, size_t l
         /* A committed row with the key, unless this transaction changed it. */
         if ((s = cdb_index_get((cdb_index *)&x->ix, key, klen, v, sizeof v, &vlen, &found)) != CDB_OK)
             return s;
-        if (found && vlen == 8 && (s = has_key(&c, cdb_load_u64(v, CDB_ORDER_BIG))) != CDB_OK)
+        if (found && vlen == 8 && (s = has_key(&c, cdb_load_u64(v, CDB_ORDER_BIG), CDB_STAGE_OFF_NONE)) != CDB_OK)
             return s;
         /* Rows this transaction inserted or changed. The row in T_ROW is
          * untouched: has_key reads into T_OTHER. */
@@ -739,8 +739,8 @@ static cdb_status replace_row(cdb_db *db, uint64_t store, uint64_t entry, const 
     if (update) {
         /* The row as this transaction sees it, through the current columns. */
         size_t raw;
-        if ((s = cdb_doc_get_in_tx(db, store, entry, tbuf(db, T_OTHER), tbuf_size(db), &raw, &live, &version))
-            != CDB_OK)
+        if ((s = cdb_doc_get_in_tx(db, store, entry, CDB_STAGE_OFF_NONE, tbuf(db, T_OTHER), tbuf_size(db),
+                                   &raw, &live, &version)) != CDB_OK)
             return s;
         if (!live)
             return CDB_E_NOT_FOUND;

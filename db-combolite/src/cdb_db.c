@@ -924,6 +924,7 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
         || cfg->record_buf == NULL || cfg->record_buf_size < CDB_JOURNAL_HEADER_SIZE + CDB_COMMIT_PAYLOAD_SIZE)
         return CDB_E_INVALID_ARG;
     memset(db, 0, sizeof *db);
+    memset(db->stage_buckets, 0xFF, sizeof db->stage_buckets);
     db->env = *env;
     db->cfg = *cfg;
     if (db->cfg.durability == CDB_DURABILITY_DEFAULT)
@@ -1279,6 +1280,7 @@ static cdb_status tx_begin_locked(cdb_db *db, cdb_durability durability)
     db->tx_deltas = 0;
     db->stage_used = 0;
     db->stage_overflow = 0;
+    memset(db->stage_buckets, 0xFF, sizeof db->stage_buckets);
     db->tx_durability = durability == CDB_DURABILITY_DEFAULT ? db->cfg.durability : durability;
     return CDB_OK;
 }

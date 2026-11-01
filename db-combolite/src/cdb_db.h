@@ -19,6 +19,10 @@
 #include "cdb_slots.h"
 #include "cdb_worker.h"
 
+/* Staging hash table for transactions (spec 14.9, 14.4). */
+#define CDB_STAGE_BUCKETS 512u
+#define CDB_STAGE_NIL 0xFFFFFFFFu
+
 #define CDB_DB_PATH_MAX 200         /* longest path, including the terminating zero */
 
 /* Durability levels (spec 3.1). */
@@ -297,6 +301,7 @@ typedef struct cdb_db {
     int schema_trivial;   /* it accepts every document */
     size_t stage_used;    /* bytes of doc_stage in use by the open transaction */
     int stage_overflow;   /* a change could not be staged: consult the journal */
+    uint32_t stage_buckets[CDB_STAGE_BUCKETS]; /* head offset in doc_stage or CDB_STAGE_NIL */
     int set_aside;        /* recovery set a companion aside (spec 1.12.2) */
     int via_table;        /* the table layer is calling the document engine (cdb_table.h) */
     unsigned op_depth;    /* operation scopes open (cdb_db_op_begin) */
