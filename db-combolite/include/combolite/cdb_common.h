@@ -30,7 +30,8 @@ typedef enum cdb_status {
     CDB_E_SCHEMA = -15,          /* a document does not satisfy its pool's schema */
     CDB_E_BUSY = -16,            /* another process holds what is needed (spec 5) */
     CDB_E_COLLISION = -17,       /* a concurrent transaction wrote the same entry or key (spec 5.9.4) */
-    CDB_E_TIMEOUT = -18          /* a timed operation did not complete before its deadline */
+    CDB_E_TIMEOUT = -18,         /* a timed operation did not complete before its deadline */
+    CDB_E_OUT_OF_BUDGET = -19    /* a query or procedure exceeded its instruction or memory budget */
 } cdb_status;
 
 /* A short English name for a status, for logs and messages. The string is

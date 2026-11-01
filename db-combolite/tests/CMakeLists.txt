@@ -65,6 +65,11 @@ cdb_add_test(test_codec)
 cdb_add_test(test_colenc)
 cdb_add_test(test_rowgroup)
 cdb_add_test(test_threads)
+cdb_add_test(test_query)
+cdb_add_test(test_eval)
+cdb_add_test(test_math)
+cdb_add_test(test_exec)
+cdb_add_test(test_proc)
 
 # The suites that use several stores again, with one open store of each
 # model at a time, so a store closed while still in use shows up here.

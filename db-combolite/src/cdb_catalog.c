@@ -774,6 +774,34 @@ cdb_status cdb_catalog_get_schema(cdb_catalog *cat, uint64_t store_id, uint32_t 
     return CDB_OK;
 }
 
+/* Looks up a field's ID without adding it. *found is 0 if absent. */
+cdb_status cdb_catalog_field_lookup(cdb_catalog *cat, uint64_t store_id, const char *name, size_t len,
+                                    uint64_t *field_id, int *found)
+{
+    uint8_t v[8];
+    size_t vlen;
+    key k;
+    cdb_status s;
+
+    if (cat == NULL || name == NULL || field_id == NULL || found == NULL)
+        return CDB_E_INVALID_ARG;
+    *found = 0;
+    if ((s = check_name(cat, name, len)) != CDB_OK)
+        return s;
+    if (cat->open && len > cat->body.max_value)
+        return CDB_E_INVALID_ARG;
+    if ((s = k_field_name(&k, store_id, name, len)) != CDB_OK)
+        return s;
+    if ((s = get_either(cat, &k, v, sizeof v, &vlen, found)) != CDB_OK)
+        return s;
+    if (*found) {
+        if (vlen != 8)
+            return CDB_E_CORRUPT;
+        *field_id = cdb_load_u64(v, CDB_ORDER_BIG);
+    }
+    return CDB_OK;
+}
+
 /* Looks the name up in the store's field dictionary; if absent, assigns the
  * store's next field ID, records both directions (04 name -> ID and
  * 05 ID -> name) and commits. Field IDs are per store. The name is stored
@@ -783,31 +811,22 @@ cdb_status cdb_catalog_field_id(cdb_catalog *cat, uint64_t store_id, const char 
 {
     cdb_store_info info;
     uint8_t ref[REF_SIZE], v[8];
-    size_t vlen;
     int found;
     key k;
     cdb_status s;
 
-    if ((s = check_name(cat, name, len)) != CDB_OK)
+    if ((s = cdb_catalog_field_lookup(cat, store_id, name, len, field_id, &found)) != CDB_OK)
         return s;
-    if (cat->open && len > cat->body.max_value)
-        return CDB_E_INVALID_ARG;
-    if ((s = k_field_name(&k, store_id, name, len)) != CDB_OK)
-        return s;
-    if ((s = get_either(cat, &k, v, sizeof v, &vlen, &found)) != CDB_OK)
-        return s;
-    if (found) {
-        if (vlen != 8)
-            return CDB_E_CORRUPT;
-        *field_id = cdb_load_u64(v, CDB_ORDER_BIG);
+    if (found)
         return CDB_OK;
-    }
     if ((s = load_store(cat, store_id, &info, ref)) != CDB_OK)
         return s;
     if (info.flags & CDB_STORE_DROPPED)
         return CDB_E_NOT_FOUND;
     *field_id = info.next_field_id++;
     cdb_store_u64(v, *field_id, CDB_ORDER_BIG);
+    if ((s = k_field_name(&k, store_id, name, len)) != CDB_OK)
+        return s;
     if ((s = put_both(cat, &k, v, sizeof v)) != CDB_OK)
         return s;
     if ((s = k_pair(&k, KEY_FIELD_BY_ID, store_id, *field_id)) != CDB_OK

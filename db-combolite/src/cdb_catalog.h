@@ -138,6 +138,10 @@ cdb_status cdb_catalog_add_schema(cdb_catalog *cat, uint64_t store_id, const voi
 cdb_status cdb_catalog_get_schema(cdb_catalog *cat, uint64_t store_id, uint32_t version,
                                   void *buf, size_t cap, size_t *len);
 
+/* Looks up a field's ID without adding it. *found is 0 if absent. */
+cdb_status cdb_catalog_field_lookup(cdb_catalog *cat, uint64_t store_id, const char *name, size_t len,
+                                    uint64_t *field_id, int *found);
+
 /* Field dictionary (spec 14.6.3): returns the field's ID, adding the name if new.
  * Adding a name commits immediately. */
 cdb_status cdb_catalog_field_id(cdb_catalog *cat, uint64_t store_id, const char *name, size_t len,
