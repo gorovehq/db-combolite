@@ -86,10 +86,47 @@ A procedure can run in two ways:
 - **`Sort` null placement is configurable per key.** `Sort(input, keys: [{expr, dir, nulls}])`, where `nulls` is `first` or `last` per key.
 - **`TextSearch` and `VectorSearch` both yield a ranked, scored stream.** `TextSearch(input, fields, query)` searches the named fields of the input's entries with the existing BM25 engine (8.10) and yields matches each carrying a relevance score. `VectorSearch(input, field, near, k, metric?)` searches a named vector field (usually `$vector`) for the `k` nearest neighbours of `near` (a literal or a `Param`), optionally overriding the collection's configured distance metric (7.7) for this one query, and yields matches each carrying a similarity score. Both shapes match, which is what lets `HybridRank` treat any ranked branch — text, vector, or otherwise — the same way.
 
-## Open questions (do not specify until answered)
+## Open questions and design requirements for milestones M21–M23
 
-- How the text language lets a user write a field name containing a literal dot, and how it compiles a dotted path into 0x1F-joined segments.
-- The exact binary layout of each node kind (field order, lengths), to be written into Section 14 once implementation (M20) begins.
+The following gaps and design questions were identified in the CMBQL review and must be resolved as part of their respective milestone implementations:
+
+### M21: Structured Query Core & Bytecode Engine
+- **The exact binary layout of each node kind (field order, lengths)**: to be written into Section 14 once M21 implementation begins.
+- **Pipeline breakers vs. bounded memory (`Sort`, `Aggregate`, `HybridRank`)**:
+  - Operators like `Sort` and `Aggregate` cannot yield rows incrementally without buffering state. Under tight memory budgets (e.g. 64 KB on MCUs), the design must specify:
+    1. Does exceeding memory budget immediately fail with `CDB_E_OUT_OF_BUDGET`?
+    2. Are unbounded `Sort` operations disallowed without an index or a mandatory `Limit`?
+    3. Or does the engine support external merge-sorting using temporary scratch pages?
+- **Time-series query operators & rollup pushdown**:
+  - The 12 core operators currently lack time-series primitives. M21 needs:
+    1. A `Window` / time-bucketing node (`tumbling`, `sliding`, `hopping`) for metric streams.
+    2. An `AsofJoin` node to join event records with the most recent preceding time-series metric point.
+    3. Rollup pushdown: allowing `Aggregate` or `Scan` to query pre-aggregated chunk summaries in `cdb_ts.c` without decompressing raw tick samples.
+- **Graph traversal (`Traverse`) semantics**:
+  - **Cycle detection**: Bounded-memory visited-set tracking (e.g., fixed-capacity bloom filter or ring buffer) vs. depth-limited termination.
+  - **Output schema**: Defining whether `Traverse` emits target entry references only, or full path tuples `(source_id, depth, target_id, edge_properties)`.
+  - **Traversal pruning**: Supporting edge-property predicate pushdown to prune graph exploration paths at traversal time rather than filtering downstream.
+- **Document unnesting (`Unnest`)**:
+  - An operator node to explode arrays from document fields or Nibblet records into discrete stream items for joining and filtering.
+- **Cross-model type coercion and NULL semantics**:
+  - Explicit comparison rules between strongly-typed table columns and schemaless document/Nibblet fields.
+  - Tri-state boolean logic (`TRUE`, `FALSE`, `UNKNOWN`/`NULL`) for absent document fields in boolean expressions.
+- **Stored-procedure bytecode instruction set architecture (ISA)**:
+  - Register vs. stack evaluation architecture, control flow jump opcodes, variable storage slots, instruction-budget decrementing hooks, and host-API mutation call dispatch with error status propagation.
+
+### M22: Text Query Language (CMBQL)
+- **Grammar & Lexer (EBNF)**:
+  - Formal grammar definition for human-readable queries (`QUERY ... SELECT ...`) and stored procedures (`PROCEDURE ...`).
+- **Literal dots vs. nested field path resolution**:
+  - Syntax rules allowing field names containing literal dots to be escaped (e.g., via backticks or quotes) and disambiguated from nested document path navigation (which compiles to `0x1F` Unit Separator bytes in the structured core).
+- **Procedural variable scoping & subquery materialization**:
+  - Scoping rules for procedural variables (`LET $var = ...`) and defining when query expressions assigned to variables are materialized versus streamed.
+
+### M23: Transactions, Coordination & Triggers
+- **Cursor isolation during intra-transaction mutations**:
+  - Defining isolation and reentrancy guarantees when a procedure iterates a stream cursor while performing concurrent writes (`INSERT`, `LINK`, `APPEND`) to tables or indexes being scanned.
+- **Procedure error trapping & savepoints**:
+  - Error-handling model within stored procedures: whether any failed mutation (e.g. constraint violation) immediately aborts the transaction, or if savepoints / rollback-to-savepoint primitives are provided.
 
 ## Appendix: Worked Examples (Referenced to GutenFree Diet Demo)
 
