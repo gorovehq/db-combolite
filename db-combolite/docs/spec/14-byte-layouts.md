@@ -1309,6 +1309,43 @@ Expressions are trees embedded within operator nodes.
 | `0x24` | `Binary` | `op` (uint8: 1 = AND, 2 = OR, 3 = EQ, 4 = NE, 5 = LT, 6 = LE, 7 = GT, 8 = GE, 9 = ADD, 10 = SUB, 11 = MUL, 12 = DIV, 13 = MOD, 14 = LIKE, 15 = CONTAINS), `left` (expression), `right` (expression) |
 | `0x25` | `Call` | `fn_id` (varint uint16), `args_count` (varint N), N arguments: `[expression]` |
 
+## 14.20 Stored procedure bytecode ISA (CMBQL compiled form)
+
+Stored procedures compile to a compact, register-based bytecode stored in the catalog (spec 4.5, 11.2, 11.7). The virtual machine is sandboxed, performs zero heap allocation, and enforces instruction execution budgets.
+
+### 14.20.1 Header
+
+| Offset | Length | Description |
+|---|---|---|
+| 0 | 4 | Magic bytes: `0x43 0x4D 0x42 0x50` (`CMBP`) |
+| 4 | 1 | Format version (`0x01`) |
+| 5 | 1 | Flags (reserved, `0x00`) |
+| 6 | 1 | Register count $R$ (1–64; registers $R_0 \dots R_{R-1}$) |
+| 7 | 1 | Parameter count $P$ ($P \le R$) |
+| 8 | var | Bytecode length (varint bytes) |
+| var | var | Bytecode instruction stream |
+
+### 14.20.2 Instruction opcodes
+
+Every instruction starts with a 1-byte opcode:
+
+| Opcode | Name | Operands | Description |
+|---|---|---|---|
+| `0x00` | `NOP` | none | No operation |
+| `0x01` | `LOAD_CONST` | `dst` (uint8), `len` (varint), `bytes` | Loads encoded `cdb_value` literal into $R_{dst}$ |
+| `0x02` | `LOAD_PARAM` | `dst` (uint8), `idx` (uint8) | Loads procedure parameter $idx$ into $R_{dst}$ |
+| `0x03` | `MOVE` | `dst` (uint8), `src` (uint8) | Copies $R_{src}$ into $R_{dst}$ |
+| `0x04` | `JUMP` | `rel_off` (int16 big-endian) | Unconditional relative branch |
+| `0x05` | `JUMP_IF_TRUE` | `cond` (uint8), `rel_off` (int16 big-endian) | Branch if $R_{cond}$ is truthy |
+| `0x06` | `JUMP_IF_FALSE` | `cond` (uint8), `rel_off` (int16 big-endian) | Branch if $R_{cond}$ is falsy or NULL |
+| `0x07` | `CALL_MATH` | `dst` (uint8), `fn_id` (uint16 big-endian), `argc` (uint8), `args` ($argc \times$ uint8) | Dispatches math/DSP function; result into $R_{dst}$ |
+| `0x08` | `CALL_MUTATION` | `dst` (uint8), `op` (uint8), `store` (uint8), `entry` (uint8), `payload` (uint8) | Invokes engine mutation; returns status into $R_{dst}$ |
+| `0x09` | `OPEN_CURSOR` | `slot` (uint8), `len` (varint), `wire` | Opens query plan cursor in $slot$ using wire bytes |
+| `0x0A` | `CURSOR_NEXT` | `has_row` (uint8), `row_dst` (uint8), `slot` (uint8) | Fetches next row from cursor slot |
+| `0x0B` | `CURSOR_CLOSE`| `slot` (uint8) | Closes cursor in slot |
+| `0x0C` | `RETURN` | `src` (uint8) | Returns $R_{src}$ and halts |
+| `0x0D` | `HALT` | none | Halts procedure execution |
+
 ## Open questions (do not specify until answered)
 
 None at present.
