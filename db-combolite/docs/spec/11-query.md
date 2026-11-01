@@ -116,11 +116,211 @@ The following gaps and design questions were identified in the CMBQL review and 
 
 ### M22: Text Query Language (CMBQL)
 - **Grammar & Lexer (EBNF)**:
-  - Formal grammar definition for human-readable queries (`QUERY ... SELECT ...`) and stored procedures (`PROCEDURE ...`).
+  - Formal grammar definition for human-readable queries supporting dual syntax paradigms:
+    1. **Declarative SQL-like syntax** (`SELECT ... FROM ... WHERE ... SORT BY ... LIMIT ...`) for standard relational and analytical queries.
+    2. **Functional Pipeline syntax** (`Source | stage1(...) | stage2(...)`) familiar to InfluxDB / Flux / Kusto users for streaming, time-series, and metric workflows.
+  - Formal grammar definition for stored procedures (`PROCEDURE ... BEGIN ... END`).
 - **Literal dots vs. nested field path resolution**:
-  - Syntax rules allowing field names containing literal dots to be escaped (e.g., via backticks or quotes) and disambiguated from nested document path navigation (which compiles to `0x1F` Unit Separator bytes in the structured core).
+  - Automated 4-tier engine resolution: quoted identifiers (`"a.b"`, `'a.b'`, `` `a.b` ``) and catalog-registered columns are preserved as exact literal names; unquoted dotted paths in schemaless contexts automatically resolve to `0x1F` Unit Separator nested document paths (`a\x1Fb`).
 - **Procedural variable scoping & subquery materialization**:
   - Scoping rules for procedural variables (`LET $var = ...`) and defining when query expressions assigned to variables are materialized versus streamed.
+
+### 11.11 CMBQL Text Language Specification & EBNF Grammar
+
+The CMBQL text language is an optional host-level compilation module (Section 11.1, 11.7) that translates human-readable query and procedure scripts into the binary operator tree (`CMBQ`, Section 14.19) and sandboxed procedure bytecode (`CMBP`, Section 14.20).
+
+#### 11.11.1 Dual Query Paradigms
+
+CMBQL supports two interchangeable query syntax styles that compile into the identical M21 operator tree:
+
+1. **Declarative SQL Syntax**:
+```sql
+SELECT title, snippet, score
+FROM HybridRank(
+    TextSearch(Scan("passages"), fields: ["content"], query: $q),
+    VectorSearch(Scan("book_vec"), Field("$vector"), near: $vec, k: 5)
+)
+JOIN Scan("catalog") ON catalog.ebook_id == passages.ebook_id
+WHERE score >= 0.8
+SORT BY score DESC
+LIMIT 10;
+```
+
+2. **Pipeline / Pipe-Forward Syntax (InfluxDB / Flux Style)**:
+Stages are chained using the pipe operator `|` (or `|>`):
+```flux
+Scan("telemetry")
+  | filter(voltage > 3.3 AND status == "active")
+  | window(field: "ts", size: 60000, step: 10000)
+  | aggregate(by: [device_id], avg_v: avg(voltage), max_v: max(voltage))
+  | sort(avg_v DESC)
+  | limit(50);
+```
+
+Both paradigms may be freely embedded within subqueries or variable assignments:
+```sql
+LET $hot_sensors = (Scan("telemetry") | filter(temp > 100.0) | limit(10));
+```
+
+#### 11.11.2 Automated Dotted Path Resolution
+
+Field names containing literal dots (common in InfluxDB metrics, MIME headers, and telemetry keys, such as `cpu.usage_idle` or `sensor.temp.celsius`) are disambiguated from nested document paths (`profile.address.city`) through an automated 4-tier resolution strategy:
+
+1. **Tier 1 (Explicit Quoting)**: Any field identifier enclosed in double quotes (`"cpu.usage_idle"`), single quotes (`'cpu.usage_idle'`), or backticks (`` `cpu.usage_idle` ``), or supplied within `Field("...")` / `fields: ["..."]`, is treated as an exact literal field name and is never split.
+2. **Tier 2 (Schema Auto-Matching)**: When compiling against a catalog with an active store schema, unquoted identifiers that match a registered column name in the scanned store (e.g., `cpu.usage_idle`) automatically resolve as a single literal field.
+3. **Tier 3 (Source Stream Qualification)**: When an unquoted prefix matches an active table or stream alias in the query (e.g., `telemetry.cpu.usage_idle`), the prefix is resolved as the source qualifier and the remainder is evaluated against that source's schema.
+4. **Tier 4 (Schemaless Nested Document Fallback)**: In schemaless document stores, any unquoted dotted identifier not matched by Tiers 2 or 3 is treated as a nested document path and compiles to ASCII `0x1F` Unit Separator delimited segments (e.g., `user.address.city` $\rightarrow$ `user\x1Faddress\x1Fcity`).
+
+#### 11.11.3 Formal EBNF Grammar
+
+```ebnf
+(* Lexical Tokens *)
+Whitespace      ::= [ \t\r\n]+ ;
+Comment         ::= '--' [^\n]* | '/*' ( [^*] | '*'+ [^*/] )* '*'+ '/' ;
+Letter          ::= [a-zA-Z_] ;
+Digit           ::= [0-9] ;
+HexDigit        ::= [0-9a-fA-F] ;
+
+Ident           ::= Letter ( Letter | Digit )* ;
+Param           ::= '$' ( Letter | Digit )+ ;
+IntLit          ::= [0-9]+ | '0x' HexDigit+ ;
+FloatLit        ::= [0-9]+ '.' [0-9]+ ( [eE] [+-]? [0-9]+ )? ;
+StringLit       ::= '"' ( [^"\\] | '\\' . )* '"'
+                  | "'" ( [^'\\] | '\\' . )* "'"
+                  | '`' ( [^`\\] | '\\' . )* '`' ;
+
+(* Top-Level Declarations *)
+Program         ::= ( QueryDef | ProcDef | Stmt )* ;
+
+QueryDef        ::= 'QUERY' Ident '(' ParamList? ')' QueryBody ';' ;
+ProcDef         ::= 'PROCEDURE' Ident '(' ParamList? ')' 'BEGIN' StmtList 'END' ';' ;
+ParamList       ::= ParamDef ( ',' ParamDef )* ;
+ParamDef        ::= Param Ident? ;
+
+(* Query Bodies: Declarative or Pipeline *)
+QueryBody       ::= SelectQuery | PipeQuery ;
+
+(* Declarative SQL-Style Syntax *)
+SelectQuery     ::= 'SELECT' SelectList
+                    'FROM' FromSource
+                    ( JoinClause )*
+                    ( WhereClause )?
+                    ( GroupByClause )?
+                    ( SortByClause )?
+                    ( LimitClause )? ;
+
+SelectList      ::= '*' | SelectItem ( ',' SelectItem )* ;
+SelectItem      ::= Expr ( ( 'AS' | ':' ) Ident )? ;
+
+FromSource      ::= StreamOp | Ident ( 'AS' Ident )? | '(' QueryBody ')' ;
+JoinClause      ::= ( 'INNER' | 'LEFT' 'OUTER'? )? 'JOIN' FromSource 'ON' Expr ;
+WhereClause     ::= ( 'WHERE' | 'FILTER' ) Expr ;
+GroupByClause   ::= ( 'GROUP' 'BY' | 'AGGREGATE' 'BY' ) GroupList ;
+GroupList       ::= Expr ( ',' Expr )* ;
+SortByClause    ::= ( 'ORDER' 'BY' | 'SORT' 'BY' ) SortList ;
+SortList        ::= SortItem ( ',' SortItem )* ;
+SortItem        ::= Expr ( 'ASC' | 'DESC' )? ( 'NULLS' ( 'FIRST' | 'LAST' ) )? ;
+LimitClause     ::= 'LIMIT' IntLit ( ( 'OFFSET' | ',' ) IntLit )? ;
+
+(* Functional Pipeline Syntax *)
+PipeQuery       ::= PipeSource ( PipeOp PipeStage )* ;
+PipeOp          ::= '|' | '|>' ;
+PipeSource      ::= StreamOp | Ident | '(' QueryBody ')' ;
+PipeStage       ::= 'filter' '(' Expr ')'
+                  | ( 'project' | 'select' ) '(' SelectList ')'
+                  | 'sort' '(' SortList ')'
+                  | 'limit' '(' IntLit ( ',' IntLit )? ')'
+                  | 'window' '(' NamedArgList ')'
+                  | 'aggregate' '(' ( 'by' ':' '[' GroupList ']' ',' )? SelectList ')'
+                  | 'join' '(' FromSource ',' 'on' ':' Expr ( ',' 'kind' ':' StringLit )? ')'
+                  | 'asof_join' '(' FromSource ',' NamedArgList ')'
+                  | 'text_search' '(' NamedArgList ')'
+                  | 'vector_search' '(' NamedArgList ')'
+                  | 'traverse' '(' NamedArgList ')'
+                  | 'hybrid_rank' '(' NamedArgList ')'
+                  | 'unnest' '(' Expr ( 'AS' Ident )? ')' ;
+
+(* Stream Operator Constructors in Queries *)
+StreamOp        ::= 'Scan' '(' StringLit ')'
+                  | 'TextSearch' '(' StreamOp ',' NamedArgList ')'
+                  | 'VectorSearch' '(' StreamOp ',' NamedArgList ')'
+                  | 'HybridRank' '(' NamedArgList ')'
+                  | 'Traverse' '(' StreamOp ',' NamedArgList ')'
+                  | 'Window' '(' StreamOp ',' NamedArgList ')'
+                  | 'AsofJoin' '(' StreamOp ',' StreamOp ',' NamedArgList ')' ;
+
+NamedArgList    ::= NamedArg ( ',' NamedArg )* ;
+NamedArg        ::= Ident ':' Expr ;
+
+(* Stored Procedure Statements *)
+StmtList        ::= ( Stmt ';' )* ;
+Stmt            ::= LetStmt
+                  | IfStmt
+                  | WhileStmt
+                  | ForStmt
+                  | ReturnStmt
+                  | CallStmt
+                  | InsertStmt
+                  | UpdateStmt
+                  | DeleteStmt
+                  | LinkStmt
+                  | UnlinkStmt
+                  | AppendStmt
+                  | BeginTxStmt
+                  | CommitTxStmt ;
+
+LetStmt         ::= 'LET' Param '=' ( QueryBody | Expr ) ;
+IfStmt          ::= 'IF' Expr 'THEN' StmtList ( 'ELSEIF' Expr 'THEN' StmtList )* ( 'ELSE' StmtList )? 'END' 'IF' ;
+WhileStmt       ::= 'WHILE' Expr 'DO' StmtList 'END' 'WHILE' ;
+ForStmt         ::= 'FOR' Param 'IN' Expr 'DO' StmtList 'END' 'FOR' ;
+ReturnStmt      ::= 'RETURN' Expr? ;
+CallStmt        ::= 'CALL' Ident '(' ArgList? ')' ;
+BeginTxStmt     ::= 'BEGIN' ( 'TRANSACTION' | 'TX' )? ;
+CommitTxStmt    ::= 'COMMIT' ( 'TRANSACTION' | 'TX' )? ;
+
+(* Mutation Statements *)
+InsertStmt      ::= 'INSERT' 'INTO' ( 'TABLE' Ident '(' IdentList ')' 'VALUES' '(' ArgList ')'
+                                    | 'POOL' Ident DocLiteral
+                                    | 'VECTOR' Ident '(' IdentList ')' 'VALUES' '(' ArgList ')' ) ;
+UpdateStmt      ::= 'UPDATE' 'TABLE' Ident 'SET' SetList ( 'WHERE' Expr )? ;
+DeleteStmt      ::= 'DELETE' 'FROM' Ident ( 'WHERE' Expr )? ;
+LinkStmt        ::= 'LINK' Expr 'TO' Expr 'TYPE' StringLit ( 'PROPERTIES' DocLiteral )? ;
+UnlinkStmt      ::= 'UNLINK' Expr 'TO' Expr 'TYPE' StringLit ;
+AppendStmt      ::= 'APPEND' 'TO' 'TIMESERIES' Ident '(' NamedArgList ')' ;
+
+SetList         ::= SetItem ( ',' SetItem )* ;
+SetItem         ::= Ident '=' Expr ;
+IdentList       ::= Ident ( ',' Ident )* ;
+DocLiteral      ::= '{' ( NamedArg ( ',' NamedArg )* )? '}' ;
+
+(* Expressions & Operator Precedence *)
+Expr            ::= OrExpr ;
+OrExpr          ::= AndExpr ( 'OR' AndExpr )* ;
+AndExpr         ::= NotExpr ( 'AND' NotExpr )* ;
+NotExpr         ::= ( 'NOT' | '!' ) NotExpr | CmpExpr ;
+CmpExpr         ::= AddExpr ( ( '==' | '!=' | '<' | '<=' | '>' | '>=' | 'LIKE' | 'IN' ) AddExpr )* ;
+AddExpr         ::= MulExpr ( ( '+' | '-' ) MulExpr )* ;
+MulExpr         ::= UnaryExpr ( ( '*' | '/' | '%' ) UnaryExpr )* ;
+UnaryExpr       ::= ( '+' | '-' | '~' ) UnaryExpr | PrimaryExpr ;
+
+PrimaryExpr     ::= Literal
+                  | Param
+                  | FieldRef
+                  | CallExpr
+                  | '(' Expr ')'
+                  | ArrayLit ;
+
+FieldRef        ::= 'Field' '(' StringLit ')'
+                  | StringLit
+                  | DottedIdent ;
+
+DottedIdent     ::= Ident ( '.' Ident )* ;
+CallExpr        ::= Ident '(' ArgList? ')' ;
+ArgList         ::= Expr ( ',' Expr )* ;
+ArrayLit        ::= '[' ( Expr ( ',' Expr )* )? ']' ;
+Literal         ::= 'TRUE' | 'FALSE' | 'NULL' | IntLit | FloatLit | StringLit ;
+```
+
 
 ### M23: Transactions, Coordination & Triggers
 - **Cursor isolation during intra-transaction mutations**:
