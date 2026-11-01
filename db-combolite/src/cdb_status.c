@@ -23,6 +23,7 @@ const char *cdb_status_str(cdb_status status)
     case CDB_E_SCHEMA: return "schema violation";
     case CDB_E_BUSY: return "busy";
     case CDB_E_COLLISION: return "write collision";
+    case CDB_E_TIMEOUT: return "timeout";
     }
     return "unknown status";
 }

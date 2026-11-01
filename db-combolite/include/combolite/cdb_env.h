@@ -13,6 +13,11 @@
 #define CDB_ENV_CREATE 0x1u   /* open: create the file if it does not exist */
 #define CDB_ENV_READONLY 0x2u /* open: read-only access */
 
+/* Opaque handle types for concurrency primitives (spec 5.9.6, M20). */
+typedef struct cdb_mutex cdb_mutex;
+typedef struct cdb_cond cdb_cond;
+typedef struct cdb_thread cdb_thread;
+
 /* The operations an environment provides. ctx is the environment's own
  * state, passed back on every call. Paths are zero-terminated strings using
  * '/' as the separator. A missing file or directory should be reported as
@@ -57,6 +62,25 @@ typedef struct cdb_env_ops {
     cdb_status (*random)(void *ctx, void *buf, size_t n);
     /* Optional: waits at least ns nanoseconds. */
     void (*sleep)(void *ctx, int64_t ns);
+    /* Concurrency hooks (spec 5.9.6, M20). Optional: NULL hooks mean the
+     * environment is single-threaded (typical for microcontrollers). */
+    /* Creates a mutex. *out must be destroyed with mutex_destroy. */
+    cdb_status (*mutex_create)(void *ctx, cdb_mutex **out);
+    cdb_status (*mutex_lock)(void *ctx, cdb_mutex *m);
+    cdb_status (*mutex_unlock)(void *ctx, cdb_mutex *m);
+    void (*mutex_destroy)(void *ctx, cdb_mutex *m);
+    /* Creates a condition variable. *out must be destroyed with cond_destroy. */
+    cdb_status (*cond_create)(void *ctx, cdb_cond **out);
+    cdb_status (*cond_signal)(void *ctx, cdb_cond *c);
+    cdb_status (*cond_broadcast)(void *ctx, cdb_cond *c);
+    /* Waits on cond while unlocking m. If timeout_ns <= 0, waits indefinitely.
+     * If timeout_ns > 0, waits at most timeout_ns nanoseconds.
+     * Returns CDB_OK when signaled, CDB_E_TIMEOUT on expiration. */
+    cdb_status (*cond_wait)(void *ctx, cdb_cond *c, cdb_mutex *m, int64_t timeout_ns);
+    void (*cond_destroy)(void *ctx, cdb_cond *c);
+    /* Spawns a thread running fn(arg). The thread must be joined with thread_join. */
+    cdb_status (*thread_create)(void *ctx, cdb_thread **out, void (*fn)(void *arg), void *arg);
+    cdb_status (*thread_join)(void *ctx, cdb_thread *t);
 } cdb_env_ops;
 
 /* An environment handle: an operation table plus its state. Copied by

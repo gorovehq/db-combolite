@@ -123,6 +123,8 @@ These were agreed with the user:
     - **Tests:** `tests/test_table.c` and `tests/test_nib.c` cover this.
   - `cdb_schema`: checks schemas and validates documents against them. Validation happens in `cdb_doc` when a change is made, against the document as the open transaction sees it: from the staging cache (`doc_stage`), or, after the cache overflows, from the transaction's own journal records.
   - `cdb_journal` and `cdb_db`: transactions, reconciliation and recovery. Changes reach pages only through the `cdb_apply_fn` hook, and the data models will plug in there.
+    - **Background heartbeat thread (M20):** autonomous thread in `cdb_db` keeping idle processes alive indefinitely; synchronizes database calls through re-entrant mutexes.
+  - `cdb_worker`: fixed ring-buffer worker thread pool and task queue (spec 5.9.6, M20). Offloads heavy asynchronous maintenance tasks (`cdb_vec_refresh_async`) with zero dynamic heap allocation in the core engine; falls back to synchronous execution when thread hooks are NULL or worker threads are disabled.
   - `cdb_slots`: the open stores of each model (document pools, vector collections, time-series stores).
     - **Growth:** slots grow in chunks of 4, from `cfg.slot_mem` and then the environment's allocator, up to `cfg.max_open` (0: no cap).
     - **At the cap:** the least recently used store is closed. Its state is staged to the catalog first. A store the open transaction has used is never closed, nor a time-series store with held points.

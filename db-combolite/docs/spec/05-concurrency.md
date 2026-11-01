@@ -144,12 +144,16 @@ This implements the default policy of 11.3, where the later write is rejected. C
 - **Single writer.** No process ever writes another process's slot file, even a dead one's. A dead slot keeps its contents, including its held blocks and its journal, until a new owner takes it over.
 - **Journal in use.** A slot records whether its journal is in use (14.5.2, state flags). A slot that says its journal is in use, but whose journal is missing, means possible loss, as in 1.12.5.
 
-### 5.9.6 Liveness without threads (confirmed)
+### 5.9.6 Liveness and concurrency (spec 5.9.6, M20)
 
 - **When heartbeats are written.** Every library call writes a heartbeat if one is due, at most once per heartbeat interval. `cdb_coord_tick()` lets an idle application keep its coordinator alive.
 - **Dead coordinators.** A coordinator whose heartbeat is older than the dead timeout is dead. *Provisional:* interval 1 s, timeout 3 intervals, settle interval 2 ms.
 - **Coming back.** A process that has been idle past the timeout finds this out on its next call. It rejoins: if its slot is still free it takes it back, otherwise it takes another slot. It does so as a subordinate, then rebases.
-- **Background threads.** Optional heartbeat threads and worker threads belong to the parallel-engine milestone (M20). Micro-controllers keep the in-memory heartbeat of 5.8.
+- **Background threads and synchronization (M20).**
+  - **Environment hooks:** `cdb_env` provides opaque handles and function pointers for recursive mutexes (`cdb_mutex`), monotonic condition variables (`cdb_cond`), and threads (`cdb_thread`). POSIX environments implement these with `pthreads` (`PTHREAD_MUTEX_RECURSIVE`, `CLOCK_MONOTONIC`).
+  - **Autonomous heartbeat thread:** When concurrency hooks are present, `cdb_db_open` starts a dedicated background thread inside `cdb_db` that pulses slot heartbeats at half the heartbeat interval. Idle processes without application polling loops remain alive indefinitely. Public database operations acquire re-entrant mutex locks.
+  - **Worker thread pool:** A caller-configured pool of background worker threads (`cdb_worker_pool`, `cdb_db_config.worker_threads`) backed by a fixed ring-buffer queue offloads heavy maintenance tasks (such as `cdb_vec_refresh_async`) without heap allocation in the core engine.
+  - **Single-threaded fallback:** When thread hooks in `cdb_env` are `NULL` (single-threaded environments or microcontrollers), or when `worker_threads` is 0, heartbeats remain cooperative, and submitted worker tasks execute immediately and synchronously on the caller thread with identical semantics.
 
 ### 5.9.7 Readers and space reuse
 

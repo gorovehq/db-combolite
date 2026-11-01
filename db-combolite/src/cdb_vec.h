@@ -147,6 +147,21 @@ cdb_status cdb_vec_create_graph(cdb_db *db, uint64_t store, uint32_t k);
  * (if not NULL) is how many stay pending. Not inside a transaction. */
 cdb_status cdb_vec_refresh(cdb_db *db, uint64_t store, size_t budget, size_t *remaining);
 
+/* Asynchronous neighbour-graph refresh task and dispatch (spec 5.9.6, M20). */
+typedef struct cdb_vec_refresh_task {
+    cdb_db *db;
+    uint64_t store;
+    size_t budget;
+    size_t remaining;
+    cdb_status status;
+} cdb_vec_refresh_task;
+
+/* Submits a neighbour-graph refresh to the database's background worker pool (spec 5.9.6, M20).
+ * If pool has worker threads, executes asynchronously; otherwise executes immediately
+ * on the caller thread. When task completes, task->status holds the refresh result
+ * and task->remaining holds the count of entries still pending. */
+cdb_status cdb_vec_refresh_async(cdb_db *db, cdb_vec_refresh_task *task, uint64_t *task_id);
+
 /* The stored ranking of an entry (spec 6.4): its neighbours, nearest
  * first. *fresh is 0 while the entry is pending (its list may be empty or
  * incomplete). CDB_E_NOT_FOUND for an entry that does not exist. */
