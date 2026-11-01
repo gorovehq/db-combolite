@@ -397,9 +397,9 @@ cdb_status cdb_vec_create(cdb_db *db, const char *name, size_t len, const cdb_ve
         return s;
     /* Nothing is written for a name that is taken. */
     if ((s = cdb_catalog_find_store(&db->catalog, name, len, &existing, &found)) != CDB_OK)
-        return s;
+        return cdb_db_catalog_end(db, s);
     if (found)
-        return CDB_E_EXISTS;
+        return cdb_db_catalog_end(db, CDB_E_EXISTS);
     /* The indexes are created first, for the ID the store will get; the
      * store record names them, and one commit makes it all durable. */
     *id = cdb_catalog_next_store_id(&db->catalog);
@@ -540,10 +540,10 @@ static double distance(const coll *c, unsigned measure, const uint8_t *q, double
     }
 }
 
-/* Checks that an encoded value is a vector of the collection's shape; *data
- * points at its elements. With full, the encoding is also validated as
- * canonical (done for caller input; journaled payloads were validated when
- * they were made). Anything else is CDB_E_INVALID_ARG. */
+/* Checks that an encoded value is a vector of the collection's shape with
+ * finite elements; *data points at its elements. With full, the encoding is
+ * also validated as canonical (done for caller input; journaled payloads
+ * were validated when they were made). Anything else is CDB_E_INVALID_ARG. */
 static cdb_status vector_of(const cdb_db *db, const coll *c, const uint8_t *in, size_t len, int full,
                             const uint8_t **data)
 {
@@ -556,6 +556,14 @@ static cdb_status vector_of(const cdb_db *db, const coll *c, const uint8_t *in, 
         || v.as.vector.elem != (cdb_vector_elem)c->elem || v.as.vector.dims != c->dims
         || v.as.vector.data_len != c->vec_bytes)
         return CDB_E_INVALID_ARG;
+    if (c->elem == CDB_VEC_F32 || c->elem == CDB_VEC_F16 || c->elem == CDB_VEC_BF16) {
+        uint32_t i;
+        for (i = 0; i < c->dims; i++) {
+            double x = elem_at(v.as.vector.data, i, c->elem, db->pager.order);
+            if (x != x || x - x != 0.0)
+                return CDB_E_INVALID_ARG;
+        }
+    }
     *data = v.as.vector.data;
     return CDB_OK;
 }

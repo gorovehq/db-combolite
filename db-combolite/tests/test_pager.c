@@ -710,6 +710,42 @@ static void test_guard_stops_archive_writes(void)
         expect_text(&a, lid, "kept");
     }
     TEST_ASSERT_TRUE(budget < 12);
+    /* A refused write on a clean leaf of a two-level tree leaves the tree's
+     * dirty-ancestor invariant intact, so a later commit of other dirty
+     * leaves still succeeds. */
+    {
+        uint64_t l1 = 1, l2 = 0;
+        while (a.depth < 2) {
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_alloc(&a, &l2));
+            write_text(&a, l2, "fill");
+        }
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&a));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_reload(&a));
+        write_text(&a, l1, "updated");
+        guard_left = 0;
+        cdb_pager_set_guard(&a, count_down, NULL);
+        {
+            cdb_page_header t = data_tmpl();
+            TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, cdb_pager_write(&a, l2, &t, "blocked", 7));
+        }
+        cdb_pager_set_guard(&a, NULL, NULL);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&a));
+        expect_text(&a, l1, "updated");
+        expect_text(&a, l2, "fill");
+    }
+    /* Compaction with the minimum node cache (10 slots) still succeeds when
+     * moving pages across many leaves. */
+    {
+        cdb_pager_config small = cfg;
+        uint64_t moved, reclaimed;
+        small.node_cap = 10;
+        small.arena_size = (10u * 2u + 2u) * PAGE;
+        prepare_holes();
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_open(&a, &st, &small));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_compact(&a, 1000, &moved, &reclaimed));
+        TEST_ASSERT_TRUE(moved > 0 && reclaimed > 0);
+        expect_survivors(&a, 120, 4);
+    }
 }
 
 static void test_compaction_crash_sweep(void)

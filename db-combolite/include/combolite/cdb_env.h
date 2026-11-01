@@ -68,7 +68,7 @@ typedef struct cdb_env {
 
 /* ------------------------------------------------------- host (POSIX) */
 
-#define CDB_HOSTENV_MAX_FILES 8
+#define CDB_HOSTENV_MAX_FILES 16
 
 /* Caller-owned state for the host environment: room for the files that can
  * be open at the same time. */

@@ -1558,7 +1558,8 @@ cdb_status cdb_table_rowgroups(cdb_db *db, uint64_t store, struct cdb_rg *g)
     return s;
 }
 
-cdb_status cdb_table_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t addr)
+cdb_status cdb_table_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t old_addr,
+                               uint64_t addr)
 {
     cdb_rg g;
     cdb_status s = cdb_table_rowgroups(db, store, &g);
@@ -1568,5 +1569,5 @@ cdb_status cdb_table_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, 
         return CDB_E_NOT_FOUND;
     if (s != CDB_OK)
         return s;
-    return cdb_rg_nib_moved(&g, okey, oklen, addr);
+    return cdb_rg_nib_moved(&g, okey, oklen, old_addr, addr);
 }

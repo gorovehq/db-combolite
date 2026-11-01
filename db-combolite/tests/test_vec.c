@@ -697,6 +697,52 @@ static void test_transaction_rules(void)
     TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_vec_search(&db, coll, other.enc, other.n, 0, h, 2, &n));
     TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_vec_search(&db, coll, v.enc, v.n, CDB_VEC_HAMMING, h, 2, &n));
     TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_vec_search(&db, coll, v.enc, v.n, 9, h, 2, &n));
+    /* Non-finite float elements (NaN, infinity) are refused on insert,
+     * replace and search across f32, f16 and bf16. */
+    {
+        float bad_f32[DIMS];
+        uint16_t bad_f16[DIMS], bad_bf16[DIMS];
+        uint8_t enc_nan[128], enc_inf[128], enc_hnan[128], enc_bnan[128];
+        cdb_value_writer w;
+        uint64_t f16c, bf16c, dummy;
+        unsigned i;
+        for (i = 0; i < DIMS; i++) {
+            bad_f32[i] = 1.0f;
+            bad_f16[i] = 0x3C00u; /* 1.0 in f16 */
+            bad_bf16[i] = 0x3F80u; /* 1.0 in bf16 */
+        }
+        bad_f32[3] = (float)NAN;
+        cdb_value_writer_init(&w, enc_nan, sizeof enc_nan, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+        cdb_value_write_vector(&w, CDB_VEC_F32, DIMS, bad_f32);
+        bad_f32[3] = (float)INFINITY;
+        cdb_value_writer_init(&w, enc_inf, sizeof enc_inf, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+        cdb_value_write_vector(&w, CDB_VEC_F32, DIMS, bad_f32);
+        bad_f16[2] = 0x7E00u; /* f16 NaN */
+        cdb_value_writer_init(&w, enc_hnan, sizeof enc_hnan, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+        cdb_value_write_vector(&w, CDB_VEC_F16, DIMS, bad_f16);
+        bad_bf16[2] = 0x7FC0u; /* bf16 NaN */
+        cdb_value_writer_init(&w, enc_bnan, sizeof enc_bnan, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+        cdb_value_write_vector(&w, CDB_VEC_BF16, DIMS, bad_bf16);
+
+        TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_vec_search(&db, coll, enc_nan, cdb_value_writer_len(&w), 0, h, 2, &n));
+        TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_vec_search(&db, coll, enc_inf, cdb_value_writer_len(&w), 0, h, 2, &n));
+        f16c = make_coll("f16c", CDB_VEC_F16, CDB_VEC_COSINE);
+        bf16c = make_coll("bf16c", CDB_VEC_BF16, CDB_VEC_COSINE);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+        TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG,
+                              cdb_vec_insert(&db, coll, enc_nan, 3u + DIMS * 4u, 0, 0, &dummy));
+        TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG,
+                              cdb_vec_insert(&db, coll, enc_inf, 3u + DIMS * 4u, 0, 0, &dummy));
+        TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG,
+                              cdb_vec_replace(&db, coll, e2, enc_nan, 3u + DIMS * 4u));
+        TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG,
+                              cdb_vec_insert(&db, f16c, enc_hnan, 3u + DIMS * 2u, 0, 0, &dummy));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_abort(&db));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+        TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG,
+                              cdb_vec_insert(&db, bf16c, enc_bnan, 3u + DIMS * 2u, 0, 0, &dummy));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_abort(&db));
+    }
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search(&db, coll, v.enc, v.n, 0, h, 2, &n));
     TEST_ASSERT_EQUAL_size_t(1, n);
     TEST_ASSERT_EQUAL_UINT64(e2, h[0].entry);
