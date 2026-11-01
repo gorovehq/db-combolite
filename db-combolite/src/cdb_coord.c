@@ -661,7 +661,9 @@ cdb_status cdb_coord_join(cdb_coord *c, const cdb_env *env, const char *dir, con
                 return s;
             }
             c->joined_at = c->last_beat = mono_now(c);
-            return elect(c);
+            s = elect(c);
+            c->commit_ready = (c->live_others == 0);
+            return s;
         }
         (void)env->ops->remove(env->ctx, lobby);
         if (lost_slot)
@@ -942,6 +944,176 @@ cdb_status cdb_coord_publish_pin(cdb_coord *c, uint64_t seq)
         return CDB_OK;
     c->me.pinned = seq;
     return write_half(c);
+}
+
+cdb_status cdb_coord_claim_block(cdb_coord *c, uint64_t store, uint64_t floor, uint64_t *first)
+{
+    uint8_t old_kind;
+    uint64_t old_time, cand;
+    unsigned sl, i;
+    cdb_status st;
+
+    if (!c->joined)
+        return CDB_E_STATE;
+    if (c->me.nblocks >= CDB_COORD_MAX_BLOCKS)
+        return CDB_E_OVERFLOW;
+    if (floor == 0)
+        floor = 1;
+    old_kind = c->me.req_kind;
+    old_time = c->me.req_time;
+
+    for (;;) {
+        cdb_coord_rec r;
+        int valid, lost;
+
+        if ((st = scan(c)) != CDB_OK)
+            return st;
+        cand = floor;
+        for (;;) {
+            int moved = 0;
+            for (i = 0; i < c->me.nblocks; i++) {
+                if (c->me.blocks[i].store == store
+                    && cand < c->me.blocks[i].first + CDB_COORD_ID_BLOCK
+                    && c->me.blocks[i].first < cand + CDB_COORD_ID_BLOCK) {
+                    cand = c->me.blocks[i].first + CDB_COORD_ID_BLOCK;
+                    moved = 1;
+                }
+            }
+            for (sl = 0; sl < c->cfg.max_coords; sl++) {
+                if (sl == c->me.slot)
+                    continue;
+                if ((st = cdb_coord_read_slot(c, sl, &r, &valid)) != CDB_OK)
+                    return st;
+                if (!valid)
+                    continue;
+                for (i = 0; i < r.nblocks; i++) {
+                    if (r.blocks[i].store == store
+                        && cand < r.blocks[i].first + CDB_COORD_ID_BLOCK
+                        && r.blocks[i].first < cand + CDB_COORD_ID_BLOCK) {
+                        cand = r.blocks[i].first + CDB_COORD_ID_BLOCK;
+                        moved = 1;
+                    }
+                }
+            }
+            if (!moved)
+                break;
+        }
+
+        c->me.blocks[c->me.nblocks].store = store;
+        c->me.blocks[c->me.nblocks].first = cand;
+        c->me.nblocks++;
+
+        if (c->live_others == 0) {
+            if ((st = write_half(c)) != CDB_OK) {
+                c->me.nblocks--;
+                return st;
+            }
+            *first = cand;
+            return CDB_OK;
+        }
+
+        c->me.req_kind = CDB_COORD_REQ_ID_BLOCK;
+        c->me.req_time = clock_us(c);
+        if ((st = write_half(c)) != CDB_OK) {
+            c->me.nblocks--;
+            c->me.req_kind = old_kind == CDB_COORD_REQ_BATON ? old_kind : (uint8_t)CDB_COORD_REQ_NONE;
+            c->me.req_time = old_kind == CDB_COORD_REQ_BATON ? old_time : 0u;
+            return st;
+        }
+        pause_for(c, c->cfg.settle_ns);
+        if ((st = scan(c)) != CDB_OK) {
+            c->me.nblocks--;
+            c->me.req_kind = old_kind == CDB_COORD_REQ_BATON ? old_kind : (uint8_t)CDB_COORD_REQ_NONE;
+            c->me.req_time = old_kind == CDB_COORD_REQ_BATON ? old_time : 0u;
+            return st;
+        }
+
+        lost = 0;
+        for (sl = 0; sl < c->cfg.max_coords; sl++) {
+            if (sl == c->me.slot)
+                continue;
+            if ((st = cdb_coord_read_slot(c, sl, &r, &valid)) != CDB_OK) {
+                c->me.nblocks--;
+                c->me.req_kind = old_kind == CDB_COORD_REQ_BATON ? old_kind : (uint8_t)CDB_COORD_REQ_NONE;
+                c->me.req_time = old_kind == CDB_COORD_REQ_BATON ? old_time : 0u;
+                return st;
+            }
+            if (!valid)
+                continue;
+            for (i = 0; i < r.nblocks; i++) {
+                if (r.blocks[i].store != store
+                    || cand >= r.blocks[i].first + CDB_COORD_ID_BLOCK
+                    || r.blocks[i].first >= cand + CDB_COORD_ID_BLOCK)
+                    continue;
+                if (c->peers[sl].live && r.req_kind == CDB_COORD_REQ_ID_BLOCK && i + 1u == r.nblocks) {
+                    cdb_coord_brief pb, mine;
+                    brief_of(&r, &pb);
+                    brief_of(&c->me, &mine);
+                    if (!cdb_coord_beats(&pb, &mine))
+                        continue;
+                }
+                lost = 1;
+                if (r.blocks[i].first + CDB_COORD_ID_BLOCK > floor)
+                    floor = r.blocks[i].first + CDB_COORD_ID_BLOCK;
+            }
+        }
+
+        c->me.req_kind = old_kind == CDB_COORD_REQ_BATON ? old_kind : (uint8_t)CDB_COORD_REQ_NONE;
+        c->me.req_time = old_kind == CDB_COORD_REQ_BATON ? old_time : 0u;
+        if (!lost) {
+            if ((st = write_half(c)) != CDB_OK)
+                return st;
+            *first = cand;
+            return CDB_OK;
+        }
+        c->me.nblocks--;
+        if ((st = write_half(c)) != CDB_OK)
+            return st;
+    }
+}
+
+cdb_status cdb_coord_drop_block(cdb_coord *c, uint64_t store, uint64_t first)
+{
+    unsigned i, j = 0;
+    if (!c->joined)
+        return CDB_E_STATE;
+    for (i = 0; i < c->me.nblocks; i++) {
+        if (c->me.blocks[i].store == store && c->me.blocks[i].first == first)
+            continue;
+        c->me.blocks[j++] = c->me.blocks[i];
+    }
+    if (j == c->me.nblocks)
+        return CDB_OK;
+    memset(&c->me.blocks[j], 0, (c->me.nblocks - j) * sizeof c->me.blocks[0]);
+    c->me.nblocks = (uint8_t)j;
+    return write_half(c);
+}
+
+cdb_status cdb_coord_commit_ready(cdb_coord *c)
+{
+    cdb_status s;
+    if (!c->joined)
+        return CDB_E_STATE;
+    if (!c->have_mono)
+        return CDB_OK;
+    if (mono_now(c) - c->scanned_at >= c->cfg.beat_ns / 2) {
+        if ((s = cdb_coord_beat(c, 1)) != CDB_OK)
+            return s;
+    }
+    if (!c->commit_ready) {
+        int64_t wait = c->cfg.beat_ns + c->cfg.settle_ns;
+        while (mono_now(c) - c->joined_at < wait) {
+            int64_t rem = wait - (mono_now(c) - c->joined_at);
+            int64_t step = c->cfg.beat_ns / 2 > 0 && c->cfg.beat_ns / 2 < rem ? c->cfg.beat_ns / 2 : rem;
+            pause_for(c, step);
+            if ((s = cdb_coord_beat(c, 0)) != CDB_OK)
+                return s;
+        }
+        if ((s = cdb_coord_beat(c, 1)) != CDB_OK)
+            return s;
+        c->commit_ready = 1;
+    }
+    return CDB_OK;
 }
 
 cdb_status cdb_coord_read_slot(cdb_coord *c, unsigned s, cdb_coord_rec *r, int *valid)

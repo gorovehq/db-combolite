@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "cdb_crc32c.h"
 #include "cdb_db.h"
 #include "cdb_doc.h"
 #include "cdb_key.h"
@@ -371,7 +372,7 @@ static cdb_status scan_next(cdb_db *db, struct jcursor *c)
         uint64_t next;
         if (cdb_journal_read(&db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next) != CDB_OK)
             break;
-        if (r.kind == CDB_RECORD_DATA && r.tx_id != cur) {
+        if ((r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_WRITE_KEY) && r.tx_id != cur) {
             cur = r.tx_id;
             start = off;
         } else if (r.kind == CDB_RECORD_ABORT) {
@@ -487,6 +488,68 @@ static cdb_status fence_and_pins(cdb_db *db)
     return CDB_OK;
 }
 
+/* Raises each store's catalog entry-ID counter past every block listed by
+ * any slot (spec 5.9.3). */
+static cdb_status raise_block_counters(cdb_db *db)
+{
+    unsigned sl, i;
+    cdb_status s;
+    if (!db->has_catalog)
+        return CDB_OK;
+    for (sl = 0; sl < db->coord.cfg.max_coords; sl++) {
+        cdb_coord_rec r;
+        int valid = 0;
+        if (sl == db->coord.me.slot) {
+            r = db->coord.me;
+            valid = 1;
+        } else if ((s = cdb_coord_read_slot(&db->coord, sl, &r, &valid)) != CDB_OK) {
+            return s;
+        }
+        if (!valid)
+            continue;
+        for (i = 0; i < r.nblocks; i++) {
+            uint64_t store = r.blocks[i].store;
+            uint64_t end = r.blocks[i].first + CDB_COORD_ID_BLOCK;
+            cdb_store_info info;
+            s = cdb_catalog_get_store(&db->catalog, store, &info);
+            if (s == CDB_E_NOT_FOUND || (s == CDB_OK && (info.flags & CDB_STORE_DROPPED)))
+                continue;
+            if (s != CDB_OK)
+                return s;
+            if (info.next_entry_id < end
+                && (s = cdb_catalog_stage_next_entry(&db->catalog, store, end)) != CDB_OK)
+                return s;
+        }
+    }
+    return CDB_OK;
+}
+
+/* Drops any held block from this slot's table whose store was dropped or
+ * whose catalog counter is now at or past the block's end (spec 5.9.3). */
+static cdb_status prune_held_blocks(cdb_db *db)
+{
+    unsigned i = 0;
+    cdb_status s;
+    if (!db->has_catalog)
+        return CDB_OK;
+    while (i < db->coord.me.nblocks) {
+        uint64_t store = db->coord.me.blocks[i].store;
+        uint64_t first = db->coord.me.blocks[i].first;
+        cdb_store_info info;
+        s = cdb_catalog_get_store(&db->catalog, store, &info);
+        if (s == CDB_E_NOT_FOUND || (s == CDB_OK && (info.flags & CDB_STORE_DROPPED))
+            || (s == CDB_OK && info.next_entry_id >= first + CDB_COORD_ID_BLOCK)) {
+            if ((s = cdb_coord_drop_block(&db->coord, store, first)) != CDB_OK)
+                return s;
+            continue;
+        }
+        if (s != CDB_OK)
+            return s;
+        i++;
+    }
+    return CDB_OK;
+}
+
 /* Merges every slot's committed transactions above its mark onto the
  * archive in (stamp, slot, counter) order, commits them with the new marks,
  * and cleans up any dead slots whose journals are now folded in (spec 5.9.1,
@@ -497,7 +560,7 @@ static cdb_status merge_journals(cdb_db *db, int keep_in_use)
     struct jcursor cur[CDB_COORD_MAX];
     int in_use = (journal_slot(db)->state & COMPANION_IN_USE) != 0;
     int recovering = !keep_in_use && db->journal_st.ops == NULL;
-    int exists, usable, marks_moved = 0, removed = 0;
+    int exists, usable, marks_moved = 0, has_blocks = 0, removed = 0;
     uint64_t base_wm = watermark_of(db);
     unsigned n = 0, slot, i;
     cdb_status s;
@@ -516,6 +579,8 @@ static cdb_status merge_journals(cdb_db *db, int keep_in_use)
                 return s;
             slot_in_use = svalid && (srec.flags & CDB_COORD_JOURNAL) != 0;
         }
+        if (svalid && srec.nblocks > 0)
+            has_blocks = 1;
         if ((s = cursor_open(db, slot, &cur[n], &usable)) != CDB_OK)
             return s;
         if (slot_in_use && (!usable || db->set_aside) && !(db->cfg.flags & CDB_DB_ACCEPT_LOSS))
@@ -563,8 +628,8 @@ static cdb_status merge_journals(cdb_db *db, int keep_in_use)
     }
     if (db->last_tx > db->my_mark)
         marks_moved = 1;
-    if (db->applied != base_wm || in_use != keep_in_use || marks_moved || db->pager.dirty) {
-        if ((s = cdb_doc_flush_pools(db)) != CDB_OK)
+    if (db->applied != base_wm || in_use != keep_in_use || marks_moved || has_blocks || db->pager.dirty) {
+        if ((s = cdb_doc_flush_pools(db)) != CDB_OK || (s = raise_block_counters(db)) != CDB_OK)
             return s;
         for (i = 0; i < n; i++)
             if (cur[i].top > cur[i].mark && (s = mark_set(db, cur[i].slot, cur[i].top)) != CDB_OK)
@@ -579,6 +644,8 @@ static cdb_status merge_journals(cdb_db *db, int keep_in_use)
                 db->my_mark = cur[i].top;
         if (db->last_tx > db->my_mark)
             own_mark_committed(db);
+        if (!recovering && (s = prune_held_blocks(db)) != CDB_OK)
+            return s;
     }
 
     if (recovering && (db->coord.me.flags & CDB_COORD_JOURNAL)
@@ -732,6 +799,8 @@ static cdb_status rebase(cdb_db *db)
     release_slots(db);
     if ((s = cdb_catalog_open(&db->catalog, &db->pager, &db->cfg.catalog_work, db->cfg.catalog_page)) != CDB_OK)
         return s;
+    if ((s = prune_held_blocks(db)) != CDB_OK)
+        return s;
     db->applied = watermark_of(db);
     if ((s = mark_get(db, db->coord.me.slot, &db->my_mark)) != CDB_OK)
         return s;
@@ -766,7 +835,8 @@ static cdb_status rebase(cdb_db *db)
                 if ((s = cdb_journal_read(&db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next))
                     != CDB_OK)
                     break;
-                if ((r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_COMMIT) && r.tx_id == c.tx_id) {
+                if ((r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_WRITE_KEY || r.kind == CDB_RECORD_COMMIT)
+                    && r.tx_id == c.tx_id) {
                     if ((s = cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size))
                         != CDB_OK)
                         break;
@@ -1119,6 +1189,103 @@ cdb_status cdb_tx_put(cdb_db *db, uint64_t store_id, uint64_t entry_id, uint8_t 
     return cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size);
 }
 
+/* Journals a write-set key record (kind 4, spec 5.9.4, 14.4.7 rule 3):
+ * target store = table, target entry = 0, payload = 4-byte index number +
+ * 4-byte CRC32C of the encoded key. Counts only for collision detection. */
+cdb_status cdb_tx_put_key(cdb_db *db, uint64_t store_id, uint32_t index_num, const void *key, size_t key_len)
+{
+    uint8_t payload[CDB_WRITE_KEY_PAYLOAD_SIZE];
+    cdb_record r;
+
+    if (usable(db) != CDB_OK || !db->in_tx)
+        return CDB_E_STATE;
+    cdb_store_u32(payload + 0, index_num, db->pager.order);
+    cdb_store_u32(payload + 4, cdb_crc32c(key, key_len), db->pager.order);
+    memset(&r, 0, sizeof r);
+    r.kind = (uint8_t)CDB_RECORD_WRITE_KEY;
+    r.tx_id = db->tx_id;
+    r.store_id = store_id;
+    r.entry_id = 0;
+    r.payload = payload;
+    r.payload_len = CDB_WRITE_KEY_PAYLOAD_SIZE;
+    return cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size);
+}
+
+/* Ensures a 1024-ID block is claimed for store and returns its next ID
+ * without consuming it yet (spec 5.9.3). */
+cdb_status cdb_db_peek_entry(cdb_db *db, uint64_t store, const uint64_t *next_entry, uint64_t *id)
+{
+    uint64_t floor, first;
+    unsigned i;
+    cdb_status s;
+
+    for (i = 0; i < db->nid_ranges; i++) {
+        if (db->id_ranges[i].store == store) {
+            if (db->id_ranges[i].next < db->id_ranges[i].end) {
+                *id = db->id_ranges[i].next;
+                return CDB_OK;
+            }
+            db->id_ranges[i] = db->id_ranges[--db->nid_ranges];
+            break;
+        }
+    }
+    if ((s = prune_held_blocks(db)) != CDB_OK)
+        return s;
+    if (db->nid_ranges == CDB_COORD_MAX_BLOCKS) {
+        /* Evict an in-memory range whose block was already folded into the
+         * catalog and dropped from coord/<slot>. */
+        for (i = 0; i < db->nid_ranges; i++) {
+            unsigned j;
+            int held = 0;
+            for (j = 0; j < db->coord.me.nblocks; j++)
+                if (db->coord.me.blocks[j].store == db->id_ranges[i].store)
+                    held = 1;
+            if (!held) {
+                db->id_ranges[i] = db->id_ranges[--db->nid_ranges];
+                break;
+            }
+        }
+        if (db->nid_ranges == CDB_COORD_MAX_BLOCKS)
+            return CDB_E_BUFFER_TOO_SMALL;
+    }
+    floor = *next_entry ? *next_entry : 1u;
+    if (db->has_catalog) {
+        cdb_store_info info;
+        s = cdb_catalog_get_store(&db->catalog, store, &info);
+        if (s == CDB_OK && info.next_entry_id > floor)
+            floor = info.next_entry_id;
+        else if (s != CDB_OK && s != CDB_E_NOT_FOUND)
+            return s;
+    }
+    if ((s = cdb_coord_claim_block(&db->coord, store, floor, &first)) != CDB_OK)
+        return s;
+    db->id_ranges[db->nid_ranges].store = store;
+    db->id_ranges[db->nid_ranges].next = first;
+    db->id_ranges[db->nid_ranges].end = first + CDB_COORD_ID_BLOCK;
+    db->nid_ranges++;
+    *id = first;
+    return CDB_OK;
+}
+
+uint64_t cdb_db_take_entry(cdb_db *db, uint64_t store, uint64_t *next_entry, int *dirty)
+{
+    uint64_t id = *next_entry ? *next_entry : 1u;
+    unsigned i;
+    for (i = 0; i < db->nid_ranges; i++) {
+        if (db->id_ranges[i].store == store) {
+            id = db->id_ranges[i].next++;
+            if (db->id_ranges[i].next >= db->id_ranges[i].end)
+                db->id_ranges[i] = db->id_ranges[--db->nid_ranges];
+            break;
+        }
+    }
+    if (id >= *next_entry)
+        *next_entry = id + 1u;
+    if (dirty != NULL)
+        *dirty = 1;
+    return id;
+}
+
 /* The commit stamp (spec 5.9.2, 14.4.4): the primary's clock in ns, kept
  * rising within this journal so the merge never reorders one process's own
  * transactions. */
@@ -1152,26 +1319,300 @@ cdb_status cdb_db_now(cdb_db *db, int64_t *ns, int *have)
     return s;
 }
 
+static cdb_status append_abort(cdb_db *db)
+{
+    cdb_record r;
+    if (db->tx_deltas == 0)
+        return CDB_OK;
+    memset(&r, 0, sizeof r);
+    r.kind = (uint8_t)CDB_RECORD_ABORT;
+    r.tx_id = db->tx_id;
+    return cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size);
+}
+
+#define WS_CACHE_CAP 64u
+
+struct ws_item {
+    uint64_t store;
+    uint64_t entry;   /* 0 for CDB_RECORD_WRITE_KEY */
+    uint64_t key_tag; /* 8-byte payload of CDB_RECORD_WRITE_KEY */
+};
+
+static int ws_from_record(const cdb_record *r, struct ws_item *out)
+{
+    if (r->kind == CDB_RECORD_DATA) {
+        out->store = r->store_id;
+        out->entry = r->entry_id;
+        out->key_tag = 0;
+        return 1;
+    }
+    if (r->kind == CDB_RECORD_WRITE_KEY && r->payload_len == CDB_WRITE_KEY_PAYLOAD_SIZE) {
+        out->store = r->store_id;
+        out->entry = 0;
+        out->key_tag = cdb_load_u64(r->payload, CDB_ORDER_LITTLE);
+        return 1;
+    }
+    return 0;
+}
+
+static cdb_status own_has_item(cdb_db *db, const struct ws_item *own, unsigned nown, uint64_t more_at,
+                               uint64_t own_end, const struct ws_item *needle, int *match)
+{
+    uint64_t off;
+    unsigned i;
+    *match = 0;
+    for (i = 0; i < nown; i++) {
+        if (own[i].store == needle->store && own[i].entry == needle->entry && own[i].key_tag == needle->key_tag) {
+            *match = 1;
+            return CDB_OK;
+        }
+    }
+    for (off = more_at; off < own_end;) {
+        cdb_record r;
+        struct ws_item it;
+        uint64_t next;
+        cdb_status s = cdb_journal_read(&db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
+        if (s != CDB_OK)
+            return s;
+        off = next;
+        if (r.tx_id == db->tx_id && ws_from_record(&r, &it)
+            && it.store == needle->store && it.entry == needle->entry && it.key_tag == needle->key_tag) {
+            *match = 1;
+            return CDB_OK;
+        }
+    }
+    return CDB_OK;
+}
+
+/* Scans peer slot's journal above its archive mark for any transaction whose
+ * write set overlaps this transaction's (spec 5.9.4). An overlapping
+ * committed transaction or an overlapping earlier prepare rejects this
+ * transaction with CDB_E_COLLISION; an overlapping later prepare is waited
+ * out until it commits, aborts, or its coordinator dies. */
+static cdb_status check_slot_collisions(cdb_db *db, unsigned slot, uint64_t my_stamp,
+                                        const struct ws_item *own, unsigned nown,
+                                        uint64_t more_at, uint64_t own_end)
+{
+    char path[CDB_DB_PATH_MAX];
+    uint64_t mark = 0;
+    int exists;
+    cdb_status s;
+
+    if ((s = mark_get(db, slot, &mark)) != CDB_OK)
+        return s;
+    journal_paths(db, slot, path, NULL);
+
+    for (;;) {
+        uint64_t off, cur_tx = 0, prep_stamp = 0;
+        int cur_overlap = 0, cur_prepared = 0;
+
+        if ((s = env_exists(db, path, &exists)) != CDB_OK || !exists)
+            return s;
+        s = open_journal(db, slot);
+        if (s == CDB_E_NOT_FOUND || s == CDB_E_CORRUPT || s == CDB_E_MALFORMED || s == CDB_E_UNSUPPORTED)
+            return CDB_OK;
+        if (s != CDB_OK)
+            return s;
+        if (memcmp(db->rj.hdr.db_id, db->pager.hs.record.db_id, 16) != 0 || db->rj.hdr.slot != slot) {
+            cdb_storage_close(&db->rj_st);
+            return CDB_OK;
+        }
+
+        off = CDB_JOURNAL_HEADER_SIZE;
+        for (;;) {
+            cdb_record r;
+            struct ws_item it;
+            uint64_t next, counter;
+            if (cdb_journal_read(&db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next) != CDB_OK)
+                break;
+            off = next;
+            if ((r.tx_id >> 48) != slot)
+                continue;
+            counter = r.tx_id & TX_COUNTER_MASK;
+            if (r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_WRITE_KEY) {
+                if (r.tx_id != cur_tx) {
+                    cur_tx = r.tx_id;
+                    cur_overlap = 0;
+                    cur_prepared = 0;
+                    prep_stamp = 0;
+                }
+                if (counter > mark && !cur_overlap && ws_from_record(&r, &it)) {
+                    if ((s = own_has_item(db, own, nown, more_at, own_end, &it, &cur_overlap)) != CDB_OK) {
+                        cdb_storage_close(&db->rj_st);
+                        return s;
+                    }
+                }
+            } else if (r.kind == CDB_RECORD_PREPARE && r.tx_id == cur_tx
+                       && r.payload_len == CDB_PREPARE_PAYLOAD_SIZE) {
+                if (counter > mark) {
+                    cur_prepared = 1;
+                    prep_stamp = cdb_load_u64(r.payload, db->pager.order);
+                }
+            } else if (r.kind == CDB_RECORD_ABORT && r.tx_id == cur_tx) {
+                cur_tx = 0;
+                cur_overlap = 0;
+                cur_prepared = 0;
+            } else if (r.kind == CDB_RECORD_COMMIT && r.tx_id == cur_tx) {
+                cdb_commit_info ci;
+                if (cdb_commit_decode(&r, &ci, db->pager.order) == CDB_OK && counter > mark && cur_overlap) {
+                    cdb_storage_close(&db->rj_st);
+                    return CDB_E_COLLISION;
+                }
+                cur_tx = 0;
+                cur_overlap = 0;
+                cur_prepared = 0;
+            }
+        }
+        cdb_storage_close(&db->rj_st);
+
+        if (cur_tx != 0 && cur_prepared && cur_overlap) {
+            int64_t step;
+            if (prep_stamp < my_stamp || (prep_stamp == my_stamp && slot < db->coord.me.slot))
+                return CDB_E_COLLISION;
+            if (!db->coord.have_mono || db->env.ops->sleep == NULL || !db->coord.peers[slot].live)
+                return CDB_OK;
+            step = db->coord.cfg.settle_ns > 0 ? db->coord.cfg.settle_ns : 100000;
+            (void)db->env.ops->sleep(db->env.ctx, step);
+            if ((s = beat_only(db)) != CDB_OK)
+                return s;
+            if (!db->coord.peers[slot].live)
+                return CDB_OK;
+            continue;
+        }
+        return CDB_OK;
+    }
+}
+
+static cdb_status check_collisions(cdb_db *db, uint64_t own_end, uint64_t my_stamp)
+{
+    struct ws_item own[WS_CACHE_CAP];
+    unsigned nown = 0, slot;
+    uint64_t off = db->tx_start, more_at = own_end;
+    cdb_status s;
+
+    while (off < own_end) {
+        cdb_record r;
+        struct ws_item it;
+        uint64_t next;
+        if ((s = cdb_journal_read(&db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next)) != CDB_OK)
+            return s;
+        if (r.tx_id == db->tx_id && ws_from_record(&r, &it)) {
+            if (nown < WS_CACHE_CAP) {
+                own[nown++] = it;
+            } else {
+                more_at = off;
+                break;
+            }
+        }
+        off = next;
+    }
+    for (slot = 0; slot < db->coord.cfg.max_coords; slot++) {
+        if (slot == db->coord.me.slot)
+            continue;
+        if ((s = check_slot_collisions(db, slot, my_stamp, own, nown, more_at, own_end)) != CDB_OK)
+            return s;
+    }
+    return CDB_OK;
+}
+
+/* The coordination half of a commit (spec 5.9.4), run while the transaction
+ * is still marked open so that heartbeats taken while it waits (the settle
+ * interval, a joiner's first-commit wait, waiting out a later prepare) never
+ * rebase and rotate the journal under it. Returns the stamp the commit
+ * record carries; CDB_E_COLLISION when this transaction is the later
+ * writer. */
+static cdb_status coordinate_commit(cdb_db *db, uint64_t *stamp)
+{
+    cdb_record r;
+    uint64_t prep_at;
+    cdb_status s;
+
+    s = cdb_coord_commit_ready(&db->coord);
+    if (s == CDB_E_BUSY) {
+        db->failed = 1; /* the slot was lost while silent (spec 5.9.6) */
+        return s;
+    }
+    if (s != CDB_OK)
+        return s;
+    cdb_pager_set_reuse_below(&db->pager, db->coord.min_pin);
+    if (cdb_coord_baton_held(&db->coord) && db->coord.max_cts > db->coord.me.cts
+        && (s = cdb_coord_baton_release(&db->coord)) != CDB_OK)
+        return s;
+
+    /* If another process reconciled into the archive while this transaction
+     * was open, its view was older than the archive and the reconciled write
+     * sets are no longer in any journal: it is rejected (spec 5.9.4). */
+    if (!cdb_coord_baton_held(&db->coord) || db->coord.live_others > 0) {
+        cdb_header_state hs;
+        if ((s = cdb_header_open(&db->archive_st, &hs)) != CDB_OK)
+            return s;
+        if (hs.record.committed_seq != db->pager.hs.record.committed_seq)
+            return CDB_E_COLLISION;
+    }
+
+    *stamp = next_stamp(db);
+    if (db->coord.live_others == 0)
+        return CDB_OK; /* only coordinator: no prepare, settle or scan */
+
+    /* Prepare, settle, scan (spec 5.9.4, 14.4.7 rule 4). */
+    {
+        uint8_t prep[CDB_PREPARE_PAYLOAD_SIZE];
+        cdb_store_u64(prep, *stamp, db->pager.order);
+        memset(&r, 0, sizeof r);
+        r.kind = (uint8_t)CDB_RECORD_PREPARE;
+        r.tx_id = db->tx_id;
+        r.payload = prep;
+        r.payload_len = CDB_PREPARE_PAYLOAD_SIZE;
+        prep_at = db->journal.end;
+        if ((s = cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size)) != CDB_OK)
+            return s;
+    }
+    /* Other processes read this journal while it is unsynced: the page
+     * cache shares it, so no sync is needed for them to see it. */
+    if (db->coord.have_mono && db->env.ops->sleep != NULL && db->coord.cfg.settle_ns > 0)
+        (void)db->env.ops->sleep(db->env.ctx, db->coord.cfg.settle_ns);
+    return check_collisions(db, prep_at, *stamp);
+}
+
 cdb_status cdb_tx_commit(cdb_db *db)
 {
     uint8_t info[CDB_COMMIT_PAYLOAD_SIZE];
     cdb_commit_info ci;
     cdb_record r;
-    uint64_t record_at, counter;
+    uint64_t stamp = 0, record_at, counter;
     cdb_status s;
 
     if (usable(db) != CDB_OK || !db->in_tx)
         return CDB_E_STATE;
-    db->in_tx = 0;
     /* An empty transaction leaves no trace and uses no commit number. */
-    if (db->tx_deltas == 0)
+    if (db->tx_deltas == 0) {
+        db->in_tx = 0;
         return CDB_OK;
+    }
+
+    s = coordinate_commit(db, &stamp);
+    if (s != CDB_OK) {
+        /* The transaction ends here: an abort record closes its run of
+         * records, so neither replay nor another process's scan counts it. */
+        cdb_status as = db->failed ? CDB_OK : append_abort(db);
+        db->in_tx = 0;
+        if (as != CDB_OK)
+            return as;
+        /* A rejected writer moves to the current archive at once, so its
+         * retry sees what it collided with (spec 5.9.4). */
+        if (s == CDB_E_COLLISION && db->op_depth <= 1 && !cdb_coord_baton_held(&db->coord)
+            && (as = rebase(db)) != CDB_OK)
+            return as;
+        return s;
+    }
+    db->in_tx = 0;
 
     /* Build and append the commit record (spec 14.4.4). Its presence in
      * the journal is what makes the transaction count at replay. The commit
-     * number is left 0: reconciliation assigns it (spec 5.9.2). */
+     * number is left 0: reconciliation assigns it (spec 5.9.2). When a
+     * prepare record was written, it carries the same stamp. */
     memset(&ci, 0, sizeof ci);
-    ci.timestamp = next_stamp(db);
+    ci.timestamp = stamp;
     ci.delta_count = db->tx_deltas;
     ci.track_mask = 1u << CDB_COMPANION_MAIN_JOURNAL;
     cdb_commit_encode(&ci, info, db->pager.order);
@@ -1316,13 +1757,17 @@ static cdb_status reconcile_hold(cdb_db *db, int closing)
     if (db->fresh && db->coord.journals_others == 0) {
         int in_use = (journal_slot(db)->state & COMPANION_IN_USE) != 0;
         cdb_pager_set_guard(&db->pager, (cdb_status (*)(void *))cdb_coord_guard, &db->coord);
-        if (db->applied != watermark_of(db) || db->pager.dirty || in_use != keep_in_use || db->last_tx > db->my_mark) {
-            if ((s = cdb_doc_flush_pools(db)) != CDB_OK || (s = stage_own_mark(db)) != CDB_OK)
+        if (db->applied != watermark_of(db) || db->pager.dirty || in_use != keep_in_use
+            || db->last_tx > db->my_mark || db->coord.me.nblocks > 0) {
+            if ((s = cdb_doc_flush_pools(db)) != CDB_OK || (s = raise_block_counters(db)) != CDB_OK
+                || (s = stage_own_mark(db)) != CDB_OK)
                 return on_baton_err(db, s);
             set_journal_slot(db, keep_in_use, db->applied);
             if ((s = fence_and_pins(db)) != CDB_OK || (s = cdb_pager_commit(&db->pager)) != CDB_OK)
                 return on_baton_err(db, s);
             own_mark_committed(db);
+            if (!closing && (s = prune_held_blocks(db)) != CDB_OK)
+                return s;
         }
         if (!closing) {
             cdb_slots_shrink(db, &db->pool_slots);
@@ -1437,7 +1882,16 @@ cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
         slot->in_use = 0;
     if ((slot = cdb_slots_find(&db->table_slots, id)) != NULL)
         slot->in_use = 0;
-    return finish_archive_op(db, CDB_OK);
+    {
+        unsigned i = 0;
+        while (i < db->nid_ranges) {
+            if (db->id_ranges[i].store == id)
+                db->id_ranges[i] = db->id_ranges[--db->nid_ranges];
+            else
+                i++;
+        }
+    }
+    return finish_archive_op(db, prune_held_blocks(db));
 }
 
 cdb_status cdb_db_catalog_begin(cdb_db *db)
@@ -1497,6 +1951,8 @@ cdb_status cdb_db_close(cdb_db *db)
     }
     if (db->in_tx && (s = cdb_tx_abort(db)) != CDB_OK)
         return s;
+    if (db->coord.live_others == 0 && db->coord.journals_others == 0 && db->fresh)
+        db->coord.me.nblocks = 0;
     if ((s = reconcile_hold(db, 1)) != CDB_OK)
         return s;
     alone = db->coord.live_others == 0;

@@ -1795,15 +1795,15 @@ cdb_status cdb_doc_insert(cdb_db *db, uint64_t store, const char *summary, size_
                           const void *body, size_t body_len, uint64_t *entry)
 {
     struct cdb_doc_pool *pool;
+    uint64_t id;
     int guarded;
     cdb_status s;
-    if ((s = tx_pool(db, store, &pool, &guarded)) != CDB_OK)
+    if ((s = tx_pool(db, store, &pool, &guarded)) != CDB_OK
+        || (s = cdb_db_peek_entry(db, store, &pool->next_entry, &id)) != CDB_OK)
         return s;
-    if ((s = put_body(db, pool, guarded, pool->next_entry, CDB_OP_INSERT, summary, summary_len, body,
-                      body_len)) != CDB_OK)
+    if ((s = put_body(db, pool, guarded, id, CDB_OP_INSERT, summary, summary_len, body, body_len)) != CDB_OK)
         return s;
-    *entry = pool->next_entry++;
-    pool->dirty = 1;
+    *entry = cdb_db_take_entry(db, store, &pool->next_entry, &pool->dirty);
     return CDB_OK;
 }
 

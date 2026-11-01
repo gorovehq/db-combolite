@@ -1980,15 +1980,16 @@ cdb_status cdb_vec_insert(cdb_db *db, uint64_t store, const void *vec, size_t le
                           uint64_t source_store, uint64_t source_entry, uint64_t *entry)
 {
     coll *c;
+    uint64_t id;
     cdb_status s;
     if ((s = tx_coll(db, store, &c)) != CDB_OK)
         return s;
     if (source_store == 0 && source_entry != 0)
         return CDB_E_INVALID_ARG;
-    if ((s = put_vector(db, c, c->next_entry, CDB_OP_INSERT, vec, len, source_store, source_entry)) != CDB_OK)
+    if ((s = cdb_db_peek_entry(db, store, &c->next_entry, &id)) != CDB_OK
+        || (s = put_vector(db, c, id, CDB_OP_INSERT, vec, len, source_store, source_entry)) != CDB_OK)
         return s;
-    *entry = c->next_entry++;
-    c->dirty = 1;
+    *entry = cdb_db_take_entry(db, store, &c->next_entry, &c->dirty);
     return CDB_OK;
 }
 

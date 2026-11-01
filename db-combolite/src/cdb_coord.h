@@ -27,6 +27,7 @@
 #define CDB_COORD_HALF 512u          /* bytes per slot half (spec 14.5.2) */
 #define CDB_COORD_MAX 64u            /* most coordinators this build tracks */
 #define CDB_COORD_MAX_BLOCKS 21u     /* held entry-ID blocks per slot (spec 5.9.3) */
+#define CDB_COORD_ID_BLOCK 1024u     /* entry IDs per claimed block (spec 5.9.3) */
 #define CDB_COORD_MAX_LOBBY 16u      /* lobby files looked at per scan */
 #define CDB_COORD_DIR 172u           /* longest coord/ folder path, with its zero */
 #define CDB_COORD_PATH 220u          /* the folder plus "/" and the longest name */
@@ -154,6 +155,7 @@ typedef struct cdb_coord {
     uint64_t min_pin;            /* lowest sequence a live other publishes (spec 5.9.7); 0 none */
     int64_t scanned_at;          /* monotonic time of the last scan */
     int64_t req_at;              /* monotonic time of this coordinator's baton request */
+    int commit_ready;            /* nonzero once the post-join commit wait has passed */
 } cdb_coord;
 
 /* Joins the coordinators of the database in dir (created if missing; its
@@ -218,6 +220,21 @@ cdb_status cdb_coord_set_journal(cdb_coord *c, int in_use);
 
 /* Publishes the archive committed sequence this process reads (spec 5.9.7). */
 cdb_status cdb_coord_publish_pin(cdb_coord *c, uint64_t seq);
+
+/* Claims a block of CDB_COORD_ID_BLOCK consecutive entry IDs for store,
+ * starting at or above floor, through append -> settle -> choose (spec 5.9.3,
+ * 14.5.2). With no other live coordinator, no settle wait is needed. */
+cdb_status cdb_coord_claim_block(cdb_coord *c, uint64_t store, uint64_t floor, uint64_t *first);
+
+/* Drops the held block (store, first) from this slot's table once
+ * reconciliation has raised the catalog counter past its end (spec 5.9.3). */
+cdb_status cdb_coord_drop_block(cdb_coord *c, uint64_t store, uint64_t first);
+
+/* Refreshes the live coordinator list if older than half a heartbeat
+ * interval, and on the first commit after joining alongside another live
+ * coordinator, waits one heartbeat interval plus the settle interval
+ * (spec 5.9.4). */
+cdb_status cdb_coord_commit_ready(cdb_coord *c);
 
 /* Reads slot s's file: *valid is 0 when there is none, or none of this
  * database. */

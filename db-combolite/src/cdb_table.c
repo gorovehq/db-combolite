@@ -671,6 +671,29 @@ static cdb_status check_keys(cdb_db *db, const table *t, uint64_t self, size_t l
     return CDB_OK;
 }
 
+/* Journals a write-set key record for every non-null unique index key of
+ * the row in T_ROW (spec 5.9.4, 14.4.7 rule 3). */
+static cdb_status write_keys(cdb_db *db, const table *t, uint64_t self, size_t len)
+{
+    unsigned i;
+    for (i = 0; i < t->nidx; i++) {
+        const idx *x = &t->idx[i];
+        uint8_t key[CDB_TABLE_KEY_MAX + 8u];
+        size_t klen;
+        int null;
+        cdb_status s;
+        if (!x->unique)
+            continue;
+        if ((s = row_key(db, t, x, tbuf(db, T_ROW), len, t->version, self, key, &klen, &null)) != CDB_OK)
+            return s;
+        if (null)
+            continue;
+        if ((s = cdb_tx_put_key(db, t->slot.store_id, x->number, key, klen)) != CDB_OK)
+            return s;
+    }
+    return CDB_OK;
+}
+
 /* -------------------------------------------------------- row changes */
 
 /* The common start of a row change: an open transaction and a table with
@@ -699,7 +722,9 @@ static cdb_status insert_row(cdb_db *db, uint64_t store, const void *row, size_t
     if ((s = normalize(db, t, (const uint8_t *)row, len, NULL, 0, 1, &n)) != CDB_OK
         || (s = check_keys(db, t, 0, n)) != CDB_OK)
         return s;
-    return cdb_doc_insert(db, store, NULL, 0, tbuf(db, T_ROW), n, entry);
+    if ((s = cdb_doc_insert(db, store, NULL, 0, tbuf(db, T_ROW), n, entry)) != CDB_OK)
+        return s;
+    return write_keys(db, t, *entry, n);
 }
 
 static cdb_status replace_row(cdb_db *db, uint64_t store, uint64_t entry, const void *row, size_t len, int update)
@@ -725,7 +750,9 @@ static cdb_status replace_row(cdb_db *db, uint64_t store, uint64_t entry, const 
     if ((s = normalize(db, t, (const uint8_t *)row, len, update ? tbuf(db, T_CUR) : NULL, cur, 0, &n)) != CDB_OK
         || (s = check_keys(db, t, entry, n)) != CDB_OK)
         return s;
-    return cdb_doc_replace(db, store, entry, NULL, 0, tbuf(db, T_ROW), n);
+    if ((s = cdb_doc_replace(db, store, entry, NULL, 0, tbuf(db, T_ROW), n)) != CDB_OK)
+        return s;
+    return write_keys(db, t, entry, n);
 }
 
 cdb_status cdb_table_insert(cdb_db *db, uint64_t store, const void *row, size_t len, uint64_t *entry)

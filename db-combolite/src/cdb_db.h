@@ -300,6 +300,13 @@ typedef struct cdb_db {
     unsigned op_depth;    /* operation scopes open (cdb_db_op_begin) */
     uint64_t op_id;       /* the outermost one's ID */
     uint64_t op_seq;      /* the last ID given out */
+    /* Claimed entry-ID blocks still being handed out in memory (spec 5.9.3). */
+    struct {
+        uint64_t store;
+        uint64_t next;
+        uint64_t end;
+    } id_ranges[CDB_COORD_MAX_BLOCKS];
+    unsigned nid_ranges;
 } cdb_db;
 
 /* Opens <base>.cdbarch, recovering if needed, and starts a session. If the
@@ -349,6 +356,15 @@ cdb_status cdb_tx_begin(cdb_db *db, cdb_durability durability);
  * copied. CDB_E_INVALID_ARG when the record would not fit record_buf. */
 cdb_status cdb_tx_put(cdb_db *db, uint64_t store_id, uint64_t entry_id, uint8_t op,
                       const void *data, size_t len);
+/* Journals a write-set key record (kind 4, spec 5.9.4, 14.4.7 rule 3) for a
+ * unique index key written by the open transaction. */
+cdb_status cdb_tx_put_key(cdb_db *db, uint64_t store_id, uint32_t index_num, const void *key, size_t key_len);
+/* Entry-ID allocation from claimed blocks of CDB_COORD_ID_BLOCK (spec 5.9.3).
+ * peek_entry ensures a block is claimed for store (at or above *next_entry)
+ * and returns the next ID without consuming it; take_entry consumes it after
+ * the insert record is journaled. */
+cdb_status cdb_db_peek_entry(cdb_db *db, uint64_t store, const uint64_t *next_entry, uint64_t *id);
+uint64_t cdb_db_take_entry(cdb_db *db, uint64_t store, uint64_t *next_entry, int *dirty);
 /* Writes the commit record, syncs per the durability level, and applies
  * the changes to the pages. */
 cdb_status cdb_tx_commit(cdb_db *db);

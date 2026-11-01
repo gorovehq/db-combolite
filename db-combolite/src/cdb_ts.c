@@ -752,11 +752,10 @@ cdb_status cdb_ts_series(cdb_db *db, uint64_t store, const char *name, size_t le
     d = *def;
     if (d.window == 0)
         d.window = default_window(d.precision);
-    *series = t->next_entry;
-    if ((s = cdb_tx_put(db, store, *series, CDB_OP_INSERT, payload, encode_create(&d, key, klen, payload))) != CDB_OK)
+    if ((s = cdb_db_peek_entry(db, store, &t->next_entry, series)) != CDB_OK
+        || (s = cdb_tx_put(db, store, *series, CDB_OP_INSERT, payload, encode_create(&d, key, klen, payload))) != CDB_OK)
         return s;
-    t->next_entry++;
-    t->dirty = 1;
+    *series = cdb_db_take_entry(db, store, &t->next_entry, &t->dirty);
     t->touched_tx = db->tx_id;
     *created = 1;
     return CDB_OK;

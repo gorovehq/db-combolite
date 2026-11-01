@@ -18,6 +18,8 @@
 #define CDB_RECORD_HEADER_SIZE 48u
 #define CDB_RECORD_TRAILER_SIZE 16u
 #define CDB_COMMIT_PAYLOAD_SIZE 34u
+#define CDB_WRITE_KEY_PAYLOAD_SIZE 8u
+#define CDB_PREPARE_PAYLOAD_SIZE 8u
 
 /* Companion type IDs (spec 1.12.3). */
 #define CDB_COMPANION_MAIN_JOURNAL 1u
@@ -27,6 +29,8 @@
 #define CDB_RECORD_COMMIT 1u
 #define CDB_RECORD_ABORT 2u
 #define CDB_RECORD_WEIGHT 3u
+#define CDB_RECORD_WRITE_KEY 4u
+#define CDB_RECORD_PREPARE 5u
 
 /* Data-change operation codes (spec 14.4.5). */
 #define CDB_OP_INSERT 1u
