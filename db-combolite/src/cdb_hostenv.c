@@ -222,16 +222,28 @@ struct cdb_thread {
 static cdb_status he_mutex_create(void *ctx, cdb_mutex **out)
 {
     cdb_mutex *m;
+    pthread_mutexattr_t attr;
     (void)ctx;
     if (out == NULL)
         return CDB_E_INVALID_ARG;
     m = (cdb_mutex *)malloc(sizeof *m);
     if (m == NULL)
         return CDB_E_BUFFER_TOO_SMALL;
-    if (pthread_mutex_init(&m->m, NULL) != 0) {
+    if (pthread_mutexattr_init(&attr) != 0) {
         free(m);
         return CDB_E_IO;
     }
+    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0) {
+        pthread_mutexattr_destroy(&attr);
+        free(m);
+        return CDB_E_IO;
+    }
+    if (pthread_mutex_init(&m->m, &attr) != 0) {
+        pthread_mutexattr_destroy(&attr);
+        free(m);
+        return CDB_E_IO;
+    }
+    pthread_mutexattr_destroy(&attr);
     *out = m;
     return CDB_OK;
 }

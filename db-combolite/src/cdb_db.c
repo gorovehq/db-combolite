@@ -36,6 +36,12 @@
 #define COMPANION_IN_USE 0x02u
 #define CLASS_INCOMPATIBLE 2u      /* the main journal's compatibility class (spec 14.4.6 rule 2) */
 
+static void db_lock(cdb_db *db);
+static void db_unlock(cdb_db *db);
+static void start_heartbeat(cdb_db *db);
+static void stop_heartbeat_thread(cdb_db *db);
+static void cleanup_concurrency(cdb_db *db);
+
 /* -------------------------------------------------------- environment */
 
 /* Thin wrappers over the caller-supplied environment (files and
@@ -945,8 +951,10 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
             cdb_storage_close(&db->archive_st);
         release_slots(db); /* recovery may have opened stores */
         (void)cdb_coord_leave(&db->coord); /* so the next opener need not wait it out */
+        return s;
     }
-    return s;
+    start_heartbeat(db);
+    return CDB_OK;
 }
 
 /* The body of cdb_db_open, after the configuration is copied and the slot
@@ -1082,6 +1090,98 @@ static cdb_status beat_only(cdb_db *db)
     return CDB_OK;
 }
 
+static void db_lock(cdb_db *db)
+{
+    if (db->mutex != NULL && db->env.ops != NULL && db->env.ops->mutex_lock != NULL)
+        (void)db->env.ops->mutex_lock(db->env.ctx, db->mutex);
+}
+
+static void db_unlock(cdb_db *db)
+{
+    if (db->mutex != NULL && db->env.ops != NULL && db->env.ops->mutex_unlock != NULL)
+        (void)db->env.ops->mutex_unlock(db->env.ctx, db->mutex);
+}
+
+static void heartbeat_worker(void *arg)
+{
+    cdb_db *db = (cdb_db *)arg;
+    int64_t interval_ns;
+
+    if (db->coord.cfg.beat_ns > 0)
+        interval_ns = (int64_t)(db->coord.cfg.beat_ns / 2);
+    else
+        interval_ns = 500000000; /* 500 ms default */
+
+    if (interval_ns < 1000000) /* floor at 1 ms */
+        interval_ns = 1000000;
+
+    db_lock(db);
+    while (!db->hb_stop && !db->failed) {
+        (void)db->env.ops->cond_wait(db->env.ctx, db->hb_cond, db->mutex, interval_ns);
+        if (db->hb_stop || db->failed)
+            break;
+        (void)beat_only(db);
+    }
+    db_unlock(db);
+}
+
+static void start_heartbeat(cdb_db *db)
+{
+    if (db->env.ops == NULL || db->env.ops->mutex_create == NULL ||
+        db->env.ops->cond_create == NULL || db->env.ops->thread_create == NULL)
+        return;
+    if (db->env.ops->mutex_create(db->env.ctx, &db->mutex) != CDB_OK)
+        return;
+    if (db->env.ops->cond_create(db->env.ctx, &db->hb_cond) != CDB_OK) {
+        if (db->env.ops->mutex_destroy != NULL)
+            db->env.ops->mutex_destroy(db->env.ctx, db->mutex);
+        db->mutex = NULL;
+        return;
+    }
+    db->hb_stop = 0;
+    if (db->env.ops->thread_create(db->env.ctx, &db->hb_thread, heartbeat_worker, db) != CDB_OK) {
+        if (db->env.ops->cond_destroy != NULL)
+            db->env.ops->cond_destroy(db->env.ctx, db->hb_cond);
+        if (db->env.ops->mutex_destroy != NULL)
+            db->env.ops->mutex_destroy(db->env.ctx, db->mutex);
+        db->hb_cond = NULL;
+        db->mutex = NULL;
+        return;
+    }
+    db->hb_running = 1;
+}
+
+static void stop_heartbeat_thread(cdb_db *db)
+{
+    if (db->hb_running) {
+        db_lock(db);
+        db->hb_stop = 1;
+        if (db->env.ops != NULL && db->env.ops->cond_signal != NULL)
+            (void)db->env.ops->cond_signal(db->env.ctx, db->hb_cond);
+        db_unlock(db);
+
+        if (db->env.ops != NULL && db->env.ops->thread_join != NULL)
+            (void)db->env.ops->thread_join(db->env.ctx, db->hb_thread);
+        db->hb_running = 0;
+        db->hb_thread = NULL;
+    }
+}
+
+static void cleanup_concurrency(cdb_db *db)
+{
+    stop_heartbeat_thread(db);
+    if (db->hb_cond != NULL) {
+        if (db->env.ops != NULL && db->env.ops->cond_destroy != NULL)
+            db->env.ops->cond_destroy(db->env.ctx, db->hb_cond);
+        db->hb_cond = NULL;
+    }
+    if (db->mutex != NULL) {
+        if (db->env.ops != NULL && db->env.ops->mutex_destroy != NULL)
+            db->env.ops->mutex_destroy(db->env.ctx, db->mutex);
+        db->mutex = NULL;
+    }
+}
+
 static cdb_status heartbeat(cdb_db *db)
 {
     cdb_status s = beat_only(db);
@@ -1099,8 +1199,13 @@ static cdb_status heartbeat(cdb_db *db)
 
 cdb_status cdb_db_tick(cdb_db *db)
 {
-    cdb_status s = usable(db);
-    return s == CDB_OK ? heartbeat(db) : s;
+    cdb_status s;
+    db_lock(db);
+    s = usable(db);
+    if (s == CDB_OK)
+        s = heartbeat(db);
+    db_unlock(db);
+    return s;
 }
 
 /* Operation scopes (see cdb_db.h). Only the outermost begin takes a new ID;
@@ -1110,24 +1215,28 @@ cdb_status cdb_db_tick(cdb_db *db)
  * failed beat shows up at the next call that can report it. */
 void cdb_db_op_begin(cdb_db *db)
 {
+    db_lock(db);
     if (db->op_depth++ == 0) {
         db->op_id = ++db->op_seq;
         if (!db->failed)
             (void)heartbeat(db);
     }
+    db_unlock(db);
 }
 
 void cdb_db_op_end(cdb_db *db)
 {
+    db_lock(db);
     if (db->op_depth > 0)
         db->op_depth--;
+    db_unlock(db);
 }
 
 /* Starts a transaction. Only one may be open at a time. The transaction ID
  * is the coordinator slot in the top 16 bits and the slot's counter in the
  * low 48 (spec 14.4.3). Counters are reserved durably in the slot, a block
  * at a time, before any of the block is used. */
-cdb_status cdb_tx_begin(cdb_db *db, cdb_durability durability)
+static cdb_status tx_begin_locked(cdb_db *db, cdb_durability durability)
 {
     cdb_status s;
     if (usable(db) != CDB_OK || db->in_tx)
@@ -1157,6 +1266,15 @@ cdb_status cdb_tx_begin(cdb_db *db, cdb_durability durability)
     db->stage_overflow = 0;
     db->tx_durability = durability == CDB_DURABILITY_DEFAULT ? db->cfg.durability : durability;
     return CDB_OK;
+}
+
+cdb_status cdb_tx_begin(cdb_db *db, cdb_durability durability)
+{
+    cdb_status s;
+    db_lock(db);
+    s = tx_begin_locked(db, durability);
+    db_unlock(db);
+    return s;
 }
 
 /* Journals one change. The payload (op byte + data) is assembled directly
@@ -1574,7 +1692,7 @@ static cdb_status coordinate_commit(cdb_db *db, uint64_t *stamp)
     return check_collisions(db, prep_at, *stamp);
 }
 
-cdb_status cdb_tx_commit(cdb_db *db)
+static cdb_status tx_commit_locked(cdb_db *db)
 {
     uint8_t info[CDB_COMMIT_PAYLOAD_SIZE];
     cdb_commit_info ci;
@@ -1672,21 +1790,38 @@ cdb_status cdb_tx_commit(cdb_db *db)
     return CDB_OK;
 }
 
+cdb_status cdb_tx_commit(cdb_db *db)
+{
+    cdb_status s;
+    db_lock(db);
+    s = tx_commit_locked(db);
+    db_unlock(db);
+    return s;
+}
+
 /* Nothing was applied, so aborting only needs an abort record, which ends
  * the transaction's run of records for the replay scan. Records without a
  * commit record are never applied. */
 cdb_status cdb_tx_abort(cdb_db *db)
 {
     cdb_record r;
-    if (usable(db) != CDB_OK || !db->in_tx)
+    cdb_status s;
+    db_lock(db);
+    if (usable(db) != CDB_OK || !db->in_tx) {
+        db_unlock(db);
         return CDB_E_STATE;
+    }
     db->in_tx = 0;
-    if (db->tx_deltas == 0)
+    if (db->tx_deltas == 0) {
+        db_unlock(db);
         return CDB_OK;
+    }
     memset(&r, 0, sizeof r);
     r.kind = (uint8_t)CDB_RECORD_ABORT;
     r.tx_id = db->tx_id;
-    return cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size);
+    s = cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size);
+    db_unlock(db);
+    return s;
 }
 
 /* -------------------------------------------------------- reconcile/close */
@@ -1806,8 +1941,13 @@ static cdb_status reconcile_hold(cdb_db *db, int closing)
  * commit as the pages, so the archive and the watermark always agree. */
 cdb_status cdb_db_reconcile(cdb_db *db)
 {
-    cdb_status s = reconcile_hold(db, 0);
-    return s == CDB_OK ? finish_baton(db) : s;
+    cdb_status s;
+    db_lock(db);
+    s = reconcile_hold(db, 0);
+    if (s == CDB_OK)
+        s = finish_baton(db);
+    db_unlock(db);
+    return s;
 }
 
 /* Common start of every catalog change: no transaction may be open, a
@@ -1936,7 +2076,10 @@ cdb_status cdb_db_close(cdb_db *db)
     int alone;
     cdb_status s;
 
+    db_lock(db);
     if (db->failed) {
+        db_unlock(db);
+        cleanup_concurrency(db);
         if (db->have_overlay) {
             cdb_storage_close(&db->overlay_st);
             (void)env_remove(db, db->overlay_path);
@@ -1949,39 +2092,66 @@ cdb_status cdb_db_close(cdb_db *db)
         (void)cdb_coord_leave(&db->coord); /* the journal stays for the next open */
         return CDB_E_STATE;
     }
-    if (db->in_tx && (s = cdb_tx_abort(db)) != CDB_OK)
+    if (db->in_tx && (s = cdb_tx_abort(db)) != CDB_OK) {
+        db_unlock(db);
         return s;
+    }
     if (db->coord.live_others == 0 && db->coord.journals_others == 0 && db->fresh)
         db->coord.me.nblocks = 0;
-    if ((s = reconcile_hold(db, 1)) != CDB_OK)
+    if ((s = reconcile_hold(db, 1)) != CDB_OK) {
+        db_unlock(db);
         return s;
+    }
+
+    db_unlock(db);
+    stop_heartbeat_thread(db);
+    db_lock(db);
+
     alone = db->coord.live_others == 0;
     release_slots(db); /* everything they held is in the archive */
-    if ((s = cdb_coord_set_journal(&db->coord, 0)) != CDB_OK)
+    if ((s = cdb_coord_set_journal(&db->coord, 0)) != CDB_OK) {
+        db_unlock(db);
         return s;
+    }
     if (db->have_overlay) {
         cdb_storage_close(&db->overlay_st);
         db->have_overlay = 0;
-        if ((s = env_remove(db, db->overlay_path)) != CDB_OK && s != CDB_E_NOT_FOUND)
+        if ((s = env_remove(db, db->overlay_path)) != CDB_OK && s != CDB_E_NOT_FOUND) {
+            db_unlock(db);
             return s;
+        }
     }
     cdb_storage_close(&db->journal_st);
-    if ((s = env_remove(db, db->journal_path)) != CDB_OK)
+    if ((s = env_remove(db, db->journal_path)) != CDB_OK) {
+        db_unlock(db);
         return s;
-    if ((s = env_sync_dir(db, db->workdir)) != CDB_OK)
+    }
+    if ((s = env_sync_dir(db, db->workdir)) != CDB_OK) {
+        db_unlock(db);
         return s;
-    if ((s = cdb_coord_leave(&db->coord)) != CDB_OK)
+    }
+    if ((s = cdb_coord_leave(&db->coord)) != CDB_OK) {
+        db_unlock(db);
         return s;
+    }
     if (alone) {
         s = db->env.ops->rmdir(db->env.ctx, db->coorddir);
-        if (s != CDB_OK && s != CDB_E_STATE && s != CDB_E_NOT_FOUND) /* a leftover lobby file keeps it */
+        if (s != CDB_OK && s != CDB_E_STATE && s != CDB_E_NOT_FOUND) {
+            db_unlock(db);
             return s;
+        }
         s = db->env.ops->rmdir(db->env.ctx, db->workdir);
-        if (s != CDB_OK && s != CDB_E_STATE) /* a set-aside companion keeps it */
+        if (s != CDB_OK && s != CDB_E_STATE) {
+            db_unlock(db);
             return s;
-        if ((s = env_sync_dir(db, db->parent)) != CDB_OK)
+        }
+        if ((s = env_sync_dir(db, db->parent)) != CDB_OK) {
+            db_unlock(db);
             return s;
+        }
     }
     cdb_storage_close(&db->archive_st);
+    db_unlock(db);
+    cleanup_concurrency(db);
     return CDB_OK;
 }

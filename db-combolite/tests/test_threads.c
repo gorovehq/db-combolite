@@ -3,20 +3,69 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "unity.h"
+#include "cdb_db.h"
 #include "combolite/cdb_env.h"
+
+#define PAGE_LOG2 9u
+#define PAGE (1u << PAGE_LOG2)
+#define NODES 16u
 
 static cdb_hostenv he;
 static cdb_env env;
+static char base_path[200];
+
+static uint8_t arena1[NODES * 2u * PAGE + 2u * PAGE];
+static cdb_pager_node nodes1[NODES];
+static cdb_free_extent free_list1[512];
+static uint8_t record_buf1[1024];
+static uint8_t cat_work1[8192];
+static cdb_index_entry cat_entries1[256];
+static uint8_t cat_page1[PAGE];
+
+static uint8_t arena2[NODES * 2u * PAGE + 2u * PAGE];
+static cdb_pager_node nodes2[NODES];
+static cdb_free_extent free_list2[512];
+static uint8_t record_buf2[1024];
+static uint8_t cat_work2[8192];
+static cdb_index_entry cat_entries2[256];
+static uint8_t cat_page2[PAGE];
+
+static void cleanup_files(void)
+{
+    char p[512];
+    snprintf(p, sizeof p, "%s.cdbarch", base_path);
+    unlink(p);
+    snprintf(p, sizeof p, "%s.cdbwork/main.0.cdb", base_path);
+    unlink(p);
+    snprintf(p, sizeof p, "%s.cdbwork/main.1.cdb", base_path);
+    unlink(p);
+    snprintf(p, sizeof p, "%s.cdbwork/pages.0.cdb", base_path);
+    unlink(p);
+    snprintf(p, sizeof p, "%s.cdbwork/pages.1.cdb", base_path);
+    unlink(p);
+    snprintf(p, sizeof p, "%s.cdbwork/coord/slot.0", base_path);
+    unlink(p);
+    snprintf(p, sizeof p, "%s.cdbwork/coord/slot.1", base_path);
+    unlink(p);
+    snprintf(p, sizeof p, "%s.cdbwork/coord", base_path);
+    rmdir(p);
+    snprintf(p, sizeof p, "%s.cdbwork", base_path);
+    rmdir(p);
+}
 
 void setUp(void)
 {
     cdb_hostenv_init(&he, &env);
+    snprintf(base_path, sizeof base_path, "%s/th_db_%ld", CDB_TEST_TMPDIR, (long)getpid());
+    cleanup_files();
 }
 
 void tearDown(void)
 {
+    cleanup_files();
 }
 
 static void test_mutex_lifecycle(void)
@@ -32,6 +81,9 @@ static void test_mutex_lifecycle(void)
     TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, env.ops->mutex_unlock(env.ctx, NULL));
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->mutex_lock(env.ctx, m));
+    /* Recursive locking */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->mutex_lock(env.ctx, m));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->mutex_unlock(env.ctx, m));
     TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->mutex_unlock(env.ctx, m));
 
     env.ops->mutex_destroy(env.ctx, m);
@@ -200,6 +252,101 @@ static void test_single_threaded_null_hooks(void)
     TEST_ASSERT_NULL(st_env.ops->thread_create);
 }
 
+static cdb_status test_apply(void *ctx, cdb_pager *p, const cdb_delta *d)
+{
+    (void)ctx;
+    (void)p;
+    (void)d;
+    return CDB_OK;
+}
+
+static cdb_header test_hdr(void)
+{
+    cdb_header h;
+    memset(&h, 0, sizeof h);
+    h.order = CDB_ORDER_LITTLE;
+    h.layout_flags = CDB_LAYOUT_ADDR64;
+    h.default_page_log2 = (uint8_t)PAGE_LOG2;
+    for (int i = 0; i < 16; i++)
+        h.db_id[i] = (uint8_t)(0x50 + i);
+    return h;
+}
+
+static void init_db_cfg(cdb_db_config *cfg, uint8_t *arena, cdb_pager_node *nodes,
+                        cdb_free_extent *free_list, uint8_t *record_buf,
+                        uint8_t *cat_work, cdb_index_entry *cat_entries, uint8_t *cat_page)
+{
+    memset(cfg, 0, sizeof *cfg);
+    cfg->pager.arena = arena;
+    cfg->pager.arena_size = NODES * 2u * PAGE + 2u * PAGE;
+    cfg->pager.nodes = nodes;
+    cfg->pager.node_cap = NODES;
+    cfg->pager.free_list = free_list;
+    cfg->pager.free_cap = 512;
+    cfg->record_buf = record_buf;
+    cfg->record_buf_size = 1024;
+    cfg->apply = test_apply;
+    cfg->catalog_work.bytes = cat_work;
+    cfg->catalog_work.bytes_size = 8192;
+    cfg->catalog_work.entries = cat_entries;
+    cfg->catalog_work.entries_cap = 256;
+    cfg->catalog_page = cat_page;
+    cfg->durability = CDB_DURABILITY_FULL;
+}
+
+static void test_heartbeat_thread_runs_and_stops(void)
+{
+    cdb_db db;
+    cdb_db_config cfg;
+    cdb_header h = test_hdr();
+
+    init_db_cfg(&cfg, arena1, nodes1, free_list1, record_buf1, cat_work1, cat_entries1, cat_page1);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open(&db, &env, base_path, &cfg, &h));
+    TEST_ASSERT_EQUAL_INT(1, db.hb_running);
+    TEST_ASSERT_NOT_NULL(db.mutex);
+    TEST_ASSERT_NOT_NULL(db.hb_cond);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    TEST_ASSERT_EQUAL_INT(0, db.hb_running);
+    TEST_ASSERT_NULL(db.mutex);
+    TEST_ASSERT_NULL(db.hb_cond);
+}
+
+static void test_idle_process_kept_alive_by_heartbeat_thread(void)
+{
+    cdb_db db1, db2;
+    cdb_db_config cfg1, cfg2;
+    cdb_header h = test_hdr();
+
+    init_db_cfg(&cfg1, arena1, nodes1, free_list1, record_buf1, cat_work1, cat_entries1, cat_page1);
+    /* Beat every 40 ms, dead after 3 intervals = 120 ms */
+    cfg1.coord.beat_ns = 40000000;
+    cfg1.coord.dead_after = 3;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open(&db1, &env, base_path, &cfg1, &h));
+    TEST_ASSERT_EQUAL_INT(1, db1.hb_running);
+    TEST_ASSERT_EQUAL_UINT32(0, db1.coord.me.slot);
+
+    /* Sleep for 250 ms: more than 2x the 120 ms dead timeout!
+     * We do NOT call cdb_db_tick(&db1). The background heartbeat thread must
+     * keep db1's coordinator slot alive on its own! */
+    env.ops->sleep(env.ctx, 250000000);
+
+    /* Open second process */
+    init_db_cfg(&cfg2, arena2, nodes2, free_list2, record_buf2, cat_work2, cat_entries2, cat_page2);
+    cfg2.coord.beat_ns = 40000000;
+    cfg2.coord.dead_after = 3;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open(&db2, &env, base_path, &cfg2, NULL));
+    /* db2 should see db1 as live in slot 0, and db2 should get slot 1 */
+    TEST_ASSERT_EQUAL_UINT32(1, db2.coord.me.slot);
+    TEST_ASSERT_EQUAL_INT(1, db2.coord.peers[0].live);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db1));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -209,5 +356,7 @@ int main(void)
     RUN_TEST(test_cond_broadcast);
     RUN_TEST(test_cond_timedwait_timeout);
     RUN_TEST(test_single_threaded_null_hooks);
+    RUN_TEST(test_heartbeat_thread_runs_and_stops);
+    RUN_TEST(test_idle_process_kept_alive_by_heartbeat_thread);
     return UNITY_END();
 }
