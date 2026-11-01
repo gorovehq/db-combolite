@@ -10,7 +10,7 @@ db-combolite is a lightweight, embeddable database library in C99, in the same c
 
 It is serverless: a library, a single file at rest, and no daemon. It is built for crash safety. The core never allocates on the heap; all memory comes from the caller, so that microcontroller builds stay possible later. The file format, storage engine and query layer are a clean-room design.
 
-> **Status: early development.** The specification is complete. The implementation is following a milestone plan, and the file format is not yet stable. Not built yet: multi-process access (one process per database for now), the query core and query language, column-oriented tables, and cross-store transactions. Don't use it for data you care about.
+> **Status: early development.** The specification is complete. The implementation is following a milestone plan, and the file format is not yet stable. Not built yet: the query core and query language (CMBQL), column-oriented tables, and cross-store transactions. Don't use it for data you care about.
 
 ## Layout
 

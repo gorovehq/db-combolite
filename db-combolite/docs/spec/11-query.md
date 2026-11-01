@@ -8,15 +8,16 @@ This section covers how one query can reach across relational, document, vector 
 
 ## Confirmed decisions
 
-### 11.1 A structured core with our own text language on top
+### 11.1 A structured core with our own text language on top (CMBQL)
 
+- **Name: CMBQL (cmbql).** db-combolite's query language is named **CMBQL** (ComboLite Query Language). It encompasses both the structured operator-tree core (the canonical wire and compiled representation) and the human-readable text syntax that compiles into it.
 - **Core: a structured query format.** Every query has a canonical structured representation. Agents and MCP tools build queries in this form directly.
-- **Text language: new, not SQL.** db-combolite defines its own human-readable query language. It is designed to handle links, similarity, documents and time series as first-class features, not as additions bolted onto SQL. Text queries compile into the structured core.
+- **Text language: new, not SQL.** CMBQL defines its own human-readable query language. It is designed to handle links, similarity, documents and time series as first-class features, not as additions bolted onto SQL. Text queries compile into the structured core.
 - **The text language is an optional module.** A build can include it or leave it out.
 
 ### 11.2 Stored procedures
 
-- Procedures are written in the query language, extended with control flow: variables, conditionals and loops.
+- Procedures are written in CMBQL, extended with control flow: variables, conditionals and loops.
 - They compile to a **small bytecode of db-combolite's own design**. This bytecode is the "compiled form" stored in the catalog (Section 4.5).
 - They are **sandboxed**:
   - no file access and no network access;
@@ -70,7 +71,7 @@ A procedure can run in two ways:
 - **Scans are named by catalog name.** `Scan("orders")` names a store the way the user created it; the planner resolves the name to a store ID when the query is prepared. A compiled/prepared query (11.7) still names its store this way, so it survives the store being dropped and recreated.
 - **Expressions are a tree too.** A condition, join key or sort key is itself a small expression tree: field references, literals (the shared value encoding, Section 14.6), parameters, and operators (comparison, boolean, arithmetic, and model-specific functions such as text and vector search predicates). One expression grammar is reused in every node that needs one.
 - **One `Field(name)` form across every model.** `Field("price")` resolves to whatever "price" means on that scan's model: a table column, a document field (absent is null, as documents already treat a missing field), a time-series value field, or a vector collection's metadata field. A vector itself is a reserved pseudo-field, e.g. `Field("$vector")`.
-- **Nested field paths use a reserved separator byte, not a literal dot.** In the structured core, a path to a nested document field is its segments joined by the ASCII Unit Separator (0x1F), not by `.`. A field name may freely contain a literal dot; nothing needs escaping, because the delimiter is never the dot character. The field dictionary (14.6) instead disallows 0x1F in a field name, which costs far less than disallowing the common case. The human-readable text language (Section 11.1) still writes a nested path as `address.city`; its compiler is responsible for turning that into 0x1F-joined segments (and for however it lets a user write a field name containing a literal dot — an open question for the text-language design, not the structured core).
+- **Nested field paths use a reserved separator byte, not a literal dot.** In the structured core, a path to a nested document field is its segments joined by the ASCII Unit Separator (0x1F), not by `.`. A field name may freely contain a literal dot; nothing needs escaping, because the delimiter is never the dot character. The field dictionary (14.6) instead disallows 0x1F in a field name, which costs far less than disallowing the common case. The human-readable text language (CMBQL, Section 11.1) still writes a nested path as `address.city`; its compiler is responsible for turning that into 0x1F-joined segments (and for however it lets a user write a field name containing a literal dot — an open question for the text-language design, not the structured core).
 - **Parameters.** `Param(name)` or `Param(index)` appears anywhere a literal could. The caller supplies bindings when the query runs. This is what lets one compiled, prepared query (11.7) run again with different values without recompiling.
 - **Joins: inner and left-outer.** A `Join` node supports those two kinds. Right-outer is a left-outer with its inputs swapped; full-outer is left for later if it turns out to be needed, since it is just another join-kind tag and does not require a format change. The unmatched side of a left-outer join yields **null for every one of its fields**, the same null a document's missing field already produces (Section 8.1) — no second kind of absence.
 - **No correlated sub-trees.** Every node's inputs are fully independent: a sub-tree (a `HybridRank` branch, a `Join`'s right input) never references a field from an enclosing node. What a `Join` or `Traverse` node already covers is enough for this database's scope (Hard constraint 4); a correlated-subquery execution and scoping model is not needed.
