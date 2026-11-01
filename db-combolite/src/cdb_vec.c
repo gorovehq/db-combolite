@@ -2390,20 +2390,55 @@ cdb_status cdb_vec_refresh(cdb_db *db, uint64_t store, size_t budget, size_t *re
     size_t done;
     coll *c;
     cdb_status s;
-    if (db->in_tx || db->failed)
+    if (db == NULL)
+        return CDB_E_INVALID_ARG;
+    cdb_db_lock(db);
+    if (db->in_tx || db->failed) {
+        cdb_db_unlock(db);
         return CDB_E_STATE;
-    if ((s = coll_get(db, store, &c)) != CDB_OK)
+    }
+    if ((s = coll_get(db, store, &c)) != CDB_OK) {
+        cdb_db_unlock(db);
         return s;
-    if (!c->graph_on)
+    }
+    if (!c->graph_on) {
+        cdb_db_unlock(db);
         return CDB_E_STATE;
-    if ((s = cdb_db_catalog_begin(db)) != CDB_OK)
+    }
+    if ((s = cdb_db_catalog_begin(db)) != CDB_OK) {
+        cdb_db_unlock(db);
         return s;
+    }
     s = refresh_coll(db, c, budget, &done);
     if (s == CDB_OK && db->pager.dirty)
         s = cdb_pager_commit(&db->pager);
-    if ((s = cdb_db_catalog_end(db, s)) != CDB_OK)
+    if ((s = cdb_db_catalog_end(db, s)) != CDB_OK) {
+        cdb_db_unlock(db);
         return s;
-    return remaining ? count_pending(db, c, remaining) : CDB_OK;
+    }
+    if (remaining)
+        s = count_pending(db, c, remaining);
+    cdb_db_unlock(db);
+    return s;
+}
+
+static void vec_refresh_worker_fn(void *arg)
+{
+    cdb_vec_refresh_task *t = (cdb_vec_refresh_task *)arg;
+    if (t == NULL || t->db == NULL)
+        return;
+    t->status = cdb_vec_refresh(t->db, t->store, t->budget, &t->remaining);
+}
+
+cdb_status cdb_vec_refresh_async(cdb_db *db, cdb_vec_refresh_task *task, uint64_t *task_id)
+{
+    if (db == NULL || task == NULL)
+        return CDB_E_INVALID_ARG;
+
+    task->db = db;
+    task->status = CDB_OK;
+    task->remaining = 0;
+    return cdb_worker_pool_submit(&db->workers, vec_refresh_worker_fn, task, task_id);
 }
 
 /* Copies the stored list (base-measure distances, as stored in f32) and

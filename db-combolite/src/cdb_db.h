@@ -17,6 +17,7 @@
 #include "cdb_journal.h"
 #include "cdb_pager.h"
 #include "cdb_slots.h"
+#include "cdb_worker.h"
 
 #define CDB_DB_PATH_MAX 200         /* longest path, including the terminating zero */
 
@@ -131,6 +132,7 @@ typedef struct cdb_db_config {
     cdb_slot_align *slot_mem;     /* optional caller memory for slots */
     size_t slot_mem_size;         /* in bytes */
     cdb_coord_config coord;       /* coordinators (spec 5.9): zeros take the defaults */
+    unsigned worker_threads;      /* background worker pool threads; 0 means synchronous/disabled */
 } cdb_db_config;
 
 /* An open document pool (cdb_doc.h). */
@@ -313,7 +315,13 @@ typedef struct cdb_db {
     cdb_thread *hb_thread;    /* the heartbeat thread itself */
     int hb_stop;              /* set to 1 to tell the heartbeat thread to exit */
     int hb_running;           /* 1 if hb_thread is running and must be joined */
+    /* Background worker threads (spec 5.9.6, M20). */
+    cdb_worker_pool workers;
 } cdb_db;
+
+/* Re-entrant synchronization locks across threads (spec 5.9.6, M20). */
+void cdb_db_lock(cdb_db *db);
+void cdb_db_unlock(cdb_db *db);
 
 /* Opens <base>.cdbarch, recovering if needed, and starts a session. If the
  * archive does not exist and create is non-NULL, a new database is created

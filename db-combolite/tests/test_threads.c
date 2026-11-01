@@ -7,11 +7,18 @@
 
 #include "unity.h"
 #include "cdb_db.h"
+#include "cdb_doc.h"
+#include "cdb_vec.h"
+#include "cdb_worker.h"
 #include "combolite/cdb_env.h"
 
 #define PAGE_LOG2 9u
 #define PAGE (1u << PAGE_LOG2)
 #define NODES 16u
+
+static uint8_t doc_buf[4096];
+static uint8_t vec_buf[3 * PAGE];
+static uint8_t vec_w[8192];
 
 static cdb_hostenv he;
 static cdb_env env;
@@ -21,16 +28,16 @@ static uint8_t arena1[NODES * 2u * PAGE + 2u * PAGE];
 static cdb_pager_node nodes1[NODES];
 static cdb_free_extent free_list1[512];
 static uint8_t record_buf1[1024];
-static uint8_t cat_work1[8192];
-static cdb_index_entry cat_entries1[256];
+static uint8_t cat_work1[16384];
+static cdb_index_entry cat_entries1[512];
 static uint8_t cat_page1[PAGE];
 
 static uint8_t arena2[NODES * 2u * PAGE + 2u * PAGE];
 static cdb_pager_node nodes2[NODES];
 static cdb_free_extent free_list2[512];
 static uint8_t record_buf2[1024];
-static uint8_t cat_work2[8192];
-static cdb_index_entry cat_entries2[256];
+static uint8_t cat_work2[16384];
+static cdb_index_entry cat_entries2[512];
 static uint8_t cat_page2[PAGE];
 
 static void cleanup_files(void)
@@ -287,9 +294,9 @@ static void init_db_cfg(cdb_db_config *cfg, uint8_t *arena, cdb_pager_node *node
     cfg->record_buf_size = 1024;
     cfg->apply = test_apply;
     cfg->catalog_work.bytes = cat_work;
-    cfg->catalog_work.bytes_size = 8192;
+    cfg->catalog_work.bytes_size = 16384;
     cfg->catalog_work.entries = cat_entries;
-    cfg->catalog_work.entries_cap = 256;
+    cfg->catalog_work.entries_cap = 512;
     cfg->catalog_page = cat_page;
     cfg->durability = CDB_DURABILITY_FULL;
 }
@@ -347,6 +354,193 @@ static void test_idle_process_kept_alive_by_heartbeat_thread(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db1));
 }
 
+typedef struct task_counter_ctx {
+    cdb_mutex *m;
+    int count;
+} task_counter_ctx;
+
+static void worker_inc_task(void *arg)
+{
+    task_counter_ctx *ctx = (task_counter_ctx *)arg;
+    (void)env.ops->mutex_lock(env.ctx, ctx->m);
+    ctx->count++;
+    (void)env.ops->mutex_unlock(env.ctx, ctx->m);
+}
+
+static void test_worker_pool_dispatch_and_wait_all(void)
+{
+    cdb_worker_pool pool;
+    task_counter_ctx ctx;
+    cdb_mutex *m = NULL;
+    unsigned i;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->mutex_create(env.ctx, &m));
+    ctx.m = m;
+    ctx.count = 0;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_init(&pool, &env, 3));
+    TEST_ASSERT_EQUAL_UINT(3, pool.nthreads);
+
+    for (i = 0; i < 10; i++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_submit(&pool, worker_inc_task, &ctx, NULL));
+    }
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_wait(&pool, 0));
+    TEST_ASSERT_EQUAL_INT(10, ctx.count);
+
+    cdb_worker_pool_destroy(&pool);
+    env.ops->mutex_destroy(env.ctx, m);
+}
+
+typedef struct task_flag_ctx {
+    int started;
+    int done;
+} task_flag_ctx;
+
+static void worker_flag_task(void *arg)
+{
+    task_flag_ctx *ctx = (task_flag_ctx *)arg;
+    ctx->started = 1;
+    env.ops->sleep(env.ctx, 15000000); /* 15 ms */
+    ctx->done = 1;
+}
+
+static void test_worker_pool_wait_individual_task(void)
+{
+    cdb_worker_pool pool;
+    task_flag_ctx ctx1 = {0, 0};
+    task_flag_ctx ctx2 = {0, 0};
+    uint64_t id1 = 0, id2 = 0;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_init(&pool, &env, 2));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_submit(&pool, worker_flag_task, &ctx1, &id1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_submit(&pool, worker_flag_task, &ctx2, &id2));
+    TEST_ASSERT_NOT_EQUAL(0, id1);
+    TEST_ASSERT_NOT_EQUAL(0, id2);
+    TEST_ASSERT_NOT_EQUAL(id1, id2);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_wait(&pool, id1));
+    TEST_ASSERT_EQUAL_INT(1, ctx1.done);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_wait(&pool, id2));
+    TEST_ASSERT_EQUAL_INT(1, ctx2.done);
+
+    cdb_worker_pool_destroy(&pool);
+}
+
+static void worker_noop_task(void *arg)
+{
+    (void)arg;
+    env.ops->sleep(env.ctx, 20000000); /* 20 ms */
+}
+
+static void test_worker_pool_queue_full(void)
+{
+    cdb_worker_pool pool;
+    unsigned i;
+
+    /* 1 worker thread so queue fills up quickly */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_init(&pool, &env, 1));
+
+    for (i = 0; i < CDB_WORKER_MAX_TASKS; i++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_submit(&pool, worker_noop_task, NULL, NULL));
+    }
+
+    /* Queue should now be full */
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUFFER_TOO_SMALL, cdb_worker_pool_submit(&pool, worker_noop_task, NULL, NULL));
+
+    /* Wait for all to complete */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_wait(&pool, 0));
+
+    /* After draining, submission succeeds again */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_submit(&pool, worker_noop_task, NULL, NULL));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_wait(&pool, 0));
+
+    cdb_worker_pool_destroy(&pool);
+}
+
+static void test_worker_pool_sync_fallback(void)
+{
+    cdb_worker_pool pool;
+    task_flag_ctx ctx = {0, 0};
+    uint64_t tid = 0;
+
+    /* Pool with 0 threads: operates synchronously */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_init(&pool, &env, 0));
+    TEST_ASSERT_EQUAL_UINT(0, pool.nthreads);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_submit(&pool, worker_flag_task, &ctx, &tid));
+    TEST_ASSERT_EQUAL_INT(1, ctx.done);
+    TEST_ASSERT_NOT_EQUAL(0, tid);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_wait(&pool, tid));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_wait(&pool, 0));
+
+    cdb_worker_pool_destroy(&pool);
+}
+
+static void test_db_worker_threads_and_vec_refresh_async(void)
+{
+    static cdb_db db;
+    cdb_db_config cfg;
+    cdb_header h = test_hdr();
+    cdb_vec_config vc;
+    uint64_t vcoll = 0;
+    cdb_vec_refresh_task rtask;
+    uint64_t rtask_id = 0;
+    float vdata[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    uint64_t eid = 0;
+    int i;
+
+    init_db_cfg(&cfg, arena1, nodes1, free_list1, record_buf1, cat_work1, cat_entries1, cat_page1);
+    cfg.apply = NULL;
+    cfg.doc_buffers = doc_buf;
+    cfg.vec_buffers = vec_buf;
+    cfg.vec_work = vec_w;
+    cfg.vec_work_size = sizeof vec_w;
+    cfg.worker_threads = 2;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open(&db, &env, base_path, &cfg, &h));
+    TEST_ASSERT_EQUAL_UINT(2, db.workers.nthreads);
+
+    memset(&vc, 0, sizeof vc);
+    vc.elem = CDB_VEC_F32;
+    vc.dims = 4;
+    vc.measure = CDB_VEC_EUCLIDEAN;
+    vc.model = "test";
+    vc.model_len = 4;
+    vc.model_version = "1";
+    vc.model_version_len = 1;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_create(&db, "test_vecs", 9, &vc, &vcoll));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_create_graph(&db, vcoll, 2));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+    for (i = 0; i < 6; i++) {
+        uint8_t enc[64];
+        cdb_value_writer w;
+        vdata[0] = (float)i;
+        cdb_value_writer_init(&w, enc, sizeof enc, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_write_vector(&w, CDB_VEC_F32, 4, vdata));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_insert(&db, vcoll, enc, cdb_value_writer_len(&w), 0, 0, &eid));
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+
+    memset(&rtask, 0, sizeof rtask);
+    rtask.store = vcoll;
+    rtask.budget = 10;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_refresh_async(&db, &rtask, &rtask_id));
+    TEST_ASSERT_NOT_EQUAL(0, rtask_id);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_wait(&db.workers, rtask_id));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, rtask.status);
+    TEST_ASSERT_EQUAL_UINT(0, rtask.remaining);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    TEST_ASSERT_EQUAL_UINT(0, db.workers.nthreads);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -358,5 +552,10 @@ int main(void)
     RUN_TEST(test_single_threaded_null_hooks);
     RUN_TEST(test_heartbeat_thread_runs_and_stops);
     RUN_TEST(test_idle_process_kept_alive_by_heartbeat_thread);
+    RUN_TEST(test_worker_pool_dispatch_and_wait_all);
+    RUN_TEST(test_worker_pool_wait_individual_task);
+    RUN_TEST(test_worker_pool_queue_full);
+    RUN_TEST(test_worker_pool_sync_fallback);
+    RUN_TEST(test_db_worker_threads_and_vec_refresh_async);
     return UNITY_END();
 }

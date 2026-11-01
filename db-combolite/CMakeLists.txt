@@ -86,7 +86,8 @@ add_library(combolite
   src/cdb_link.c
   src/cdb_ts.c
   src/cdb_tsbits.c
-  src/cdb_tsblock.c)
+  src/cdb_tsblock.c
+  src/cdb_worker.c)
 target_include_directories(combolite
   PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

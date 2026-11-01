@@ -954,6 +954,10 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
         return s;
     }
     start_heartbeat(db);
+    if ((s = cdb_worker_pool_init(&db->workers, &db->env, db->cfg.worker_threads)) != CDB_OK) {
+        (void)cdb_db_close(db);
+        return s;
+    }
     return CDB_OK;
 }
 
@@ -1090,16 +1094,26 @@ static cdb_status beat_only(cdb_db *db)
     return CDB_OK;
 }
 
+void cdb_db_lock(cdb_db *db)
+{
+    if (db != NULL && db->mutex != NULL && db->env.ops != NULL && db->env.ops->mutex_lock != NULL)
+        (void)db->env.ops->mutex_lock(db->env.ctx, db->mutex);
+}
+
+void cdb_db_unlock(cdb_db *db)
+{
+    if (db != NULL && db->mutex != NULL && db->env.ops != NULL && db->env.ops->mutex_unlock != NULL)
+        (void)db->env.ops->mutex_unlock(db->env.ctx, db->mutex);
+}
+
 static void db_lock(cdb_db *db)
 {
-    if (db->mutex != NULL && db->env.ops != NULL && db->env.ops->mutex_lock != NULL)
-        (void)db->env.ops->mutex_lock(db->env.ctx, db->mutex);
+    cdb_db_lock(db);
 }
 
 static void db_unlock(cdb_db *db)
 {
-    if (db->mutex != NULL && db->env.ops != NULL && db->env.ops->mutex_unlock != NULL)
-        (void)db->env.ops->mutex_unlock(db->env.ctx, db->mutex);
+    cdb_db_unlock(db);
 }
 
 static void heartbeat_worker(void *arg)
@@ -1169,6 +1183,7 @@ static void stop_heartbeat_thread(cdb_db *db)
 
 static void cleanup_concurrency(cdb_db *db)
 {
+    cdb_worker_pool_destroy(&db->workers);
     stop_heartbeat_thread(db);
     if (db->hb_cond != NULL) {
         if (db->env.ops != NULL && db->env.ops->cond_destroy != NULL)
@@ -2104,6 +2119,7 @@ cdb_status cdb_db_close(cdb_db *db)
     }
 
     db_unlock(db);
+    cdb_worker_pool_destroy(&db->workers);
     stop_heartbeat_thread(db);
     db_lock(db);
 
