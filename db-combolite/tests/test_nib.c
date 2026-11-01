@@ -167,6 +167,26 @@ static void test_small_records_share_pages(void)
         expect_doc(pool, e[i], i, 0);
     expect_doc(pool, big, 99, 1);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    /* A stale nibblet record whose owner now points elsewhere is reported as
+     * CDB_E_NOT_FOUND by *_nib_moved, leaving the current address intact. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    {
+        uint64_t pool2, entry;
+        uint8_t okey[16];
+        d = make_doc(7, 0);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_store(&db, "st", 2, CDB_MODEL_DOCUMENT, &pool2));
+        begin();
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_insert(&db, pool2, NULL, 0, d.b, d.n, &entry));
+        commit();
+        memset(okey, 0, sizeof okey);
+        okey[7] = (uint8_t)entry;
+        okey[15] = 1u; /* revision 1 */
+        TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND,
+                              cdb_doc_nib_moved(&db, pool2, okey, sizeof okey, (UINT64_C(1) << 63) | 9999u,
+                                                (UINT64_C(1) << 63) | 8888u));
+        expect_doc(pool2, entry, 7, 0);
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
 /* ------------------------------------------------------- time series */

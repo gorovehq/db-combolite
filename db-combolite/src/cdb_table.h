@@ -169,6 +169,7 @@ struct cdb_rg;
 cdb_status cdb_table_rowgroups(cdb_db *db, uint64_t store, struct cdb_rg *g);
 /* A column-chunk nibblet moved (cdb_nib_merge). CDB_E_NOT_FOUND if its
  * table is gone or no group refers to it. */
-cdb_status cdb_table_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t addr);
+cdb_status cdb_table_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t old_addr,
+                               uint64_t addr);
 
 #endif

@@ -442,17 +442,18 @@ cdb_status cdb_nib_free(cdb_db *db, uint64_t addr)
 /* ------------------------------------------------------------ merging */
 
 /* Tells a record's owner it moved. CDB_E_NOT_FOUND: the owner no longer
- * refers to it (a dropped store, say), so the record is not kept. */
+ * refers to it (a dropped store or a record since replaced), so the record
+ * is not kept. */
 static cdb_status moved(cdb_db *db, uint64_t store, unsigned kind, const uint8_t *okey, size_t oklen,
-                        uint64_t addr)
+                        uint64_t old_addr, uint64_t addr)
 {
     switch (kind) {
     case CDB_NIB_KIND_REVISION:
-        return cdb_doc_nib_moved(db, store, okey, oklen, addr);
+        return cdb_doc_nib_moved(db, store, okey, oklen, old_addr, addr);
     case CDB_NIB_KIND_TS_BLOCK:
-        return cdb_ts_nib_moved(db, store, okey, oklen, addr);
+        return cdb_ts_nib_moved(db, store, okey, oklen, old_addr, addr);
     case CDB_NIB_KIND_COLCHUNK:
-        return cdb_table_nib_moved(db, store, okey, oklen, addr);
+        return cdb_table_nib_moved(db, store, okey, oklen, old_addr, addr);
     default:
         return CDB_E_CORRUPT;
     }
@@ -485,7 +486,7 @@ static cdb_status move_page(cdb_db *db, cdb_index *ix, uint64_t src, unsigned sr
             if ((s = record_at(db, 1, i, &store, &kind, &okey, &oklen, &data, &len)) != CDB_OK)
                 return s;
             slot = place(db, dp, sp + off, rlen);
-            s = moved(db, store, kind, okey, oklen, make_addr(dst, slot));
+            s = moved(db, store, kind, okey, oklen, make_addr(src, i), make_addr(dst, slot));
             if (s == CDB_E_NOT_FOUND)
                 (void)unplace(db, dp, slot); /* its owner is gone */
             else if (s != CDB_OK)

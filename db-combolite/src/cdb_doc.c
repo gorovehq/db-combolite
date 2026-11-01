@@ -1956,12 +1956,13 @@ cdb_status cdb_doc_next_live(cdb_db *db, uint64_t store, uint64_t after, uint64_
 
 /* A revision nibblet moved (cdb_nib_merge): the revisions index, and the
  * head if it is the head revision, point at the new address. */
-cdb_status cdb_doc_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t addr)
+cdb_status cdb_doc_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t old_addr,
+                             uint64_t addr)
 {
     struct cdb_doc_pool *pool;
     uint8_t v[10];
     size_t vlen;
-    uint64_t entry, rev;
+    uint64_t entry, rev, cur;
     head_rec h;
     int found;
     cdb_status s;
@@ -1977,6 +1978,10 @@ cdb_status cdb_doc_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, si
     if ((s = cdb_index_get(&pool->revs, okey, oklen, v, sizeof v, &vlen, &found)) != CDB_OK)
         return s;
     if (!found)
+        return CDB_E_NOT_FOUND;
+    if ((s = cdb_nib_addr_load(v, vlen, &cur)) != CDB_OK)
+        return s;
+    if (cur != old_addr)
         return CDB_E_NOT_FOUND;
     if ((s = rev_put(pool, entry, rev, addr)) != CDB_OK || (s = head_get(pool, entry, &h, &found)) != CDB_OK)
         return s;

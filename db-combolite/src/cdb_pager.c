@@ -223,7 +223,7 @@ static cdb_status read_page(cdb_pager *p, uint64_t phys, uint8_t *buf, uint16_t 
         return s == CDB_E_TRUNCATED ? CDB_E_CORRUPT : s;
     if ((s = cdb_page_open(buf, p->page_size, p->fmt, p->order, p->checksum_alg, h)) != CDB_OK)
         return s;
-    return h->type == type ? CDB_OK : CDB_E_CORRUPT;
+    return h->type == type && h->payload_len == cdb_page_capacity(p->fmt, p->page_size) ? CDB_OK : CDB_E_CORRUPT;
 }
 
 /* -------------------------------------------------------- free list */
@@ -568,6 +568,39 @@ static cdb_status get_node(cdb_pager *p, unsigned level, uint64_t number, cdb_pa
     return CDB_OK;
 }
 
+/* Makes sure n and every ancestor are in the cache at the same time, without
+ * leaving clean nodes marked dirty if a load or a later step fails. Once
+ * this succeeds, mark_dirty(p, n) finds every ancestor cached and cannot
+ * fail. */
+static cdb_status load_ancestors(cdb_pager *p, cdb_pager_node *n)
+{
+    cdb_pager_node *path[MAX_DEPTH];
+    uint8_t was_dirty[MAX_DEPTH];
+    unsigned count = 0, i;
+    unsigned level = n->level;
+    uint64_t number = n->number;
+    cdb_status s = CDB_OK;
+
+    path[count] = n;
+    was_dirty[count] = (uint8_t)n->dirty;
+    n->dirty = 1;
+    count++;
+    while (level + 1 < p->depth) {
+        cdb_pager_node *parent;
+        level++;
+        number /= p->inner_fan;
+        if ((s = get_node(p, level, number, &parent)) != CDB_OK)
+            break;
+        path[count] = parent;
+        was_dirty[count] = (uint8_t)parent->dirty;
+        parent->dirty = 1;
+        count++;
+    }
+    for (i = 0; i < count; i++)
+        path[i]->dirty = was_dirty[i];
+    return s;
+}
+
 /* Marks a node and every ancestor dirty. Dirty nodes are never evicted.
  * Ancestors must be dirty too: rewriting a node moves it to new physical
  * pages, so its parent's pointer changes, and so on up to the root. The
@@ -578,6 +611,8 @@ static cdb_status mark_dirty(cdb_pager *p, cdb_pager_node *n)
     uint64_t number = n->number;
     cdb_status s;
 
+    if ((s = load_ancestors(p, n)) != CDB_OK)
+        return s;
     n->dirty = 1;
     while (level + 1 < p->depth) {
         cdb_pager_node *parent;
@@ -667,13 +702,19 @@ static cdb_status grow(cdb_pager *p)
 {
     cdb_pager_node *old_root, *new_root;
     size_t from, to, len;
+    int was_dirty;
     cdb_status s;
 
     if (p->depth >= MAX_DEPTH)
         return CDB_E_OVERFLOW;
     if ((s = get_node(p, p->depth - 1, 0, &old_root)) != CDB_OK)
         return s;
-    old_root->dirty = 1; /* pin it while the new root is set up */
+    was_dirty = old_root->dirty;
+    old_root->dirty = 1; /* pin it while the new root's slot is taken */
+    if ((s = take_slot(p, &new_root)) != CDB_OK) {
+        old_root->dirty = was_dirty;
+        return s;
+    }
     /* The old root is about to become an ordinary node, which has no 32-byte
      * root area. Slide its entries down to where an ordinary node keeps
      * them, zero the freed bytes at the end, and clear its root flag. */
@@ -688,11 +729,9 @@ static cdb_status grow(cdb_pager *p)
     old_root->mirror[payload_off(p) + 1] = 0;
 
     /* With the depth raised, the old root is node (depth - 2, 0), child 0 of
-     * the new root. Create the new root in the cache, pointing its first
+     * the new root. Set up the new root in the cache, pointing its first
      * child slot at the old root's current pages in each copy's tree. */
     p->depth++;
-    if ((s = take_slot(p, &new_root)) != CDB_OK)
-        return s;
     new_root->level = p->depth - 1;
     new_root->number = 0;
     new_root->phys_primary = 0;
@@ -921,14 +960,17 @@ cdb_status cdb_pager_open(cdb_pager *p, const cdb_storage *st, const cdb_pager_c
         cdb_page_header h;
         uint64_t phys = p->root_primary;
         /* The root's level gives the depth. Peek at it through either copy. */
-        if (read_page(p, phys, p->scratch, CDB_PAGE_TYPE_ANCHOR_MAP, &h) != CDB_OK) {
+        if (read_page(p, phys, p->scratch, CDB_PAGE_TYPE_ANCHOR_MAP, &h) != CDB_OK
+            || (p->scratch[payload_off(p) + 1] & NODE_FLAG_ROOT) == 0
+            || (unsigned)p->scratch[payload_off(p)] >= MAX_DEPTH) {
             phys = p->root_mirror;
             if ((s = read_page(p, phys, p->scratch, CDB_PAGE_TYPE_ANCHOR_MAP, &h)) != CDB_OK)
                 return s;
+            if ((p->scratch[payload_off(p) + 1] & NODE_FLAG_ROOT) == 0
+                || (unsigned)p->scratch[payload_off(p)] >= MAX_DEPTH)
+                return CDB_E_CORRUPT;
         }
         p->depth = (unsigned)p->scratch[payload_off(p)] + 1u;
-        if (p->depth > MAX_DEPTH)
-            return CDB_E_CORRUPT;
         if ((s = get_node(p, p->depth - 1, 0, &root)) != CDB_OK)
             return s;
         area = root->primary + payload_off(p) + NODE_HDR;
@@ -1046,7 +1088,6 @@ static cdb_status pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header 
         return s;
     if (e.state == CDB_ANCHOR_RELEASED)
         return CDB_E_NOT_FOUND;
-    leaf->dirty = 1; /* pin the leaf while the page is written */
     /* Private mode (spec 5.9.1): the new version goes to the overlay, in
      * place if it is there already. The archive page is left alone and not
      * put on the free list, since this pager never commits. */
@@ -1059,9 +1100,12 @@ static cdb_status pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header 
         h.payload_len = (uint32_t)len;
         if (e.state == CDB_ANCHOR_PRIVATE)
             return write_overlay(p, p->scratch, &h, e.phys);
-        phys = p->ov_next++;
+        if ((s = load_ancestors(p, leaf)) != CDB_OK)
+            return s;
+        phys = p->ov_next;
         if ((s = write_overlay(p, p->scratch, &h, phys)) != CDB_OK)
             return s;
+        p->ov_next++;
         e.phys = phys;
         e.size_log2 = (uint8_t)p->hs.record.default_page_log2;
         e.state = CDB_ANCHOR_PRIVATE;
@@ -1083,6 +1127,8 @@ static cdb_status pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header 
     /* Case 2: copy-on-write. Write the new version to a fresh physical page,
      * put the old page (if any) on the free list, and point the anchor entry
      * at the new page. The old page stays intact for the committed state. */
+    if ((s = load_ancestors(p, leaf)) != CDB_OK)
+        return s;
     memset(p->scratch, 0, p->page_size);
     if (len)
         memcpy(p->scratch + payload_off(p), payload, len);
@@ -1144,7 +1190,8 @@ cdb_status cdb_pager_free(cdb_pager *p, uint64_t lid)
         return s;
     if (e.state != CDB_ANCHOR_LIVE && e.state != CDB_ANCHOR_PRIVATE)
         return CDB_E_NOT_FOUND;
-    leaf->dirty = 1; /* pin the leaf so free_push cannot evict it */
+    if ((s = load_ancestors(p, leaf)) != CDB_OK)
+        return s;
     if (!p->private_mode && (s = free_push(p, e.phys, 1)) != CDB_OK)
         return s;
     e.phys = 0;
@@ -1477,6 +1524,8 @@ cdb_status cdb_pager_compact(cdb_pager *p, uint64_t max_moves, uint64_t *moved, 
         if ((s = pager_write(p, lid, &h, p->page2 + payload_off(p), h.payload_len, 0)) != CDB_OK)
             return s;
         (*moved)++;
+        if (dirty_nodes(p) + p->depth + 2u >= p->node_count && (s = cdb_pager_commit(p)) != CDB_OK)
+            return s;
     }
     /* Anchor-map nodes living in the high region must move too. */
     if ((s = relocate_nodes(p, target, max_moves, moved)) != CDB_OK)

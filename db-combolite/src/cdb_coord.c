@@ -190,10 +190,12 @@ static int64_t dead_ns(const cdb_coord *c)
 static int wall_stale(cdb_coord *c, uint64_t beat_time_us)
 {
     int64_t wall;
+    uint64_t now_us;
     if (!wall_now(c, &wall) || wall <= 0)
         return 0;
-    return (uint64_t)(wall / 1000) > beat_time_us
-           && (int64_t)((uint64_t)(wall / 1000) - beat_time_us) > WALL_STALE_FACTOR * dead_ns(c) / 1000;
+    now_us = (uint64_t)(wall / 1000);
+    return now_us > beat_time_us
+           && now_us - beat_time_us > (uint64_t)(dead_ns(c) / 1000) * (uint64_t)WALL_STALE_FACTOR;
 }
 
 static void pause_for(cdb_coord *c, int64_t ns)
@@ -422,10 +424,14 @@ static cdb_status settle_liveness(cdb_coord *c)
  * clock, so its stamps never run behind it (spec 14.5.3). */
 static void follow_clock(cdb_coord *c)
 {
+    uint64_t pclock;
     int64_t t, mine;
     if (c->primary < 0)
         return;
-    t = (int64_t)(c->peers[c->primary].b.clock * 1000u);
+    pclock = c->peers[c->primary].b.clock;
+    if (pclock > (uint64_t)(INT64_MAX / 1000))
+        return;
+    t = (int64_t)(pclock * 1000u);
     mine = cdb_coord_clock(c);
     if (t > mine)
         c->offset += t - mine;
