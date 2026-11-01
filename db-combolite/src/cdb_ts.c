@@ -752,11 +752,10 @@ cdb_status cdb_ts_series(cdb_db *db, uint64_t store, const char *name, size_t le
     d = *def;
     if (d.window == 0)
         d.window = default_window(d.precision);
-    *series = t->next_entry;
-    if ((s = cdb_tx_put(db, store, *series, CDB_OP_INSERT, payload, encode_create(&d, key, klen, payload))) != CDB_OK)
+    if ((s = cdb_db_peek_entry(db, store, &t->next_entry, series)) != CDB_OK
+        || (s = cdb_tx_put(db, store, *series, CDB_OP_INSERT, payload, encode_create(&d, key, klen, payload))) != CDB_OK)
         return s;
-    t->next_entry++;
-    t->dirty = 1;
+    *series = cdb_db_take_entry(db, store, &t->next_entry, &t->dirty);
     t->touched_tx = db->tx_id;
     *created = 1;
     return CDB_OK;
@@ -922,7 +921,8 @@ static cdb_status blk_decode(const uint8_t *v, size_t vlen, blk *b)
 
 /* A block nibblet moved (cdb_nib_merge): its row in the blocks index
  * points at the new address. CDB_E_NOT_FOUND: the store or block is gone. */
-cdb_status cdb_ts_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t addr)
+cdb_status cdb_ts_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t old_addr,
+                            uint64_t addr)
 {
     uint8_t v[BLOCK_VAL + 2u];
     size_t vlen;
@@ -943,6 +943,8 @@ cdb_status cdb_ts_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, siz
         return CDB_E_NOT_FOUND;
     if ((s = blk_decode(v, vlen, &b)) != CDB_OK)
         return s;
+    if (b.lid != old_addr)
+        return CDB_E_NOT_FOUND;
     b.lid = addr;
     b.first = key_ts(okey);
     return blk_put(t, cdb_load_u64(okey, CDB_ORDER_BIG), &b);

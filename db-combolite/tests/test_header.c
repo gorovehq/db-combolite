@@ -149,7 +149,7 @@ static void test_rejects_bad_fields(void)
     TEST_ASSERT_EQUAL_INT(CDB_E_MALFORMED, cdb_header_decode(img, &back));
 
     encode_valid(&h, img);
-    img[485] = 1; /* reserved byte */
+    img[482] = 1; /* reserved byte (484..491 is the marks root) */
     reseal(img, CDB_ORDER_LITTLE);
     TEST_ASSERT_EQUAL_INT(CDB_E_MALFORMED, cdb_header_decode(img, &back));
 

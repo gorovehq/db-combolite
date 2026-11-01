@@ -164,6 +164,6 @@ cdb_status cdb_rg_drop(cdb_rg *g, uint64_t last);
 
 /* A chunk nibblet of the group moved (cdb_nib_merge): the header points at
  * its new address. CDB_E_NOT_FOUND if no group refers to it. */
-cdb_status cdb_rg_nib_moved(cdb_rg *g, const uint8_t *okey, size_t oklen, uint64_t addr);
+cdb_status cdb_rg_nib_moved(cdb_rg *g, const uint8_t *okey, size_t oklen, uint64_t old_addr, uint64_t addr);
 
 #endif

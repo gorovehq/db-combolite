@@ -13,12 +13,12 @@
 
 #include "combolite/cdb_env.h"
 #include "cdb_catalog.h"
+#include "cdb_coord.h"
 #include "cdb_journal.h"
 #include "cdb_pager.h"
 #include "cdb_slots.h"
 
 #define CDB_DB_PATH_MAX 200         /* longest path, including the terminating zero */
-#define CDB_COMMIT_RESERVE_BLOCK 1024u /* commit numbers reserved per header checkpoint */
 
 /* Durability levels (spec 3.1). */
 typedef enum cdb_durability {
@@ -86,7 +86,7 @@ typedef struct cdb_db_config {
     cdb_durability durability;    /* default level; DEFAULT means NORMAL (spec 3.1) */
     unsigned normal_sync_every;   /* 0 means 32 */
     unsigned flags;               /* CDB_DB_ACCEPT_LOSS */
-    cdb_index_work catalog_work;  /* optional: the catalog is available when set */
+    cdb_index_work catalog_work;  /* the catalog, and the reconciliation marks (spec 14.4.8) */
     uint8_t *catalog_page;        /* page_size bytes, with catalog_work */
     uint8_t *doc_buffers;         /* documents: cdb_doc_buffers_size() bytes (cdb_doc.h) */
     size_t doc_max;               /* documents: largest body in bytes, kept in overflow pages
@@ -130,6 +130,7 @@ typedef struct cdb_db_config {
     unsigned max_open;
     cdb_slot_align *slot_mem;     /* optional caller memory for slots */
     size_t slot_mem_size;         /* in bytes */
+    cdb_coord_config coord;       /* coordinators (spec 5.9): zeros take the defaults */
 } cdb_db_config;
 
 /* An open document pool (cdb_doc.h). */
@@ -243,14 +244,26 @@ typedef struct cdb_db {
     char workdir[CDB_DB_PATH_MAX];      /* <base>.cdbwork */
     char journal_path[CDB_DB_PATH_MAX]; /* <base>.cdbwork/main.0.cdb */
     char journal_tmp[CDB_DB_PATH_MAX];  /* the same with .new, used while rotating */
+    char coorddir[CDB_DB_PATH_MAX];     /* <base>.cdbwork/coord */
+    cdb_coord coord;                    /* this process's coordinator (spec 5) */
     cdb_storage archive_st;
     cdb_storage journal_st;
     cdb_pager pager;
     cdb_journal journal;
-    uint64_t next_commit; /* next global commit number to hand out */
-    uint64_t commit_hwm;  /* numbers below this are reserved durably */
+    /* Sharing the archive with other processes (spec 5.9). */
+    char overlay_path[CDB_DB_PATH_MAX]; /* <base>.cdbwork/pages.<slot>.cdb (spec 5.9.1) */
+    cdb_storage overlay_st;
+    int have_overlay;     /* overlay_st is open */
+    cdb_storage rj_st;    /* reads journals while recovering or merging */
+    cdb_journal rj;
+    int fresh;            /* the pager holds the archive's last commit plus only this
+                             process's own transactions, so it may be committed as is */
+    uint64_t pins_seq;    /* committed sequence at which the others' pins were last read */
     uint64_t applied;     /* highest commit number applied to the pager */
     uint64_t next_tx;     /* counter part of the next transaction ID */
+    uint64_t last_tx;     /* counter of this slot's last committed transaction */
+    uint64_t my_mark;     /* this slot's mark in the committed archive (spec 5.9.2) */
+    uint64_t last_stamp;  /* stamp of this journal's last commit */
     int in_tx;            /* a transaction is open */
     uint64_t tx_id;
     uint64_t tx_start;    /* journal offset of the open transaction's first record */
@@ -287,6 +300,13 @@ typedef struct cdb_db {
     unsigned op_depth;    /* operation scopes open (cdb_db_op_begin) */
     uint64_t op_id;       /* the outermost one's ID */
     uint64_t op_seq;      /* the last ID given out */
+    /* Claimed entry-ID blocks still being handed out in memory (spec 5.9.3). */
+    struct {
+        uint64_t store;
+        uint64_t next;
+        uint64_t end;
+    } id_ranges[CDB_COORD_MAX_BLOCKS];
+    unsigned nid_ranges;
 } cdb_db;
 
 /* Opens <base>.cdbarch, recovering if needed, and starts a session. If the
@@ -295,13 +315,28 @@ typedef struct cdb_db {
  * Other errors: CDB_E_INVALID_ARG for missing buffers or a path too long;
  * CDB_E_READ_ONLY for a file this build may only read (not supported yet);
  * CDB_E_CORRUPT when a journal marked in use is missing or had to be set
- * aside, unless cfg->flags has CDB_DB_ACCEPT_LOSS. */
+ * aside, unless cfg->flags has CDB_DB_ACCEPT_LOSS; CDB_E_BUSY when every
+ * coordinator slot is held by a live process.
+ *
+ * Several processes may have one database open (spec 5.9). Only the one
+ * holding the baton writes the archive; the others keep their changes in
+ * an overlay file until they reconcile, and see the others' changes once
+ * those are reconciled. Opening may wait: see cdb_coord_join. */
 cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const cdb_db_config *cfg,
                        const cdb_header *create);
 
-/* Reconciles everything and leaves the database as one file at rest.
- * CDB_E_STATE if an apply failed earlier: the journal is then kept so the
- * next open can replay it. */
+/* Keeps this process's coordinator alive (spec 5.9.6). Every engine entry
+ * point that starts work writes a heartbeat when one is due; an application
+ * that may sit idle longer than the dead timeout (3 s by default) calls this
+ * from its own loop. CDB_E_BUSY if another process took this coordinator's
+ * slot while it was silent; the database is then failed and must be closed. */
+cdb_status cdb_db_tick(cdb_db *db);
+
+/* Reconciles everything and, if no other process has the database open,
+ * leaves it as one file at rest. CDB_E_STATE if an apply failed earlier:
+ * the journal is then kept so the next open can replay it. CDB_E_BUSY when
+ * the baton could not be had (spec 5.9.8); the database stays open and the
+ * call may be repeated. */
 cdb_status cdb_db_close(cdb_db *db);
 
 /* An operation scope: every store opened inside it stays open until the
@@ -321,12 +356,24 @@ cdb_status cdb_tx_begin(cdb_db *db, cdb_durability durability);
  * copied. CDB_E_INVALID_ARG when the record would not fit record_buf. */
 cdb_status cdb_tx_put(cdb_db *db, uint64_t store_id, uint64_t entry_id, uint8_t op,
                       const void *data, size_t len);
+/* Journals a write-set key record (kind 4, spec 5.9.4, 14.4.7 rule 3) for a
+ * unique index key written by the open transaction. */
+cdb_status cdb_tx_put_key(cdb_db *db, uint64_t store_id, uint32_t index_num, const void *key, size_t key_len);
+/* Entry-ID allocation from claimed blocks of CDB_COORD_ID_BLOCK (spec 5.9.3).
+ * peek_entry ensures a block is claimed for store (at or above *next_entry)
+ * and returns the next ID without consuming it; take_entry consumes it after
+ * the insert record is journaled. */
+cdb_status cdb_db_peek_entry(cdb_db *db, uint64_t store, const uint64_t *next_entry, uint64_t *id);
+uint64_t cdb_db_take_entry(cdb_db *db, uint64_t store, uint64_t *next_entry, int *dirty);
 /* Writes the commit record, syncs per the durability level, and applies
  * the changes to the pages. */
 cdb_status cdb_tx_commit(cdb_db *db);
 cdb_status cdb_tx_abort(cdb_db *db);
 
-/* Folds every applied change into the archive (spec 3.2) and starts a new journal. */
+/* Folds every applied change into the archive (spec 3.2) and starts a new
+ * journal. With other processes open it takes the baton, waiting for it if
+ * need be, and merges every process's committed transactions (spec 5.9.1);
+ * CDB_E_BUSY when the wait passes its cap. */
 cdb_status cdb_db_reconcile(cdb_db *db);
 
 /* The environment's clock, in nanoseconds since the Unix epoch. *have is 0

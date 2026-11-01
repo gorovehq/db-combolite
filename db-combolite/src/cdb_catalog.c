@@ -646,6 +646,8 @@ cdb_status cdb_catalog_stage_pool(cdb_catalog *cat, uint64_t store_id, uint64_t 
     cdb_status s;
     if ((s = load_store(cat, store_id, &info, ref)) != CDB_OK)
         return s;
+    if (next_entry_id < info.next_entry_id)
+        next_entry_id = info.next_entry_id;
     if (info.head_root == head_root && info.rev_root == rev_root && info.next_entry_id == next_entry_id)
         return CDB_OK;
     info.head_root = head_root;
@@ -666,6 +668,8 @@ cdb_status cdb_catalog_stage_next_entry(cdb_catalog *cat, uint64_t store_id, uin
     cdb_status s;
     if ((s = load_store(cat, store_id, &info, ref)) != CDB_OK)
         return s;
+    if (next_entry_id < info.next_entry_id)
+        next_entry_id = info.next_entry_id;
     if (info.next_entry_id == next_entry_id)
         return CDB_OK;
     info.next_entry_id = next_entry_id;

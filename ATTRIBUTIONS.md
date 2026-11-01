@@ -5,7 +5,8 @@
 db-combolite is designed and owned by Casey Annis (unklStewy).
 
 The specification and implementation were developed with the help of
-Claude, an AI assistant made by Anthropic, working through Claude Code.
+Claude, an AI assistant made by Anthropic, working through Claude Code, and
+Gemini, an AI assistant made by Google DeepMind, working through Antigravity.
 Every design decision in the specification was confirmed by the owner.
 
 ## Third-party components

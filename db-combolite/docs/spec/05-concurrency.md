@@ -95,6 +95,80 @@ No two processes ever write to the same bytes. As a result, coordination doesn't
 - The **heartbeat interval can be configured**. Each device class in the table in Section 2.8 has a default interval.
 - **On microcontrollers**, where usually only one process runs, heartbeats stay **in memory** and are never written to flash. This avoids flash wear.
 
+## 5.9 How processes share one archive (M19)
+
+Status: **confirmed by the project owner on 2026-10-30.** The four choices marked *(confirmed)* were asked as questions; the rest, which carries them out, was approved as a whole. Values marked *provisional* move to the device-class table (Section 2.8) once they have been measured.
+
+### 5.9.1 Applying and merging
+
+- **Private pages.** Each process applies its own committed transactions to private copy-on-write pages over the archive. That is how a writer sees its own unreconciled changes (5.6). No other process ever sees those pages.
+- **Only the baton holder writes the archive (confirmed).** Free space, the append point and the header are shared, so a process that does not hold the baton (5.9.8) writes its private pages to its **overlay file**, `pages.<slot>.cdb` in the working directory, and never commits. The overlay is emptied at every rebase and removed at close. A process that holds the baton writes its private pages into the archive, as a single process always has.
+- **Merging is logical (confirmed).** At reconciliation, the baton holder replays the committed transactions of **every** slot's journal onto the archive, in merge order (5.9.2), through the same apply hook as recovery. Pages are never merged.
+- **Rebase.** When a process sees that the archive has moved (its committed sequence changed), it drops its private pages and re-applies its own committed transactions that are not yet reconciled (5.9.2) on top of the new archive. It checks at transaction begin, at the start of an operation scope and at every heartbeat.
+- **Journals belong to slots, not sessions.** The baton holder also merges the journals of dead coordinators. A process that later takes over a dead slot adopts its journal.
+
+### 5.9.2 Merge order and per-slot marks (confirmed)
+
+- **Commit stamp.** Every commit record carries a stamp from the primary's clock (14.5.3). The merge order is (stamp, slot, transaction counter), which is unique because the counter is.
+- **Commit numbers are given at reconciliation.** The baton holder numbers the transactions it merges contiguously, in merge order. The header watermark (14.1.8) remains "reconciled through commit number X". A writer leaves the commit-number field of its commit record at 0.
+- **Per-slot marks.** The archive keeps a **reconciliation-marks index**: one record per coordinator slot, saying that slot's journal is reconciled through transaction counter N. It is committed together with the pages it describes, so after a crash a transaction is replayed only if its counter is above its slot's mark.
+- **Before reconciliation, a revision has no commit number.** Model data that records the commit number (for example document revisions, 14.9) holds 0 on private pages. The real number is written when the transaction is merged into the archive.
+- **Counters survive slot reuse.** A process that takes a slot continues its transaction counter above both the slot's high-water mark (14.5.2) and the slot's mark in the archive.
+
+### 5.9.3 Entry-ID blocks (confirmed)
+
+- A store's entry-ID counter in the catalog is the floor below which no process may hand out IDs.
+- **Claiming a block.** A process that inserts into a store claims a block of **1024** consecutive IDs for that store. It lists the block in its coordinator slot's held-blocks table (14.5.2) and makes the claim through append → settle → choose (5.5).
+- **Which claim wins.** The claim fails if any other slot lists an overlapping block that it already holds, or that it claimed with an earlier request. The process then claims the next free block.
+- **No wait when alone.** When no other coordinator is alive, the block is listed without a settle wait.
+- **Reconciliation raises the floor.** Reconciliation raises each store's counter in the catalog past the end of every block that any slot lists for that store. Once the counter is past a block's end, the holder may drop the block from its table and keep using the rest of it from memory. Unused IDs are never reused.
+
+### 5.9.4 Collisions at commit (confirmed)
+
+This implements the default policy of 11.3, where the later write is rejected. Configurable policies and the identity carried in a collision notice come with the query-layer milestones.
+
+- **Write set.** A transaction's write set is the (store, entry) of each of its data records. It also includes a hash of every unique-key value it writes (tables, 9.9), each journaled as a *write-set key* record (14.4.2, kind 4).
+- **Prepare, settle, scan.** When another coordinator is alive, the committer:
+  1. appends a *prepare* record (kind 5) holding its stamp;
+  2. waits the settle interval;
+  3. reads the other slots' journals from where it last stopped;
+  4. checks its write set against every transaction there that is committed, or prepared and not aborted, and that is not reconciled yet.
+- **Who loses.** An overlap with a committed transaction, or with one that was prepared with an earlier (stamp, slot), makes the committer the later writer. It appends an abort record and gets `CDB_E_COLLISION`. An overlap with a transaction prepared with a *later* (stamp, slot) that has neither committed nor aborted makes the committer wait until it does, or until its coordinator dies (a transaction with no commit record never counts). A commit by that transaction then makes the committer lose. Waits only run from earlier stamps to later ones, so they can't form a cycle, and the outcome is safe even when a process stalls between taking its stamp and writing its prepare record. Otherwise it writes its commit record, which carries the prepare stamp.
+- **Changes merged during the transaction.** If another process reconciled changes from other slots into the archive while the transaction was open, the transaction is rejected the same way. Its view was older than the archive, and the reconciled write sets are no longer in any journal.
+- **Joining.** A coordinator that has just joined waits one heartbeat interval plus the settle interval before its first commit. Every coordinator refreshes its list of live coordinators at each heartbeat. A commit that starts with a list older than half a heartbeat interval refreshes it first.
+- **Only coordinator.** With no other live coordinator, there is no prepare record, no settle wait and no scan.
+
+### 5.9.5 Joining and slot ownership
+
+- **Lobby.** A new coordinator first writes a join request to a lobby file, `coord/join.<session identity>`. Session identities are random, so no two processes ever write the same lobby file. The request names the slot it wants: the lowest free one, or the lowest one whose coordinator is dead. The join then follows append → settle → choose, and a loser tries the next slot. The winner writes its slot file and removes its lobby file.
+- **Single writer.** No process ever writes another process's slot file, even a dead one's. A dead slot keeps its contents, including its held blocks and its journal, until a new owner takes it over.
+- **Journal in use.** A slot records whether its journal is in use (14.5.2, state flags). A slot that says its journal is in use, but whose journal is missing, means possible loss, as in 1.12.5.
+
+### 5.9.6 Liveness without threads (confirmed)
+
+- **When heartbeats are written.** Every library call writes a heartbeat if one is due, at most once per heartbeat interval. `cdb_coord_tick()` lets an idle application keep its coordinator alive.
+- **Dead coordinators.** A coordinator whose heartbeat is older than the dead timeout is dead. *Provisional:* interval 1 s, timeout 3 intervals, settle interval 2 ms.
+- **Coming back.** A process that has been idle past the timeout finds this out on its next call. It rejoins: if its slot is still free it takes it back, otherwise it takes another slot. It does so as a subordinate, then rebases.
+- **Background threads.** Optional heartbeat threads and worker threads belong to the parallel-engine milestone (M20). Micro-controllers keep the in-memory heartbeat of 5.8.
+
+### 5.9.7 Readers and space reuse
+
+- Each coordinator publishes in its slot the archive's committed sequence that its readers are using (14.5.2, offset 144).
+- A page freed by the commit with sequence *f* is reused only when *f* is below the committed sequence (3.4) **and** below the sequence published by every live coordinator. That way, no process reading an older archive state has a page overwritten under it.
+- **Publishing is checked.** A process reads the header, publishes its committed sequence *P*, then reads the header again. If the sequence is no longer *P*, it starts over. The baton holder reads every slot's published sequence before each archive commit it prepares, so a page that state *P* uses, freed at *P* + 1 or later, is never reused while *P* is published.
+
+### 5.9.8 The baton (first version)
+
+- **One heat, round-robin.** Requests are served in merge order of their request stamps. The congestion-detecting queue and multiple heats come later.
+- **What needs the baton.** Reconciliation, compaction and catalog changes. Catalog changes and compaction already reconcile first (14.4.6, rule 4), so each of them runs as one baton session.
+- **Fencing.** Each baton's ID (CTS) is one above the previous baton's, which is published in the holder's slot (offset 112). Before committing the archive, the holder checks that its CTS is still the highest one published by any slot.
+- **Request and grant.** A requester writes request kind 1, its request stamp and *x-total* into its slot. When no live slot holds a baton, the request that is first by the rule of 5.5 takes it: it publishes the next CTS and the time it was issued (offset 128), waits the settle interval and checks again that no other slot published the same or a higher CTS. A slot holds the baton while its issue time is not 0. Releasing sets the issue time to 0 and keeps the CTS.
+- **Standing baton (confirmed).** A process that is the only live coordinator takes the baton without a settle wait and keeps it between reconciliations. When another process requests the baton, the holder reconciles what it has applied at its next library call or `cdb_db_tick`, then releases.
+- **Service window and timeout.** The window is the dead timeout plus a share sized from *x-total*. The holder publishes its progress *x* with every heartbeat. A holder that is dead, or that has gone a whole window without progress, has lost the baton: the next requester takes a CTS above it.
+- **Lease margin (confirmed).** Before each archive page write and before its commit, the holder checks on its own monotonic clock how long it has gone without a heartbeat. Past half the dead timeout, it gives the session up, releases and rebases. Others wait the whole timeout, so a stalled holder that wakes up stops writing before anyone else starts. What remains is a stall that falls between that check and the write itself.
+- **Waiting (confirmed).** A call that needs the baton while another live process holds it waits: it sleeps through the environment, heartbeats, and checks again, until it is granted or the holder times out. After a configurable cap (default: the service window plus the dead timeout), it returns `CDB_E_BUSY`.
+- **Renew and resume are the same.** A reconciliation is one atomic archive commit, so a session that crashes leaves nothing to resume: its process starts over from the archive state. Compaction commits at each step and simply continues from the last one.
+
 ## Open questions (do not specify until answered)
 
 None at present. How identity keys are issued is covered in [Section 12.5](12-security.md).

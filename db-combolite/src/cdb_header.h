@@ -80,6 +80,7 @@ typedef struct cdb_header {
     uint64_t commit_hwm;
     uint64_t anchor_mirror_root;
     uint8_t content_hash_alg;
+    uint64_t marks_root;     /* reconciliation-marks index (spec 14.4.8); 0 = none yet */
     uint8_t tamper_tag[16];
 } cdb_header;
 

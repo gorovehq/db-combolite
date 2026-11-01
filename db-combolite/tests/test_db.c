@@ -30,18 +30,23 @@ static uint8_t page[PAGE];
 static cdb_db_config cfg;
 static cdb_db db;
 
-/* A tiny key-value store: entry N lives in logical page N. */
+/* A tiny key-value store: entry N lives in logical page N. The first change
+ * reserves pages up to KV_PAGES, so pages the engine allocates for itself
+ * (the reconciliation marks, spec 14.4.8) land above every entry. */
+#define KV_PAGES 128u
+
 static cdb_status kv_apply(void *ctx, cdb_pager *p, const cdb_delta *d)
 {
     cdb_page_header t;
     uint64_t lid;
     cdb_status s;
     (void)ctx;
+    TEST_ASSERT_TRUE(d->entry_id < KV_PAGES);
     if (d->op == CDB_OP_DELETE) {
         s = cdb_pager_free(p, d->entry_id);
         return s == CDB_E_NOT_FOUND ? CDB_OK : s;
     }
-    while (p->next_lid <= d->entry_id)
+    while (p->next_lid < KV_PAGES)
         if ((s = cdb_pager_alloc(p, &lid)) != CDB_OK)
             return s;
     memset(&t, 0, sizeof t);
@@ -203,29 +208,44 @@ static size_t commit_times(uint64_t *out, size_t cap)
     return n;
 }
 
-/* Commit records carry the environment's clock, or 0 without one. */
+/* Commit records carry stamps from the primary coordinator's clock (spec
+ * 5.9.2, 14.4.4): always rising within a journal, and on the wall clock when
+ * the environment has one at open. The environment's clock itself is still
+ * what cdb_db_now reports. */
 static void test_commit_timestamp(void)
 {
     const int64_t t = INT64_C(1761768000123456789);
     uint64_t times[4];
     int64_t now;
     int have;
+
+    /* No wall clock: the monotonic one, still rising. */
     TEST_ASSERT_EQUAL_INT(CDB_OK, open_db(&env, "t"));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_now(&db, &now, &have));
     TEST_ASSERT_EQUAL_INT(0, have);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
-    TEST_ASSERT_EQUAL_INT(CDB_OK, put(1, "no clock"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put(1, "a"));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put(2, "b"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db)); /* the clock did not move in between */
+    TEST_ASSERT_EQUAL_size_t(2, commit_times(times, 4));
+    TEST_ASSERT_TRUE(times[0] > 0);
+    TEST_ASSERT_TRUE(times[1] > times[0]);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+
+    /* A wall clock at open: stamps follow it. */
     cdb_faultenv_set_time(&fe, 1, t);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db(&env, "t"));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_now(&db, &now, &have));
     TEST_ASSERT_EQUAL_INT(1, have);
     TEST_ASSERT_EQUAL_INT64(t, now);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
-    TEST_ASSERT_EQUAL_INT(CDB_OK, put(2, "clock"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put(3, "clock"));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
-    TEST_ASSERT_EQUAL_size_t(2, commit_times(times, 4));
-    TEST_ASSERT_EQUAL_UINT64(0, times[0]);
-    TEST_ASSERT_EQUAL_UINT64((uint64_t)t, times[1]);
+    TEST_ASSERT_EQUAL_size_t(1, commit_times(times, 4));
+    TEST_ASSERT_TRUE(times[0] >= (uint64_t)t);
+    TEST_ASSERT_TRUE(times[0] - (uint64_t)t < 1000000000u); /* the settle waits at open, no more */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 

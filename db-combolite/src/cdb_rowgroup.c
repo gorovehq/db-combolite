@@ -778,7 +778,7 @@ cdb_status cdb_rg_drop(cdb_rg *g, uint64_t last)
     return cdb_index_delete(g->groups, k, gkey(k, last), &found);
 }
 
-cdb_status cdb_rg_nib_moved(cdb_rg *g, const uint8_t *okey, size_t oklen, uint64_t addr)
+cdb_status cdb_rg_nib_moved(cdb_rg *g, const uint8_t *okey, size_t oklen, uint64_t old_addr, uint64_t addr)
 {
     uint64_t last, field;
     cdb_rg_ref *r = NULL;
@@ -798,7 +798,7 @@ cdb_status cdb_rg_nib_moved(cdb_rg *g, const uint8_t *okey, size_t oklen, uint64
     for (i = 0; r == NULL && i < g->hdr->ncols; i++)
         if (g->hdr->cols[i].field_id == field)
             r = &g->hdr->cols[i];
-    if (r == NULL || !cdb_nib_is(r->addr))
+    if (r == NULL || r->addr != old_addr)
         return CDB_E_NOT_FOUND;
     r->addr = addr;
     return hdr_store(g);
