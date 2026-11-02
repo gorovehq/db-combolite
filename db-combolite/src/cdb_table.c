@@ -49,6 +49,10 @@ typedef struct cdb_table_store table;
 typedef struct cdb_table_col col;
 typedef struct cdb_table_idx idx;
 
+static cdb_status rowgroups(cdb_db *db, uint64_t store, cdb_rg *g);
+static cdb_status fold_pending(cdb_db *db, table *t);
+static cdb_status col_next_live(cdb_db *db, table *t, uint64_t after, uint64_t *out_entry, int *done);
+
 size_t cdb_table_buffers_size(size_t page_size, size_t doc_max)
 {
     return (size_t)T_COUNT * cdb_doc_buffer_size(page_size, doc_max);
@@ -93,9 +97,10 @@ static int indexable(int type)
 
 static cdb_status save_table(cdb_db *db, void *slot)
 {
-    (void)db;
-    (void)slot;
-    return CDB_OK; /* index roots never change; columns change by catalog commits */
+    table *t = (table *)slot;
+    if (t->layout == CDB_TABLE_LAYOUT_COLUMN && db->cfg.col_work != NULL)
+        return fold_pending(db, t);
+    return CDB_OK;
 }
 
 const cdb_slot_ops cdb_table_slot_ops = { NULL, save_table };
@@ -705,8 +710,6 @@ static cdb_status tx_table(cdb_db *db, uint64_t store, table **t)
         return CDB_E_STATE;
     if ((s = table_get(db, store, t)) != CDB_OK)
         return s;
-    if ((*t)->layout == CDB_TABLE_LAYOUT_COLUMN)
-        return CDB_E_UNSUPPORTED; /* column-oriented rows: M18 layers 2-4 */
     return (*t)->version == 0 ? CDB_E_STATE : CDB_OK;
 }
 
@@ -717,11 +720,15 @@ static cdb_status insert_row(cdb_db *db, uint64_t store, const void *row, size_t
     cdb_status s;
     if ((s = tx_table(db, store, &t)) != CDB_OK)
         return s;
+    if (t->layout == CDB_TABLE_LAYOUT_COLUMN && (len > t->chunk_cap || len > tbuf_size(db)))
+        return CDB_E_OVERFLOW;
     /* A new row has no entry ID yet; 0 stands in (it matches no row, and
      * the ID's length in a key is fixed, so key sizes are checked right). */
     if ((s = normalize(db, t, (const uint8_t *)row, len, NULL, 0, 1, &n)) != CDB_OK
         || (s = check_keys(db, t, 0, n)) != CDB_OK)
         return s;
+    if (t->layout == CDB_TABLE_LAYOUT_COLUMN && n > t->chunk_cap)
+        return CDB_E_OVERFLOW;
     if ((s = cdb_doc_insert(db, store, NULL, 0, tbuf(db, T_ROW), n, entry)) != CDB_OK)
         return s;
     return write_keys(db, t, *entry, n);
@@ -736,6 +743,8 @@ static cdb_status replace_row(cdb_db *db, uint64_t store, uint64_t entry, const 
     cdb_status s;
     if ((s = tx_table(db, store, &t)) != CDB_OK)
         return s;
+    if (t->layout == CDB_TABLE_LAYOUT_COLUMN && (len > t->chunk_cap || len > tbuf_size(db)))
+        return CDB_E_OVERFLOW;
     if (update) {
         /* The row as this transaction sees it, through the current columns. */
         size_t raw;
@@ -750,6 +759,8 @@ static cdb_status replace_row(cdb_db *db, uint64_t store, uint64_t entry, const 
     if ((s = normalize(db, t, (const uint8_t *)row, len, update ? tbuf(db, T_CUR) : NULL, cur, 0, &n)) != CDB_OK
         || (s = check_keys(db, t, entry, n)) != CDB_OK)
         return s;
+    if (t->layout == CDB_TABLE_LAYOUT_COLUMN && n > t->chunk_cap)
+        return CDB_E_OVERFLOW;
     if ((s = cdb_doc_replace(db, store, entry, NULL, 0, tbuf(db, T_ROW), n)) != CDB_OK)
         return s;
     return write_keys(db, t, entry, n);
@@ -808,16 +819,219 @@ static cdb_status read_row(cdb_db *db, table *t, uint64_t entry, void *out, size
     return project(db, t, tbuf(db, T_OTHER), raw, info.schema_version, (uint8_t *)out, cap, len);
 }
 
+cdb_status cdb_table_is_column(cdb_db *db, uint64_t store, int *is_col)
+{
+    table *t;
+    cdb_status s;
+    *is_col = 0;
+    s = table_get(db, store, &t);
+    if (s != CDB_OK)
+        return s;
+    *is_col = (t->layout == CDB_TABLE_LAYOUT_COLUMN);
+    return CDB_OK;
+}
+
+cdb_status cdb_table_chunk_cap(cdb_db *db, uint64_t store, uint32_t *cap)
+{
+    table *t;
+    cdb_status s;
+    *cap = 0;
+    s = table_get(db, store, &t);
+    if (s != CDB_OK)
+        return s;
+    *cap = t->chunk_cap;
+    return CDB_OK;
+}
+
+static cdb_status col_committed_row(cdb_db *db, table *t, uint64_t entry, void *body, size_t cap,
+                                    size_t *len, int *live, uint32_t *schema)
+{
+    uint8_t k[8];
+    cdb_key_builder kb;
+    size_t vlen = 0;
+    int found = 0;
+    cdb_status s;
+
+    *live = 0;
+    *len = 0;
+    *schema = t->version;
+
+    /* 1. Check t->pending */
+    cdb_key_init(&kb, k, sizeof k);
+    if ((s = cdb_key_u64(&kb, entry)) != CDB_OK)
+        return s;
+    s = cdb_index_get(&t->pending, k, kb.len, body, cap, &vlen, &found);
+    if (s != CDB_OK && s != CDB_E_BUFFER_TOO_SMALL)
+        return s;
+    if (found) {
+        if (vlen == 0) {
+            *live = 0;
+            return CDB_OK;
+        }
+        if (s == CDB_E_BUFFER_TOO_SMALL) {
+            *len = vlen;
+            return CDB_E_BUFFER_TOO_SMALL;
+        }
+        *len = vlen;
+        *live = 1;
+        *schema = t->version;
+        return CDB_OK;
+    }
+
+    /* 2. Check t->groups */
+    if (t->groups.root != 0 && db->cfg.col_work != NULL) {
+        cdb_rg g;
+        if ((s = cdb_rg_init(&g, db, t->slot.store_id, &t->groups, t->group_rows, t->chunk_cap,
+                             db->cfg.col_work, db->cfg.col_work_size)) == CDB_OK) {
+            if ((s = cdb_rg_get_row(&g, entry, body, cap, len, &found)) != CDB_OK)
+                return s;
+            if (found) {
+                *live = 1;
+                *schema = g.hdr->schema;
+                return CDB_OK;
+            }
+        }
+    }
+
+    *live = 0;
+    return CDB_OK;
+}
+
+cdb_status cdb_table_col_committed_row(cdb_db *db, uint64_t store, uint64_t entry, void *body, size_t cap,
+                                       size_t *len, int *live, uint32_t *schema)
+{
+    table *t;
+    cdb_status s;
+
+    *live = 0;
+    *len = 0;
+    if ((s = table_get(db, store, &t)) != CDB_OK)
+        return s;
+    if (t->layout != CDB_TABLE_LAYOUT_COLUMN)
+        return CDB_E_INVALID_ARG;
+
+    return col_committed_row(db, t, entry, body, cap, len, live, schema);
+}
+
+cdb_status cdb_table_col_apply(cdb_db *db, uint64_t store, const cdb_delta *d)
+{
+    table *t;
+    uint8_t k[8];
+    cdb_key_builder kb;
+    size_t before_len = 0, after_len = 0;
+    uint32_t before_schema = 0, after_schema;
+    int before_live = 0, after_live = 0;
+    const uint8_t *after_body = NULL;
+    cdb_status s;
+
+    db->via_table = 1;
+    s = table_get(db, store, &t);
+    if (s != CDB_OK) {
+        db->via_table = 0;
+        return s == CDB_E_NOT_FOUND || s == CDB_E_INVALID_ARG ? CDB_OK : s;
+    }
+    if (t->layout != CDB_TABLE_LAYOUT_COLUMN) {
+        db->via_table = 0;
+        return CDB_E_INVALID_ARG;
+    }
+    after_schema = t->version;
+
+    /* 1. Retrieve the row before this change for secondary index maintenance */
+    if (t->nidx > 0) {
+        s = cdb_table_col_committed_row(db, store, d->entry_id, tbuf(db, T_BEFORE), tbuf_size(db),
+                                        &before_len, &before_live, &before_schema);
+        if (s != CDB_OK && s != CDB_E_NOT_FOUND) {
+            db->via_table = 0;
+            return s;
+        }
+    }
+
+    /* 2. Apply change to t->pending */
+    cdb_key_init(&kb, k, sizeof k);
+    if ((s = cdb_key_u64(&kb, d->entry_id)) != CDB_OK) {
+        db->via_table = 0;
+        return s;
+    }
+
+    if (d->op == CDB_OP_INSERT || d->op == CDB_OP_REPLACE) {
+        const uint8_t *summary;
+        size_t slen;
+        if ((s = cdb_doc_split_payload(d, &summary, &slen, &after_body, &after_len)) != CDB_OK) {
+            db->via_table = 0;
+            return s;
+        }
+        if ((s = cdb_index_put(&t->pending, k, kb.len, after_body, after_len)) != CDB_OK) {
+            db->via_table = 0;
+            return s;
+        }
+        after_live = 1;
+    } else if (d->op == CDB_OP_DELETE) {
+        if ((s = cdb_index_put(&t->pending, k, kb.len, NULL, 0)) != CDB_OK) {
+            db->via_table = 0;
+            return s;
+        }
+        after_live = 0;
+    }
+
+    /* 3. Update secondary indexes from before to after */
+    if (t->nidx > 0) {
+        unsigned i;
+        for (i = 0; i < t->nidx; i++) {
+            idx *x = &t->idx[i];
+            uint8_t ok[CDB_TABLE_KEY_MAX + 8u], nk[CDB_TABLE_KEY_MAX + 8u], v[8];
+            size_t oklen = 0, nklen = 0;
+            int null, found;
+            if (before_live && (s = row_key(db, t, x, tbuf(db, T_BEFORE), before_len, before_schema,
+                                            d->entry_id, ok, &oklen, &null)) != CDB_OK) {
+                db->via_table = 0;
+                return s;
+            }
+            if (after_live && (s = row_key(db, t, x, after_body, after_len, after_schema,
+                                           d->entry_id, nk, &nklen, &null)) != CDB_OK) {
+                db->via_table = 0;
+                return s;
+            }
+            if (before_live && after_live && oklen == nklen && memcmp(ok, nk, oklen) == 0)
+                continue;
+            if (before_live && (s = cdb_index_delete(&x->ix, ok, oklen, &found)) != CDB_OK) {
+                db->via_table = 0;
+                return s;
+            }
+            cdb_store_u64(v, d->entry_id, CDB_ORDER_BIG);
+            if (after_live && (s = cdb_index_put(&x->ix, nk, nklen, v, sizeof v)) != CDB_OK) {
+                db->via_table = 0;
+                return s;
+            }
+        }
+    }
+
+    db->via_table = 0;
+    return CDB_OK;
+}
+
 cdb_status cdb_table_get(cdb_db *db, uint64_t store, uint64_t entry, void *out, size_t cap, size_t *len)
 {
     table *t;
     cdb_status s;
     db->via_table = 1;
     s = table_get(db, store, &t);
-    if (s == CDB_OK && t->layout == CDB_TABLE_LAYOUT_COLUMN)
-        s = CDB_E_UNSUPPORTED;
-    if (s == CDB_OK)
-        s = read_row(db, t, entry, out, cap, len);
+    if (s == CDB_OK) {
+        if (t->layout == CDB_TABLE_LAYOUT_COLUMN) {
+            size_t raw = 0;
+            int live = 0;
+            uint32_t ver = 0;
+            s = cdb_table_col_committed_row(db, store, entry, tbuf(db, T_OTHER), tbuf_size(db),
+                                            &raw, &live, &ver);
+            if (s == CDB_OK) {
+                if (!live)
+                    s = CDB_E_NOT_FOUND;
+                else
+                    s = project(db, t, tbuf(db, T_OTHER), raw, ver, (uint8_t *)out, cap, len);
+            }
+        } else {
+            s = read_row(db, t, entry, out, cap, len);
+        }
+    }
     db->via_table = 0;
     return s;
 }
@@ -832,8 +1046,6 @@ static cdb_status find_row(cdb_db *db, uint64_t store, const void *key, size_t k
     *found = 0;
     if ((s = table_get(db, store, &t)) != CDB_OK)
         return s;
-    if (t->layout == CDB_TABLE_LAYOUT_COLUMN)
-        return CDB_E_UNSUPPORTED;
     if (t->npk == 0 || (x = index_of(t, 0)) == NULL)
         return CDB_E_STATE; /* no primary key */
     if ((s = array_key(db, x, (const uint8_t *)key, key_len, k, &klen)) != CDB_OK)
@@ -869,9 +1081,18 @@ static cdb_status scan(cdb_db *db, uint64_t store, uint32_t index, const void *f
     *n = 0;
     if ((s = table_get(db, store, &t)) != CDB_OK)
         return s;
-    if (t->layout == CDB_TABLE_LAYOUT_COLUMN)
-        return CDB_E_UNSUPPORTED;
     if (index == CDB_TABLE_NO_INDEX) {
+        if (t->layout == CDB_TABLE_LAYOUT_COLUMN) {
+            while (*n < max) {
+                uint64_t e;
+                if ((s = col_next_live(db, t, cur->started ? cur->entry : 0, &e, &done)) != CDB_OK || done)
+                    return s;
+                cur->started = 1;
+                cur->entry = e;
+                entries[(*n)++] = e;
+            }
+            return CDB_OK;
+        }
         /* Entry order: the committed live rows. */
         while (*n < max) {
             uint64_t e;
@@ -1158,15 +1379,29 @@ static cdb_status add_index(cdb_db *db, uint64_t store, table *t, const uint64_t
         return s;
     /* Existing rows (none for a new table). */
     for (;;) {
-        cdb_doc_info info;
         uint8_t key[CDB_TABLE_KEY_MAX + 8u], v[8];
         size_t len, klen;
         int null, found;
-        if ((s = cdb_doc_next_live(db, store, e, &e, &done)) != CDB_OK || done)
-            break;
-        if ((s = cdb_doc_get(db, store, e, 0, tbuf(db, T_OTHER), tbuf_size(db), &len, NULL, 0, NULL, &info))
-                != CDB_OK
-            || (s = row_key(db, t, x, tbuf(db, T_OTHER), len, info.schema_version, e, key, &klen, &null)) != CDB_OK)
+        uint32_t schema_ver = 0;
+        if (t->layout == CDB_TABLE_LAYOUT_COLUMN) {
+            int live = 0;
+            if ((s = col_next_live(db, t, e, &e, &done)) != CDB_OK || done)
+                break;
+            if ((s = col_committed_row(db, t, e, tbuf(db, T_OTHER), tbuf_size(db),
+                                        &len, &live, &schema_ver)) != CDB_OK)
+                return s;
+            if (!live)
+                continue;
+        } else {
+            cdb_doc_info info;
+            if ((s = cdb_doc_next_live(db, store, e, &e, &done)) != CDB_OK || done)
+                break;
+            if ((s = cdb_doc_get(db, store, e, 0, tbuf(db, T_OTHER), tbuf_size(db), &len, NULL, 0, NULL, &info))
+                    != CDB_OK)
+                return s;
+            schema_ver = info.schema_version;
+        }
+        if ((s = row_key(db, t, x, tbuf(db, T_OTHER), len, schema_ver, e, key, &klen, &null)) != CDB_OK)
             return s;
         if (x->unique && !null) {
             if ((s = cdb_index_get(&x->ix, key, klen, v, sizeof v, &len, &found)) != CDB_OK)
@@ -1515,8 +1750,6 @@ static cdb_status do_create_index(cdb_db *db, uint64_t store, table *t, uint64_t
 {
     const index_arg *a = (const index_arg *)arg;
     cdb_status s;
-    if (t->layout == CDB_TABLE_LAYOUT_COLUMN)
-        return CDB_E_UNSUPPORTED; /* it would be built from the row store */
     if (next == 0 || next >= UINT32_MAX)
         return CDB_E_OVERFLOW;
     if ((s = add_index(db, store, t, a->fields, a->n, a->unique, (uint32_t)next)) != CDB_OK)
@@ -1597,4 +1830,464 @@ cdb_status cdb_table_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, 
     if (s != CDB_OK)
         return s;
     return cdb_rg_nib_moved(&g, okey, oklen, old_addr, addr);
+}
+
+/* -------------------------------------------------------- fold and scan */
+
+static uint8_t type_tag(uint8_t type)
+{
+    switch ((cdb_value_type)type) {
+    case CDB_TYPE_BOOL:
+        return (uint8_t)CDB_TAG_FALSE;
+    case CDB_TYPE_INT:
+        return (uint8_t)CDB_TAG_INT;
+    case CDB_TYPE_F64:
+        return (uint8_t)CDB_TAG_F64;
+    case CDB_TYPE_F32:
+        return (uint8_t)CDB_TAG_F32;
+    case CDB_TYPE_TIMESTAMP:
+        return (uint8_t)CDB_TAG_TIMESTAMP;
+    case CDB_TYPE_REF:
+        return (uint8_t)CDB_TAG_REF;
+    case CDB_TYPE_STRING:
+        return (uint8_t)CDB_TAG_STRING;
+    case CDB_TYPE_BINARY:
+        return (uint8_t)CDB_TAG_BINARY;
+    case CDB_TYPE_DECIMAL:
+        return (uint8_t)CDB_TAG_DECIMAL;
+    case CDB_TYPE_ARRAY:
+        return (uint8_t)CDB_TAG_ARRAY;
+    case CDB_TYPE_OBJECT:
+        return (uint8_t)CDB_TAG_OBJECT;
+    case CDB_TYPE_VECTOR:
+        return (uint8_t)CDB_TAG_VECTOR;
+    case CDB_TYPE_NULL:
+    case CDB_TYPE_UNKNOWN:
+    default:
+        return (uint8_t)CDB_TAG_NULL;
+    }
+}
+
+static size_t gkey(uint8_t *k, uint64_t last)
+{
+    cdb_key_builder kb;
+    cdb_key_init(&kb, k, 8);
+    (void)cdb_key_u64(&kb, last);
+    return kb.len;
+}
+
+typedef struct fold_source_ctx {
+    cdb_db *db;
+    table *t;
+    uint64_t start_entry;
+    uint32_t count;
+    uint32_t current_idx;
+    cdb_index_cursor cur;
+} fold_source_ctx;
+
+static cdb_status fold_rewind(void *ctx)
+{
+    fold_source_ctx *f = (fold_source_ctx *)ctx;
+    uint8_t k[8];
+    size_t klen = gkey(k, f->start_entry);
+    f->current_idx = 0;
+    return cdb_index_seek(&f->cur, &f->t->pending, tbuf(f->db, T_OTHER), k, klen);
+}
+
+static cdb_status fold_next(void *ctx, uint64_t field_id, uint64_t *entry, const uint8_t **val, size_t *vlen)
+{
+    fold_source_ctx *f = (fold_source_ctx *)ctx;
+    uint8_t k[16];
+    size_t klen, rlen;
+    int done;
+    cdb_status s;
+
+    if (f->current_idx >= f->count)
+        return CDB_E_CORRUPT;
+
+    s = cdb_index_next(&f->cur, k, sizeof k, &klen, tbuf(f->db, T_ROW), tbuf_size(f->db), &rlen, &done);
+    if (s != CDB_OK)
+        return s;
+    if (done || klen != 8)
+        return CDB_E_CORRUPT;
+
+    *entry = cdb_load_u64(k, CDB_ORDER_BIG);
+    f->current_idx++;
+
+    if (field_id == 0) {
+        *val = NULL;
+        *vlen = 0;
+        return CDB_OK;
+    }
+
+    {
+        cdb_value obj, col_val;
+        int found = 0;
+        s = cdb_value_read(tbuf(f->db, T_ROW), rlen, f->db->pager.order, &obj);
+        if (s != CDB_OK || obj.type != CDB_TYPE_OBJECT)
+            return CDB_E_CORRUPT;
+        s = cdb_value_object_get(&obj, f->db->pager.order, field_id, &col_val, &found);
+        if (s != CDB_OK)
+            return s;
+        if (!found || col_val.type == CDB_TYPE_NULL) {
+            *val = NULL;
+            *vlen = 0;
+        } else {
+            *val = col_val.start;
+            *vlen = col_val.encoded_len;
+        }
+        return CDB_OK;
+    }
+}
+
+static cdb_status fold_pending(cdb_db *db, table *t)
+{
+    cdb_rg g;
+    cdb_rg_col cols[CDB_TABLE_MAX_COLUMNS];
+    uint64_t next_scan_entry = 0;
+    unsigned i;
+    cdb_status s;
+
+    if (db->cfg.col_work == NULL)
+        return CDB_E_UNSUPPORTED;
+    if (t->groups.root == 0 || t->pending.root == 0)
+        return CDB_E_STATE;
+
+    if ((s = cdb_rg_init(&g, db, t->slot.store_id, &t->groups, t->group_rows, t->chunk_cap,
+                         db->cfg.col_work, db->cfg.col_work_size)) != CDB_OK)
+        return s;
+
+    /* Check if t->pending is empty */
+    {
+        cdb_index_cursor cur;
+        uint8_t k[16];
+        size_t klen, vlen;
+        int done;
+        if ((s = cdb_index_seek(&cur, &t->pending, tbuf(db, T_OTHER), NULL, 0)) != CDB_OK)
+            return s;
+        if ((s = cdb_index_next(&cur, k, sizeof k, &klen, tbuf(db, T_ROW), tbuf_size(db), &vlen, &done)) != CDB_OK)
+            return s;
+        if (done)
+            return CDB_OK;
+    }
+
+    for (i = 0; i < t->ncols; i++) {
+        cols[i].field_id = t->cols[i].id;
+        cols[i].tag = type_tag(t->cols[i].type);
+    }
+
+    /* 1. Unpack affected groups into t->pending and drop them */
+    for (;;) {
+        cdb_index_cursor cur;
+        uint8_t k[16];
+        size_t klen, vlen;
+        uint64_t pe;
+        int done, found;
+        uint8_t sk[8];
+        size_t sklen = gkey(sk, next_scan_entry);
+
+        if ((s = cdb_index_seek(&cur, &t->pending, tbuf(db, T_OTHER), sk, sklen)) != CDB_OK)
+            return s;
+        if ((s = cdb_index_next(&cur, k, sizeof k, &klen, tbuf(db, T_ROW), tbuf_size(db), &vlen, &done)) != CDB_OK)
+            return s;
+        if (done)
+            break;
+        if (klen != 8)
+            return CDB_E_CORRUPT;
+        pe = cdb_load_u64(k, CDB_ORDER_BIG);
+
+        if ((s = cdb_rg_find(&g, pe, &found)) != CDB_OK)
+            return s;
+        if (found && g.hdr->first <= pe) {
+            uint64_t last = g.hdr->last;
+            uint32_t rows = g.hdr->rows;
+            uint32_t r;
+
+            if ((s = cdb_rg_load_entries(&g)) != CDB_OK)
+                return s;
+
+            for (r = 0; r < rows; r++) {
+                uint64_t eid = g.entries[r];
+                uint8_t ek[8];
+                size_t eklen = gkey(ek, eid);
+                int pfound = 0;
+                size_t rlen = 0;
+
+                if ((s = cdb_index_get(&t->pending, ek, eklen, tbuf(db, T_ROW), tbuf_size(db), &rlen, &pfound)) != CDB_OK)
+                    return s;
+                if (!pfound) {
+                    if ((s = cdb_rg_get_row(&g, eid, g.enc, g.enc_cap, &rlen, &pfound)) != CDB_OK || !pfound)
+                        return s == CDB_OK ? CDB_E_CORRUPT : s;
+                    if ((s = cdb_index_put(&t->pending, ek, eklen, g.enc, rlen)) != CDB_OK)
+                        return s;
+                }
+            }
+
+            if ((s = cdb_rg_drop(&g, last)) != CDB_OK)
+                return s;
+
+            if (last == UINT64_MAX)
+                break;
+            next_scan_entry = last + 1u;
+        } else {
+            if (pe == UINT64_MAX)
+                break;
+            next_scan_entry = pe + 1u;
+        }
+    }
+
+    /* 2. Delete tombstones in t->pending */
+    {
+        cdb_index_cursor tc;
+        uint8_t tk[16];
+        size_t tklen, tvlen;
+        int tdone;
+        uint64_t resume_e = 0;
+        int need_seek = 1;
+
+        for (;;) {
+            if (need_seek) {
+                uint8_t seek_k[8];
+                size_t seek_klen = gkey(seek_k, resume_e);
+                if ((s = cdb_index_seek(&tc, &t->pending, tbuf(db, T_OTHER), seek_k, seek_klen)) != CDB_OK)
+                    return s;
+                need_seek = 0;
+            }
+            if ((s = cdb_index_next(&tc, tk, sizeof tk, &tklen, tbuf(db, T_ROW), tbuf_size(db), &tvlen, &tdone)) != CDB_OK)
+                return s;
+            if (tdone)
+                break;
+            if (tklen != 8)
+                return CDB_E_CORRUPT;
+            resume_e = cdb_load_u64(tk, CDB_ORDER_BIG);
+            if (tvlen == 0) {
+                int dfound;
+                if ((s = cdb_index_delete(&t->pending, tk, tklen, &dfound)) != CDB_OK)
+                    return s;
+                if (resume_e == UINT64_MAX)
+                    break;
+                resume_e++;
+                need_seek = 1;
+            }
+        }
+    }
+
+    /* 3. Form row groups from pending live rows */
+    for (;;) {
+        uint8_t fk[16];
+        size_t fklen, fvlen;
+        int fdone, found;
+        uint64_t first_entry;
+        uint64_t limit_entry = UINT64_MAX;
+        uint32_t count = 0;
+        cdb_index_cursor cc;
+        uint8_t ck[16];
+        size_t cklen, cvlen;
+        int cdone;
+        uint8_t sk[8];
+        size_t sklen;
+
+        if ((s = cdb_index_seek(&cc, &t->pending, tbuf(db, T_OTHER), NULL, 0)) != CDB_OK)
+            return s;
+        if ((s = cdb_index_next(&cc, fk, sizeof fk, &fklen, tbuf(db, T_ROW), tbuf_size(db), &fvlen, &fdone)) != CDB_OK)
+            return s;
+        if (fdone)
+            break; /* All pending rows folded! */
+        if (fklen != 8)
+            return CDB_E_CORRUPT;
+        first_entry = cdb_load_u64(fk, CDB_ORDER_BIG);
+
+        if ((s = cdb_rg_find(&g, first_entry, &found)) != CDB_OK)
+            return s;
+        if (found)
+            limit_entry = g.hdr->first;
+
+        /* Count rows up to t->group_rows and < limit_entry */
+        sklen = gkey(sk, first_entry);
+        if ((s = cdb_index_seek(&cc, &t->pending, tbuf(db, T_OTHER), sk, sklen)) != CDB_OK)
+            return s;
+
+        while (count < t->group_rows) {
+            if ((s = cdb_index_next(&cc, ck, sizeof ck, &cklen, tbuf(db, T_ROW), tbuf_size(db), &cvlen, &cdone)) != CDB_OK)
+                return s;
+            if (cdone)
+                break;
+            if (cklen != 8)
+                return CDB_E_CORRUPT;
+            if (cdb_load_u64(ck, CDB_ORDER_BIG) >= limit_entry)
+                break;
+            count++;
+        }
+        if (count == 0)
+            return CDB_E_CORRUPT;
+
+        /* Write group of up to count rows, splitting on overflow */
+        while (count > 0) {
+            fold_source_ctx fctx;
+            cdb_rg_source src;
+            fctx.db = db;
+            fctx.t = t;
+            fctx.start_entry = first_entry;
+            fctx.count = count;
+            fctx.current_idx = 0;
+
+            src.ctx = &fctx;
+            src.rewind = fold_rewind;
+            src.next = fold_next;
+
+            s = cdb_rg_write(&g, &src, count, t->version, cols, (unsigned)t->ncols);
+            if (s == CDB_OK)
+                break;
+            if (s == CDB_E_OVERFLOW && count > 1u) {
+                count /= 2u;
+                continue;
+            }
+            return s;
+        }
+
+        /* Delete the folded rows from t->pending */
+        for (i = 0; i < count; i++) {
+            uint8_t dk[8];
+            size_t dklen = gkey(dk, g.entries[i]);
+            int dfound;
+            if ((s = cdb_index_delete(&t->pending, dk, dklen, &dfound)) != CDB_OK)
+                return s;
+        }
+    }
+
+    return CDB_OK;
+}
+
+static cdb_status col_next_live(cdb_db *db, table *t, uint64_t after, uint64_t *out_entry, int *done)
+{
+    cdb_rg g;
+    cdb_status s;
+
+    *done = 0;
+    *out_entry = 0;
+
+    if (db->cfg.col_work == NULL)
+        return CDB_E_UNSUPPORTED;
+    if (t->groups.root == 0 || t->pending.root == 0) {
+        *done = 1;
+        return CDB_OK;
+    }
+    if ((s = cdb_rg_init(&g, db, t->slot.store_id, &t->groups, t->group_rows, t->chunk_cap,
+                         db->cfg.col_work, db->cfg.col_work_size)) != CDB_OK)
+        return s;
+
+    for (;;) {
+        uint64_t cand_grp = UINT64_MAX;
+        int have_grp = 0;
+        uint64_t cand_pend = UINT64_MAX;
+        int have_pend = 0;
+        int gfound = 0;
+
+        /* 1. Candidate from t->groups */
+        if (after < UINT64_MAX) {
+            if ((s = cdb_rg_find(&g, after + 1u, &gfound)) != CDB_OK)
+                return s;
+            if (gfound) {
+                uint32_t lo = 0, hi;
+                if ((s = cdb_rg_load_entries(&g)) != CDB_OK)
+                    return s;
+                hi = g.hdr->rows;
+                while (lo < hi) {
+                    uint32_t mid = lo + (hi - lo) / 2u;
+                    if (g.entries[mid] <= after)
+                        lo = mid + 1u;
+                    else
+                        hi = mid;
+                }
+                if (lo < g.hdr->rows) {
+                    cand_grp = g.entries[lo];
+                    have_grp = 1;
+                }
+            }
+        }
+
+        /* 2. Candidate from t->pending */
+        if (after < UINT64_MAX) {
+            cdb_index_cursor pc;
+            uint8_t pk[16], pseek[8];
+            size_t pklen, pvlen;
+            int pdone;
+            uint64_t pe;
+            size_t pseek_len = gkey(pseek, after + 1u);
+            if ((s = cdb_index_seek(&pc, &t->pending, tbuf(db, T_OTHER), pseek, pseek_len)) != CDB_OK)
+                return s;
+            while (!have_pend) {
+                if ((s = cdb_index_next(&pc, pk, sizeof pk, &pklen, tbuf(db, T_ROW), tbuf_size(db), &pvlen, &pdone)) != CDB_OK)
+                    return s;
+                if (pdone)
+                    break;
+                if (pklen != 8)
+                    return CDB_E_CORRUPT;
+                pe = cdb_load_u64(pk, CDB_ORDER_BIG);
+                if (pvlen > 0) {
+                    cand_pend = pe;
+                    have_pend = 1;
+                }
+            }
+        }
+
+        /* 3. Merge candidates */
+        if (!have_grp && !have_pend) {
+            *done = 1;
+            return CDB_OK;
+        }
+
+        if (have_grp && (!have_pend || cand_grp < cand_pend)) {
+            /* Check if cand_grp is tombstoned in t->pending */
+            uint8_t chk[8];
+            size_t chk_len = gkey(chk, cand_grp);
+            int pfound = 0;
+            size_t chk_vlen = 0;
+            if ((s = cdb_index_get(&t->pending, chk, chk_len, NULL, 0, &chk_vlen, &pfound)) != CDB_OK)
+                return s;
+            if (pfound && chk_vlen == 0) {
+                /* Tombstoned in pending; skip it */
+                after = cand_grp;
+                continue;
+            }
+            *out_entry = cand_grp;
+            return CDB_OK;
+        }
+
+        /* have_pend is smaller or equal (or have_grp not present) */
+        *out_entry = cand_pend;
+        return CDB_OK;
+    }
+}
+
+cdb_status cdb_table_col_fold_pending(cdb_db *db, uint64_t store)
+{
+    table *t;
+    cdb_status s;
+    db->via_table = 1;
+    s = table_get(db, store, &t);
+    if (s == CDB_OK) {
+        if (t->layout == CDB_TABLE_LAYOUT_COLUMN)
+            s = fold_pending(db, t);
+        else
+            s = CDB_E_INVALID_ARG;
+    }
+    db->via_table = 0;
+    return s;
+}
+
+cdb_status cdb_table_flush(cdb_db *db)
+{
+    cdb_slot_iter it;
+    table *t;
+    cdb_status s = CDB_OK;
+    db->via_table = 1;
+    for (t = (table *)cdb_slots_first(&db->table_slots, &it); t != NULL; t = (table *)cdb_slots_next(&it)) {
+        if (t->layout == CDB_TABLE_LAYOUT_COLUMN) {
+            if ((s = fold_pending(db, t)) != CDB_OK)
+                break;
+        }
+    }
+    db->via_table = 0;
+    return s;
 }
