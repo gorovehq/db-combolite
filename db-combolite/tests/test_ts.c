@@ -522,6 +522,33 @@ static void test_clock(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+static void test_nibblet_inplace_rewrite(void)
+{
+    uint64_t store = 0, s;
+    pt p;
+    unsigned i;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_create(&db, "inplace", 7, CDB_TS_LATE_ACCEPT, 0, &store));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+    s = series_of(store, "s1", 0);
+    commit();
+
+    model_n = 0;
+    /* Append 10 points one-by-one in separate commits */
+    for (i = 0; i < 10; i++) {
+        p = nth((int64_t)(1000 + i * 100), i);
+        model_put(&p);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, append1(store, s, &p));
+        commit();
+    }
+
+    expect_range(store, s, INT64_MIN, INT64_MAX, 10);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 /* ------------------------------------------------------- crash sweep */
 
 /* S0: nothing. S1: series with points 0..59 (two windows). S2: a late point
@@ -660,6 +687,7 @@ int main(void)
     RUN_TEST(test_held_store_stays_open);
     RUN_TEST(test_change_of_value_and_drop);
     RUN_TEST(test_clock);
+    RUN_TEST(test_nibblet_inplace_rewrite);
     RUN_TEST(test_crash_sweep);
     return UNITY_END();
 }

@@ -54,6 +54,14 @@ int cdb_nib_fits(const cdb_db *db, size_t len);
 /* Places a record and returns its address. */
 cdb_status cdb_nib_put(cdb_db *db, uint64_t store, unsigned kind, const uint8_t *okey, size_t oklen,
                        const void *data, size_t len, uint64_t *addr);
+/* Rewrites an existing record in place at addr if it still fits on its page.
+ * If it fits, rewrites the record, adjusts free space on the page and in the
+ * free-space index, sets *fits = 1, and leaves addr unchanged.
+ * If it does not fit (not enough room on the page or len > quarter page),
+ * sets *fits = 0 without changing the record. */
+cdb_status cdb_nib_rewrite(cdb_db *db, uint64_t addr, uint64_t store, unsigned kind,
+                           const uint8_t *okey, size_t oklen, const void *data, size_t len,
+                           int *fits);
 /* Copies a record's data; CDB_E_BUFFER_TOO_SMALL with *len set. */
 cdb_status cdb_nib_get(cdb_db *db, uint64_t addr, void *out, size_t cap, size_t *len);
 /* Removes a record; a page left empty is freed. */

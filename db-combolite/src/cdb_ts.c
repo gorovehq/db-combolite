@@ -1024,6 +1024,17 @@ static cdb_status blk_store(cdb_db *db, const ts_store *t, uint64_t series, int6
     uint8_t k[16];
     cdb_status s;
     if (cdb_nib_fits(db, len)) {
+        if (old && cdb_nib_is(old)) {
+            int fits = 0;
+            s = cdb_nib_rewrite(db, old, t->slot.store_id, CDB_NIB_KIND_TS_BLOCK, k, k_series_ts(k, series, first),
+                                pl, len, &fits);
+            if (s != CDB_OK)
+                return s;
+            if (fits) {
+                *addr = old;
+                return CDB_OK;
+            }
+        }
         if (old && (s = blk_release(db, old)) != CDB_OK)
             return s;
         return cdb_nib_put(db, t->slot.store_id, CDB_NIB_KIND_TS_BLOCK, k, k_series_ts(k, series, first), pl, len,
