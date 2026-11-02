@@ -300,12 +300,12 @@ static void test_create(void)
     TEST_ASSERT_EQUAL_UINT32(ROWS, G.rows);
     TEST_ASSERT_EQUAL_size_t(CAP, G.cap);
     TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_table_rowgroups(&db, plain, &G));
-    /* Row calls are not built for column-oriented tables yet. */
+    /* Row calls on column-oriented tables: invalid input or missing entries. */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
-    TEST_ASSERT_EQUAL_INT(CDB_E_UNSUPPORTED, cdb_table_insert(&db, T, row, 0, &e));
-    TEST_ASSERT_EQUAL_INT(CDB_E_UNSUPPORTED, cdb_table_delete(&db, T, 1));
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_table_insert(&db, T, row, 0, &e));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_table_delete(&db, T, 1));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
-    TEST_ASSERT_EQUAL_INT(CDB_E_UNSUPPORTED, cdb_table_get(&db, T, 1, row, sizeof row, &len));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_table_get(&db, T, 1, row, sizeof row, &len));
     {
         uint32_t ix;
         TEST_ASSERT_EQUAL_INT(CDB_E_UNSUPPORTED, cdb_table_create_index(&db, T, &F_A, 1, 0, &ix));

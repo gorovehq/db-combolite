@@ -161,6 +161,11 @@ cdb_status cdb_table_scan(cdb_db *db, uint64_t store, uint32_t index, const void
 cdb_status cdb_table_keep_setting(const uint8_t *settings, size_t len, cdb_byte_order o, uint32_t *keep);
 cdb_status cdb_table_apply_before(cdb_db *db, uint64_t store, uint64_t entry);
 cdb_status cdb_table_apply_after(cdb_db *db, uint64_t store, uint64_t entry);
+cdb_status cdb_table_is_column(cdb_db *db, uint64_t store, int *is_col);
+cdb_status cdb_table_chunk_cap(cdb_db *db, uint64_t store, uint32_t *cap);
+cdb_status cdb_table_col_committed_row(cdb_db *db, uint64_t store, uint64_t entry, void *body, size_t cap,
+                                       size_t *len, int *live, uint32_t *schema);
+cdb_status cdb_table_col_apply(cdb_db *db, uint64_t store, const cdb_delta *d);
 extern const cdb_slot_ops cdb_table_slot_ops; /* open tables (cdb_slots.h) */
 
 /* Column-oriented tables: sets g up over the table's row groups, with

@@ -976,6 +976,12 @@ static cdb_status split_payload(const cdb_delta *d, const uint8_t **summary, siz
     return CDB_OK;
 }
 
+cdb_status cdb_doc_split_payload(const cdb_delta *d, const uint8_t **summary, size_t *slen,
+                                 const uint8_t **body, size_t *blen)
+{
+    return split_payload(d, summary, slen, body, blen);
+}
+
 /* Writes revision e for the entry and points the head at it. chain is the
  * number of deltas since the last full revision, including this one (0 for
  * a full revision or tombstone). */
@@ -1313,6 +1319,14 @@ cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
     if (s != CDB_OK)
         return s;
     if (pool->is_table && d->entry_id != 0) {
+        int is_col = 0;
+        cdb_table_is_column(db, d->store_id, &is_col);
+        if (d->entry_id >= pool->next_entry) {
+            pool->next_entry = d->entry_id + 1;
+            pool->dirty = 1;
+        }
+        if (is_col)
+            return cdb_table_col_apply(db, d->store_id, d);
         /* A table: its indexes follow the row from before to after. */
         if ((s = cdb_table_apply_before(db, d->store_id, d->entry_id)) != CDB_OK
             || (s = apply_change(db, d)) != CDB_OK)
@@ -1651,7 +1665,27 @@ static cdb_status replay_tx(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entr
 
     /* Start from the committed state (as of the last applied commit). */
     memset(v, 0, sizeof *v);
-    if (need_state) {
+    int is_col = 0;
+    if (pool->is_table)
+        cdb_table_is_column(db, pool->slot.store_id, &is_col);
+
+    if (is_col) {
+        size_t rlen = 0;
+        int live = 0;
+        uint32_t ver = 0;
+        s = cdb_table_col_committed_row(db, pool->slot.store_id, entry, buf(db, B_DOC0), capacity(db),
+                                        &rlen, &live, &ver);
+        if (s != CDB_OK && s != CDB_E_NOT_FOUND)
+            return s;
+        v->live = live;
+        if (v->live) {
+            v->b = B_DOC0;
+            v->len = rlen;
+            v->has_summary = 0;
+            v->summary_len = 0;
+            v->schema = ver;
+        }
+    } else if (need_state) {
         materialized m;
         s = materialize(db, pool, entry, 0, &m);
         if (s != CDB_OK && s != CDB_E_NOT_FOUND)
@@ -1789,8 +1823,18 @@ static cdb_status put_body(cdb_db *db, struct cdb_doc_pool *pool, int guarded, u
         return CDB_E_INVALID_ARG;
     if (summary == NULL && summary_len)
         return CDB_E_INVALID_ARG;
-    if (summary_len > cap || body_len > body_max(db))
+    int is_col = 0;
+    if (pool->is_table)
+        cdb_table_is_column(db, pool->slot.store_id, &is_col);
+
+    if (summary_len > cap || (!is_col && body_len > body_max(db)))
         return CDB_E_OVERFLOW;
+    if (is_col) {
+        uint32_t ccap = 0;
+        cdb_table_chunk_cap(db, pool->slot.store_id, &ccap);
+        if (body_len > ccap)
+            return CDB_E_OVERFLOW;
+    }
     stage_find(db, pool->slot.store_id, entry, &st);
     memset(&now, 0, sizeof now);
     if (op == CDB_OP_REPLACE) {
@@ -1806,7 +1850,7 @@ static cdb_status put_body(cdb_db *db, struct cdb_doc_pool *pool, int guarded, u
         now.summary_len = summary_len;
     }
     /* The revision must be writable, with the summary it will carry. */
-    if (!revision_fits(db, now.has_summary, now.summary_len, body_len))
+    if (!is_col && !revision_fits(db, now.has_summary, now.summary_len, body_len))
         return CDB_E_OVERFLOW;
     if (guarded && (s = schema_validate(db, (const uint8_t *)body, body_len)) != CDB_OK)
         return s;
