@@ -13,6 +13,7 @@
 
 #include "combolite/cdb_env.h"
 #include "combolite/cdb_crypto.h"
+#include "combolite/cdb_blob.h"
 #include "cdb_catalog.h"
 #include "cdb_coord.h"
 #include "cdb_journal.h"
@@ -474,5 +475,16 @@ cdb_status cdb_db_grant_role(cdb_db *db, uint64_t principal_id, uint32_t role_id
                              uint64_t scope_store_or_enclave, uint8_t perm_mask);
 cdb_status cdb_db_check_perm(cdb_db *db, uint64_t principal_id, uint64_t scope_store_or_enclave,
                              uint8_t required_perm);
+
+/* Streaming blobs (spec 8.4, 14.15). */
+cdb_status cdb_db_blob_write_begin(cdb_db *db, uint64_t store_id, uint8_t *scratch, cdb_blob_writer *w);
+cdb_status cdb_db_blob_write_chunk(cdb_blob_writer *w, const void *chunk, size_t len);
+cdb_status cdb_db_blob_write_end(cdb_blob_writer *w, cdb_blob_ref *out_ref);
+cdb_status cdb_db_blob_write_abort(cdb_blob_writer *w);
+cdb_status cdb_db_blob_read_begin(cdb_db *db, uint64_t store_id, const cdb_blob_ref *ref,
+                                  uint8_t *page_buf, int verify_hash, cdb_blob_reader *r);
+cdb_status cdb_db_blob_read_chunk(cdb_blob_reader *r, void *dest, size_t cap, size_t *out_len);
+cdb_status cdb_db_blob_read_end(cdb_blob_reader *r);
+cdb_status cdb_db_blob_free(cdb_db *db, uint64_t store_id, const cdb_blob_ref *ref, uint8_t *page_buf);
 
 #endif

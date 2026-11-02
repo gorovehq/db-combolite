@@ -8,13 +8,13 @@ Features and follow-ups that were agreed and deferred. Each one becomes a milest
 
 **What:** write and read content a piece at a time, for example "open, append chunk, …, close", so a whole book or file is never held in memory at once.
 
-**Why deferred:** M14 sized memory with `doc_max`, the largest document allowed. The caller provides buffers that size, because the core never allocates. That's enough for documents up to `doc_max`. The Gutenberg ingest can store books as chapter and paragraph documents (spec 7.5). Streaming was the more costly option, at about 2–3× the M14 work.
-
-**What it touches:**
-- **Journal:** one change split across several records, replayed as a unit.
-- **Documents:** patches, diffs and checkpoints that work without the whole value in memory.
-- **Full-text search:** indexing piece by piece instead of comparing two whole versions.
-- **Where it may live:** possibly as blob attachments (spec 8.4, 14.15), page extents with a content hash. That needs SHA-256 through mbedTLS, behind the engine's own crypto interface.
+*Implemented on branch `feat_streaming-blobs`:*
+- **Streaming crypto primitives:** incremental SHA-256 and HMAC-SHA-256 (`cdb_crypto_hash_*`) using Mbed TLS with zero heap allocations.
+- **Blob storage engine:** `cdb_blob_write_begin`, `cdb_blob_write_chunk`, `cdb_blob_write_end`, `cdb_blob_write_abort`, `cdb_blob_read_begin`, `cdb_blob_read_chunk`, `cdb_blob_read_end`, `cdb_blob_free`. Pages are allocated across standard overflow page extents (`0x0007`).
+- **Value encoding:** Tag `CDB_TAG_BLOB = 0x46` (spec 14.15) with `cdb_value_write_blob_ref` and `CDB_TYPE_BLOB_REF` decoding in `cdb_value_read`.
+- **Multipart journal framing:** `CDB_RECORD_FLAG_CONTINUED = 0x04u` for multipart streaming frame logging.
+- **High-level DB integration:** `cdb_db_blob_*` with automatic enclave HMAC content addressing and store isolation.
+- **Unit test suite:** `test_blob` verifying NIST vectors, chunked roundtrip, tamper detection, page reclamation on abort, value encoding, multipart journaling, and enclave integration.
 
 ## Follow-ups
 
