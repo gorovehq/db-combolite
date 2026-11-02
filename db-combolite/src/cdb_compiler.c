@@ -1325,6 +1325,40 @@ static uint8_t proc_get_or_alloc_var(proc_compiler *pc, const char *name, size_t
     return 0;
 }
 
+static int proc_match(proc_compiler *pc, cdb_token_kind kind, cdb_token *out_tok) {
+    cdb_token tok;
+    if (cdb_lexer_peek(&pc->lex, &tok) != CDB_OK) return 0;
+    if (tok.kind == kind) {
+        cdb_lexer_next(&pc->lex, &tok);
+        if (out_tok) *out_tok = tok;
+        return 1;
+    }
+    return 0;
+}
+
+static cdb_status proc_expect(proc_compiler *pc, cdb_token_kind kind, const char *msg, cdb_token *out_tok) {
+    cdb_token tok;
+    cdb_status s = cdb_lexer_next(&pc->lex, &tok);
+    if (s != CDB_OK) {
+        if (pc->err) {
+            pc->err->line = pc->lex.line;
+            pc->err->col = pc->lex.col;
+            snprintf(pc->err->msg, sizeof(pc->err->msg), "%s", "Unexpected end of input");
+        }
+        return s;
+    }
+    if (tok.kind != kind) {
+        if (pc->err) {
+            pc->err->line = tok.line;
+            pc->err->col = tok.col;
+            snprintf(pc->err->msg, sizeof(pc->err->msg), "%s", msg);
+        }
+        return CDB_E_INVALID_ARG;
+    }
+    if (out_tok) *out_tok = tok;
+    return CDB_OK;
+}
+
 cdb_status cdb_compile_proc(const char *src, size_t len,
                             cdb_catalog *cat,
                             uint8_t *bc_buf, size_t bc_cap,
@@ -1344,28 +1378,28 @@ cdb_status cdb_compile_proc(const char *src, size_t len,
 
     /* Optional PROCEDURE name(...) */
     cdb_token tok;
-    if (match((compiler_ctx *)(void *)&pc, CDB_TOK_KW_PROCEDURE, NULL)) {
+    if (proc_match(&pc, CDB_TOK_KW_PROCEDURE, NULL)) {
         if (cdb_lexer_next(&pc.lex, &tok) != CDB_OK) return CDB_E_INVALID_ARG;
-        if (match((compiler_ctx *)(void *)&pc, CDB_TOK_LPAREN, NULL)) {
-            while (!match((compiler_ctx *)(void *)&pc, CDB_TOK_RPAREN, NULL)) {
+        if (proc_match(&pc, CDB_TOK_LPAREN, NULL)) {
+            while (!proc_match(&pc, CDB_TOK_RPAREN, NULL)) {
                 cdb_token ptok;
                 if (cdb_lexer_next(&pc.lex, &ptok) != CDB_OK) return CDB_E_INVALID_ARG;
-                match((compiler_ctx *)(void *)&pc, CDB_TOK_COMMA, NULL);
+                proc_match(&pc, CDB_TOK_COMMA, NULL);
             }
         }
     }
 
     /* Optional BEGIN ... END */
-    match((compiler_ctx *)(void *)&pc, CDB_TOK_KW_BEGIN, NULL);
-    match((compiler_ctx *)(void *)&pc, CDB_TOK_KW_TRANSACTION, NULL);
-    match((compiler_ctx *)(void *)&pc, CDB_TOK_KW_TX, NULL);
+    proc_match(&pc, CDB_TOK_KW_BEGIN, NULL);
+    proc_match(&pc, CDB_TOK_KW_TRANSACTION, NULL);
+    proc_match(&pc, CDB_TOK_KW_TX, NULL);
 
     while (cdb_lexer_peek(&pc.lex, &tok) == CDB_OK && tok.kind != CDB_TOK_EOF) {
         if (tok.kind == CDB_TOK_KW_END || tok.kind == CDB_TOK_KW_COMMIT) {
             cdb_lexer_next(&pc.lex, &tok);
-            match((compiler_ctx *)(void *)&pc, CDB_TOK_KW_TRANSACTION, NULL);
-            match((compiler_ctx *)(void *)&pc, CDB_TOK_KW_TX, NULL);
-            match((compiler_ctx *)(void *)&pc, CDB_TOK_SEMICOLON, NULL);
+            proc_match(&pc, CDB_TOK_KW_TRANSACTION, NULL);
+            proc_match(&pc, CDB_TOK_KW_TX, NULL);
+            proc_match(&pc, CDB_TOK_SEMICOLON, NULL);
             break;
         }
 
@@ -1373,8 +1407,8 @@ cdb_status cdb_compile_proc(const char *src, size_t len,
         if (tok.kind == CDB_TOK_KW_LET) {
             cdb_lexer_next(&pc.lex, &tok);
             cdb_token var_tok;
-            if (expect((compiler_ctx *)(void *)&pc, CDB_TOK_PARAM, "Expected $variable after LET", &var_tok) != CDB_OK) return CDB_E_INVALID_ARG;
-            expect((compiler_ctx *)(void *)&pc, CDB_TOK_EQ, "Expected '=' in LET assignment", NULL);
+            if (proc_expect(&pc, CDB_TOK_PARAM, "Expected $variable after LET", &var_tok) != CDB_OK) return CDB_E_INVALID_ARG;
+            proc_expect(&pc, CDB_TOK_EQ, "Expected '=' in LET assignment", NULL);
 
             uint8_t r = proc_get_or_alloc_var(&pc, var_tok.start, (size_t)var_tok.len);
 
@@ -1397,7 +1431,7 @@ cdb_status cdb_compile_proc(const char *src, size_t len,
                 /* Other expressions or math calls */
                 cdb_lexer_next(&pc.lex, &val_tok);
             }
-            match((compiler_ctx *)(void *)&pc, CDB_TOK_SEMICOLON, NULL);
+            proc_match(&pc, CDB_TOK_SEMICOLON, NULL);
             continue;
         }
 
@@ -1411,7 +1445,7 @@ cdb_status cdb_compile_proc(const char *src, size_t len,
                 src_reg = proc_get_or_alloc_var(&pc, ret_tok.start, (size_t)ret_tok.len);
             }
             cdb_proc_write_return(&pw, src_reg);
-            match((compiler_ctx *)(void *)&pc, CDB_TOK_SEMICOLON, NULL);
+            proc_match(&pc, CDB_TOK_SEMICOLON, NULL);
             continue;
         }
 
@@ -1419,10 +1453,10 @@ cdb_status cdb_compile_proc(const char *src, size_t len,
         if (cdb_token_equals_ci(&tok, "SAVEPOINT")) {
             cdb_lexer_next(&pc.lex, &tok);
             cdb_token sp_name;
-            if (expect((compiler_ctx *)(void *)&pc, CDB_TOK_IDENT, "Expected savepoint name", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
+            if (proc_expect(&pc, CDB_TOK_IDENT, "Expected savepoint name", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
             uint8_t sp_id = (uint8_t)(sp_name.len > 0 ? (uint8_t)((unsigned char)sp_name.start[0] % 8) : 1u);
             cdb_proc_write_savepoint(&pw, sp_id);
-            match((compiler_ctx *)(void *)&pc, CDB_TOK_SEMICOLON, NULL);
+            proc_match(&pc, CDB_TOK_SEMICOLON, NULL);
             continue;
         }
 
@@ -1434,10 +1468,10 @@ cdb_status cdb_compile_proc(const char *src, size_t len,
                 cdb_lexer_next(&pc.lex, &to_tok);
             }
             cdb_token sp_name;
-            if (expect((compiler_ctx *)(void *)&pc, CDB_TOK_IDENT, "Expected savepoint name after ROLLBACK TO", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
+            if (proc_expect(&pc, CDB_TOK_IDENT, "Expected savepoint name after ROLLBACK TO", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
             uint8_t sp_id = (uint8_t)(sp_name.len > 0 ? (uint8_t)((unsigned char)sp_name.start[0] % 8) : 1u);
             cdb_proc_write_rollback_to(&pw, sp_id);
-            match((compiler_ctx *)(void *)&pc, CDB_TOK_SEMICOLON, NULL);
+            proc_match(&pc, CDB_TOK_SEMICOLON, NULL);
             continue;
         }
 
@@ -1449,16 +1483,16 @@ cdb_status cdb_compile_proc(const char *src, size_t len,
                 cdb_lexer_next(&pc.lex, &sp_kw);
             }
             cdb_token sp_name;
-            if (expect((compiler_ctx *)(void *)&pc, CDB_TOK_IDENT, "Expected savepoint name after RELEASE", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
+            if (proc_expect(&pc, CDB_TOK_IDENT, "Expected savepoint name after RELEASE", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
             uint8_t sp_id = (uint8_t)(sp_name.len > 0 ? (uint8_t)((unsigned char)sp_name.start[0] % 8) : 1u);
             cdb_proc_write_release_sp(&pw, sp_id);
-            match((compiler_ctx *)(void *)&pc, CDB_TOK_SEMICOLON, NULL);
+            proc_match(&pc, CDB_TOK_SEMICOLON, NULL);
             continue;
         }
 
         /* Other statements */
         cdb_lexer_next(&pc.lex, &tok);
-        match((compiler_ctx *)(void *)&pc, CDB_TOK_SEMICOLON, NULL);
+        proc_match(&pc, CDB_TOK_SEMICOLON, NULL);
     }
 
     cdb_proc_write_halt(&pw);

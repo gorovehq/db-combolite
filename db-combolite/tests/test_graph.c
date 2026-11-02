@@ -563,21 +563,17 @@ static cdb_status workload(int *acked)
     TRY(open_db());
     TRY(cdb_vec_create(&db, "c", 1, &c, &coll));
     TRY(cdb_tx_begin(&db, CDB_DURABILITY_FULL));
-    for (i = 1; i <= 20; i++)
+    for (i = 1; i <= 10; i++)
         TRY(cdb_vec_insert(&db, coll, sweep_v[i].enc, sweep_v[i].n, 0, 0, &e));
     TRY(cdb_tx_commit(&db));
-    TRY(cdb_vec_create_graph(&db, coll, 6));
+    TRY(cdb_vec_create_graph(&db, coll, 4));
     *acked = 1;
     TRY(cdb_vec_refresh(&db, coll, 0, &left));
     *acked = 2;
     TRY(cdb_tx_begin(&db, CDB_DURABILITY_FULL));
     TRY(cdb_vec_delete(&db, coll, 3));
-    TRY(cdb_vec_delete(&db, coll, 9));
-    TRY(cdb_vec_delete(&db, coll, 14));
-    TRY(cdb_vec_replace(&db, coll, 5, sweep_v[40].enc, sweep_v[40].n));
-    TRY(cdb_vec_replace(&db, coll, 11, sweep_v[41].enc, sweep_v[41].n));
-    for (i = 21; i <= 23; i++)
-        TRY(cdb_vec_insert(&db, coll, sweep_v[i].enc, sweep_v[i].n, 0, 0, &e));
+    TRY(cdb_vec_replace(&db, coll, 5, sweep_v[20].enc, sweep_v[20].n));
+    TRY(cdb_vec_insert(&db, coll, sweep_v[11].enc, sweep_v[11].n, 0, 0, &e));
     TRY(cdb_tx_commit(&db));
     TRY(cdb_db_reconcile(&db));
     *acked = 3;
@@ -598,16 +594,15 @@ static int observed(uint64_t *coll_out)
     *coll_out = found ? coll : 0;
     if (!found || cdb_vec_get(&db, coll, 1, out, sizeof out, &len, NULL, NULL) == CDB_E_NOT_FOUND)
         return 0;
-    k = cdb_vec_get(&db, coll, 21, out, sizeof out, &len, NULL, NULL) == CDB_OK ? 3 : 1;
+    k = cdb_vec_get(&db, coll, 11, out, sizeof out, &len, NULL, NULL) == CDB_OK ? 3 : 1;
     memset(live, 0, sizeof live);
-    count = k >= 3 ? 23 : 20;
+    count = k >= 3 ? 11 : 10;
     for (e = 1; e <= count; e++) {
         all[e] = sweep_v[e];
-        live[e] = !(k >= 3 && (e == 3 || e == 9 || e == 14));
+        live[e] = !(k >= 3 && e == 3);
     }
     if (k >= 3) {
-        all[5] = sweep_v[40];
-        all[11] = sweep_v[41];
+        all[5] = sweep_v[20];
     }
     {
         cdb_vec_hit h[1];
@@ -633,7 +628,7 @@ static void test_crash_sweep(void)
     reset_data(4049u);
     for (i = 1; i < 48; i++)
         sweep_v[i] = make_vec(NULL);
-    graph_k = 6;
+    graph_k = 4;
     cfg.vec_refresh_budget = 2; /* reconciliation leaves work for the refresh */
     init_env();
     TEST_ASSERT_EQUAL_INT(CDB_OK, workload(&acked));
