@@ -32,6 +32,10 @@
 #define CDB_RECORD_WRITE_KEY 4u
 #define CDB_RECORD_PREPARE 5u
 
+/* Record flags (spec 14.4.2). */
+#define CDB_RECORD_FLAG_ENCRYPTED 0x01u
+#define CDB_RECORD_FLAG_COMPRESSED 0x02u
+
 /* Data-change operation codes (spec 14.4.5). */
 #define CDB_OP_INSERT 1u
 #define CDB_OP_REPLACE 2u
@@ -93,17 +97,19 @@ cdb_status cdb_journal_create(cdb_journal *j, const cdb_storage *st, cdb_byte_or
 cdb_status cdb_journal_open(cdb_journal *j, const cdb_storage *st, cdb_byte_order order);
 
 /* Appends one record at the end, using buf (at least the record's size) to
- * assemble it. Sets r->seq. No barrier. r->payload may point inside buf at
- * offset CDB_RECORD_HEADER_SIZE, to avoid a copy. CDB_E_BUFFER_TOO_SMALL
- * when buf cannot hold header + payload + trailer. */
+ * assemble it. When encrypted, payload is encrypted under key and authenticated with AEAD tag. */
+cdb_status cdb_journal_append_crypto(cdb_journal *j, cdb_record *r, uint8_t *buf, size_t buf_size,
+                                     unsigned aead_alg, const uint8_t *key);
+
+/* Appends one unencrypted record at the end. */
 cdb_status cdb_journal_append(cdb_journal *j, cdb_record *r, uint8_t *buf, size_t buf_size);
 
-/* Reads the record at offset into buf and verifies it. On success *next is
- * the offset of the following record. A torn or damaged record returns
- * CDB_E_CORRUPT or CDB_E_TRUNCATED: it marks the end of the journal.
- * A record bigger than buf_size is also reported as CDB_E_CORRUPT, so buf
- * must be as big as the largest record the writer could produce.
- * r->payload points into buf and is valid until buf is reused. */
+/* Reads and verifies the record at offset into buf. If encrypted, decrypts payload with key. */
+cdb_status cdb_journal_read_crypto(cdb_journal *j, uint64_t offset, uint8_t *buf, size_t buf_size,
+                                   cdb_record *r, uint64_t *next,
+                                   unsigned aead_alg, const uint8_t *key);
+
+/* Reads and verifies an unencrypted record at offset into buf. */
 cdb_status cdb_journal_read(cdb_journal *j, uint64_t offset, uint8_t *buf, size_t buf_size,
                             cdb_record *r, uint64_t *next);
 

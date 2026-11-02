@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "combolite/cdb_crypto.h"
 #include "cdb_crc32c.h"
 #include "cdb_db.h"
 #include "cdb_doc.h"
@@ -266,6 +267,62 @@ static cdb_status new_journal(cdb_db *db, const char *path, uint64_t unsealed_se
     return cdb_storage_sync(&db->journal_st);
 }
 
+static cdb_status cdb_db_domain_key_cb(void *ctx, uint64_t domain_id, uint32_t key_version, uint8_t key_out[32])
+{
+    cdb_db *db = (cdb_db *)ctx;
+    unsigned i;
+    (void)key_version;
+
+    if (db == NULL || key_out == NULL)
+        return CDB_E_INVALID_ARG;
+
+    for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
+        if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == domain_id) {
+            memcpy(key_out, db->enclaves[i].page_key, 32);
+            return CDB_OK;
+        }
+    }
+    return CDB_E_SECURITY;
+}
+
+static cdb_status read_record(cdb_db *db, cdb_journal *j, uint64_t offset,
+                              uint8_t *buf, size_t buf_size, cdb_record *r, uint64_t *next)
+{
+    cdb_status s;
+    if (buf_size < CDB_RECORD_HEADER_SIZE)
+        return CDB_E_BUFFER_TOO_SMALL;
+    if ((s = cdb_storage_read(&j->st, offset, buf, CDB_RECORD_HEADER_SIZE)) != CDB_OK)
+        return s;
+    if (buf[0] != 0xC0u || buf[1] != 0xDEu)
+        return CDB_E_CORRUPT;
+    if (buf[3] & CDB_RECORD_FLAG_ENCRYPTED) {
+        uint64_t store_id = cdb_load_u64(buf + 24, j->order);
+        const uint8_t *key = NULL;
+        unsigned i;
+        for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
+            if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == store_id) {
+                key = db->enclaves[i].page_key;
+                break;
+            }
+        }
+        if (key == NULL && db->has_catalog) {
+            cdb_store_info sinfo;
+            if (cdb_catalog_get_store(&db->catalog, store_id, &sinfo) == CDB_OK && sinfo.domain_id > 0) {
+                for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
+                    if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == sinfo.domain_id) {
+                        key = db->enclaves[i].page_key;
+                        break;
+                    }
+                }
+            }
+        }
+        if (key == NULL)
+            return CDB_E_SECURITY;
+        return cdb_journal_read_crypto(j, offset, buf, buf_size, r, next, db->aead_alg, key);
+    }
+    return cdb_journal_read(j, offset, buf, buf_size, r, next);
+}
+
 /* Applies the data records of transaction tx_id found between start and end.
  * Used both by a live commit and by recovery, so both run exactly the same
  * code on exactly the same bytes. Each data record's payload is one op byte
@@ -279,7 +336,7 @@ static cdb_status apply_range(cdb_db *db, cdb_journal *j, uint64_t tx_id, uint64
     while (off < end) {
         cdb_record r;
         uint64_t next;
-        cdb_status s = cdb_journal_read(j, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
+        cdb_status s = read_record(db, j, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
         if (s != CDB_OK)
             return s;
         if (r.kind == CDB_RECORD_DATA && r.tx_id == tx_id) {
@@ -376,7 +433,7 @@ static cdb_status scan_next(cdb_db *db, struct jcursor *c)
     for (;;) {
         cdb_record r;
         uint64_t next;
-        if (cdb_journal_read(&db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next) != CDB_OK)
+        if (read_record(db, &db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next) != CDB_OK)
             break;
         if ((r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_WRITE_KEY) && r.tx_id != cur) {
             cur = r.tx_id;
@@ -838,13 +895,30 @@ static cdb_status rebase(cdb_db *db)
             while (off < c.off) {
                 cdb_record r;
                 uint64_t next;
-                if ((s = cdb_journal_read(&db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next))
+                if ((s = read_record(db, &db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next))
                     != CDB_OK)
                     break;
                 if ((r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_WRITE_KEY || r.kind == CDB_RECORD_COMMIT)
                     && r.tx_id == c.tx_id) {
-                    if ((s = cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size))
-                        != CDB_OK)
+                    if (r.flags & CDB_RECORD_FLAG_ENCRYPTED) {
+                        const uint8_t *enc_key = NULL;
+                        unsigned k;
+                        for (k = 0; k < sizeof(db->enclaves) / sizeof(db->enclaves[0]); k++) {
+                            if (db->enclaves[k].in_use && db->enclaves[k].enclave_id == r.store_id) {
+                                enc_key = db->enclaves[k].page_key;
+                                break;
+                            }
+                        }
+                        if (enc_key != NULL && db->aead_alg != CDB_AEAD_NONE) {
+                            s = cdb_journal_append_crypto(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size,
+                                                          db->aead_alg, enc_key);
+                        } else {
+                            s = cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size);
+                        }
+                    } else {
+                        s = cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size);
+                    }
+                    if (s != CDB_OK)
                         break;
                     if (r.kind == CDB_RECORD_DATA) {
                         cdb_delta d;
@@ -927,6 +1001,17 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
     memset(db->stage_buckets, 0xFF, sizeof db->stage_buckets);
     db->env = *env;
     db->cfg = *cfg;
+    db->aead_alg = cfg->aead_alg;
+    db->is_production = cfg->is_production;
+    db->key_provider = cfg->key_provider;
+    db->key_provider_ctx = cfg->key_provider_ctx;
+    db->rotation_interval_days = cfg->rotation_interval_days;
+    db->rotation_policy = cfg->rotation_policy;
+    db->signing_policy = cfg->signing_policy;
+    if (cfg->identity != NULL) {
+        db->active_identity = *cfg->identity;
+        db->has_identity = 1;
+    }
     if (db->cfg.durability == CDB_DURABILITY_DEFAULT)
         db->cfg.durability = CDB_DURABILITY_NORMAL;
     if (db->cfg.normal_sync_every == 0)
@@ -974,6 +1059,30 @@ static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg
     if ((s = set_paths(db, base)) != CDB_OK)
         return s;
 
+    if (cfg->master_key_uri != NULL || cfg->key_provider != NULL) {
+        s = cdb_crypto_resolve_key(cfg->master_key_uri, cfg->is_production,
+                                   cfg->key_provider, cfg->key_provider_ctx, db->master_key);
+        if (s != CDB_OK)
+            return s;
+        db->has_master_key = 1;
+        s = cdb_crypto_derive_subkey(db->master_key, CDB_SUBKEY_INTEGRITY, db->integrity_key);
+        if (s != CDB_OK)
+            return s;
+        db->has_integrity_key = 1;
+    }
+
+    if (create != NULL && (create->layout_flags & CDB_LAYOUT_GOVERNANCE) && !db->has_master_key)
+        return CDB_E_SECURITY;
+
+    if (db->rotation_interval_days > 0 && db->rotation_expired &&
+        db->rotation_policy == CDB_ROTATION_REFUSE_OPEN)
+        return CDB_E_SECURITY;
+
+    cdb_pager_set_crypto(&db->pager, db->aead_alg,
+                         db->has_master_key ? db->master_key : NULL,
+                         db->has_integrity_key ? db->integrity_key : NULL,
+                         cdb_db_domain_key_cb, db);
+
     /* Open the archive, or create it (syncing the parent directory so the
      * new file's name is durable). */
     if ((s = env_exists(db, db->archive, &exists)) != CDB_OK)
@@ -992,6 +1101,8 @@ static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg
             return s;
         if ((s = cdb_pager_open(&db->pager, &db->archive_st, &cfg->pager)) != CDB_OK)
             return s;
+        if ((db->pager.hs.record.layout_flags & CDB_LAYOUT_GOVERNANCE) && !db->has_master_key)
+            return CDB_E_SECURITY;
     }
     if (db->pager.read_only)
         return CDB_E_READ_ONLY; /* read-only sessions come with the coordinator milestone */
@@ -1257,6 +1368,9 @@ static cdb_status tx_begin_locked(cdb_db *db, cdb_durability durability)
     cdb_status s;
     if (usable(db) != CDB_OK || db->in_tx)
         return CDB_E_STATE;
+    if (db->rotation_interval_days > 0 && db->rotation_expired &&
+        db->rotation_policy == CDB_ROTATION_REFUSE_WRITES)
+        return CDB_E_SECURITY;
     if ((s = heartbeat(db)) != CDB_OK)
         return s;
     if (cdb_coord_baton_held(&db->coord)
@@ -1303,9 +1417,14 @@ cdb_status cdb_tx_put(cdb_db *db, uint64_t store_id, uint64_t entry_id, uint8_t 
 {
     uint8_t *payload = db->cfg.record_buf + CDB_RECORD_HEADER_SIZE;
     cdb_record r;
+    const uint8_t *enc_key = NULL;
+    unsigned i;
 
     if (usable(db) != CDB_OK || !db->in_tx)
         return CDB_E_STATE;
+    if (db->rotation_interval_days > 0 && db->rotation_expired &&
+        db->rotation_policy == CDB_ROTATION_REFUSE_WRITES)
+        return CDB_E_SECURITY;
     /* The whole record (header, op byte, data, trailer) must fit record_buf. */
     if (len > db->cfg.record_buf_size - CDB_RECORD_HEADER_SIZE - CDB_RECORD_TRAILER_SIZE - 1u
         || (data == NULL && len != 0))
@@ -1321,6 +1440,34 @@ cdb_status cdb_tx_put(cdb_db *db, uint64_t store_id, uint64_t entry_id, uint8_t 
     r.payload = payload;
     r.payload_len = (uint32_t)(len + 1u);
     db->tx_deltas++;
+
+    for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
+        if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == store_id) {
+            enc_key = db->enclaves[i].page_key;
+            r.key_version = db->enclaves[i].key_version;
+            break;
+        }
+    }
+    if (enc_key == NULL && db->has_catalog) {
+        cdb_store_info sinfo;
+        if (cdb_catalog_get_store(&db->catalog, store_id, &sinfo) == CDB_OK && sinfo.domain_id > 0) {
+            for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
+                if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == sinfo.domain_id) {
+                    enc_key = db->enclaves[i].page_key;
+                    r.key_version = db->enclaves[i].key_version;
+                    break;
+                }
+            }
+            if (enc_key == NULL)
+                return CDB_E_SECURITY;
+        }
+    }
+
+    if (enc_key != NULL && db->aead_alg != CDB_AEAD_NONE) {
+        r.flags |= CDB_RECORD_FLAG_ENCRYPTED;
+        return cdb_journal_append_crypto(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size,
+                                         db->aead_alg, enc_key);
+    }
     return cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size);
 }
 
@@ -1506,7 +1653,7 @@ static cdb_status own_has_item(cdb_db *db, const struct ws_item *own, unsigned n
         cdb_record r;
         struct ws_item it;
         uint64_t next;
-        cdb_status s = cdb_journal_read(&db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
+        cdb_status s = read_record(db, &db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
         if (s != CDB_OK)
             return s;
         off = next;
@@ -1558,7 +1705,7 @@ static cdb_status check_slot_collisions(cdb_db *db, unsigned slot, uint64_t my_s
             cdb_record r;
             struct ws_item it;
             uint64_t next, counter;
-            if (cdb_journal_read(&db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next) != CDB_OK)
+            if (read_record(db, &db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next) != CDB_OK)
                 break;
             off = next;
             if ((r.tx_id >> 48) != slot)
@@ -1629,7 +1776,7 @@ static cdb_status check_collisions(cdb_db *db, uint64_t own_end, uint64_t my_sta
         cdb_record r;
         struct ws_item it;
         uint64_t next;
-        if ((s = cdb_journal_read(&db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next)) != CDB_OK)
+        if ((s = read_record(db, &db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next)) != CDB_OK)
             return s;
         if (r.tx_id == db->tx_id && ws_from_record(&r, &it)) {
             if (nown < WS_CACHE_CAP) {
@@ -1711,11 +1858,12 @@ static cdb_status coordinate_commit(cdb_db *db, uint64_t *stamp)
 
 static cdb_status tx_commit_locked(cdb_db *db)
 {
-    uint8_t info[CDB_COMMIT_PAYLOAD_SIZE];
+    uint8_t info[CDB_COMMIT_PAYLOAD_SIZE + 72];
     cdb_commit_info ci;
     cdb_record r;
     uint64_t stamp = 0, record_at, counter;
     cdb_status s;
+    size_t sig_len = 0;
 
     if (usable(db) != CDB_OK || !db->in_tx)
         return CDB_E_STATE;
@@ -1751,11 +1899,19 @@ static cdb_status tx_commit_locked(cdb_db *db)
     ci.delta_count = db->tx_deltas;
     ci.track_mask = 1u << CDB_COMPANION_MAIN_JOURNAL;
     cdb_commit_encode(&ci, info, db->pager.order);
+    if (db->has_identity && db->signing_policy != CDB_SIGN_NONE) {
+        uint8_t h[32];
+        cdb_crypto_sha256(info, 32, h);
+        if (cdb_identity_sign(&db->active_identity, h, 32, info + CDB_COMMIT_PAYLOAD_SIZE) == CDB_OK) {
+            sig_len = CDB_SIGNATURE_SIZE;
+            cdb_store_u16(info + 32, (uint16_t)sig_len, db->pager.order);
+        }
+    }
     memset(&r, 0, sizeof r);
     r.kind = (uint8_t)CDB_RECORD_COMMIT;
     r.tx_id = db->tx_id;
     r.payload = info;
-    r.payload_len = CDB_COMMIT_PAYLOAD_SIZE;
+    r.payload_len = (uint32_t)(CDB_COMMIT_PAYLOAD_SIZE + sig_len);
     record_at = db->journal.end;
     if ((s = cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size)) != CDB_OK)
         return s;
@@ -2082,6 +2238,23 @@ cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint6
     return finish_archive_op(db, cdb_pager_compact(&db->pager, max_moves, moved, reclaimed));
 }
 
+static void db_wipe_crypto(cdb_db *db)
+{
+    unsigned i;
+    cdb_crypto_wipe(db->master_key, sizeof db->master_key);
+    cdb_crypto_wipe(db->integrity_key, sizeof db->integrity_key);
+    cdb_crypto_wipe(db->active_identity.secret_key, sizeof db->active_identity.secret_key);
+    for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
+        if (db->enclaves[i].in_use) {
+            cdb_crypto_wipe(db->enclaves[i].enclave_key, 32);
+            cdb_crypto_wipe(db->enclaves[i].page_key, 32);
+            cdb_crypto_wipe(db->enclaves[i].hash_key, 32);
+            cdb_crypto_wipe(db->enclaves[i].index_key, 32);
+            db->enclaves[i].in_use = 0;
+        }
+    }
+}
+
 /* Close is a final reconciliation under the baton, followed by removing
  * this slot's journal and overlay, and, when no other process is live,
  * marking the header's companion slot "not in use" and removing the working
@@ -2107,6 +2280,7 @@ cdb_status cdb_db_close(cdb_db *db)
             cdb_storage_close(&db->archive_st);
         release_slots(db); /* their state is lost with the session anyway */
         (void)cdb_coord_leave(&db->coord); /* the journal stays for the next open */
+        db_wipe_crypto(db);
         return CDB_E_STATE;
     }
     if (db->in_tx && (s = cdb_tx_abort(db)) != CDB_OK) {
@@ -2169,7 +2343,309 @@ cdb_status cdb_db_close(cdb_db *db)
         }
     }
     cdb_storage_close(&db->archive_st);
+    db_wipe_crypto(db);
     db_unlock(db);
     cleanup_concurrency(db);
     return CDB_OK;
+}
+
+/* -------------------------------------------------------- security & RBAC */
+
+cdb_status cdb_db_create_enclave(cdb_db *db, uint64_t enclave_id, const char *key_ref)
+{
+    unsigned i;
+    int free_idx = -1;
+    uint8_t raw_key[32];
+    cdb_status s;
+
+    if (db == NULL || enclave_id == 0)
+        return CDB_E_INVALID_ARG;
+
+    for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
+        if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == enclave_id)
+            return CDB_E_EXISTS;
+        if (!db->enclaves[i].in_use && free_idx == -1)
+            free_idx = (int)i;
+    }
+
+    if (free_idx == -1)
+        return CDB_E_OVERFLOW;
+
+    if (key_ref != NULL) {
+        s = cdb_crypto_resolve_key(key_ref, db->is_production, db->key_provider, db->key_provider_ctx, raw_key);
+        if (s != CDB_OK)
+            return s;
+    } else {
+        s = cdb_crypto_random_bytes(raw_key, 32);
+        if (s != CDB_OK)
+            return s;
+    }
+
+    db->enclaves[free_idx].enclave_id = enclave_id;
+    db->enclaves[free_idx].key_version = 1;
+    memcpy(db->enclaves[free_idx].enclave_key, raw_key, 32);
+
+    s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_PAGE, db->enclaves[free_idx].page_key);
+    if (s == CDB_OK)
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_CONTENT_HASH, db->enclaves[free_idx].hash_key);
+    if (s == CDB_OK)
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, db->enclaves[free_idx].index_key);
+
+    cdb_crypto_wipe(raw_key, sizeof raw_key);
+
+    if (s != CDB_OK)
+        return s;
+
+    db->enclaves[free_idx].in_use = 1;
+    return CDB_OK;
+}
+
+cdb_status cdb_db_open_enclave(cdb_db *db, uint64_t enclave_id, const char *key_ref)
+{
+    unsigned i;
+    int idx = -1;
+    uint8_t raw_key[32];
+    cdb_status s;
+
+    if (db == NULL || enclave_id == 0 || key_ref == NULL)
+        return CDB_E_INVALID_ARG;
+
+    for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
+        if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == enclave_id) {
+            idx = (int)i;
+            break;
+        } else if (!db->enclaves[i].in_use && idx == -1) {
+            idx = (int)i;
+        }
+    }
+
+    if (idx == -1)
+        return CDB_E_OVERFLOW;
+
+    s = cdb_crypto_resolve_key(key_ref, db->is_production, db->key_provider, db->key_provider_ctx, raw_key);
+    if (s != CDB_OK)
+        return s;
+
+    db->enclaves[idx].enclave_id = enclave_id;
+    if (db->enclaves[idx].key_version == 0)
+        db->enclaves[idx].key_version = 1;
+    memcpy(db->enclaves[idx].enclave_key, raw_key, 32);
+
+    s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_PAGE, db->enclaves[idx].page_key);
+    if (s == CDB_OK)
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_CONTENT_HASH, db->enclaves[idx].hash_key);
+    if (s == CDB_OK)
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, db->enclaves[idx].index_key);
+
+    cdb_crypto_wipe(raw_key, sizeof raw_key);
+
+    if (s != CDB_OK)
+        return s;
+
+    db->enclaves[idx].in_use = 1;
+    return CDB_OK;
+}
+
+cdb_status cdb_db_rotate_master_key(cdb_db *db, const char *new_master_key_uri)
+{
+    uint8_t new_mk[32];
+    uint8_t wrapped[CDB_WRAPPED_KEY_SIZE];
+    unsigned i;
+    cdb_status s;
+
+    if (db == NULL || new_master_key_uri == NULL)
+        return CDB_E_INVALID_ARG;
+
+    s = cdb_crypto_resolve_key(new_master_key_uri, db->is_production, db->key_provider, db->key_provider_ctx, new_mk);
+    if (s != CDB_OK)
+        return s;
+
+    /* Verify re-wrapping for all active enclaves under new master key */
+    for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
+        if (db->enclaves[i].in_use) {
+            s = cdb_crypto_wrap_key(new_mk, db->enclaves[i].enclave_key, wrapped);
+            if (s != CDB_OK) {
+                cdb_crypto_wipe(new_mk, sizeof new_mk);
+                cdb_crypto_wipe(wrapped, sizeof wrapped);
+                return s;
+            }
+        }
+    }
+    cdb_crypto_wipe(wrapped, sizeof wrapped);
+
+    /* Derive new integrity key */
+    s = cdb_crypto_derive_subkey(new_mk, CDB_SUBKEY_INTEGRITY, db->integrity_key);
+    if (s != CDB_OK) {
+        cdb_crypto_wipe(new_mk, sizeof new_mk);
+        return s;
+    }
+
+    memcpy(db->master_key, new_mk, 32);
+    db->has_master_key = 1;
+    db->has_integrity_key = 1;
+    cdb_crypto_wipe(new_mk, sizeof new_mk);
+
+    /* Update pager */
+    cdb_pager_set_crypto(&db->pager, db->aead_alg, db->master_key, db->integrity_key,
+                         cdb_db_domain_key_cb, db);
+
+    return CDB_OK;
+}
+
+cdb_status cdb_db_rotate_enclave_key(cdb_db *db, uint64_t enclave_id, const char *new_enclave_key_uri)
+{
+    unsigned i;
+    int idx = -1;
+    uint8_t raw_key[32];
+    cdb_status s;
+
+    if (db == NULL || enclave_id == 0)
+        return CDB_E_INVALID_ARG;
+
+    for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
+        if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == enclave_id) {
+            idx = (int)i;
+            break;
+        }
+    }
+    if (idx == -1)
+        return CDB_E_NOT_FOUND;
+
+    if (new_enclave_key_uri != NULL) {
+        s = cdb_crypto_resolve_key(new_enclave_key_uri, db->is_production, db->key_provider, db->key_provider_ctx, raw_key);
+        if (s != CDB_OK)
+            return s;
+    } else {
+        s = cdb_crypto_random_bytes(raw_key, 32);
+        if (s != CDB_OK)
+            return s;
+    }
+
+    db->enclaves[idx].key_version++;
+    memcpy(db->enclaves[idx].enclave_key, raw_key, 32);
+
+    s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_PAGE, db->enclaves[idx].page_key);
+    if (s == CDB_OK)
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_CONTENT_HASH, db->enclaves[idx].hash_key);
+    if (s == CDB_OK)
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, db->enclaves[idx].index_key);
+
+    cdb_crypto_wipe(raw_key, sizeof raw_key);
+    return s;
+}
+
+cdb_status cdb_db_check_key_rotation(cdb_db *db)
+{
+    if (db == NULL)
+        return CDB_E_INVALID_ARG;
+    if (db->rotation_interval_days == 0)
+        return CDB_OK;
+
+    if (db->rotation_policy == CDB_ROTATION_REFUSE_OPEN ||
+        db->rotation_policy == CDB_ROTATION_REFUSE_WRITES) {
+        if (db->rotation_expired)
+            return CDB_E_SECURITY;
+    }
+    return CDB_OK;
+}
+
+cdb_status cdb_db_register_principal(cdb_db *db, uint64_t principal_id, uint32_t tenant_id,
+                                     const uint8_t pubkey[33])
+{
+    unsigned i;
+    int free_idx = -1;
+
+    if (db == NULL || principal_id == 0)
+        return CDB_E_INVALID_ARG;
+
+    for (i = 0; i < sizeof(db->rbac_grants) / sizeof(db->rbac_grants[0]); i++) {
+        if (db->rbac_grants[i].in_use) {
+            if (db->rbac_grants[i].principal_id == principal_id) {
+                db->rbac_grants[i].tenant_id = tenant_id;
+                if (pubkey != NULL)
+                    memcpy(db->rbac_grants[i].pubkey, pubkey, 33);
+                return CDB_OK;
+            }
+        } else if (free_idx == -1) {
+            free_idx = (int)i;
+        }
+    }
+
+    if (free_idx == -1)
+        return CDB_E_OVERFLOW;
+
+    db->rbac_grants[free_idx].principal_id = principal_id;
+    db->rbac_grants[free_idx].tenant_id = tenant_id;
+    if (pubkey != NULL)
+        memcpy(db->rbac_grants[free_idx].pubkey, pubkey, 33);
+    else
+        memset(db->rbac_grants[free_idx].pubkey, 0, 33);
+    db->rbac_grants[free_idx].scope = 0;
+    db->rbac_grants[free_idx].perms = 0;
+    db->rbac_grants[free_idx].in_use = 1;
+    db->num_grants++;
+    return CDB_OK;
+}
+
+cdb_status cdb_db_grant_role(cdb_db *db, uint64_t principal_id, uint32_t role_id,
+                             uint64_t scope_store_or_enclave, uint8_t perm_mask)
+{
+    unsigned i;
+    int free_idx = -1;
+    (void)role_id;
+
+    if (db == NULL || principal_id == 0)
+        return CDB_E_INVALID_ARG;
+
+    for (i = 0; i < sizeof(db->rbac_grants) / sizeof(db->rbac_grants[0]); i++) {
+        if (db->rbac_grants[i].in_use) {
+            if (db->rbac_grants[i].principal_id == principal_id &&
+                db->rbac_grants[i].scope == scope_store_or_enclave) {
+                db->rbac_grants[i].perms |= perm_mask;
+                return CDB_OK;
+            }
+        } else if (free_idx == -1) {
+            free_idx = (int)i;
+        }
+    }
+
+    if (free_idx == -1)
+        return CDB_E_OVERFLOW;
+
+    db->rbac_grants[free_idx].principal_id = principal_id;
+    db->rbac_grants[free_idx].scope = scope_store_or_enclave;
+    db->rbac_grants[free_idx].perms = perm_mask;
+    db->rbac_grants[free_idx].in_use = 1;
+    db->num_grants++;
+    return CDB_OK;
+}
+
+cdb_status cdb_db_check_perm(cdb_db *db, uint64_t principal_id, uint64_t scope_store_or_enclave,
+                             uint8_t required_perm)
+{
+    unsigned i;
+
+    if (db == NULL)
+        return CDB_E_INVALID_ARG;
+
+    if (db->num_grants == 0)
+        return CDB_OK;
+
+    if (principal_id == 0)
+        return CDB_E_SECURITY;
+
+    for (i = 0; i < sizeof(db->rbac_grants) / sizeof(db->rbac_grants[0]); i++) {
+        if (!db->rbac_grants[i].in_use)
+            continue;
+        if (db->rbac_grants[i].principal_id == principal_id) {
+            if (db->rbac_grants[i].perms & CDB_PERM_ADMIN)
+                return CDB_OK;
+            if (db->rbac_grants[i].scope == 0 || db->rbac_grants[i].scope == scope_store_or_enclave) {
+                if ((db->rbac_grants[i].perms & required_perm) == required_perm)
+                    return CDB_OK;
+            }
+        }
+    }
+
+    return CDB_E_SECURITY;
 }

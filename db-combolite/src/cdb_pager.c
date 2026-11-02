@@ -24,6 +24,7 @@
  * so a physical number of 0 is used to mean "none". */
 #include <string.h>
 
+#include "combolite/cdb_crypto.h"
 #include "cdb_endian.h"
 #include "cdb_pager.h"
 
@@ -176,6 +177,113 @@ static uint64_t alloc_phys(cdb_pager *p)
     return p->append_point++;
 }
 
+void cdb_pager_set_crypto(cdb_pager *p, unsigned aead_alg, const uint8_t *master_key,
+                          const uint8_t *integrity_key,
+                          cdb_status (*domain_key_fn)(void *, uint64_t, uint32_t, uint8_t *),
+                          void *domain_key_ctx)
+{
+    if (p == NULL)
+        return;
+    p->aead_alg = (uint8_t)aead_alg;
+    if (master_key != NULL) {
+        memcpy(p->master_key, master_key, 32);
+        p->has_master_key = 1;
+    } else {
+        p->has_master_key = 0;
+    }
+    if (integrity_key != NULL) {
+        memcpy(p->integrity_key, integrity_key, 32);
+        p->has_integrity_key = 1;
+    } else {
+        p->has_integrity_key = 0;
+    }
+    p->domain_key_fn = domain_key_fn;
+    p->domain_key_ctx = domain_key_ctx;
+}
+
+static cdb_status pager_seal_page(cdb_pager *p, uint8_t *buf, cdb_page_header *h)
+{
+    const uint8_t *key = NULL;
+    uint8_t key_buf[32];
+    unsigned aead_alg = CDB_AEAD_NONE;
+    cdb_status s;
+
+    if (h->domain_id > 0 && p->aead_alg != CDB_AEAD_NONE) {
+        if (p->domain_key_fn != NULL &&
+            p->domain_key_fn(p->domain_key_ctx, h->domain_id, h->key_version, key_buf) == CDB_OK) {
+            key = key_buf;
+            aead_alg = p->aead_alg;
+        } else {
+            return CDB_E_SECURITY;
+        }
+    } else if ((p->hs.record.layout_flags & CDB_LAYOUT_GOVERNANCE) || (h->flags & CDB_PAGE_FLAG_TAMPER_EVIDENT)) {
+        if (!p->has_integrity_key)
+            return CDB_E_SECURITY;
+        h->flags |= CDB_PAGE_FLAG_TAMPER_EVIDENT;
+        key = p->integrity_key;
+    }
+
+    s = cdb_page_seal_crypto(buf, p->page_size, p->fmt, p->order, p->checksum_alg,
+                             aead_alg, key, h);
+    cdb_crypto_wipe(key_buf, sizeof key_buf);
+    return s;
+}
+
+static uint64_t load_domain_id(const uint8_t *p, unsigned w, cdb_byte_order o)
+{
+    if (w == 8)
+        return cdb_load_u64(p, o);
+    if (w == 4)
+        return cdb_load_u32(p, o);
+    return cdb_load_u16(p, o);
+}
+
+static cdb_status pager_open_page(cdb_pager *p, uint8_t *buf, cdb_page_header *h)
+{
+    const uint8_t *key = NULL;
+    uint8_t key_buf[32];
+    unsigned aead_alg = CDB_AEAD_NONE;
+    cdb_status s;
+
+    /* First attempt to open unencrypted */
+    s = cdb_page_open(buf, p->page_size, p->fmt, p->order, p->checksum_alg, h);
+    if (s != CDB_OK) {
+        /* Peek header to determine domain_id and flags without CRC check */
+        if (buf[0] != 0xC0u || buf[1] != 0xDBu)
+            return CDB_E_CORRUPT;
+        h->flags = buf[5];
+        if (p->fmt == CDB_PAGE_FMT_COMPACT) {
+            h->domain_id = load_domain_id(buf + 24, 2, p->order);
+            h->key_version = cdb_load_u16(buf + 16, p->order);
+        } else {
+            unsigned w = p->fmt == CDB_PAGE_FMT_FULL64 ? 8u : 4u;
+            h->domain_id = load_domain_id(buf + 24 + 2 * w, w, p->order);
+            h->key_version = cdb_load_u32(buf + 8, p->order);
+        }
+    }
+
+    if (h->domain_id > 0 && p->aead_alg != CDB_AEAD_NONE) {
+        if (p->domain_key_fn != NULL &&
+            p->domain_key_fn(p->domain_key_ctx, h->domain_id, h->key_version, key_buf) == CDB_OK) {
+            key = key_buf;
+            aead_alg = p->aead_alg;
+        } else {
+            return CDB_E_SECURITY;
+        }
+    } else if (h->flags & CDB_PAGE_FLAG_TAMPER_EVIDENT) {
+        if (!p->has_integrity_key)
+            return CDB_E_SECURITY;
+        key = p->integrity_key;
+    } else if (s == CDB_OK) {
+        return CDB_OK;
+    }
+
+    s = cdb_page_open_crypto(buf, p->page_size, p->fmt, p->order, p->checksum_alg,
+                             aead_alg, key, h);
+    cdb_crypto_wipe(key_buf, sizeof key_buf);
+    return s;
+}
+
 /* Seals the image in buf with a fresh sequence number and writes it at phys.
  * buf must be a full page image with the payload already in place; the
  * header and checksum trailer are filled in here. h->write_seq is set. */
@@ -186,7 +294,7 @@ static cdb_status write_page_at(cdb_pager *p, uint8_t *buf, cdb_page_header *h, 
         return s;
     if ((s = next_seq(p, &h->write_seq)) != CDB_OK)
         return s;
-    if ((s = cdb_page_seal(buf, p->page_size, p->fmt, p->order, p->checksum_alg, h)) != CDB_OK)
+    if ((s = pager_seal_page(p, buf, h)) != CDB_OK)
         return s;
     return cdb_storage_program(&p->st, phys_offset(p, phys), buf, p->page_size);
 }
@@ -198,7 +306,7 @@ static cdb_status write_overlay(cdb_pager *p, uint8_t *buf, cdb_page_header *h, 
 {
     cdb_status s;
     h->write_seq = p->next_seq++;
-    if ((s = cdb_page_seal(buf, p->page_size, p->fmt, p->order, p->checksum_alg, h)) != CDB_OK)
+    if ((s = pager_seal_page(p, buf, h)) != CDB_OK)
         return s;
     return cdb_storage_program(&p->overlay, phys_offset(p, phys), buf, p->page_size);
 }
@@ -221,7 +329,7 @@ static cdb_status read_page(cdb_pager *p, uint64_t phys, uint8_t *buf, uint16_t 
         return CDB_E_CORRUPT;
     if ((s = cdb_storage_read(&p->st, phys_offset(p, phys), buf, p->page_size)) != CDB_OK)
         return s == CDB_E_TRUNCATED ? CDB_E_CORRUPT : s;
-    if ((s = cdb_page_open(buf, p->page_size, p->fmt, p->order, p->checksum_alg, h)) != CDB_OK)
+    if ((s = pager_open_page(p, buf, h)) != CDB_OK)
         return s;
     return h->type == type && h->payload_len == cdb_page_capacity(p->fmt, p->page_size) ? CDB_OK : CDB_E_CORRUPT;
 }
@@ -929,10 +1037,26 @@ cdb_status cdb_pager_open(cdb_pager *p, const cdb_storage *st, const cdb_pager_c
 {
     const cdb_header *r;
     cdb_status s;
+    unsigned saved_alg = p ? p->aead_alg : 0;
+    int saved_hmk = p ? p->has_master_key : 0;
+    int saved_hik = p ? p->has_integrity_key : 0;
+    uint8_t saved_mk[32];
+    uint8_t saved_ik[32];
+    cdb_status (*saved_fn)(void *, uint64_t, uint32_t, uint8_t *) = p ? p->domain_key_fn : NULL;
+    void *saved_ctx = p ? p->domain_key_ctx : NULL;
 
     if (p == NULL || st == NULL || cfg == NULL)
         return CDB_E_INVALID_ARG;
+    if (saved_hmk) memcpy(saved_mk, p->master_key, 32);
+    if (saved_hik) memcpy(saved_ik, p->integrity_key, 32);
     memset(p, 0, sizeof *p);
+    p->aead_alg = (uint8_t)saved_alg;
+    p->has_master_key = saved_hmk;
+    p->has_integrity_key = saved_hik;
+    if (saved_hmk) memcpy(p->master_key, saved_mk, 32);
+    if (saved_hik) memcpy(p->integrity_key, saved_ik, 32);
+    p->domain_key_fn = saved_fn;
+    p->domain_key_ctx = saved_ctx;
     if ((s = cdb_header_open(st, &p->hs)) != CDB_OK)
         return s;
     if ((s = setup(p, st, cfg)) != CDB_OK)
@@ -1056,7 +1180,7 @@ static int written_since_commit(cdb_pager *p, uint64_t phys, uint64_t lid)
 {
     cdb_page_header h;
     if (phys < p->data_start || cdb_storage_read(&p->st, phys_offset(p, phys), p->scratch, p->page_size) != CDB_OK
-        || cdb_page_open(p->scratch, p->page_size, p->fmt, p->order, p->checksum_alg, &h) != CDB_OK)
+        || pager_open_page(p, p->scratch, &h) != CDB_OK)
         return 0;
     return h.write_seq >= p->seq_at_commit && h.logical_id == lid;
 }
@@ -1169,7 +1293,7 @@ cdb_status cdb_pager_read(cdb_pager *p, uint64_t lid, uint8_t *page, cdb_page_he
     if ((s = cdb_storage_read(e.state == CDB_ANCHOR_PRIVATE ? &p->overlay : &p->st, phys_offset(p, e.phys), page,
                               p->page_size)) != CDB_OK)
         return s == CDB_E_TRUNCATED ? CDB_E_CORRUPT : s;
-    if ((s = cdb_page_open(page, p->page_size, p->fmt, p->order, p->checksum_alg, h)) != CDB_OK)
+    if ((s = pager_open_page(p, page, h)) != CDB_OK)
         return s;
     return h->logical_id == lid ? CDB_OK : CDB_E_CORRUPT;
 }

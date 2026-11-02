@@ -122,7 +122,21 @@ typedef struct cdb_pager {
     uint64_t reuse_below; /* space freed at this sequence or later is not reused; 0: no limit */
     cdb_status (*guard)(void *ctx); /* checked before every archive write; NULL: none */
     void *guard_ctx;
+    /* Cryptographic and security state (spec 12, 14.2.5). */
+    uint8_t aead_alg;
+    uint8_t master_key[32];
+    uint8_t integrity_key[32];
+    int has_master_key;
+    int has_integrity_key;
+    cdb_status (*domain_key_fn)(void *ctx, uint64_t domain_id, uint32_t key_version, uint8_t key_out[32]);
+    void *domain_key_ctx;
 } cdb_pager;
+
+/* Configures encryption, integrity keys, and enclave domain key resolver on the pager. */
+void cdb_pager_set_crypto(cdb_pager *p, unsigned aead_alg, const uint8_t *master_key,
+                          const uint8_t *integrity_key,
+                          cdb_status (*domain_key_fn)(void *, uint64_t, uint32_t, uint8_t *),
+                          void *domain_key_ctx);
 
 /* Creates a new database on empty storage. h supplies the file settings:
  * byte order, page size (default_page_log2, used for every page), address
