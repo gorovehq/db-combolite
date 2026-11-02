@@ -28,6 +28,7 @@ static cdb_index_entry cat_entries[512];
 static uint8_t cat_page[PAGE];
 static uint8_t doc_buffers[8u * PAGE];
 static uint8_t doc_stage[4096];
+static uint8_t idx_stage[16u * 1024u];
 static uint8_t vec_buffers[3u * PAGE];
 static cdb_db_config cfg;
 static cdb_db db;
@@ -66,6 +67,8 @@ void setUp(void)
     cfg.doc_buffers = doc_buffers;
     cfg.doc_stage = doc_stage;
     cfg.doc_stage_size = sizeof doc_stage;
+    cfg.idx_stage = idx_stage;
+    cfg.idx_stage_size = sizeof idx_stage;
     cfg.vec_buffers = vec_buffers;
     cfg.durability = CDB_DURABILITY_FULL;
 }
@@ -156,6 +159,20 @@ static size_t count(cdb_ref e, int dir, uint64_t type)
     size_t n;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_list(&db, e, dir, type, NULL, out, 16, &n));
     return n;
+}
+
+static size_t count_all(cdb_ref e, int dir, uint64_t type)
+{
+    cdb_link out[32];
+    size_t total = 0, n = 0;
+    cdb_link *after = NULL;
+    do {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_list(&db, e, dir, type, after, out, 32, &n));
+        total += n;
+        if (n > 0)
+            after = &out[n - 1];
+    } while (n == 32);
+    return total;
 }
 
 /* ------------------------------------------------------------ tests */
@@ -514,6 +531,81 @@ static int observed_state(void)
     return -1;
 }
 
+static void test_staging_links_batch(void)
+{
+    uint64_t t_nm, t_11, src, targets[100];
+    cdb_ref s_ref, t_ref;
+    int i;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    pool = make_pool("batch_docs");
+    t_nm = define("nm_links", CDB_CARD_N_M, 1, CDB_LINK_ON_DELETE_TOMBSTONE);
+    t_11 = define("one_one", CDB_CARD_1_1, 1, CDB_LINK_ON_DELETE_TOMBSTONE);
+
+    begin();
+    src = new_doc();
+    s_ref = D(src);
+    for (i = 0; i < 100; i++) {
+        targets[i] = new_doc();
+    }
+
+    /* Batch create 100 links in the same transaction */
+    for (i = 0; i < 100; i++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_add(&db, t_nm, s_ref, D(targets[i]), 1.0f, 1000 + i));
+    }
+
+    /* Duplicate in open transaction is rejected via staging cache in O(1) */
+    TEST_ASSERT_EQUAL_INT(CDB_E_EXISTS, cdb_link_add(&db, t_nm, s_ref, D(targets[25]), 1.0f, 9999));
+
+    /* Unlink a staged link within the open transaction */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_remove(&db, t_nm, s_ref, D(targets[25])));
+
+    /* Staged unlink allows re-creation in the same transaction */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_add(&db, t_nm, s_ref, D(targets[25]), 2.0f, 5000));
+
+    /* Reinforce a staged link */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_reinforce(&db, t_nm, s_ref, D(targets[50]), 3.0f, 6000));
+
+    /* 1:1 cardinality check within open transaction */
+    t_ref = D(targets[0]);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_add(&db, t_11, s_ref, t_ref, 1.0f, 100));
+    /* Target already has incoming 1:1 link in open transaction: rejected */
+    TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_link_add(&db, t_11, D(targets[1]), t_ref, 1.0f, 200));
+    /* Source already has outgoing 1:1 link in open transaction: rejected */
+    TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_link_add(&db, t_11, s_ref, D(targets[2]), 1.0f, 300));
+
+    commit();
+
+    /* Verify committed state */
+    TEST_ASSERT_EQUAL_size_t(100, count_all(s_ref, CDB_LINK_OUT, t_nm));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+static void test_staging_links_overflow(void)
+{
+    uint64_t t, src, targets[20];
+    int i;
+
+    /* Tiny idx_stage forcing overflow fallback */
+    cfg.idx_stage_size = 32;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    pool = make_pool("overflow_docs");
+    t = define("overflow_links", CDB_CARD_N_M, 1, CDB_LINK_ON_DELETE_TOMBSTONE);
+
+    begin();
+    src = new_doc();
+    for (i = 0; i < 20; i++) {
+        targets[i] = new_doc();
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_add(&db, t, D(src), D(targets[i]), 1.0f, (int64_t)i));
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_E_EXISTS, cdb_link_add(&db, t, D(src), D(targets[5]), 1.0f, 999));
+    commit();
+
+    TEST_ASSERT_EQUAL_size_t(20, count_all(D(src), CDB_LINK_OUT, t));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 static void test_crash_sweep(void)
 {
     const cdb_crash_mode modes[4] = { CDB_CRASH_DROP_UNSYNCED, CDB_CRASH_KEEP_PREFIX, CDB_CRASH_TORN,
@@ -558,6 +650,8 @@ int main(void)
     RUN_TEST(test_cardinality);
     RUN_TEST(test_delete_rules);
     RUN_TEST(test_drop_store);
+    RUN_TEST(test_staging_links_batch);
+    RUN_TEST(test_staging_links_overflow);
     RUN_TEST(test_crash_sweep);
     return UNITY_END();
 }

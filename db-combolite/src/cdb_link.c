@@ -322,6 +322,13 @@ static int state_of(const cdb_link *l)
     return (l->flags & (CDB_LINK_SOURCE_GONE | CDB_LINK_TARGET_GONE)) ? TOMB : REMOVED;
 }
 
+static void stage_link_key(uint8_t *k, uint64_t type, cdb_ref s, cdb_ref t)
+{
+    cdb_store_u64(k, type, CDB_ORDER_BIG);
+    put_ref(k + 8, s);
+    put_ref(k + 24, t);
+}
+
 /* A link as the open transaction sees it: the committed row, then the
  * transaction's own records for the pair, in order. The state changes
  * mirror cdb_link_apply: a create makes a never-linked or removed pair live,
@@ -329,13 +336,26 @@ static int state_of(const cdb_link *l)
 static cdb_status tx_state(cdb_db *db, uint64_t type, cdb_ref s, cdb_ref t, int *state)
 {
     cdb_link l;
-    uint64_t off = db->tx_start;
+    uint64_t off = db->tx_start, st_entry;
     txrec r;
-    int found, done;
+    int found, done, st_live, st_found;
     cdb_status st;
+    uint8_t lk[40];
+
+    stage_link_key(lk, type, s, t);
+    if ((st = cdb_stage_idx_get(db, db->links.store_id, 0, lk, sizeof lk, &st_entry, &st_live, &st_found)) != CDB_OK)
+        return st;
+    if (st_found) {
+        *state = st_live ? LIVE : REMOVED;
+        return CDB_OK;
+    }
+
     if ((st = row_get(&db->links, type, s, t, &l, &found)) != CDB_OK)
         return st;
     *state = found ? state_of(&l) : NONE;
+    if (!db->stage_idx_overflow)
+        return CDB_OK;
+
     for (;;) {
         if ((st = tx_next(db, &off, &r, &done)) != CDB_OK || done)
             return st;
@@ -401,6 +421,39 @@ static cdb_status any_live(cdb_db *db, int direction, cdb_ref e, uint64_t type, 
     if (s != CDB_OK)
         return s;
     /* Pass 2: links this transaction made. */
+    if (!db->stage_idx_overflow) {
+        size_t off_st = 0;
+        while (off_st < db->stage_idx_used) {
+            const uint8_t *rec = db->idx_stage + off_st;
+            uint64_t st_store = cdb_load_u64(rec, CDB_ORDER_BIG);
+            uint16_t r_klen = cdb_load_u16(rec + 20, CDB_ORDER_BIG);
+            size_t rec_len = 24u + (size_t)r_klen;
+            if (st_store == ls->store_id && r_klen == 40u) {
+                const uint8_t *k = rec + 24u;
+                uint64_t r_type = cdb_load_u64(k, CDB_ORDER_BIG);
+                cdb_ref r_source = get_ref(k + 8);
+                cdb_ref r_target = get_ref(k + 24);
+                cdb_ref end = direction == CDB_LINK_IN ? r_target : r_source;
+                if (end.store == e.store && end.entry == e.entry && (!type || r_type == type)) {
+                    int counts = 1;
+                    if (refuse_only) {
+                        if ((s = type_of(db, r_type, &ti)) != CDB_OK)
+                            return s;
+                        counts = (ti.on_delete == CDB_LINK_ON_DELETE_REFUSE);
+                    }
+                    if (counts && (s = tx_state(db, r_type, r_source, r_target, &state)) != CDB_OK)
+                        return s;
+                    if (counts && state == LIVE) {
+                        *any = 1;
+                        return CDB_OK;
+                    }
+                }
+            }
+            off_st += rec_len;
+        }
+        return CDB_OK;
+    }
+
     for (;;) {
         cdb_ref end;
         if ((s = tx_next(db, &off, &r, &done)) != CDB_OK || done)
@@ -545,7 +598,13 @@ cdb_status cdb_link_add(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref targe
                 return CDB_E_STATE; /* the source has its one target */
         }
     }
-    return put_link(db, MODE_CREATE, type, source, target, weight, time);
+    if ((s = put_link(db, MODE_CREATE, type, source, target, weight, time)) != CDB_OK)
+        return s;
+    {
+        uint8_t lk[40];
+        stage_link_key(lk, type, source, target);
+        return cdb_stage_idx_put(db, db->links.store_id, 0, lk, sizeof lk, type, 1);
+    }
 }
 
 cdb_status cdb_link_reinforce(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, float weight,
@@ -562,7 +621,13 @@ cdb_status cdb_link_reinforce(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref
         return s;
     if (state != LIVE)
         return CDB_E_NOT_FOUND;
-    return put_link(db, MODE_REINFORCE, type, source, target, weight, time);
+    if ((s = put_link(db, MODE_REINFORCE, type, source, target, weight, time)) != CDB_OK)
+        return s;
+    {
+        uint8_t lk[40];
+        stage_link_key(lk, type, source, target);
+        return cdb_stage_idx_put(db, db->links.store_id, 0, lk, sizeof lk, type, 1);
+    }
 }
 
 cdb_status cdb_link_remove(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target)
@@ -580,7 +645,13 @@ cdb_status cdb_link_remove(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref ta
     cdb_store_u64(p, type, CDB_ORDER_BIG);
     put_ref(p + 8, source);
     put_ref(p + 24, target);
-    return cdb_tx_put(db, db->links.store_id, 0, CDB_OP_UNLINK, p, sizeof p);
+    if ((s = cdb_tx_put(db, db->links.store_id, 0, CDB_OP_UNLINK, p, sizeof p)) != CDB_OK)
+        return s;
+    {
+        uint8_t lk[40];
+        stage_link_key(lk, type, source, target);
+        return cdb_stage_idx_put(db, db->links.store_id, 0, lk, sizeof lk, type, 0);
+    }
 }
 
 /* Only incoming links are checked: a refuse type protects the target of a

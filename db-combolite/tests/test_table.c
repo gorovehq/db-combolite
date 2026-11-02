@@ -30,6 +30,7 @@ static cdb_index_entry cat_entries[512];
 static uint8_t cat_page[PAGE];
 static uint8_t doc_buffers[8u * PAGE];
 static uint8_t doc_stage[4096];
+static uint8_t idx_stage[16u * 1024u];
 static uint8_t table_buffers[4u * PAGE];
 static uint8_t page[PAGE];
 static cdb_db_config cfg;
@@ -69,6 +70,8 @@ void setUp(void)
     cfg.doc_buffers = doc_buffers;
     cfg.doc_stage = doc_stage;
     cfg.doc_stage_size = sizeof doc_stage;
+    cfg.idx_stage = idx_stage;
+    cfg.idx_stage_size = sizeof idx_stage;
     cfg.table_buffers = table_buffers;
     cfg.durability = CDB_DURABILITY_FULL;
     TEST_ASSERT_EQUAL_size_t(cdb_table_buffers_size(PAGE, 0), sizeof table_buffers);
@@ -621,6 +624,28 @@ static void test_staging_unique_batch(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+/* Verifies that when idx_stage buffer is exhausted or absent, unique checks
+ * gracefully fall back to doc_stage and journal scanning. */
+static void test_staging_unique_overflow(void)
+{
+    uint64_t e, entries[20];
+    int i;
+
+    /* Test with tiny idx_stage forcing overflow */
+    cfg.idx_stage_size = 32;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_EQUAL_INT(CDB_OK, make_table(0));
+
+    begin();
+    for (i = 0; i < 20; i++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, insert(2000 + i, "overflow", i, &entries[i]));
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_E_EXISTS, insert(2005, "dupe", 999, &e));
+    commit();
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 /* With keep 1, a row updated many times keeps one revision, so its pages
  * stay few; a delete removes the row. With history on they grow. */
 static unsigned live_pages(void)
@@ -801,6 +826,7 @@ int main(void)
     RUN_TEST(test_schema_changes);
     RUN_TEST(test_secondary_index);
     RUN_TEST(test_staging_unique_batch);
+    RUN_TEST(test_staging_unique_overflow);
     RUN_TEST(test_revision_window);
     RUN_TEST(test_crash_sweep);
     return UNITY_END();
