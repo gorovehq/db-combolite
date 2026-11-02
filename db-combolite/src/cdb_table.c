@@ -664,14 +664,45 @@ static cdb_status check_keys(cdb_db *db, const table *t, uint64_t self, size_t l
         /* A committed row with the key, unless this transaction changed it. */
         if ((s = cdb_index_get((cdb_index *)&x->ix, key, klen, v, sizeof v, &vlen, &found)) != CDB_OK)
             return s;
-        if (found && vlen == 8 && (s = has_key(&c, cdb_load_u64(v, CDB_ORDER_BIG), CDB_STAGE_OFF_NONE)) != CDB_OK)
-            return s;
+        if (found && vlen == 8) {
+            uint64_t committed_entry = cdb_load_u64(v, CDB_ORDER_BIG);
+            if (committed_entry != self) {
+                uint64_t st_entry = 0;
+                int st_live = 0, st_found = 0;
+                if ((s = cdb_stage_idx_get(db, t->slot.store_id, (uint8_t)i, key, klen,
+                                           &st_entry, &st_live, &st_found)) != CDB_OK)
+                    return s;
+                if (st_found) {
+                    if (st_live)
+                        return CDB_E_EXISTS;
+                } else if (!db->stage_idx_overflow) {
+                    return CDB_E_EXISTS;
+                } else {
+                    if ((s = has_key(&c, committed_entry, CDB_STAGE_OFF_NONE)) != CDB_OK)
+                        return s;
+                    if (c.clash)
+                        return CDB_E_EXISTS;
+                }
+            }
+        }
         /* Rows this transaction inserted or changed. The row in T_ROW is
          * untouched: has_key reads into T_OTHER. */
-        if (!c.clash && (s = cdb_doc_tx_entries(db, t->slot.store_id, tx_entry, &c)) != CDB_OK)
-            return s;
-        if (c.clash)
-            return CDB_E_EXISTS;
+        if (!c.clash) {
+            uint64_t st_entry = 0;
+            int st_live = 0, st_found = 0;
+            if ((s = cdb_stage_idx_get(db, t->slot.store_id, (uint8_t)i, key, klen,
+                                       &st_entry, &st_live, &st_found)) != CDB_OK)
+                return s;
+            if (st_found) {
+                if (st_live && st_entry != self)
+                    return CDB_E_EXISTS;
+            } else if (db->stage_idx_overflow) {
+                if ((s = cdb_doc_tx_entries(db, t->slot.store_id, tx_entry, &c)) != CDB_OK)
+                    return s;
+                if (c.clash)
+                    return CDB_E_EXISTS;
+            }
+        }
     }
     return CDB_OK;
 }
@@ -731,14 +762,27 @@ static cdb_status insert_row(cdb_db *db, uint64_t store, const void *row, size_t
         return CDB_E_OVERFLOW;
     if ((s = cdb_doc_insert(db, store, NULL, 0, tbuf(db, T_ROW), n, entry)) != CDB_OK)
         return s;
+    {
+        unsigned i;
+        for (i = 0; i < t->nidx; i++) {
+            const idx *x = &t->idx[i];
+            if (x->unique) {
+                uint8_t k[CDB_TABLE_KEY_MAX + 8u];
+                size_t klen;
+                int null;
+                if (row_key(db, t, x, tbuf(db, T_ROW), n, t->version, *entry, k, &klen, &null) == CDB_OK && !null)
+                    cdb_stage_idx_put(db, store, (uint8_t)i, k, klen, *entry, 1);
+            }
+        }
+    }
     return write_keys(db, t, *entry, n);
 }
 
 static cdb_status replace_row(cdb_db *db, uint64_t store, uint64_t entry, const void *row, size_t len, int update)
 {
     table *t;
-    size_t n, cur = 0;
-    uint32_t version;
+    size_t n, cur = 0, old_raw = 0;
+    uint32_t version = 0;
     int live = 1;
     cdb_status s;
     if ((s = tx_table(db, store, &t)) != CDB_OK)
@@ -747,14 +791,16 @@ static cdb_status replace_row(cdb_db *db, uint64_t store, uint64_t entry, const 
         return CDB_E_OVERFLOW;
     if (update) {
         /* The row as this transaction sees it, through the current columns. */
-        size_t raw;
         if ((s = cdb_doc_get_in_tx(db, store, entry, CDB_STAGE_OFF_NONE, tbuf(db, T_OTHER), tbuf_size(db),
-                                   &raw, &live, &version)) != CDB_OK)
+                                   &old_raw, &live, &version)) != CDB_OK)
             return s;
         if (!live)
             return CDB_E_NOT_FOUND;
-        if ((s = project(db, t, tbuf(db, T_OTHER), raw, version, tbuf(db, T_CUR), tbuf_size(db), &cur)) != CDB_OK)
+        if ((s = project(db, t, tbuf(db, T_OTHER), old_raw, version, tbuf(db, T_CUR), tbuf_size(db), &cur)) != CDB_OK)
             return s;
+    } else {
+        (void)cdb_doc_get_in_tx(db, store, entry, CDB_STAGE_OFF_NONE, tbuf(db, T_OTHER), tbuf_size(db),
+                                &old_raw, &live, &version);
     }
     if ((s = normalize(db, t, (const uint8_t *)row, len, update ? tbuf(db, T_CUR) : NULL, cur, 0, &n)) != CDB_OK
         || (s = check_keys(db, t, entry, n)) != CDB_OK)
@@ -763,6 +809,31 @@ static cdb_status replace_row(cdb_db *db, uint64_t store, uint64_t entry, const 
         return CDB_E_OVERFLOW;
     if ((s = cdb_doc_replace(db, store, entry, NULL, 0, tbuf(db, T_ROW), n)) != CDB_OK)
         return s;
+    if (live) {
+        unsigned i;
+        for (i = 0; i < t->nidx; i++) {
+            if (t->idx[i].unique) {
+                uint8_t ok[CDB_TABLE_KEY_MAX + 8u];
+                size_t oklen;
+                int onull;
+                if (row_key(db, t, &t->idx[i], tbuf(db, T_OTHER), old_raw, version, entry, ok, &oklen, &onull) == CDB_OK && !onull)
+                    cdb_stage_idx_put(db, store, (uint8_t)i, ok, oklen, entry, 0);
+            }
+        }
+    }
+    {
+        unsigned i;
+        for (i = 0; i < t->nidx; i++) {
+            const idx *x = &t->idx[i];
+            if (x->unique) {
+                uint8_t nk[CDB_TABLE_KEY_MAX + 8u];
+                size_t nklen;
+                int nnull;
+                if (row_key(db, t, x, tbuf(db, T_ROW), n, t->version, entry, nk, &nklen, &nnull) == CDB_OK && !nnull)
+                    cdb_stage_idx_put(db, store, (uint8_t)i, nk, nklen, entry, 1);
+            }
+        }
+    }
     return write_keys(db, t, entry, n);
 }
 
@@ -799,8 +870,25 @@ cdb_status cdb_table_delete(cdb_db *db, uint64_t store, uint64_t entry)
     cdb_status s;
     db->via_table = 1;
     s = tx_table(db, store, &t);
-    if (s == CDB_OK)
+    if (s == CDB_OK) {
+        size_t raw;
+        int live = 0;
+        uint32_t version = 0;
+        if (cdb_doc_get_in_tx(db, store, entry, CDB_STAGE_OFF_NONE, tbuf(db, T_OTHER), tbuf_size(db),
+                              &raw, &live, &version) == CDB_OK && live) {
+            unsigned i;
+            for (i = 0; i < t->nidx; i++) {
+                if (t->idx[i].unique) {
+                    uint8_t k[CDB_TABLE_KEY_MAX + 8u];
+                    size_t klen;
+                    int null;
+                    if (row_key(db, t, &t->idx[i], tbuf(db, T_OTHER), raw, version, entry, k, &klen, &null) == CDB_OK && !null)
+                        cdb_stage_idx_put(db, store, (uint8_t)i, k, klen, entry, 0);
+                }
+            }
+        }
         s = cdb_doc_delete(db, store, entry);
+    }
     db->via_table = 0;
     return s;
 }

@@ -1000,8 +1000,12 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
         return CDB_E_INVALID_ARG;
     memset(db, 0, sizeof *db);
     memset(db->stage_buckets, 0xFF, sizeof db->stage_buckets);
+    memset(db->stage_idx_buckets, 0xFF, sizeof db->stage_idx_buckets);
     db->env = *env;
     db->cfg = *cfg;
+    db->idx_stage = cfg->idx_stage;
+    db->idx_stage_size = cfg->idx_stage_size;
+    db->stage_idx_overflow = (db->idx_stage == NULL || db->idx_stage_size == 0) ? 1 : 0;
     db->aead_alg = cfg->aead_alg;
     db->is_production = cfg->is_production;
     db->key_provider = cfg->key_provider;
@@ -1396,6 +1400,9 @@ static cdb_status tx_begin_locked(cdb_db *db, cdb_durability durability)
     db->stage_used = 0;
     db->stage_overflow = 0;
     memset(db->stage_buckets, 0xFF, sizeof db->stage_buckets);
+    db->stage_idx_used = 0;
+    db->stage_idx_overflow = (db->idx_stage == NULL || db->idx_stage_size == 0) ? 1 : 0;
+    memset(db->stage_idx_buckets, 0xFF, sizeof db->stage_idx_buckets);
     db->tx_durability = durability == CDB_DURABILITY_DEFAULT ? db->cfg.durability : durability;
     return CDB_OK;
 }
@@ -1407,6 +1414,94 @@ cdb_status cdb_tx_begin(cdb_db *db, cdb_durability durability)
     s = tx_begin_locked(db, durability);
     db_unlock(db);
     return s;
+}
+
+#define STAGE_IDX_HDR 24u
+
+static inline unsigned stage_idx_bucket(uint64_t store, uint8_t idx_no, const uint8_t *key, size_t klen)
+{
+    uint64_t h = (store * 0x517cc1b727220a95ULL) ^ ((uint64_t)idx_no * 0x9e3779b97f4a7c15ULL);
+    size_t i;
+    for (i = 0; i < klen; i++) {
+        h ^= (uint64_t)key[i];
+        h *= 0x100000001b3ULL;
+    }
+    return (unsigned)(((h ^ (h >> 32)) & (uint64_t)(CDB_STAGE_IDX_BUCKETS - 1u)));
+}
+
+cdb_status cdb_stage_idx_put(cdb_db *db, uint64_t store, uint8_t idx_no, const uint8_t *key, size_t klen,
+                             uint64_t entry, int live)
+{
+    unsigned b;
+    size_t need, rec_off;
+    uint8_t *r;
+
+    if (db == NULL || db->stage_idx_overflow)
+        return CDB_OK;
+    if (db->idx_stage == NULL || db->idx_stage_size == 0 || klen > 0xFFFFu) {
+        db->stage_idx_overflow = 1;
+        return CDB_OK;
+    }
+    need = STAGE_IDX_HDR + klen;
+    if (need > db->idx_stage_size || db->stage_idx_used > db->idx_stage_size - need) {
+        db->stage_idx_overflow = 1;
+        return CDB_OK;
+    }
+
+    b = stage_idx_bucket(store, idx_no, key, klen);
+    rec_off = db->stage_idx_used;
+    r = db->idx_stage + rec_off;
+
+    cdb_store_u64(r, store, CDB_ORDER_BIG);
+    cdb_store_u64(r + 8, entry, CDB_ORDER_BIG);
+    cdb_store_u32(r + 16, db->stage_idx_buckets[b], CDB_ORDER_BIG);
+    cdb_store_u16(r + 20, (uint16_t)klen, CDB_ORDER_BIG);
+    r[22] = idx_no;
+    r[23] = (uint8_t)(live ? 1u : 0u);
+    if (klen)
+        memcpy(r + STAGE_IDX_HDR, key, klen);
+
+    db->stage_idx_buckets[b] = (uint32_t)rec_off;
+    db->stage_idx_used += need;
+    return CDB_OK;
+}
+
+cdb_status cdb_stage_idx_get(const cdb_db *db, uint64_t store, uint8_t idx_no, const uint8_t *key, size_t klen,
+                             uint64_t *entry, int *live, int *found)
+{
+    unsigned b;
+    uint32_t off;
+
+    if (found == NULL)
+        return CDB_E_INVALID_ARG;
+    *found = 0;
+    if (db == NULL || db->idx_stage == NULL || db->stage_idx_used == 0 || klen > 0xFFFFu)
+        return CDB_OK;
+
+    b = stage_idx_bucket(store, idx_no, key, klen);
+    off = db->stage_idx_buckets[b];
+
+    while (off != CDB_STAGE_NIL) {
+        const uint8_t *r;
+        uint16_t r_klen;
+        if (off > db->stage_idx_used || db->stage_idx_used - off < STAGE_IDX_HDR)
+            return CDB_E_CORRUPT;
+        r = db->idx_stage + off;
+        r_klen = cdb_load_u16(r + 20, CDB_ORDER_BIG);
+        if (db->stage_idx_used - off < STAGE_IDX_HDR + (size_t)r_klen)
+            return CDB_E_CORRUPT;
+        if (cdb_load_u64(r, CDB_ORDER_BIG) == store && r[22] == idx_no && (size_t)r_klen == klen
+            && (klen == 0 || memcmp(r + STAGE_IDX_HDR, key, klen) == 0)) {
+            if (entry != NULL)
+                *entry = cdb_load_u64(r + 8, CDB_ORDER_BIG);
+            if (live != NULL)
+                *live = r[23] ? 1 : 0;
+            *found = 1;
+            return CDB_OK;
+        }
+        off = cdb_load_u32(r + 16, CDB_ORDER_BIG);
+    }
+    return CDB_OK;
 }
 
 /* Journals one change. The payload (op byte + data) is assembled directly

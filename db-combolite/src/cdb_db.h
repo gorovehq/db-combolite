@@ -23,6 +23,7 @@
 
 /* Staging hash table for transactions (spec 14.9, 14.4). */
 #define CDB_STAGE_BUCKETS 512u
+#define CDB_STAGE_IDX_BUCKETS 512u
 #define CDB_STAGE_NIL 0xFFFFFFFFu
 
 #define CDB_DB_PATH_MAX 200         /* longest path, including the terminating zero */
@@ -101,6 +102,8 @@ typedef struct cdb_db_config {
     unsigned checkpoint_every;    /* documents: full revision every N; 0 means 16 */
     uint8_t *doc_stage;           /* documents: per-transaction staging (cdb_doc.h) */
     size_t doc_stage_size;
+    uint8_t *idx_stage;           /* index & link staging: table unique checks & links */
+    size_t idx_stage_size;
     uint8_t *fts_buffers;         /* full-text: cdb_fts_buffers_size() bytes (cdb_fts.h) */
     uint8_t *vec_buffers;         /* vectors: 3 * page_size bytes (cdb_vec.h) */
     uint8_t *vec_work;            /* vectors with a neighbour graph: working memory (cdb_vec.h) */
@@ -314,6 +317,11 @@ typedef struct cdb_db {
     size_t stage_used;    /* bytes of doc_stage in use by the open transaction */
     int stage_overflow;   /* a change could not be staged: consult the journal */
     uint32_t stage_buckets[CDB_STAGE_BUCKETS]; /* head offset in doc_stage or CDB_STAGE_NIL */
+    uint8_t *idx_stage;
+    size_t idx_stage_size;
+    size_t stage_idx_used;
+    int stage_idx_overflow;
+    uint32_t stage_idx_buckets[CDB_STAGE_IDX_BUCKETS];
     int set_aside;        /* recovery set a companion aside (spec 1.12.2) */
     int via_table;        /* the table layer is calling the document engine (cdb_table.h) */
     unsigned op_depth;    /* operation scopes open (cdb_db_op_begin) */
@@ -490,5 +498,11 @@ cdb_status cdb_db_blob_read_begin(cdb_db *db, uint64_t store_id, const cdb_blob_
 cdb_status cdb_db_blob_read_chunk(cdb_blob_reader *r, void *dest, size_t cap, size_t *out_len);
 cdb_status cdb_db_blob_read_end(cdb_blob_reader *r);
 cdb_status cdb_db_blob_free(cdb_db *db, uint64_t store_id, const cdb_blob_ref *ref, uint8_t *page_buf);
+
+/* Staging cache for index keys and links (spec 14.4, backlog L69/L74). */
+cdb_status cdb_stage_idx_put(cdb_db *db, uint64_t store, uint8_t idx_no, const uint8_t *key, size_t klen,
+                             uint64_t entry, int live);
+cdb_status cdb_stage_idx_get(const cdb_db *db, uint64_t store, uint8_t idx_no, const uint8_t *key, size_t klen,
+                             uint64_t *entry, int *live, int *found);
 
 #endif
