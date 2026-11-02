@@ -8,6 +8,7 @@
  * detect by its marker, length or CRC and treat as the end of the journal. */
 #include <string.h>
 
+#include "combolite/cdb_crypto.h"
 #include "cdb_crc32c.h"
 #include "cdb_endian.h"
 #include "cdb_journal.h"
@@ -102,10 +103,12 @@ static size_t record_size(uint32_t payload_len)
  * CRC32C over header and payload, padded with 12 zero bytes; the space is
  * sized for a future AEAD tag (spec 14.4.2). The handle's end and sequence
  * advance only if the write succeeds. */
-cdb_status cdb_journal_append(cdb_journal *j, cdb_record *r, uint8_t *buf, size_t buf_size)
+cdb_status cdb_journal_append_crypto(cdb_journal *j, cdb_record *r, uint8_t *buf, size_t buf_size,
+                                     unsigned aead_alg, const uint8_t *key)
 {
     size_t size = record_size(r->payload_len);
     uint8_t *p = buf;
+    uint8_t *trailer;
     cdb_status s;
 
     if (size > buf_size)
@@ -125,9 +128,25 @@ cdb_status cdb_journal_append(cdb_journal *j, cdb_record *r, uint8_t *buf, size_
     cdb_store_u32(p + 40, r->key_version, j->order);
     if (r->payload_len) /* the payload may already sit in place inside buf */
         memmove(p + CDB_RECORD_HEADER_SIZE, r->payload, r->payload_len);
-    memset(p + size - CDB_RECORD_TRAILER_SIZE, 0, CDB_RECORD_TRAILER_SIZE);
-    cdb_store_u32(p + size - CDB_RECORD_TRAILER_SIZE,
-                  cdb_crc32c(p, size - CDB_RECORD_TRAILER_SIZE), j->order);
+
+    trailer = p + size - CDB_RECORD_TRAILER_SIZE;
+
+    if (r->flags & CDB_RECORD_FLAG_ENCRYPTED) {
+        uint8_t nonce[CDB_AEAD_NONCE_SIZE];
+        uint32_t track_id = ((uint32_t)j->hdr.slot << 16) | (uint32_t)j->hdr.type_id;
+        if (key == NULL || aead_alg == CDB_AEAD_NONE)
+            return CDB_E_INVALID_ARG;
+        cdb_crypto_make_nonce(track_id, r->seq, nonce);
+        s = cdb_crypto_aead_encrypt(aead_alg, key, nonce, p, CDB_RECORD_HEADER_SIZE,
+                                    p + CDB_RECORD_HEADER_SIZE, r->payload_len,
+                                    p + CDB_RECORD_HEADER_SIZE, trailer);
+        if (s != CDB_OK)
+            return s;
+    } else {
+        memset(trailer, 0, CDB_RECORD_TRAILER_SIZE);
+        cdb_store_u32(trailer, cdb_crc32c(p, size - CDB_RECORD_TRAILER_SIZE), j->order);
+    }
+
     if ((s = cdb_storage_program(&j->st, j->end, p, size)) != CDB_OK)
         return s;
     j->end += size;
@@ -135,14 +154,18 @@ cdb_status cdb_journal_append(cdb_journal *j, cdb_record *r, uint8_t *buf, size_
     return CDB_OK;
 }
 
-/* Two reads: the fixed header first (to learn the payload length), then the
- * payload and trailer. Nothing in the header is trusted until the CRC over
- * the whole record has been checked. */
-cdb_status cdb_journal_read(cdb_journal *j, uint64_t offset, uint8_t *buf, size_t buf_size,
-                            cdb_record *r, uint64_t *next)
+cdb_status cdb_journal_append(cdb_journal *j, cdb_record *r, uint8_t *buf, size_t buf_size)
+{
+    return cdb_journal_append_crypto(j, r, buf, buf_size, CDB_AEAD_NONE, NULL);
+}
+
+cdb_status cdb_journal_read_crypto(cdb_journal *j, uint64_t offset, uint8_t *buf, size_t buf_size,
+                                   cdb_record *r, uint64_t *next,
+                                   unsigned aead_alg, const uint8_t *key)
 {
     uint32_t payload_len;
-    size_t size, i;
+    size_t size;
+    uint8_t *trailer;
     cdb_status s;
 
     if (buf_size < CDB_RECORD_HEADER_SIZE + CDB_RECORD_TRAILER_SIZE)
@@ -161,13 +184,9 @@ cdb_status cdb_journal_read(cdb_journal *j, uint64_t offset, uint8_t *buf, size_
     if ((s = cdb_storage_read(&j->st, offset + CDB_RECORD_HEADER_SIZE, buf + CDB_RECORD_HEADER_SIZE,
                               size - CDB_RECORD_HEADER_SIZE)) != CDB_OK)
         return s;
-    if (cdb_load_u32(buf + size - CDB_RECORD_TRAILER_SIZE, j->order)
-        != cdb_crc32c(buf, size - CDB_RECORD_TRAILER_SIZE))
-        return CDB_E_CORRUPT;
-    /* The 12 padding bytes after the CRC must be zero. */
-    for (i = size - CDB_RECORD_TRAILER_SIZE + 4; i < size; i++)
-        if (buf[i])
-            return CDB_E_CORRUPT;
+
+    trailer = buf + size - CDB_RECORD_TRAILER_SIZE;
+
     /* Verified: decode the header. r->payload points into buf. */
     memset(r, 0, sizeof *r);
     r->kind = buf[2];
@@ -179,8 +198,36 @@ cdb_status cdb_journal_read(cdb_journal *j, uint64_t offset, uint8_t *buf, size_
     r->entry_id = cdb_load_u64(buf + 32, j->order);
     r->key_version = cdb_load_u32(buf + 40, j->order);
     r->payload = buf + CDB_RECORD_HEADER_SIZE;
+
+    if (r->flags & CDB_RECORD_FLAG_ENCRYPTED) {
+        uint8_t nonce[CDB_AEAD_NONCE_SIZE];
+        uint32_t track_id = ((uint32_t)j->hdr.slot << 16) | (uint32_t)j->hdr.type_id;
+        if (key == NULL || aead_alg == CDB_AEAD_NONE)
+            return CDB_E_SECURITY;
+        cdb_crypto_make_nonce(track_id, r->seq, nonce);
+        s = cdb_crypto_aead_decrypt(aead_alg, key, nonce, buf, CDB_RECORD_HEADER_SIZE,
+                                    buf + CDB_RECORD_HEADER_SIZE, payload_len,
+                                    trailer, buf + CDB_RECORD_HEADER_SIZE);
+        if (s != CDB_OK)
+            return CDB_E_CORRUPT;
+    } else {
+        size_t i;
+        if (cdb_load_u32(trailer, j->order) != cdb_crc32c(buf, size - CDB_RECORD_TRAILER_SIZE))
+            return CDB_E_CORRUPT;
+        /* The 12 padding bytes after the CRC must be zero. */
+        for (i = size - CDB_RECORD_TRAILER_SIZE + 4; i < size; i++)
+            if (buf[i])
+                return CDB_E_CORRUPT;
+    }
+
     *next = offset + size;
     return CDB_OK;
+}
+
+cdb_status cdb_journal_read(cdb_journal *j, uint64_t offset, uint8_t *buf, size_t buf_size,
+                            cdb_record *r, uint64_t *next)
+{
+    return cdb_journal_read_crypto(j, offset, buf, buf_size, r, next, CDB_AEAD_NONE, NULL);
 }
 
 /* Commit record payload (spec 14.4.4): commit number, timestamp, principal,

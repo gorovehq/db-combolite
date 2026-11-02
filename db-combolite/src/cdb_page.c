@@ -6,6 +6,7 @@
  * zero (room for an AEAD tag later, spec 14.2.4). */
 #include <string.h>
 
+#include "combolite/cdb_crypto.h"
 #include "cdb_crc32c.h"
 #include "cdb_endian.h"
 #include "cdb_page.h"
@@ -81,8 +82,10 @@ static uint64_t load_id(const uint8_t *p, unsigned width, cdb_byte_order o)
     return cdb_load_u16(p, o);
 }
 
-cdb_status cdb_page_seal(uint8_t *page, size_t page_size, cdb_page_format fmt,
-                         cdb_byte_order order, unsigned checksum_alg, const cdb_page_header *h)
+cdb_status cdb_page_seal_crypto(uint8_t *page, size_t page_size, cdb_page_format fmt,
+                               cdb_byte_order order, unsigned checksum_alg,
+                               unsigned aead_alg, const uint8_t *key,
+                               const cdb_page_header *h)
 {
     size_t hsize = cdb_page_header_size(fmt);
     size_t tsize = cdb_page_trailer_size(fmt);
@@ -131,16 +134,46 @@ cdb_status cdb_page_seal(uint8_t *page, size_t page_size, cdb_page_format fmt,
         cdb_store_u16(page + ids + 3 * w, h->extent_pos, order);
     }
 
-    /* Trailer last: the CRC covers header, payload and any unused bytes
-     * between them. */
     trailer = page + page_size - tsize;
-    memset(trailer, 0, tsize);
-    cdb_store_u32(trailer, cdb_crc32c(page, page_size - tsize), order);
+
+    /* Authenticated encryption or integrity tag */
+    if (h->domain_id > 0 && aead_alg != CDB_AEAD_NONE) {
+        uint8_t nonce[CDB_AEAD_NONCE_SIZE];
+        size_t cap = page_size - hsize - tsize;
+        if (key == NULL)
+            return CDB_E_INVALID_ARG;
+        cdb_crypto_make_nonce(CDB_TRACK_ARCHIVE_PAGE, h->write_seq, nonce);
+        s = cdb_crypto_aead_encrypt(aead_alg, key, nonce, page, hsize,
+                                    page + hsize, cap, page + hsize, trailer);
+        if (s != CDB_OK)
+            return s;
+    } else if (h->flags & CDB_PAGE_FLAG_TAMPER_EVIDENT) {
+        uint8_t mac[CDB_CRYPTO_HASH_SIZE];
+        if (key == NULL)
+            return CDB_E_INVALID_ARG;
+        s = cdb_crypto_hmac_sha256(key, page, page_size - tsize, mac);
+        if (s != CDB_OK)
+            return s;
+        memcpy(trailer, mac, 16);
+    } else {
+        /* Trailer last: the CRC covers header, payload and any unused bytes between them. */
+        memset(trailer, 0, tsize);
+        cdb_store_u32(trailer, cdb_crc32c(page, page_size - tsize), order);
+    }
+
     return CDB_OK;
 }
 
-cdb_status cdb_page_open(const uint8_t *page, size_t page_size, cdb_page_format fmt,
-                         cdb_byte_order order, unsigned checksum_alg, cdb_page_header *h)
+cdb_status cdb_page_seal(uint8_t *page, size_t page_size, cdb_page_format fmt,
+                         cdb_byte_order order, unsigned checksum_alg, const cdb_page_header *h)
+{
+    return cdb_page_seal_crypto(page, page_size, fmt, order, checksum_alg, CDB_AEAD_NONE, NULL, h);
+}
+
+cdb_status cdb_page_open_crypto(uint8_t *page, size_t page_size, cdb_page_format fmt,
+                               cdb_byte_order order, unsigned checksum_alg,
+                               unsigned aead_alg, const uint8_t *key,
+                               cdb_page_header *h)
 {
     size_t hsize = cdb_page_header_size(fmt);
     size_t tsize = cdb_page_trailer_size(fmt);
@@ -149,19 +182,10 @@ cdb_status cdb_page_open(const uint8_t *page, size_t page_size, cdb_page_format 
 
     if (s != CDB_OK)
         return s;
-    /* Integrity first (marker and CRC: CDB_E_CORRUPT), then form (zero
-     * padding and reserved bytes, payload length: CDB_E_MALFORMED). */
-    trailer = page + page_size - tsize;
     if (page[0] != MARKER_0 || page[1] != MARKER_1)
         return CDB_E_CORRUPT;
-    if (cdb_load_u32(trailer, order) != cdb_crc32c(page, page_size - tsize))
-        return CDB_E_CORRUPT;
-    {
-        size_t i;
-        for (i = 4; i < tsize; i++) /* checksum padding must be zero */
-            if (trailer[i])
-                return CDB_E_MALFORMED;
-    }
+
+    trailer = page + page_size - tsize;
 
     memset(h, 0, sizeof *h);
     h->type = cdb_load_u16(page + 2, order);
@@ -196,5 +220,44 @@ cdb_status cdb_page_open(const uint8_t *page, size_t page_size, cdb_page_format 
     }
     if (h->payload_len > cdb_page_capacity(fmt, page_size))
         return CDB_E_MALFORMED;
+
+    /* Integrity and Decryption verification */
+    if (h->domain_id > 0 && aead_alg != CDB_AEAD_NONE) {
+        uint8_t nonce[CDB_AEAD_NONCE_SIZE];
+        size_t cap = page_size - hsize - tsize;
+        if (key == NULL)
+            return CDB_E_SECURITY;
+        cdb_crypto_make_nonce(CDB_TRACK_ARCHIVE_PAGE, h->write_seq, nonce);
+        s = cdb_crypto_aead_decrypt(aead_alg, key, nonce, page, hsize,
+                                    page + hsize, cap, trailer, page + hsize);
+        if (s != CDB_OK)
+            return CDB_E_CORRUPT;
+    } else if (h->flags & CDB_PAGE_FLAG_TAMPER_EVIDENT) {
+        uint8_t mac[CDB_CRYPTO_HASH_SIZE];
+        if (key == NULL)
+            return CDB_E_SECURITY;
+        s = cdb_crypto_hmac_sha256(key, page, page_size - tsize, mac);
+        if (s != CDB_OK)
+            return s;
+        if (memcmp(trailer, mac, 16) != 0)
+            return CDB_E_CORRUPT;
+    } else {
+        if (cdb_load_u32(trailer, order) != cdb_crc32c(page, page_size - tsize))
+            return CDB_E_CORRUPT;
+        {
+            size_t i;
+            for (i = 4; i < tsize; i++) /* checksum padding must be zero */
+                if (trailer[i])
+                    return CDB_E_MALFORMED;
+        }
+    }
+
     return CDB_OK;
+}
+
+cdb_status cdb_page_open(const uint8_t *page, size_t page_size, cdb_page_format fmt,
+                         cdb_byte_order order, unsigned checksum_alg, cdb_page_header *h)
+{
+    return cdb_page_open_crypto((uint8_t *)(uintptr_t)page, page_size, fmt, order, checksum_alg,
+                                CDB_AEAD_NONE, NULL, h);
 }

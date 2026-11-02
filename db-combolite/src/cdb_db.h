@@ -12,6 +12,7 @@
 #define CDB_DB_H
 
 #include "combolite/cdb_env.h"
+#include "combolite/cdb_crypto.h"
 #include "cdb_catalog.h"
 #include "cdb_coord.h"
 #include "cdb_journal.h"
@@ -137,6 +138,16 @@ typedef struct cdb_db_config {
     size_t slot_mem_size;         /* in bytes */
     cdb_coord_config coord;       /* coordinators (spec 5.9): zeros take the defaults */
     unsigned worker_threads;      /* background worker pool threads; 0 means synchronous/disabled */
+    /* Security & Encryption (spec 12). */
+    const char *master_key_uri;
+    int is_production;
+    uint8_t aead_alg;
+    cdb_key_provider_fn key_provider;
+    void *key_provider_ctx;
+    uint32_t rotation_interval_days;
+    cdb_rotation_policy rotation_policy;
+    cdb_signing_policy signing_policy;
+    const cdb_identity *identity;
 } cdb_db_config;
 
 /* An open document pool (cdb_doc.h). */
@@ -322,6 +333,39 @@ typedef struct cdb_db {
     int hb_running;           /* 1 if hb_thread is running and must be joined */
     /* Background worker threads (spec 5.9.6, M20). */
     cdb_worker_pool workers;
+    /* Security, encryption & RBAC (spec 12). */
+    uint8_t master_key[32];
+    uint8_t integrity_key[32];
+    int has_master_key;
+    int has_integrity_key;
+    uint8_t aead_alg;
+    int is_production;
+    cdb_key_provider_fn key_provider;
+    void *key_provider_ctx;
+    uint32_t rotation_interval_days;
+    cdb_rotation_policy rotation_policy;
+    cdb_signing_policy signing_policy;
+    int rotation_expired;
+    cdb_identity active_identity;
+    int has_identity;
+    struct {
+        uint64_t enclave_id;
+        uint32_t key_version;
+        uint8_t enclave_key[32];
+        uint8_t page_key[32];
+        uint8_t hash_key[32];
+        uint8_t index_key[32];
+        int in_use;
+    } enclaves[16];
+    struct {
+        uint64_t principal_id;
+        uint32_t tenant_id;
+        uint8_t pubkey[33];
+        uint64_t scope;
+        uint8_t perms;
+        int in_use;
+    } rbac_grants[32];
+    unsigned num_grants;
 } cdb_db;
 
 /* Re-entrant synchronization locks across threads (spec 5.9.6, M20). */
@@ -415,5 +459,20 @@ cdb_status cdb_db_catalog_end(cdb_db *db, cdb_status s);
 /* Maintenance (spec 3.4, 3.7): reconciles, moves up to max_moves live pages
  * down into reusable space, and releases the free tail of the archive. */
 cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed);
+
+/* Security, enclaves, and key rotation (spec 12). */
+cdb_status cdb_db_create_enclave(cdb_db *db, uint64_t enclave_id, const char *key_ref);
+cdb_status cdb_db_open_enclave(cdb_db *db, uint64_t enclave_id, const char *key_ref);
+cdb_status cdb_db_rotate_master_key(cdb_db *db, const char *new_master_key_uri);
+cdb_status cdb_db_rotate_enclave_key(cdb_db *db, uint64_t enclave_id, const char *new_enclave_key_uri);
+cdb_status cdb_db_check_key_rotation(cdb_db *db);
+
+/* RBAC and principal identities (spec 12.5). */
+cdb_status cdb_db_register_principal(cdb_db *db, uint64_t principal_id, uint32_t tenant_id,
+                                     const uint8_t pubkey[33]);
+cdb_status cdb_db_grant_role(cdb_db *db, uint64_t principal_id, uint32_t role_id,
+                             uint64_t scope_store_or_enclave, uint8_t perm_mask);
+cdb_status cdb_db_check_perm(cdb_db *db, uint64_t principal_id, uint64_t scope_store_or_enclave,
+                             uint8_t required_perm);
 
 #endif

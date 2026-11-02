@@ -42,6 +42,13 @@ if(CDB_WITH_XZ)
   add_subdirectory(third-party/xz EXCLUDE_FROM_ALL)
 endif()
 
+# Mbed TLS crypto library (spec 12, third-party/mbedtls/VENDORED.md).
+set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+set(INSTALL_MBEDTLS_HEADERS OFF CACHE BOOL "" FORCE)
+add_subdirectory(third-party/mbedtls EXCLUDE_FROM_ALL)
+
 find_package(Threads REQUIRED)
 
 set(CDB_WARNINGS
@@ -95,12 +102,14 @@ add_library(combolite
   src/cdb_proc.c
   src/cdb_lexer.c
   src/cdb_compiler.c
-  src/cdb_trigger.c)
+  src/cdb_trigger.c
+  src/cdb_crypto.c)
 target_include_directories(combolite
   PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+  SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third-party/mbedtls/include)
 target_compile_options(combolite PRIVATE ${CDB_WARNINGS})
-target_link_libraries(combolite PUBLIC Threads::Threads)
+target_link_libraries(combolite PUBLIC Threads::Threads PRIVATE mbedcrypto)
 if(UNIX)
   target_link_libraries(combolite PUBLIC m) # log() for BM25 ranking
 endif()

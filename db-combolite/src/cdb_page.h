@@ -32,8 +32,12 @@ typedef enum cdb_page_format {
 #define CDB_PAGE_TYPE_NIBBLET 0x0009u
 #define CDB_PAGE_TYPE_DATA_TEST 0x7F00u /* reserved for tests */
 
-/* Page header flags (spec 13), in the order section 13 lists them. */
-#define CDB_PAGE_FLAG_OVERFLOW 0x04u /* an overflow continuation */
+/* Page header flags (spec 13, 14.2.6), in the order section 13 lists them. */
+#define CDB_PAGE_FLAG_COMPRESSED     0x01u
+#define CDB_PAGE_FLAG_EXTENT         0x02u
+#define CDB_PAGE_FLAG_OVERFLOW       0x04u /* an overflow continuation */
+#define CDB_PAGE_FLAG_TAMPER_EVIDENT 0x08u /* authenticated with keyed integrity tag */
+#define CDB_PAGE_FLAG_DANGER_MODE    0x10u
 
 typedef struct cdb_page_header {
     uint16_t type;
@@ -54,6 +58,22 @@ size_t cdb_page_trailer_size(cdb_page_format fmt);
 
 /* Bytes available for payload in a page of page_size bytes. */
 size_t cdb_page_capacity(cdb_page_format fmt, size_t page_size);
+
+/* Writes h at the start of page and seals the trailer.
+ * When domain_id > 0, encrypts the payload in place using aead_alg and key.
+ * When domain_id == 0 and CDB_PAGE_FLAG_TAMPER_EVIDENT is set, seals trailer with HMAC-SHA-256.
+ * Otherwise writes CRC32C. */
+cdb_status cdb_page_seal_crypto(uint8_t *page, size_t page_size, cdb_page_format fmt,
+                               cdb_byte_order order, unsigned checksum_alg,
+                               unsigned aead_alg, const uint8_t *key,
+                               const cdb_page_header *h);
+
+/* Verifies the marker and trailer, decodes the header, and decrypts the payload in place
+ * if domain_id > 0 using aead_alg and key. CDB_E_CORRUPT on verification failure. */
+cdb_status cdb_page_open_crypto(uint8_t *page, size_t page_size, cdb_page_format fmt,
+                               cdb_byte_order order, unsigned checksum_alg,
+                               unsigned aead_alg, const uint8_t *key,
+                               cdb_page_header *h);
 
 /* Writes h at the start of page and the checksum trailer at its end.
  * The payload must already be in place. Fields too wide for the format

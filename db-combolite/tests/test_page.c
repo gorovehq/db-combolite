@@ -1,6 +1,7 @@
 #include <string.h>
 
 #include "unity.h"
+#include "combolite/cdb_crypto.h"
 #include "cdb_page.h"
 
 void setUp(void) {}
@@ -101,6 +102,86 @@ static void test_unknown_checksum(void)
                                                            CDB_ORDER_LITTLE, 9, &h));
 }
 
+static void test_encrypted_page_roundtrip(void)
+{
+    static uint8_t page[4096];
+    uint8_t key[32];
+    cdb_page_header h = sample(), back;
+    size_t hsize = cdb_page_header_size(CDB_PAGE_FMT_FULL64);
+
+    memset(key, 0x88, sizeof(key));
+    memset(page, 0, sizeof(page));
+    h.domain_id = 42; /* Encrypted enclave domain */
+    h.write_seq = 1001;
+    memcpy(page + hsize, "Super secret database enclave payload bytes", 43);
+    h.payload_len = 43;
+
+    /* Seal with AES-256-GCM */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_seal_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
+                                                      CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
+                                                      CDB_AEAD_AES_256_GCM, key, &h));
+
+    /* Ciphertext must not match original plaintext */
+    TEST_ASSERT_NOT_EQUAL(0, memcmp(page + hsize, "Super secret database enclave payload bytes", 43));
+
+    /* Open and decrypt */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_open_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
+                                                      CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
+                                                      CDB_AEAD_AES_256_GCM, key, &back));
+    TEST_ASSERT_EQUAL_UINT64(42, back.domain_id);
+    TEST_ASSERT_EQUAL_MEMORY("Super secret database enclave payload bytes", page + hsize, 43);
+
+    /* Wrong key fails */
+    key[0] ^= 0x01;
+    TEST_ASSERT_EQUAL_INT(CDB_E_CORRUPT, cdb_page_open_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
+                                                             CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
+                                                             CDB_AEAD_AES_256_GCM, key, &back));
+    key[0] ^= 0x01;
+
+    /* Seal with ChaCha20-Poly1305 */
+    memcpy(page + hsize, "ChaCha encrypted page", 21);
+    h.payload_len = 21;
+    h.write_seq = 1002;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_seal_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
+                                                      CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
+                                                      CDB_AEAD_CHACHA20_POLY1305, key, &h));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_open_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
+                                                      CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
+                                                      CDB_AEAD_CHACHA20_POLY1305, key, &back));
+    TEST_ASSERT_EQUAL_MEMORY("ChaCha encrypted page", page + hsize, 21);
+}
+
+static void test_tamper_evident_page_roundtrip(void)
+{
+    static uint8_t page[4096];
+    uint8_t integrity_key[32];
+    cdb_page_header h = sample(), back;
+    size_t hsize = cdb_page_header_size(CDB_PAGE_FMT_FULL64);
+
+    memset(integrity_key, 0x55, sizeof(integrity_key));
+    memset(page, 0, sizeof(page));
+    h.domain_id = 0; /* Public page */
+    h.flags |= CDB_PAGE_FLAG_TAMPER_EVIDENT;
+    memcpy(page + hsize, "Public governance page content", 30);
+    h.payload_len = 30;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_seal_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
+                                                      CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
+                                                      CDB_AEAD_NONE, integrity_key, &h));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_open_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
+                                                      CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
+                                                      CDB_AEAD_NONE, integrity_key, &back));
+    TEST_ASSERT_TRUE(back.flags & CDB_PAGE_FLAG_TAMPER_EVIDENT);
+    TEST_ASSERT_EQUAL_MEMORY("Public governance page content", page + hsize, 30);
+
+    /* Tampering with page body is detected */
+    page[hsize + 5] ^= 0x01;
+    TEST_ASSERT_EQUAL_INT(CDB_E_CORRUPT, cdb_page_open_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
+                                                             CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
+                                                             CDB_AEAD_NONE, integrity_key, &back));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -109,5 +190,7 @@ int main(void)
     RUN_TEST(test_detects_damage);
     RUN_TEST(test_overflow_in_narrow_formats);
     RUN_TEST(test_unknown_checksum);
+    RUN_TEST(test_encrypted_page_roundtrip);
+    RUN_TEST(test_tamper_evident_page_roundtrip);
     return UNITY_END();
 }

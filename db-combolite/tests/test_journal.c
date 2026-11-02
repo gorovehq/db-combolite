@@ -1,6 +1,7 @@
 #include <string.h>
 
 #include "unity.h"
+#include "combolite/cdb_crypto.h"
 #include "cdb_faultdev.h"
 #include "cdb_journal.h"
 
@@ -120,6 +121,60 @@ static void test_commit_payload(void)
     TEST_ASSERT_EQUAL_INT(CDB_E_MALFORMED, cdb_commit_decode(&r, &out, CDB_ORDER_BIG));
 }
 
+static void test_encrypted_records_roundtrip(void)
+{
+    cdb_record r1, r2, read;
+    uint8_t key[32];
+    uint64_t next;
+    const char *p1 = "Encrypted delta payload data 1";
+    const char *p2 = "Encrypted delta payload data 2";
+
+    memset(key, 0x33, sizeof(key));
+
+    memset(&r1, 0, sizeof(r1));
+    r1.kind = CDB_RECORD_DATA;
+    r1.flags = CDB_RECORD_FLAG_ENCRYPTED;
+    r1.payload = (const uint8_t *)p1;
+    r1.payload_len = (uint32_t)strlen(p1) + 1;
+    r1.store_id = 10;
+    r1.entry_id = 101;
+
+    memset(&r2, 0, sizeof(r2));
+    r2.kind = CDB_RECORD_DATA;
+    r2.flags = CDB_RECORD_FLAG_ENCRYPTED;
+    r2.payload = (const uint8_t *)p2;
+    r2.payload_len = (uint32_t)strlen(p2) + 1;
+    r2.store_id = 10;
+    r2.entry_id = 102;
+
+    /* Append using AES-256-GCM */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_journal_append_crypto(&j, &r1, buf, sizeof(buf),
+                                                           CDB_AEAD_AES_256_GCM, key));
+    /* Append using ChaCha20-Poly1305 */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_journal_append_crypto(&j, &r2, buf, sizeof(buf),
+                                                           CDB_AEAD_CHACHA20_POLY1305, key));
+
+    /* Read back r1 */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_journal_read_crypto(&j, CDB_JOURNAL_HEADER_SIZE, buf, sizeof(buf),
+                                                         &read, &next,
+                                                         CDB_AEAD_AES_256_GCM, key));
+    TEST_ASSERT_TRUE(read.flags & CDB_RECORD_FLAG_ENCRYPTED);
+    TEST_ASSERT_EQUAL_STRING(p1, (const char *)read.payload);
+
+    /* Read back r2 */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_journal_read_crypto(&j, next, buf, sizeof(buf),
+                                                         &read, &next,
+                                                         CDB_AEAD_CHACHA20_POLY1305, key));
+    TEST_ASSERT_TRUE(read.flags & CDB_RECORD_FLAG_ENCRYPTED);
+    TEST_ASSERT_EQUAL_STRING(p2, (const char *)read.payload);
+
+    /* Read with wrong key fails verification */
+    key[0] ^= 0x01;
+    TEST_ASSERT_EQUAL_INT(CDB_E_CORRUPT, cdb_journal_read_crypto(&j, CDB_JOURNAL_HEADER_SIZE, buf, sizeof(buf),
+                                                                &read, &next,
+                                                                CDB_AEAD_AES_256_GCM, key));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -127,5 +182,6 @@ int main(void)
     RUN_TEST(test_records_roundtrip);
     RUN_TEST(test_torn_record_ends_journal);
     RUN_TEST(test_commit_payload);
+    RUN_TEST(test_encrypted_records_roundtrip);
     return UNITY_END();
 }
