@@ -345,14 +345,19 @@ static cdb_status put_chunk(cdb_rg *g, uint64_t last, cdb_rg_ref *r, size_t clen
         okey_of(ok, last, r->field_id);
         return cdb_nib_put(g->db, g->store, CDB_NIB_KIND_COLCHUNK, ok, sizeof ok, g->chunk, clen, &r->addr);
     }
-    return cdb_overflow_write(&g->db->pager, g->store, g->chunk, clen, g->page, &r->addr);
+    {
+        uint8_t tokey[17];
+        tokey[0] = CDB_OVERFLOW_OWNER_COL_CHUNK;
+        okey_of(tokey + 1, last, r->field_id);
+        return cdb_overflow_write_db(g->db, &g->db->pager, g->store, g->chunk, clen, g->page, tokey, sizeof tokey, &r->addr);
+    }
 }
 
 static cdb_status free_chunk(cdb_rg *g, const cdb_rg_ref *r)
 {
     if (cdb_nib_is(r->addr))
         return cdb_nib_free(g->db, r->addr);
-    return cdb_overflow_free(&g->db->pager, r->addr, g->store, r->stored, g->page);
+    return cdb_overflow_free_db(g->db, &g->db->pager, r->addr, g->store, r->stored, g->page);
 }
 
 /* Encodes the vl bytes of present values in g->vals, with g->bitmap when
@@ -404,7 +409,7 @@ static cdb_status load_chunk(cdb_rg *g, const cdb_rg_ref *r, uint32_t rows, unsi
             return s == CDB_E_BUFFER_TOO_SMALL ? CDB_E_CORRUPT : s;
         if (len != r->stored)
             return CDB_E_CORRUPT;
-    } else if ((s = cdb_overflow_read(&g->db->pager, r->addr, g->store, g->chunk, r->stored, g->page)) != CDB_OK) {
+    } else if ((s = cdb_overflow_read_db(g->db, &g->db->pager, r->addr, g->store, g->chunk, r->stored, g->page)) != CDB_OK) {
         return s;
     }
     if (g->chunk[0] > CDB_COLENC_BITPACK)

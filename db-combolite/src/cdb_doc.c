@@ -448,8 +448,8 @@ static cdb_status read_revision(cdb_db *db, uint64_t lid, envelope *e, uint8_t *
         }
         memcpy(dest, p, inline_len);
         e->body = dest;
-        return cdb_overflow_read(&db->pager, first, h.store_id, dest + inline_len, e->body_len - inline_len,
-                                 buf(db, B_PAGE));
+        return cdb_overflow_read_db(db, &db->pager, first, h.store_id, dest + inline_len, e->body_len - inline_len,
+                                    buf(db, B_PAGE));
     }
     /* Ordinary case: the body is the rest of the payload. */
     e->body = p;
@@ -502,9 +502,13 @@ static cdb_status write_revision(cdb_db *db, struct cdb_doc_pool *pool, const en
     if (e->body_len > cap - head) {
         if (!revision_fits(db, e->summary != NULL, e->summary_len, e->body_len))
             return CDB_E_OVERFLOW;
+        uint8_t okey[17];
+        okey[0] = CDB_OVERFLOW_OWNER_DOC_REV;
+        cdb_store_u64(okey + 1, e->entry, CDB_ORDER_BIG);
+        cdb_store_u64(okey + 9, e->rev, CDB_ORDER_BIG);
         inline_len = cap - head - 8u - db->pager.addr_width;
-        if ((s = cdb_overflow_write(&db->pager, pool->slot.store_id, e->body + inline_len, e->body_len - inline_len, pl,
-                                    &first)) != CDB_OK)
+        if ((s = cdb_overflow_write_db(db, &db->pager, pool->slot.store_id, e->body + inline_len, e->body_len - inline_len, pl,
+                                       okey, sizeof okey, &first)) != CDB_OK)
             return s;
     }
     memset(pl, 0, ENV_SIZE);
@@ -1020,8 +1024,8 @@ static cdb_status release(cdb_db *db, struct cdb_doc_pool *pool, uint64_t lid)
         return cdb_nib_free(db, lid);
     if ((s = read_revision(db, lid, &e, NULL)) != CDB_OK)
         return s;
-    if (e.chain_first && (s = cdb_overflow_free(&db->pager, e.chain_first, pool->slot.store_id, e.chain_len,
-                                                buf(db, B_PAGE))) != CDB_OK)
+    if (e.chain_first && (s = cdb_overflow_free_db(db, &db->pager, e.chain_first, pool->slot.store_id, e.chain_len,
+                                                  buf(db, B_PAGE))) != CDB_OK)
         return s;
     return cdb_pager_free(&db->pager, lid);
 }
@@ -2109,6 +2113,61 @@ cdb_status cdb_doc_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, si
         return head_put(pool, entry, &h);
     }
     return CDB_OK;
+}
+
+cdb_status cdb_doc_overflow_tail_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen,
+                                       uint64_t old_addr, uint64_t addr)
+{
+    struct cdb_doc_pool *pool;
+    uint8_t val_buf[10];
+    size_t vlen, off;
+    uint64_t rev_addr;
+    cdb_page_header h;
+    uint8_t *pl;
+    uint8_t *pbuf;
+    int found;
+    cdb_status s;
+
+    if (oklen != 16)
+        return CDB_E_CORRUPT;
+    s = pool_get(db, store, &pool);
+    if (s == CDB_E_NOT_FOUND || s == CDB_E_INVALID_ARG || (s == CDB_OK && !pool->have_indexes))
+        return CDB_E_NOT_FOUND;
+    if (s != CDB_OK)
+        return s;
+    if ((s = cdb_index_get(&pool->revs, okey, oklen, val_buf, sizeof val_buf, &vlen, &found)) != CDB_OK)
+        return s;
+    if (!found)
+        return CDB_E_NOT_FOUND;
+    if ((s = cdb_nib_addr_load(val_buf, vlen, &rev_addr)) != CDB_OK)
+        return s;
+    if (cdb_nib_is(rev_addr))
+        return CDB_E_NOT_FOUND;
+
+    pbuf = db->pager.page2;
+    if ((s = cdb_pager_read(&db->pager, rev_addr, pbuf, &h)) != CDB_OK)
+        return s == CDB_E_NOT_FOUND ? CDB_E_NOT_FOUND : s;
+    if (h.type != CDB_PAGE_TYPE_DOCUMENT || h.store_id != store)
+        return CDB_E_NOT_FOUND;
+
+    pl = pbuf + cdb_page_header_size(db->pager.fmt);
+    if (h.payload_len < ENV_SIZE || !(pl[45] & ENV_FLAG_OVERFLOW))
+        return CDB_E_NOT_FOUND;
+
+    off = ENV_SIZE;
+    if (pl[45] & ENV_FLAG_SUMMARY) {
+        cdb_value v;
+        if (cdb_value_read(pl + off, h.payload_len - off, db->pager.order, &v) != CDB_OK || v.type != CDB_TYPE_STRING)
+            return CDB_E_CORRUPT;
+        off += v.encoded_len;
+    }
+    off += 8u; /* skip total length */
+    if (h.payload_len < off + db->pager.addr_width)
+        return CDB_E_CORRUPT;
+    if (load_lid(db, pl + off) != old_addr)
+        return CDB_E_NOT_FOUND;
+    store_lid(db, pl + off, addr);
+    return cdb_pager_write(&db->pager, rev_addr, &h, pl, h.payload_len);
 }
 
 cdb_status cdb_doc_set_keep(cdb_db *db, uint64_t store, uint32_t keep)

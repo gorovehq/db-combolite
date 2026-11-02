@@ -5,6 +5,7 @@
 #include "cdb_doc.h"
 #include "cdb_endian.h"
 #include "cdb_nib.h"
+#include "cdb_overflow.h"
 #include "cdb_page.h"
 #include "cdb_table.h"
 #include "cdb_ts.h"
@@ -455,6 +456,8 @@ static cdb_status moved(cdb_db *db, uint64_t store, unsigned kind, const uint8_t
         return cdb_ts_nib_moved(db, store, okey, oklen, old_addr, addr);
     case CDB_NIB_KIND_COLCHUNK:
         return cdb_table_nib_moved(db, store, okey, oklen, old_addr, addr);
+    case CDB_NIB_KIND_OVERFLOW_TAIL:
+        return cdb_overflow_nib_moved(db, store, okey, oklen, old_addr, addr);
     default:
         return CDB_E_CORRUPT;
     }
