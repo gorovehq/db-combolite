@@ -78,6 +78,7 @@ cdb_add_test(test_tx_cross_store)
 cdb_add_test(test_crypto)
 cdb_add_test(test_security)
 cdb_add_test(test_blob)
+cdb_add_test(test_reclaim)
 
 # The suites that use several stores again, with one open store of each
 # model at a time, so a store closed while still in use shows up here.

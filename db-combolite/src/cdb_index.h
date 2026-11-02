@@ -93,6 +93,10 @@ cdb_status cdb_index_get(cdb_index *ix, const uint8_t *key, size_t klen,
  * the status CDB_OK) when the key was not there. */
 cdb_status cdb_index_delete(cdb_index *ix, const uint8_t *key, size_t klen, int *found);
 
+/* Drops the entire index tree (all interior and leaf nodes, plus any
+ * overflow chains) and marks root 0. */
+cdb_status cdb_index_drop(cdb_index *ix);
+
 /* Range cursor. Invalidated by any change to the index. It does not use the
  * index's work memory, so lookups (but not changes) may be made while a
  * cursor is open. */

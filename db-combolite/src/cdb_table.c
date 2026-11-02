@@ -1779,6 +1779,9 @@ static cdb_status do_drop_index(cdb_db *db, uint64_t store, table *t, uint64_t n
         return CDB_E_STATE; /* the primary key's index stays */
     for (i = 0; i < t->nidx; i++)
         if (t->idx[i].number == number) {
+            cdb_status s = cdb_index_drop(&t->idx[i].ix);
+            if (s != CDB_OK)
+                return s;
             memmove(&t->idx[i], &t->idx[i + 1u], (size_t)(t->nidx - i - 1u) * sizeof t->idx[0]);
             t->nidx--;
             return save(db, store, t, next, 0);
