@@ -140,6 +140,9 @@ cdb_status cdb_doc_next_live(cdb_db *db, uint64_t store, uint64_t after, uint64_
  * store or revision is gone, so the record is dropped. */
 cdb_status cdb_doc_nib_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen, uint64_t old_addr,
                              uint64_t addr);
+/* Nibblet merging moved an overflow tail owned by a document revision. */
+cdb_status cdb_doc_overflow_tail_moved(cdb_db *db, uint64_t store, const uint8_t *okey, size_t oklen,
+                                       uint64_t old_addr, uint64_t addr);
 /* A table's revision window changed (spec 9.11): the open pool follows. */
 cdb_status cdb_doc_set_keep(cdb_db *db, uint64_t store, uint32_t keep);
 
