@@ -308,7 +308,7 @@ static void test_create(void)
     TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_table_get(&db, T, 1, row, sizeof row, &len));
     {
         uint32_t ix;
-        TEST_ASSERT_EQUAL_INT(CDB_E_UNSUPPORTED, cdb_table_create_index(&db, T, &F_A, 1, 0, &ix));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_create_index(&db, T, &F_A, 1, 0, &ix));
     }
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }

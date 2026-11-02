@@ -258,7 +258,11 @@ cdb_status cdb_doc_flush_pools(cdb_db *db)
     }
     {
         cdb_status s = cdb_vec_flush(db);
-        return s == CDB_OK ? cdb_ts_flush(db) : s;
+        if (s != CDB_OK)
+            return s;
+        if ((s = cdb_ts_flush(db)) != CDB_OK)
+            return s;
+        return cdb_table_flush(db);
     }
 }
 
@@ -1325,8 +1329,13 @@ cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
             pool->next_entry = d->entry_id + 1;
             pool->dirty = 1;
         }
-        if (is_col)
+        if (is_col) {
+            if (pool->keep == 0 || pool->keep > 1) {
+                if ((s = apply_change(db, d)) != CDB_OK)
+                    return s;
+            }
             return cdb_table_col_apply(db, d->store_id, d);
+        }
         /* A table: its indexes follow the row from before to after. */
         if ((s = cdb_table_apply_before(db, d->store_id, d->entry_id)) != CDB_OK
             || (s = apply_change(db, d)) != CDB_OK)

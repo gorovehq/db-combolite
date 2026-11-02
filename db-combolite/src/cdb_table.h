@@ -166,6 +166,8 @@ cdb_status cdb_table_chunk_cap(cdb_db *db, uint64_t store, uint32_t *cap);
 cdb_status cdb_table_col_committed_row(cdb_db *db, uint64_t store, uint64_t entry, void *body, size_t cap,
                                        size_t *len, int *live, uint32_t *schema);
 cdb_status cdb_table_col_apply(cdb_db *db, uint64_t store, const cdb_delta *d);
+cdb_status cdb_table_flush(cdb_db *db);
+cdb_status cdb_table_col_fold_pending(cdb_db *db, uint64_t store);
 extern const cdb_slot_ops cdb_table_slot_ops; /* open tables (cdb_slots.h) */
 
 /* Column-oriented tables: sets g up over the table's row groups, with
