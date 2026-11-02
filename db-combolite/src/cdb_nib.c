@@ -362,6 +362,94 @@ cdb_status cdb_nib_put(cdb_db *db, uint64_t store, unsigned kind, const uint8_t 
     return CDB_OK;
 }
 
+cdb_status cdb_nib_rewrite(cdb_db *db, uint64_t addr, uint64_t store, unsigned kind,
+                           const uint8_t *okey, size_t oklen, const void *data, size_t len,
+                           int *fits)
+{
+    uint64_t page;
+    unsigned slot;
+    uint8_t *p;
+    cdb_byte_order o;
+    unsigned count, off, old_rlen, old_free, new_free, low;
+    size_t new_rlen;
+    cdb_index ix;
+    int have;
+    cdb_status s;
+
+    if (fits == NULL)
+        return CDB_E_INVALID_ARG;
+    *fits = 0;
+
+    if (db == NULL || !cdb_nib_is(addr) || !cdb_nib_fits(db, len) || oklen > CDB_NIB_KEY_MAX)
+        return CDB_OK;
+
+    page = cdb_nib_page(addr);
+    slot = cdb_nib_slot(addr);
+    o = db->pager.order;
+
+    if ((s = read_page(db, page, 0)) != CDB_OK)
+        return s;
+
+    p = payload(db, 0);
+    count = get16(p, P_COUNT, o);
+    if (slot >= count)
+        return CDB_E_CORRUPT;
+
+    slot_get(p, slot, o, &off, &old_rlen);
+    if (old_rlen == 0)
+        return CDB_E_CORRUPT;
+
+    new_rlen = REC_HDR + oklen + len;
+    old_free = get16(p, P_FREE, o);
+
+    if (new_rlen > (size_t)old_rlen) {
+        size_t grow = new_rlen - (size_t)old_rlen;
+        if ((size_t)old_free < grow)
+            return CDB_OK; /* does not fit on this page */
+        new_free = old_free - (unsigned)grow;
+    } else {
+        new_free = old_free + (old_rlen - (unsigned)new_rlen);
+    }
+
+    *fits = 1;
+
+    /* Assemble the new record in buffer 1 */
+    {
+        uint8_t *rec = page_buf(db, 1);
+        cdb_store_u64(rec, store, CDB_ORDER_BIG);
+        rec[8] = (uint8_t)kind;
+        rec[9] = (uint8_t)oklen;
+        memcpy(rec + REC_HDR, okey, oklen);
+        memcpy(rec + REC_HDR + oklen, data, len);
+
+        if (new_rlen == (size_t)old_rlen) {
+            memcpy(p + off, rec, new_rlen);
+        } else {
+            slot_set(p, slot, o, 0, 0);
+            compact(db, p);
+            low = get16(p, P_LOW, o) - (unsigned)new_rlen;
+            memcpy(p + low, rec, new_rlen);
+            slot_set(p, slot, o, low, (unsigned)new_rlen);
+            put16(p, P_LOW, low, o);
+            put16(p, P_FREE, new_free, o);
+        }
+    }
+
+    if ((s = write_page(db, page, 0)) != CDB_OK)
+        return s;
+
+    if (new_free != old_free) {
+        if ((s = open_index(db, &ix, 0, &have)) != CDB_OK)
+            return s;
+        if (!have)
+            return CDB_E_CORRUPT;
+        if ((s = rekey(&ix, page, 1, old_free, 1, new_free)) != CDB_OK)
+            return s;
+    }
+
+    return CDB_OK;
+}
+
 /* The record in slot `slot` of the page in buffer i: header fields and
  * where its data is. CDB_E_CORRUPT for a free or malformed slot. */
 static cdb_status record_at(cdb_db *db, unsigned i, unsigned slot, uint64_t *store, unsigned *kind,
