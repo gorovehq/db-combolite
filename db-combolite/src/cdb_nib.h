@@ -60,4 +60,8 @@ cdb_status cdb_nib_free(cdb_db *db, uint64_t addr);
 /* At reconciliation: merges up to budget under-half-full pages. */
 cdb_status cdb_nib_merge(cdb_db *db, unsigned budget);
 
+/* Sweeps a nibblet page for records belonging to dropped stores.
+ * Removes them, updates free space in the index, and frees the page if empty. */
+cdb_status cdb_nib_sweep_page(cdb_db *db, uint64_t page, uint64_t *nibblets_freed, int *page_freed);
+
 #endif

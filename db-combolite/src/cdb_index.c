@@ -961,3 +961,65 @@ cdb_status cdb_index_next(cdb_index_cursor *c, uint8_t *key, size_t kcap, size_t
         }
     }
 }
+
+static cdb_status drop_subtree(cdb_index *ix, uint64_t lid, unsigned depth)
+{
+    node_view v;
+    size_t i, count;
+    cdb_status s;
+
+    if (lid == 0)
+        return CDB_OK;
+    if (depth >= CDB_INDEX_MAX_DEPTH)
+        return CDB_E_CORRUPT;
+
+    if ((s = read_node(ix, lid, w_page(ix), &v)) != CDB_OK)
+        return s;
+
+    if (v.level == 0) {
+        for (i = 0; i < v.count; i++) {
+            const uint8_t *suffix, *val;
+            size_t slen, vlen, tlen;
+            if ((s = view_entry(ix, &v, i, &suffix, &slen, &val, &vlen, &tlen)) != CDB_OK)
+                return s;
+            if (tlen > ix->max_value) {
+                uint64_t chain = child_of(ix, val);
+                if ((s = cdb_overflow_free(ix->pager, chain, ix->store_id, tlen, w_image(ix))) != CDB_OK)
+                    return s;
+            }
+        }
+        return cdb_pager_free(ix->pager, lid);
+    }
+
+    /* Interior node */
+    count = v.count;
+    for (i = 0; i < count; i++) {
+        const uint8_t *suffix, *val;
+        size_t slen, vlen, tlen;
+        uint64_t child_lid;
+        if ((s = read_node(ix, lid, w_page(ix), &v)) != CDB_OK)
+            return s;
+        if (i >= v.count)
+            return CDB_E_CORRUPT;
+        if ((s = view_entry(ix, &v, i, &suffix, &slen, &val, &vlen, &tlen)) != CDB_OK)
+            return s;
+        child_lid = child_of(ix, val);
+        if ((s = drop_subtree(ix, child_lid, depth + 1)) != CDB_OK)
+            return s;
+    }
+
+    return cdb_pager_free(ix->pager, lid);
+}
+
+cdb_status cdb_index_drop(cdb_index *ix)
+{
+    cdb_status s;
+    if (ix == NULL || ix->pager == NULL)
+        return CDB_E_INVALID_ARG;
+    if (ix->root == 0)
+        return CDB_OK;
+    s = drop_subtree(ix, ix->root, 0);
+    if (s == CDB_OK)
+        ix->root = 0;
+    return s;
+}

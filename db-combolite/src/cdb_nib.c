@@ -1,6 +1,7 @@
 /* Nibblets (cdb_nib.h; spec 16, 14.18). */
 #include <string.h>
 
+#include "cdb_catalog.h"
 #include "cdb_doc.h"
 #include "cdb_endian.h"
 #include "cdb_nib.h"
@@ -545,5 +546,71 @@ cdb_status cdb_nib_merge(cdb_db *db, unsigned budget)
             break;
         }
     }
+    return CDB_OK;
+}
+
+cdb_status cdb_nib_sweep_page(cdb_db *db, uint64_t page, uint64_t *nibblets_freed, int *page_freed)
+{
+    cdb_byte_order o;
+    uint8_t *p;
+    cdb_index ix;
+    unsigned count, i, old_free, live = 0;
+    int changed = 0, have = 0;
+    cdb_status s;
+
+    if (page_freed != NULL)
+        *page_freed = 0;
+
+    if (db == NULL || db->cfg.doc_buffers == NULL || !db->has_catalog)
+        return CDB_OK;
+
+    if ((s = read_page(db, page, 0)) != CDB_OK)
+        return s;
+
+    o = db->pager.order;
+    p = payload(db, 0);
+    count = get16(p, P_COUNT, o);
+    old_free = get16(p, P_FREE, o);
+
+    for (i = 0; i < count; i++) {
+        unsigned off, len;
+        slot_get(p, i, o, &off, &len);
+        if (len == 0)
+            continue;
+        {
+            const uint8_t *okey, *data;
+            size_t oklen, rlen;
+            uint64_t store;
+            unsigned kind;
+            cdb_store_info sinfo;
+            if ((s = record_at(db, 0, i, &store, &kind, &okey, &oklen, &data, &rlen)) != CDB_OK)
+                continue;
+            if (cdb_catalog_get_store(&db->catalog, store, &sinfo) == CDB_OK && (sinfo.flags & CDB_STORE_DROPPED)) {
+                live = unplace(db, p, i);
+                if (nibblets_freed != NULL)
+                    (*nibblets_freed)++;
+                changed = 1;
+            }
+        }
+    }
+
+    if (changed) {
+        if ((s = open_index(db, &ix, 0, &have)) != CDB_OK)
+            return s;
+        if (!have)
+            return CDB_E_CORRUPT;
+        if (live == 0) {
+            if ((s = rekey(&ix, page, 1, old_free, 0, 0)) != CDB_OK)
+                return s;
+            if (page_freed != NULL)
+                *page_freed = 1;
+            return cdb_pager_free(&db->pager, page);
+        }
+        if ((s = write_page(db, page, 0)) != CDB_OK)
+            return s;
+        if ((s = rekey(&ix, page, 1, old_free, 1, get16(p, P_FREE, o))) != CDB_OK)
+            return s;
+    }
+
     return CDB_OK;
 }

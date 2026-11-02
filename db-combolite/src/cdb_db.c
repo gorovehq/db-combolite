@@ -25,6 +25,7 @@
 #include "cdb_doc.h"
 #include "cdb_key.h"
 #include "cdb_link.h"
+#include "cdb_nib.h"
 #include "cdb_table.h"
 #include "cdb_ts.h"
 #include "cdb_vec.h"
@@ -2225,16 +2226,100 @@ cdb_status cdb_db_add_schema(cdb_db *db, uint64_t store_id, const void *schema, 
     return finish_archive_op(db, cdb_catalog_add_schema(&db->catalog, store_id, schema, len, version));
 }
 
+static cdb_status reclaim_dropped_under_baton(cdb_db *db, uint64_t *pages_freed, uint64_t *nibblets_freed)
+{
+    uint64_t p_freed = 0, n_freed = 0;
+    uint64_t lid;
+    cdb_status s;
+
+    if (!db->has_catalog)
+        return CDB_OK;
+
+    for (lid = 1; lid < db->pager.next_lid; lid++) {
+        cdb_anchor_entry e;
+        cdb_page_header h;
+        if (cdb_pager_lookup(&db->pager, lid, &e) != CDB_OK || e.state != CDB_ANCHOR_LIVE)
+            continue;
+
+        s = cdb_pager_read(&db->pager, lid, db->pager.page2, &h);
+        if (s != CDB_OK)
+            continue;
+
+        if (h.type == CDB_PAGE_TYPE_NIBBLET) {
+            int page_freed = 0;
+            s = cdb_nib_sweep_page(db, lid, &n_freed, &page_freed);
+            if (s == CDB_OK && page_freed)
+                p_freed++;
+            continue;
+        }
+
+        if (h.store_id == 0 || (db->links.store_id && h.store_id == db->links.store_id))
+            continue;
+
+        cdb_store_info sinfo;
+        if (cdb_catalog_get_store(&db->catalog, h.store_id, &sinfo) == CDB_OK &&
+            (sinfo.flags & CDB_STORE_DROPPED)) {
+            if (cdb_pager_free(&db->pager, lid) == CDB_OK)
+                p_freed++;
+        }
+    }
+
+    if (pages_freed != NULL)
+        *pages_freed = p_freed;
+    if (nibblets_freed != NULL)
+        *nibblets_freed = n_freed;
+
+    if (p_freed > 0 || n_freed > 0) {
+        db->pager.dirty = 1;
+        if ((s = cdb_pager_commit(&db->pager)) != CDB_OK)
+            return s;
+    }
+
+    return CDB_OK;
+}
+
+cdb_status cdb_db_reclaim(cdb_db *db, uint64_t *pages_freed, uint64_t *nibblets_freed)
+{
+    uint64_t p_freed = 0, n_freed = 0;
+    cdb_status s;
+
+    if (pages_freed != NULL)
+        *pages_freed = 0;
+    if (nibblets_freed != NULL)
+        *nibblets_freed = 0;
+
+    if (usable(db) != CDB_OK || db->in_tx)
+        return CDB_E_STATE;
+    if (!db->has_catalog)
+        return CDB_OK;
+
+    if ((s = reconcile_hold(db, 0)) != CDB_OK)
+        return s;
+
+    s = reclaim_dropped_under_baton(db, &p_freed, &n_freed);
+    if (pages_freed != NULL)
+        *pages_freed = p_freed;
+    if (nibblets_freed != NULL)
+        *nibblets_freed = n_freed;
+
+    return finish_archive_op(db, s);
+}
+
 /* Compaction requires a clean pager, hence the reconcile first. It makes
  * its own archive commits under the same baton, so the journal is rotated
  * afterwards to match the new committed sequence. */
 cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed)
 {
     cdb_status s;
+    uint64_t dp = 0, dn = 0;
     if (usable(db) != CDB_OK || db->in_tx)
         return CDB_E_STATE;
     if ((s = reconcile_hold(db, 0)) != CDB_OK)
         return s;
+    if (db->has_catalog) {
+        if ((s = reclaim_dropped_under_baton(db, &dp, &dn)) != CDB_OK)
+            return finish_archive_op(db, s);
+    }
     return finish_archive_op(db, cdb_pager_compact(&db->pager, max_moves, moved, reclaimed));
 }
 

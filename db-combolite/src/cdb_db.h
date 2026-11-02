@@ -461,6 +461,10 @@ cdb_status cdb_db_catalog_end(cdb_db *db, cdb_status s);
  * down into reusable space, and releases the free tail of the archive. */
 cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed);
 
+/* Space reclamation (spec 3.7, 16.2): sweeps the archive for pages and
+ * nibblet records belonging to dropped stores, freeing them for reuse. */
+cdb_status cdb_db_reclaim(cdb_db *db, uint64_t *pages_freed, uint64_t *nibblets_freed);
+
 /* Security, enclaves, and key rotation (spec 12). */
 cdb_status cdb_db_create_enclave(cdb_db *db, uint64_t enclave_id, const char *key_ref);
 cdb_status cdb_db_open_enclave(cdb_db *db, uint64_t enclave_id, const char *key_ref);
