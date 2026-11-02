@@ -158,6 +158,7 @@ cdb_status cdb_table_scan(cdb_db *db, uint64_t store, uint32_t index, const void
                           size_t *n);
 
 /* Engine hooks. */
+cdb_status cdb_table_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *live);
 cdb_status cdb_table_keep_setting(const uint8_t *settings, size_t len, cdb_byte_order o, uint32_t *keep);
 cdb_status cdb_table_apply_before(cdb_db *db, uint64_t store, uint64_t entry);
 cdb_status cdb_table_apply_after(cdb_db *db, uint64_t store, uint64_t entry);

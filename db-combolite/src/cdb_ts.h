@@ -144,6 +144,8 @@ cdb_status cdb_ts_range(cdb_db *db, uint64_t store, uint64_t series, int64_t fro
                         size_t cap, cdb_ts_row *rows, size_t max, size_t *n, int64_t *next);
 
 /* Engine hooks. */
+cdb_status cdb_ts_live_in_tx(cdb_db *db, uint64_t store, uint64_t series, int *live);
+cdb_status cdb_ts_point_live_in_tx(cdb_db *db, uint64_t store, uint64_t series, int64_t ts, int *live);
 int cdb_ts_is_open(cdb_db *db, uint64_t store);
 cdb_status cdb_ts_apply(cdb_db *db, const cdb_delta *d, int *handled);
 cdb_status cdb_ts_flush(cdb_db *db); /* at reconciliation: held points, entry counters */

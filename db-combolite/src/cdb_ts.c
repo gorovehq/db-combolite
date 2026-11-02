@@ -1656,6 +1656,142 @@ cdb_status cdb_ts_range(cdb_db *db, uint64_t store, uint64_t series, int64_t fro
     }
 }
 
+cdb_status cdb_ts_live_in_tx(cdb_db *db, uint64_t store, uint64_t series, int *live)
+{
+    cdb_store_info info;
+    ts_store *t;
+    srec r;
+    int found = 0;
+    cdb_status s;
+    *live = 0;
+    if (!db->has_catalog)
+        return CDB_E_UNSUPPORTED;
+    if ((s = cdb_catalog_get_store(&db->catalog, store, &info)) != CDB_OK)
+        return s;
+    if (info.model != CDB_MODEL_TIME_SERIES)
+        return CDB_E_INVALID_ARG;
+    if (info.flags & CDB_STORE_DROPPED)
+        return CDB_OK;
+    if ((s = db->in_tx ? tx_store(db, store, &t) : ts_get(db, store, &t)) != CDB_OK)
+        return s;
+    if ((s = db->in_tx ? tx_series(db, t, series, &r, &found) : rec_get(t, series, &r, &found)) != CDB_OK)
+        return s;
+    *live = found;
+    return CDB_OK;
+}
+
+cdb_status cdb_ts_point_live_in_tx(cdb_db *db, uint64_t store, uint64_t series, int64_t ts, int *live)
+{
+    cdb_store_info info;
+    ts_store *t;
+    srec r;
+    int found = 0, in_tx_appended = 0, in_tx_dropped = 0;
+    int64_t at;
+    blk b = { 0, 0, 0, 0 };
+    int bfound = 0;
+    cdb_status s;
+
+    *live = 0;
+    if (!db->has_catalog)
+        return CDB_E_UNSUPPORTED;
+    if ((s = cdb_catalog_get_store(&db->catalog, store, &info)) != CDB_OK)
+        return s;
+    if (info.model != CDB_MODEL_TIME_SERIES)
+        return CDB_E_INVALID_ARG;
+    if (info.flags & CDB_STORE_DROPPED)
+        return CDB_OK;
+    if ((s = db->in_tx ? tx_store(db, store, &t) : ts_get(db, store, &t)) != CDB_OK)
+        return s;
+    if ((s = db->in_tx ? tx_series(db, t, series, &r, &found) : rec_get(t, series, &r, &found)) != CDB_OK)
+        return s;
+    if (!found)
+        return CDB_OK;
+
+    if (db->in_tx) {
+        uint64_t off = db->tx_start;
+        txrec x;
+        int done;
+        for (;;) {
+            if ((s = tx_next(db, t, &off, &x, &done)) != CDB_OK || done)
+                break;
+            if (x.series != series)
+                continue;
+            if (x.op == CDB_OP_DELETE && x.len >= 8) {
+                int64_t drop_ts = (int64_t)cdb_load_u64(x.data, CDB_ORDER_BIG);
+                if (ts < drop_ts)
+                    in_tx_dropped = 1;
+            } else if (x.op == CDB_OP_PATCH) {
+                uint64_t count;
+                size_t at_idx, k;
+                if (cdb_varint_decode(x.data, x.len, &count, &k) == CDB_OK) {
+                    at_idx = k;
+                    while (count-- > 0) {
+                        int64_t pt_ts;
+                        const uint8_t *obj;
+                        size_t olen;
+                        if (!next_point(x.data, x.len, &at_idx, &pt_ts, &obj, &olen))
+                            break;
+                        if (pt_ts == ts) {
+                            in_tx_appended = 1;
+                            in_tx_dropped = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (in_tx_appended) {
+        *live = 1;
+        return CDB_OK;
+    }
+    if (in_tx_dropped) {
+        *live = 0;
+        return CDB_OK;
+    }
+
+    if (!r.has_points)
+        return CDB_OK;
+
+    at = window_of(ts, r.def.window);
+    if ((s = blk_at(db, t, series, at, &b, &bfound)) != CDB_OK)
+        return s;
+    while (bfound && b.first <= ts) {
+        if (b.last >= ts) {
+            cdb_ts_point *pts = work(db);
+            const uint8_t *pl;
+            size_t len, cnt, i;
+            cdb_ts_layout L;
+            if ((s = blk_read(db, t, &b, &pl, &len)) != CDB_OK)
+                return s;
+            if ((s = cdb_tsblock_decode(pl, len, db->pager.order, &L, pts, CDB_TS_BLOCK_MAX_POINTS, &cnt, NULL)) != CDB_OK)
+                return s;
+            for (i = 0; i < cnt; i++) {
+                if (pts[i].ts == ts) {
+                    *live = 1;
+                    return CDB_OK;
+                }
+            }
+        }
+        if (b.first == INT64_MAX)
+            break;
+        if ((s = blk_at(db, t, series, b.first + 1, &b, &bfound)) != CDB_OK)
+            return s;
+    }
+
+    {
+        uint8_t hk[16], hv[1];
+        size_t hvlen;
+        int hfound;
+        if ((s = cdb_index_get(&t->held, hk, k_series_ts(hk, series, ts), hv, 0, &hvlen, &hfound)) == CDB_OK && hfound) {
+            *live = 1;
+            return CDB_OK;
+        }
+    }
+
+    return CDB_OK;
+}
+
 /* -------------------------------------------------------- downsampling */
 
 typedef struct agg_state {

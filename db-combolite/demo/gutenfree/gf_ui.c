@@ -1082,6 +1082,8 @@ void gf_screen_similar(gf_app *a, uint64_t row)
     char status[160];
     double t0 = gf_now_ms();
 
+    memset(&from, 0, sizeof from);
+
     if (gf_vec_book_entry(a->g, &a->cat, &a->vec, row, &from.entry, &found) == CDB_OK && found) {
         from.store = a->vec.books;
         cdb_link_list(&a->g->db, from, CDB_LINK_OUT, a->vec.similar, NULL, out, GF_SIMILAR * 4, &n);
