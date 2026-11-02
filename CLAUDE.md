@@ -36,6 +36,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M21 | Structured query core (CMBQL core): operator-tree execution (Scan/Filter/Project/Join/Sort/Limit/Union/Aggregate/Traverse/TextSearch/VectorSearch/HybridRank), pipeline breaker memory bounds, time-series Window/AsofJoin/rollup pushdown, Traverse cycle/pruning semantics, Unnest, cross-model type coercion/NULLs, binary wire form (spec 14), and stored-procedure bytecode ISA engine (spec 11.1, 11.2, 11.7, 11.10) | done |
 | M22 | Text query language (CMBQL): db-combolite's own human-readable language (CMBQL), formal EBNF grammar and lexer, literal dot escaping vs 0x1F nested path resolution, procedural variable scoping and materialization, compiling into the M21 structured core (spec 11.1, 11.10) | done |
 | M23 | Cross-store atomic transactions and collision handling, triggers and trigger safety, scheduled and maintenance-window procedure runs, intra-transaction cursor isolation, procedure error trapping and savepoints (spec 11.3, 11.6, 11.9) | done |
+| M24 | Security, authenticated encryption (AES-256-GCM, ChaCha20-Poly1305), envelope key wrapping, subkey derivations, key rotation, tamper-evident governance mode, identities and RBAC authorization (spec 12, 14) | done |
 
 ## Commands
 
