@@ -1205,6 +1205,7 @@ static cdb_status asof_next(cdb_exec_op *op, cdb_exec_cursor *cur, cdb_exec_row 
     int has_best = 0;
     int64_t best_diff = 0x7FFFFFFFFFFFFFFFLL;
 
+    memset(&best_right, 0, sizeof best_right);
     *has_row = 0;
 
     st = a->left->vtab->next(a->left, cur, &left_row, &left_has);

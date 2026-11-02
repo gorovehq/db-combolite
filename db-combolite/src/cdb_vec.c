@@ -1648,7 +1648,7 @@ static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *proce
         cdb_index_cursor cur;
         uint8_t key[8], val[BLOCKS_VAL];
         size_t klen, vlen;
-        int done, any = 0;
+        int done, any = 0, has_other_pending = 1;
 
         /* The next batch of pending entries. */
         n = cap;
@@ -1662,8 +1662,10 @@ static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *proce
             bitem *it = (bitem *)(void *)(items + i * stride);
             if ((s = cdb_index_next(&cur, key, sizeof key, &klen, val, sizeof val, &vlen, &done)) != CDB_OK)
                 return s;
-            if (done)
+            if (done) {
+                has_other_pending = 0;
                 break;
+            }
             memset(it, 0, sizeof *it);
             it->entry = cdb_load_u64(key, CDB_ORDER_BIG);
         }
@@ -1695,7 +1697,7 @@ static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *proce
                 uint64_t u = slot_entry(db, &b, j), dropped;
                 const uint8_t *ud = slot_data(db, c, &b, j);
                 double un = slot_norm(db, c, &b, j);
-                int pend, found, changed = 0;
+                int pend = 0, found, changed = 0;
                 grec ur;
                 if (u == 0)
                     continue;
@@ -1711,10 +1713,12 @@ static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *proce
                 if (in_batch(items, stride, n, u))
                     continue;
                 /* A fresh list takes the batch's vectors that are nearer. */
-                if ((s = pending_has(c, u, &pend)) != CDB_OK)
-                    return s;
-                if (pend)
-                    continue;
+                if (has_other_pending) {
+                    if ((s = pending_has(c, u, &pend)) != CDB_OK)
+                        return s;
+                    if (pend)
+                        continue;
+                }
                 if ((s = rec_get(c, u, &ur, &found)) != CDB_OK)
                     return s;
                 if (!found)
