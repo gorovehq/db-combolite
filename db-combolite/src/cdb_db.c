@@ -2649,3 +2649,75 @@ cdb_status cdb_db_check_perm(cdb_db *db, uint64_t principal_id, uint64_t scope_s
 
     return CDB_E_SECURITY;
 }
+
+/* -------------------------------------------------------- streaming blobs */
+
+static const uint8_t *get_enclave_hash_key(cdb_db *db, uint64_t store_id)
+{
+    unsigned i;
+    for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
+        if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == store_id)
+            return db->enclaves[i].hash_key;
+    }
+    if (db->has_catalog) {
+        cdb_store_info sinfo;
+        if (cdb_catalog_get_store(&db->catalog, store_id, &sinfo) == CDB_OK && sinfo.domain_id > 0) {
+            for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
+                if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == sinfo.domain_id)
+                    return db->enclaves[i].hash_key;
+            }
+        }
+    }
+    return NULL;
+}
+
+cdb_status cdb_db_blob_write_begin(cdb_db *db, uint64_t store_id, uint8_t *scratch, cdb_blob_writer *w)
+{
+    const uint8_t *hkey;
+    if (db == NULL)
+        return CDB_E_INVALID_ARG;
+    hkey = get_enclave_hash_key(db, store_id);
+    return cdb_blob_write_begin(&db->pager, store_id, scratch, hkey, w);
+}
+
+cdb_status cdb_db_blob_write_chunk(cdb_blob_writer *w, const void *chunk, size_t len)
+{
+    return cdb_blob_write_chunk(w, chunk, len);
+}
+
+cdb_status cdb_db_blob_write_end(cdb_blob_writer *w, cdb_blob_ref *out_ref)
+{
+    return cdb_blob_write_end(w, out_ref);
+}
+
+cdb_status cdb_db_blob_write_abort(cdb_blob_writer *w)
+{
+    return cdb_blob_write_abort(w);
+}
+
+cdb_status cdb_db_blob_read_begin(cdb_db *db, uint64_t store_id, const cdb_blob_ref *ref,
+                                  uint8_t *page_buf, int verify_hash, cdb_blob_reader *r)
+{
+    const uint8_t *hkey;
+    if (db == NULL)
+        return CDB_E_INVALID_ARG;
+    hkey = get_enclave_hash_key(db, store_id);
+    return cdb_blob_read_begin(&db->pager, store_id, ref, page_buf, verify_hash, hkey, r);
+}
+
+cdb_status cdb_db_blob_read_chunk(cdb_blob_reader *r, void *dest, size_t cap, size_t *out_len)
+{
+    return cdb_blob_read_chunk(r, dest, cap, out_len);
+}
+
+cdb_status cdb_db_blob_read_end(cdb_blob_reader *r)
+{
+    return cdb_blob_read_end(r);
+}
+
+cdb_status cdb_db_blob_free(cdb_db *db, uint64_t store_id, const cdb_blob_ref *ref, uint8_t *page_buf)
+{
+    if (db == NULL)
+        return CDB_E_INVALID_ARG;
+    return cdb_blob_free(&db->pager, store_id, ref, page_buf);
+}

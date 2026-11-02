@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include "combolite/cdb_common.h"
+#include "combolite/cdb_blob.h"
 
 #define CDB_VALUE_MAX_DEPTH 32 /* deepest nesting of arrays and objects */
 
@@ -32,6 +33,7 @@ enum {
     CDB_TAG_ARRAY = 0x43,
     CDB_TAG_OBJECT = 0x44,
     CDB_TAG_VECTOR = 0x45,
+    CDB_TAG_BLOB = 0x46,
     CDB_TAG_FIRST_VARIABLE = 0x40
 };
 
@@ -51,6 +53,7 @@ typedef enum cdb_value_type {
     CDB_TYPE_ARRAY,
     CDB_TYPE_OBJECT,
     CDB_TYPE_VECTOR,
+    CDB_TYPE_BLOB_REF,
     CDB_TYPE_UNKNOWN /* a variable-size tag this build does not know; skippable */
 } cdb_value_type;
 
@@ -153,6 +156,9 @@ cdb_status cdb_value_write_vector(cdb_value_writer *w, cdb_vector_elem elem,
 cdb_status cdb_value_write_vector_raw(cdb_value_writer *w, cdb_vector_elem elem, uint64_t dims,
                                       const void *data, size_t len);
 
+/* Content-addressed blob reference (spec 14.15). */
+cdb_status cdb_value_write_blob_ref(cdb_value_writer *w, const cdb_blob_ref *ref);
+
 /* Copies one value that is already encoded (for example, read from another
  * document). It is validated against the writer's decimal mode first. */
 cdb_status cdb_value_write_encoded(cdb_value_writer *w, const void *value, size_t len);
@@ -195,6 +201,7 @@ typedef struct cdb_value {
             const uint8_t *values; size_t values_len;
         } object;
         struct { cdb_vector_elem elem; uint64_t dims; const uint8_t *data; size_t data_len; } vector;
+        cdb_blob_ref blob;
     } as;
 } cdb_value;
 

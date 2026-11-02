@@ -106,6 +106,19 @@ cdb_status cdb_crypto_hmac_sha256(const uint8_t key[CDB_CRYPTO_KEY_SIZE],
                                   const void *data, size_t len,
                                   uint8_t out_mac[CDB_CRYPTO_HASH_SIZE]);
 
+/* Streaming hash context (SHA-256 or HMAC-SHA-256). Fixed size, zero heap allocation. */
+typedef struct cdb_crypto_hash_ctx {
+    uint32_t opaque[32]; /* 128 bytes, aligned, holds internal sha context */
+    uint8_t opad[64];    /* outer pad for HMAC if enabled */
+    int is_hmac;
+} cdb_crypto_hash_ctx;
+
+cdb_status cdb_crypto_hash_init(cdb_crypto_hash_ctx *ctx);
+cdb_status cdb_crypto_hash_init_hmac(cdb_crypto_hash_ctx *ctx, const uint8_t key[CDB_CRYPTO_KEY_SIZE]);
+cdb_status cdb_crypto_hash_update(cdb_crypto_hash_ctx *ctx, const void *data, size_t len);
+cdb_status cdb_crypto_hash_final(cdb_crypto_hash_ctx *ctx, uint8_t out_hash[CDB_CRYPTO_HASH_SIZE]);
+void cdb_crypto_hash_free(cdb_crypto_hash_ctx *ctx);
+
 /* Purpose-separated subkey derivation via HKDF-SHA256 (spec 12.2). */
 cdb_status cdb_crypto_derive_subkey(const uint8_t base_key[CDB_CRYPTO_KEY_SIZE],
                                     cdb_subkey_purpose purpose,

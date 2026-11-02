@@ -147,6 +147,100 @@ cdb_status cdb_crypto_hmac_sha256(const uint8_t key[CDB_CRYPTO_KEY_SIZE],
     return ret == 0 ? CDB_OK : CDB_E_CORRUPT;
 }
 
+cdb_status cdb_crypto_hash_init(cdb_crypto_hash_ctx *ctx)
+{
+    mbedtls_sha256_context *s;
+    if (ctx == NULL)
+        return CDB_E_INVALID_ARG;
+    if (sizeof(mbedtls_sha256_context) > sizeof(ctx->opaque))
+        return CDB_E_STATE;
+
+    memset(ctx, 0, sizeof *ctx);
+    s = (mbedtls_sha256_context *)(void *)ctx->opaque;
+    mbedtls_sha256_init(s);
+    if (mbedtls_sha256_starts(s, 0) != 0)
+        return CDB_E_CORRUPT;
+    ctx->is_hmac = 0;
+    return CDB_OK;
+}
+
+cdb_status cdb_crypto_hash_init_hmac(cdb_crypto_hash_ctx *ctx, const uint8_t key[CDB_CRYPTO_KEY_SIZE])
+{
+    mbedtls_sha256_context *s;
+    uint8_t k_ipad[64];
+    size_t i;
+    if (ctx == NULL || key == NULL)
+        return CDB_E_INVALID_ARG;
+    if (sizeof(mbedtls_sha256_context) > sizeof(ctx->opaque))
+        return CDB_E_STATE;
+
+    memset(ctx, 0, sizeof *ctx);
+    for (i = 0; i < 64; i++) {
+        uint8_t k = (i < CDB_CRYPTO_KEY_SIZE) ? key[i] : 0u;
+        k_ipad[i] = (uint8_t)(k ^ 0x36u);
+        ctx->opad[i] = (uint8_t)(k ^ 0x5Cu);
+    }
+
+    s = (mbedtls_sha256_context *)(void *)ctx->opaque;
+    mbedtls_sha256_init(s);
+    if (mbedtls_sha256_starts(s, 0) != 0 || mbedtls_sha256_update(s, k_ipad, 64) != 0) {
+        mbedtls_platform_zeroize(k_ipad, sizeof k_ipad);
+        return CDB_E_CORRUPT;
+    }
+    mbedtls_platform_zeroize(k_ipad, sizeof k_ipad);
+    ctx->is_hmac = 1;
+    return CDB_OK;
+}
+
+cdb_status cdb_crypto_hash_update(cdb_crypto_hash_ctx *ctx, const void *data, size_t len)
+{
+    mbedtls_sha256_context *s;
+    if (ctx == NULL || (len > 0 && data == NULL))
+        return CDB_E_INVALID_ARG;
+    if (len == 0)
+        return CDB_OK;
+
+    s = (mbedtls_sha256_context *)(void *)ctx->opaque;
+    if (mbedtls_sha256_update(s, (const unsigned char *)data, len) != 0)
+        return CDB_E_CORRUPT;
+    return CDB_OK;
+}
+
+cdb_status cdb_crypto_hash_final(cdb_crypto_hash_ctx *ctx, uint8_t out_hash[CDB_CRYPTO_HASH_SIZE])
+{
+    mbedtls_sha256_context *s;
+    if (ctx == NULL || out_hash == NULL)
+        return CDB_E_INVALID_ARG;
+
+    s = (mbedtls_sha256_context *)(void *)ctx->opaque;
+    if (!ctx->is_hmac) {
+        if (mbedtls_sha256_finish(s, out_hash) != 0)
+            return CDB_E_CORRUPT;
+    } else {
+        uint8_t inner[CDB_CRYPTO_HASH_SIZE];
+        if (mbedtls_sha256_finish(s, inner) != 0)
+            return CDB_E_CORRUPT;
+        if (mbedtls_sha256_starts(s, 0) != 0 ||
+            mbedtls_sha256_update(s, ctx->opad, 64) != 0 ||
+            mbedtls_sha256_update(s, inner, sizeof inner) != 0 ||
+            mbedtls_sha256_finish(s, out_hash) != 0) {
+            mbedtls_platform_zeroize(inner, sizeof inner);
+            return CDB_E_CORRUPT;
+        }
+        mbedtls_platform_zeroize(inner, sizeof inner);
+    }
+    return CDB_OK;
+}
+
+void cdb_crypto_hash_free(cdb_crypto_hash_ctx *ctx)
+{
+    if (ctx != NULL) {
+        mbedtls_sha256_context *s = (mbedtls_sha256_context *)(void *)ctx->opaque;
+        mbedtls_sha256_free(s);
+        mbedtls_platform_zeroize(ctx, sizeof *ctx);
+    }
+}
+
 cdb_status cdb_crypto_derive_subkey(const uint8_t base_key[CDB_CRYPTO_KEY_SIZE],
                                     cdb_subkey_purpose purpose,
                                     uint8_t subkey_out[CDB_CRYPTO_KEY_SIZE])

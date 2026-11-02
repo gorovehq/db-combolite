@@ -557,6 +557,29 @@ cdb_status cdb_value_write_vector_raw(cdb_value_writer *w, cdb_vector_elem elem,
     return CDB_OK;
 }
 
+cdb_status cdb_value_write_blob_ref(cdb_value_writer *w, const cdb_blob_ref *ref)
+{
+    size_t payload;
+    cdb_status s = w_begin_value(w);
+    if (s != CDB_OK)
+        return s;
+    if (ref == NULL)
+        return w_fail(w, CDB_E_INVALID_ARG);
+    payload = 1 + CDB_CRYPTO_HASH_SIZE + cdb_varint_size(ref->total_len) +
+              cdb_varint_size(ref->first_page) + cdb_varint_size(ref->page_count);
+    if ((s = w_room(w, 1 + cdb_varint_size(payload) + payload)) != CDB_OK)
+        return s;
+    w_put_byte(w, CDB_TAG_BLOB);
+    w_put_varint(w, payload);
+    w_put_byte(w, (uint8_t)ref->flags);
+    w_put(w, ref->hash, CDB_CRYPTO_HASH_SIZE);
+    w_put_varint(w, ref->total_len);
+    w_put_varint(w, ref->first_page);
+    w_put_varint(w, ref->page_count);
+    w_end_value(w);
+    return CDB_OK;
+}
+
 /* Tag, payload length, then the payload: the element type byte, dims as a
  * varint, and the elements. Each element is converted from host form to
  * the file's byte order and made canonical on the way. */
@@ -966,6 +989,23 @@ cdb_status cdb_value_read(const uint8_t *buf, size_t len, cdb_byte_order order, 
         out->as.vector.elem = elem;
         out->as.vector.data = p;
         out->as.vector.data_len = (size_t)(pend - p);
+        return CDB_OK;
+    }
+    case CDB_TAG_BLOB: {
+        if ((size_t)(pend - p) < 1 + CDB_CRYPTO_HASH_SIZE)
+            return CDB_E_MALFORMED;
+        out->type = CDB_TYPE_BLOB_REF;
+        out->as.blob.flags = *p++;
+        memcpy(out->as.blob.hash, p, CDB_CRYPTO_HASH_SIZE);
+        p += CDB_CRYPTO_HASH_SIZE;
+        if ((s = read_varint(&p, pend, &out->as.blob.total_len)) != CDB_OK)
+            return s == CDB_E_TRUNCATED ? CDB_E_MALFORMED : s;
+        if ((s = read_varint(&p, pend, &out->as.blob.first_page)) != CDB_OK)
+            return s == CDB_E_TRUNCATED ? CDB_E_MALFORMED : s;
+        if ((s = read_varint(&p, pend, &out->as.blob.page_count)) != CDB_OK)
+            return s == CDB_E_TRUNCATED ? CDB_E_MALFORMED : s;
+        if (p != pend)
+            return CDB_E_MALFORMED;
         return CDB_OK;
     }
     default:
