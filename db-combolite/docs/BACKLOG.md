@@ -16,6 +16,30 @@ Features and follow-ups that were agreed and deferred. Each one becomes a milest
 - **High-level DB integration:** `cdb_db_blob_*` with automatic enclave HMAC content addressing and store isolation.
 - **Unit test suite:** `test_blob` verifying NIST vectors, chunked roundtrip, tamper detection, page reclamation on abort, value encoding, multipart journaling, and enclave integration.
 
+### Conflict-Free Replicated Data Types (CRDTs) and Multi-Master P2P Replication
+
+**What:** support deterministic, conflict-free multi-master data replication and offline-first collaboration across distributed nodes, edge devices, and micro-controllers without centralized lock coordination.
+
+**Scope and Architecture:**
+- **State and Clock Tracking:**
+  - Hybrid Logical Clocks (HLC) and compact peer version vectors (`cdb_hlc`) to order mutations deterministically across independent nodes.
+  - Fixed-size peer state vectors fitting caller-provided memory, preserving micro-controller bounds (e.g. 16–32 peer slots).
+- **CRDT Model Primitives:**
+  - **Documents (`cdb_doc`):**
+    - *LWW-Element-Set / Map CRDT:* Field-level last-write-wins resolution for JSON/CBOR document attributes, avoiding whole-document collision aborts.
+    - *Collaborative Text / Sequence CRDT:* Fractional indexing or sequence DAGs (e.g., Logoot/RGA/Fugue-style) for concurrent character/token insertions and deletions in document string fields.
+    - *Counters:* Positive-Negative (PN-Counter) and Grow-only (G-Counter) primitive types for numeric fields.
+  - **Relational Tables (`cdb_table`):**
+    - Field-level convergent resolution on concurrent row updates; tombstone-aware delete tracking across peer nodes.
+  - **Link Store / Graphs (`cdb_link`):**
+    - Add-Wins Observed-Remove Set (AWORSet) for graph relationships, allowing concurrent link creation and removal across peers to resolve deterministically.
+  - **Time Series (`cdb_ts`):**
+    - Commutative point append and deduplication via `(series_id, timestamp, peer_id)`.
+- **Delta-State Replication Protocol:**
+  - Transport-agnostic sync protocol: two-way state vector handshake followed by transmission of missing delta slices (works over byte streams, BLE, serial, files, or network sockets).
+  - Direct integration with transaction delta tracks (`cdb_delta`), encoding CRDT mutation payloads into standard journal records with zero heap allocations in execution paths.
+  - Multi-parent revision DAG support in document histories (`cdb_doc`), allowing peer branches to record convergence checkpoints without breaking linear read views.
+
 ## Follow-ups
 
 - **A second process can open a database already in use (found by the demo, 2026-10-30).** *Partly fixed in M19 layer 1:* open now joins the coordinators and returns `CDB_E_BUSY` while another live process has the database open. Sharing it for real comes with M19 layers 2–3.
