@@ -51,10 +51,47 @@
 
 #define CDB_LINK_STORE_NAME "$links"
 
+/* Reference flags (spec 6.1, 6.11). */
+#define CDB_REF_ENTRY   0x00u /* standard entry: (store, entry) */
+#define CDB_REF_POINT   0x01u /* time-series point: (store, series, ts) */
+#define CDB_REF_OPAQUE  0x02u /* cross-boundary enclave opaque pointer */
+
 typedef struct cdb_ref {
     uint64_t store;
-    uint64_t entry;
+    uint64_t entry;       /* entry ID, series ID, or enclave_ptr */
+    int64_t  ts;          /* timestamp if CDB_REF_POINT */
+    uint32_t flags;       /* CDB_REF_* */
 } cdb_ref;
+
+static inline cdb_ref cdb_ref_entry(uint64_t store, uint64_t entry)
+{
+    cdb_ref r;
+    r.store = store;
+    r.entry = entry;
+    r.ts = 0;
+    r.flags = CDB_REF_ENTRY;
+    return r;
+}
+
+static inline cdb_ref cdb_ref_point(uint64_t store, uint64_t series, int64_t ts)
+{
+    cdb_ref r;
+    r.store = store;
+    r.entry = series;
+    r.ts = ts;
+    r.flags = CDB_REF_POINT;
+    return r;
+}
+
+static inline cdb_ref cdb_ref_opaque(uint64_t store_or_domain, uint64_t enclave_ptr)
+{
+    cdb_ref r;
+    r.store = store_or_domain;
+    r.entry = enclave_ptr;
+    r.ts = 0;
+    r.flags = CDB_REF_OPAQUE;
+    return r;
+}
 
 typedef struct cdb_link {
     uint64_t type;

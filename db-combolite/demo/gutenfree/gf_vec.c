@@ -204,12 +204,12 @@ cdb_status gf_vec_link_similar(gf_db *g, const gf_vec *v, uint64_t *added)
         if (s != CDB_OK || (s = cdb_vec_search(&g->db, v->books, enc, len, CDB_VEC_BASE, hits, GF_SIMILAR + 1, &n))
                                != CDB_OK)
             break;
-        from.store = v->books, from.entry = entry;
+        from = cdb_ref_entry(v->books, entry);
         for (i = 0; i < n; i++) {
             cdb_status ls;
             if (hits[i].entry == entry)
                 continue;
-            to.store = v->books, to.entry = hits[i].entry;
+            to = cdb_ref_entry(v->books, hits[i].entry);
             ls = cdb_link_add(&g->db, v->similar, from, to, (float)(1.0 - hits[i].distance), 0);
             if (ls == CDB_OK)
                 (*added)++;

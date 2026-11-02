@@ -907,6 +907,22 @@ static cdb_status read_row(cdb_db *db, table *t, uint64_t entry, void *out, size
     return project(db, t, tbuf(db, T_OTHER), raw, info.schema_version, (uint8_t *)out, cap, len);
 }
 
+cdb_status cdb_table_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *live)
+{
+    cdb_store_info info;
+    cdb_status s;
+    *live = 0;
+    if (!db->has_catalog)
+        return CDB_E_UNSUPPORTED;
+    if ((s = cdb_catalog_get_store(&db->catalog, store, &info)) != CDB_OK)
+        return s;
+    if (info.model != CDB_MODEL_RELATIONAL)
+        return CDB_E_INVALID_ARG;
+    if (info.flags & CDB_STORE_DROPPED)
+        return CDB_OK;
+    return cdb_doc_live_in_tx(db, store, entry, live);
+}
+
 cdb_status cdb_table_is_column(cdb_db *db, uint64_t store, int *is_col)
 {
     table *t;

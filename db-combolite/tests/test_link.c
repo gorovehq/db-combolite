@@ -7,6 +7,9 @@
 #include "cdb_doc.h"
 #include "cdb_faultenv.h"
 #include "cdb_link.h"
+#include "cdb_rowgroup.h"
+#include "cdb_table.h"
+#include "cdb_ts.h"
 #include "cdb_vec.h"
 
 #define FCAP (768u * 1024u)
@@ -30,6 +33,10 @@ static uint8_t doc_buffers[8u * PAGE];
 static uint8_t doc_stage[4096];
 static uint8_t idx_stage[16u * 1024u];
 static uint8_t vec_buffers[3u * PAGE];
+static uint8_t table_buffers[4u * PAGE];
+static uint8_t col_work[64u * 1024u];
+static uint8_t ts_buffers[3u * PAGE];
+static uint8_t ts_work[(CDB_TS_BLOCK_MAX_POINTS + 1u) * sizeof(cdb_ts_point)];
 static cdb_db_config cfg;
 static cdb_db db;
 
@@ -70,6 +77,12 @@ void setUp(void)
     cfg.idx_stage = idx_stage;
     cfg.idx_stage_size = sizeof idx_stage;
     cfg.vec_buffers = vec_buffers;
+    cfg.table_buffers = table_buffers;
+    cfg.col_work = col_work;
+    cfg.col_work_size = sizeof col_work;
+    cfg.ts_buffers = ts_buffers;
+    cfg.ts_work = ts_work;
+    cfg.ts_work_size = sizeof ts_work;
     cfg.durability = CDB_DURABILITY_FULL;
 }
 
@@ -122,6 +135,7 @@ static uint64_t new_doc(void)
 static cdb_ref ref(uint64_t store, uint64_t entry)
 {
     cdb_ref r;
+    memset(&r, 0, sizeof r);
     r.store = store;
     r.entry = entry;
     return r;
@@ -641,6 +655,290 @@ static void test_crash_sweep(void)
     }
 }
 
+static void test_link_table_rows(void)
+{
+    cdb_table_column cols[2];
+    cdb_table_def tdef_row, tdef_col;
+    uint64_t t_row = 0, t_col = 0;
+    uint64_t type_refuse, type_tomb, type_cascade;
+    uint64_t row_e1 = 0, row_e2 = 0, col_e1 = 0;
+    uint64_t doc_e;
+    unsigned pk = 0;
+    cdb_ref r_doc, r_row1, r_row2, r_col1;
+    cdb_link out[8];
+    cdb_link l;
+    size_t n = 0;
+    int found = 0;
+    uint8_t buf[64];
+    cdb_value_writer w;
+
+    need_open(3);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    pool = make_pool("t_docs");
+
+    cols[0].name = "id";
+    cols[0].name_len = 2;
+    cols[0].type = CDB_TYPE_INT;
+    cols[0].not_null = 1;
+    cols[0].default_value = NULL;
+    cols[0].default_len = 0;
+
+    cols[1].name = "val";
+    cols[1].name_len = 3;
+    cols[1].type = CDB_TYPE_STRING;
+    cols[1].not_null = 0;
+    cols[1].default_value = NULL;
+    cols[1].default_len = 0;
+
+    memset(&tdef_row, 0, sizeof tdef_row);
+    tdef_row.columns = cols;
+    tdef_row.ncolumns = 2;
+    tdef_row.primary_key = &pk;
+    tdef_row.npk = 1;
+    tdef_row.layout = CDB_TABLE_LAYOUT_ROW;
+
+    memset(&tdef_col, 0, sizeof tdef_col);
+    tdef_col.columns = cols;
+    tdef_col.ncolumns = 2;
+    tdef_col.primary_key = &pk;
+    tdef_col.npk = 1;
+    tdef_col.layout = CDB_TABLE_LAYOUT_COLUMN;
+    tdef_col.group_rows = 64;
+    tdef_col.chunk_cap = 4096;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_create(&db, "table_row", 9, &tdef_row, &t_row));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_create(&db, "table_col", 9, &tdef_col, &t_col));
+
+    type_tomb = define("t_tomb", CDB_CARD_N_M, 1, CDB_LINK_ON_DELETE_TOMBSTONE);
+    type_cascade = define("t_casc", CDB_CARD_N_M, 1, CDB_LINK_ON_DELETE_CASCADE);
+    type_refuse = define("t_ref", CDB_CARD_N_M, 1, CDB_LINK_ON_DELETE_REFUSE);
+
+    /* Insert doc */
+    begin();
+    doc_e = new_doc();
+    r_doc = D(doc_e);
+
+    /* Insert row into row table */
+    cdb_value_writer_init(&w, buf, sizeof buf, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, 1);
+    cdb_value_write_int(&w, 100);
+    cdb_value_field(&w, 2);
+    cdb_value_write_string(&w, "row_one", 7);
+    cdb_value_end_object(&w);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_insert(&db, t_row, buf, cdb_value_writer_len(&w), &row_e1));
+    r_row1 = cdb_ref_entry(t_row, row_e1);
+
+    /* Insert 2nd row into row table */
+    cdb_value_writer_init(&w, buf, sizeof buf, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, 1);
+    cdb_value_write_int(&w, 101);
+    cdb_value_field(&w, 2);
+    cdb_value_write_string(&w, "row_two", 7);
+    cdb_value_end_object(&w);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_insert(&db, t_row, buf, cdb_value_writer_len(&w), &row_e2));
+    r_row2 = cdb_ref_entry(t_row, row_e2);
+
+    /* Insert row into columnar table */
+    cdb_value_writer_init(&w, buf, sizeof buf, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, 1);
+    cdb_value_write_int(&w, 200);
+    cdb_value_field(&w, 2);
+    cdb_value_write_string(&w, "col_one", 7);
+    cdb_value_end_object(&w);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_insert(&db, t_col, buf, cdb_value_writer_len(&w), &col_e1));
+    r_col1 = cdb_ref_entry(t_col, col_e1);
+
+    /* Add links between doc, row table, and columnar table */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_add(&db, type_tomb, r_doc, r_row1, 1.0f, 100));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_add(&db, type_cascade, r_row1, r_col1, 2.0f, 100));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_add(&db, type_refuse, r_doc, r_row2, 3.0f, 100));
+    commit();
+
+    /* Verify links exist and can be listed in both directions */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_list(&db, r_row1, CDB_LINK_OUT, 0, NULL, out, 8, &n));
+    TEST_ASSERT_EQUAL_size_t(1, n);
+    TEST_ASSERT_EQUAL_UINT64(r_col1.store, out[0].target.store);
+    TEST_ASSERT_EQUAL_UINT64(r_col1.entry, out[0].target.entry);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_list(&db, r_row1, CDB_LINK_IN, 0, NULL, out, 8, &n));
+    TEST_ASSERT_EQUAL_size_t(1, n);
+    TEST_ASSERT_EQUAL_UINT64(r_doc.store, out[0].source.store);
+    TEST_ASSERT_EQUAL_UINT64(r_doc.entry, out[0].source.entry);
+
+    /* Test delete refuse: deleting r_row2 should fail while refuse link points at it */
+    begin();
+    TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_table_delete(&db, t_row, row_e2));
+    commit();
+
+    /* Test delete cascade: deleting r_row1 should erase r_row1 -> r_col1 cascade link,
+     * and tombstone r_doc -> r_row1 link */
+    begin();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_delete(&db, t_row, row_e1));
+    commit();
+
+    /* r_row1 -> r_col1 was cascade: should be gone */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_get(&db, type_cascade, r_row1, r_col1, &l, &found));
+    TEST_ASSERT_EQUAL_INT(0, found);
+
+    /* r_doc -> r_row1 was tombstone: should be tombstoned with TARGET_GONE */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_get(&db, type_tomb, r_doc, r_row1, &l, &found));
+    TEST_ASSERT_EQUAL_INT(1, found);
+    TEST_ASSERT_TRUE((l.flags & (CDB_LINK_TOMBSTONE | CDB_LINK_TARGET_GONE)) != 0);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+static void test_link_time_series_series_and_points(void)
+{
+    uint64_t ts_store = 0, series1 = 0;
+    cdb_ts_def sdef;
+    cdb_ts_in pts[3];
+    uint8_t valbuf[32];
+    cdb_value_writer w;
+    uint64_t type_nm;
+    int created = 0, found = 0;
+    cdb_link l;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    pool = make_pool("ts_docs");
+    type_nm = define("ts_link", CDB_CARD_N_M, 1, CDB_LINK_ON_DELETE_TOMBSTONE);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_create(&db, "metrics", 7, CDB_TS_LATE_ACCEPT, 0, &ts_store));
+
+    /* Create series with 1 field */
+    memset(&sdef, 0, sizeof sdef);
+    sdef.precision = CDB_TS_MILLIS;
+    sdef.window = 3600000; /* 1 hour */
+    sdef.nfields = 1;
+    sdef.fields[0].id = 1;
+    sdef.fields[0].type = CDB_TYPE_INT;
+
+    begin();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_series(&db, ts_store, "cpu", 3, NULL, 0, &sdef, &series1, &created));
+    TEST_ASSERT_EQUAL_INT(1, created);
+
+    cdb_value_writer_init(&w, valbuf, sizeof valbuf, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, 1);
+    cdb_value_write_int(&w, 42);
+    cdb_value_end_object(&w);
+
+    pts[0].ts = 1000;
+    pts[0].use_clock = 0;
+    pts[0].values = valbuf;
+    pts[0].len = cdb_value_writer_len(&w);
+
+    pts[1].ts = 2000;
+    pts[1].use_clock = 0;
+    pts[1].values = valbuf;
+    pts[1].len = cdb_value_writer_len(&w);
+
+    pts[2].ts = 3000;
+    pts[2].use_clock = 0;
+    pts[2].values = valbuf;
+    pts[2].len = cdb_value_writer_len(&w);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_append(&db, ts_store, series1, pts, 3));
+
+    uint64_t doc_e = new_doc();
+    cdb_ref r_doc = D(doc_e);
+    cdb_ref r_series = cdb_ref_entry(ts_store, series1);
+    cdb_ref r_pt2000 = cdb_ref_point(ts_store, series1, 2000);
+    cdb_ref r_pt9999 = cdb_ref_point(ts_store, series1, 9999);
+
+    /* Link to the series entry itself */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_add(&db, type_nm, r_doc, r_series, 1.0f, 100));
+
+    /* Link to point at ts=2000 */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_add(&db, type_nm, r_doc, r_pt2000, 2.0f, 100));
+
+    /* Link to non-existent point ts=9999: should fail with CDB_E_NOT_FOUND */
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_link_add(&db, type_nm, r_doc, r_pt9999, 3.0f, 100));
+
+    commit();
+
+    /* Verify get for both series link and point link */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_get(&db, type_nm, r_doc, r_series, &l, &found));
+    TEST_ASSERT_EQUAL_INT(1, found);
+    TEST_ASSERT_EQUAL_FLOAT(1.0f, l.weight);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_get(&db, type_nm, r_doc, r_pt2000, &l, &found));
+    TEST_ASSERT_EQUAL_INT(1, found);
+    TEST_ASSERT_EQUAL_FLOAT(2.0f, l.weight);
+    TEST_ASSERT_EQUAL_INT64(2000, l.target.ts);
+    TEST_ASSERT_EQUAL_UINT32(CDB_REF_POINT, l.target.flags);
+
+    /* Append a point in a new tx and link to it in same tx */
+    begin();
+    pts[0].ts = 4000;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_append(&db, ts_store, series1, pts, 1));
+    cdb_ref r_pt4000 = cdb_ref_point(ts_store, series1, 4000);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_add(&db, type_nm, r_doc, r_pt4000, 4.0f, 100));
+    commit();
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_get(&db, type_nm, r_doc, r_pt4000, &l, &found));
+    TEST_ASSERT_EQUAL_INT(1, found);
+
+    /* Drop points before ts=2500 */
+    begin();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_drop_before(&db, ts_store, series1, 2500));
+    commit();
+
+    /* Point 2000 should no longer be live in tx */
+    int pt_live = 0;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_point_live_in_tx(&db, ts_store, series1, 2000, &pt_live));
+    TEST_ASSERT_EQUAL_INT(0, pt_live);
+
+    /* Point 3000 should still be live */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_point_live_in_tx(&db, ts_store, series1, 3000, &pt_live));
+    TEST_ASSERT_EQUAL_INT(1, pt_live);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+static void test_link_enclave_opaque_pointers(void)
+{
+    uint64_t type_nm;
+    cdb_ref r_doc, r_opaque, r_bad_opaque;
+    cdb_link l;
+    int found = 0;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    pool = make_pool("enc_docs");
+    type_nm = define("enc_link", CDB_CARD_N_M, 1, CDB_LINK_ON_DELETE_TOMBSTONE);
+
+    begin();
+    uint64_t doc_e = new_doc();
+    r_doc = D(doc_e);
+    commit();
+
+    /* Open an enclave with ID 42 (cdb_db_create_enclave marks it active) */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_enclave(&db, 42, NULL));
+
+    r_opaque = cdb_ref_opaque(42, 0xCAFEBABEULL);
+    r_bad_opaque = cdb_ref_opaque(999, 0xDEADBEEFULL);
+
+    begin();
+    /* Link targeting active enclave opaque pointer: succeeds */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_add(&db, type_nm, r_doc, r_opaque, 1.0f, 100));
+
+    /* Link targeting inactive/unknown enclave: fails with CDB_E_NOT_FOUND */
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_link_add(&db, type_nm, r_doc, r_bad_opaque, 2.0f, 100));
+    commit();
+
+    /* Verify get and list for opaque link */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_link_get(&db, type_nm, r_doc, r_opaque, &l, &found));
+    TEST_ASSERT_EQUAL_INT(1, found);
+    TEST_ASSERT_EQUAL_UINT32(CDB_REF_OPAQUE, l.target.flags);
+    TEST_ASSERT_EQUAL_UINT64(0xCAFEBABEULL, l.target.entry);
+    TEST_ASSERT_EQUAL_UINT64(42, l.target.store);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -652,6 +950,9 @@ int main(void)
     RUN_TEST(test_drop_store);
     RUN_TEST(test_staging_links_batch);
     RUN_TEST(test_staging_links_overflow);
+    RUN_TEST(test_link_table_rows);
+    RUN_TEST(test_link_time_series_series_and_points);
+    RUN_TEST(test_link_enclave_opaque_pointers);
     RUN_TEST(test_crash_sweep);
     return UNITY_END();
 }
