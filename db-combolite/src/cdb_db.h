@@ -14,6 +14,7 @@
 #include "combolite/cdb_env.h"
 #include "combolite/cdb_crypto.h"
 #include "combolite/cdb_blob.h"
+#include "cdb_audit.h"
 #include "cdb_catalog.h"
 #include "cdb_coord.h"
 #include "cdb_journal.h"
@@ -375,6 +376,11 @@ typedef struct cdb_db {
         int in_use;
     } rbac_grants[32];
     unsigned num_grants;
+    /* System audit series (spec 10.7, 12.7). */
+    uint8_t last_audit_hash[32];
+    uint64_t audit_seq;
+    int audit_initialized;
+    uint64_t audit_store_id;
 } cdb_db;
 
 /* Re-entrant synchronization locks across threads (spec 5.9.6, M20). */

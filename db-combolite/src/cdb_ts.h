@@ -95,8 +95,48 @@ cdb_status cdb_ts_describe(cdb_db *db, uint64_t store, uint64_t series, cdb_ts_d
  * any point is refused. */
 cdb_status cdb_ts_append(cdb_db *db, uint64_t store, uint64_t series, const cdb_ts_in *points, size_t n);
 
-/* Inside a transaction: removes every point older than ts (held ones too). */
+/* Inside a transaction: removes every point older than ts (held ones too).
+ * Refused with CDB_E_SECURITY on the protected audit series. */
 cdb_status cdb_ts_drop_before(cdb_db *db, uint64_t store, uint64_t series, int64_t ts);
+
+/* Retention policy (spec 10.4).
+ * Configures retention for a series: points older than max_age_ticks are eligible
+ * for dropping. max_age_ticks = 0 keeps everything (default).
+ * Fails with CDB_E_SECURITY on the protected audit series. */
+cdb_status cdb_ts_set_retention(cdb_db *db, uint64_t store, uint64_t series, int64_t max_age_ticks);
+
+/* Retrieves the configured retention for a series in ticks (0 = keep everything). */
+cdb_status cdb_ts_get_retention(cdb_db *db, uint64_t store, uint64_t series, int64_t *max_age_ticks);
+
+/* Applies retention policy inside an open transaction: purges points older than
+ * now_ts - retention_ticks via cdb_ts_drop_before.
+ * If dropped_before is non-NULL, writes the cutoff timestamp used (or INT64_MIN if none).
+ * Fails with CDB_E_SECURITY on the protected audit series. */
+cdb_status cdb_ts_apply_retention(cdb_db *db, uint64_t store, uint64_t series, int64_t now_ts, int64_t *dropped_before);
+
+/* Downsampling recipes (spec 10.4). */
+#define CDB_TS_AGG_AVG   1u
+#define CDB_TS_AGG_MIN   2u
+#define CDB_TS_AGG_MAX   3u
+#define CDB_TS_AGG_COUNT 4u
+#define CDB_TS_AGG_SUM   5u
+#define CDB_TS_AGG_FIRST 6u
+#define CDB_TS_AGG_LAST  7u
+
+typedef struct cdb_ts_downsample_spec {
+    uint64_t src_store;
+    uint64_t src_series;
+    uint64_t dst_store;
+    uint64_t dst_series;
+    int64_t  bucket_step;       /* Duration per summary bucket in series time units */
+    uint16_t field_aggs[CDB_TS_MAX_FIELDS]; /* CDB_TS_AGG_* per field */
+} cdb_ts_downsample_spec;
+
+/* Runs a downsampling recipe over [from_ts, to_ts), appending summary points
+ * to dst_series. If db is not already in a transaction, opens and commits one.
+ * Fails with CDB_E_SECURITY on the protected audit series. */
+cdb_status cdb_ts_downsample_run(cdb_db *db, const cdb_ts_downsample_spec *spec,
+                                 int64_t from_ts, int64_t to_ts, size_t *points_generated);
 
 /* Committed points with from <= ts < to, oldest first: at most max rows,
  * values encoded into buf. *next is where to continue (to when done). */

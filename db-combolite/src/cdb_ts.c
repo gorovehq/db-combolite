@@ -16,6 +16,7 @@
 #include "combolite/cdb_value.h"
 #include "cdb_doc.h"
 #include "cdb_endian.h"
+#include "cdb_audit.h"
 #include "cdb_key.h"
 #include "cdb_nib.h"
 #include "cdb_ts.h"
@@ -864,6 +865,13 @@ cdb_status cdb_ts_append(cdb_db *db, uint64_t store, uint64_t series, const cdb_
     return CDB_OK;
 }
 
+static size_t k_retention(uint8_t out[9], uint64_t series)
+{
+    cdb_store_u64(out, series, CDB_ORDER_BIG);
+    out[8] = 0x01;
+    return 9;
+}
+
 /* Only checks the series exists; the apply does the removal. */
 cdb_status cdb_ts_drop_before(cdb_db *db, uint64_t store, uint64_t series, int64_t ts)
 {
@@ -872,6 +880,8 @@ cdb_status cdb_ts_drop_before(cdb_db *db, uint64_t store, uint64_t series, int64
     srec r;
     int found;
     cdb_status s;
+    if (store == CDB_AUDIT_STORE_ID || (db->audit_store_id && store == db->audit_store_id))
+        return CDB_E_SECURITY;
     if ((s = tx_store(db, store, &t)) != CDB_OK)
         return s;
     if ((s = tx_series(db, t, series, &r, &found)) != CDB_OK)
@@ -883,6 +893,97 @@ cdb_status cdb_ts_drop_before(cdb_db *db, uint64_t store, uint64_t series, int64
         return s;
     t->touched_tx = db->tx_id;
     return CDB_OK;
+}
+
+cdb_status cdb_ts_set_retention(cdb_db *db, uint64_t store, uint64_t series, int64_t max_age_ticks)
+{
+    ts_store *t;
+    srec r;
+    int found;
+    cdb_status s;
+    uint8_t k[9], v[8];
+
+    if (store == CDB_AUDIT_STORE_ID || (db->audit_store_id && store == db->audit_store_id))
+        return CDB_E_SECURITY;
+    if (max_age_ticks < 0)
+        return CDB_E_INVALID_ARG;
+
+    if ((s = ts_get(db, store, &t)) != CDB_OK)
+        return s;
+    if ((s = db->in_tx ? tx_series(db, t, series, &r, &found) : rec_get(t, series, &r, &found)) != CDB_OK)
+        return s;
+    if (!found)
+        return CDB_E_NOT_FOUND;
+
+    k_retention(k, series);
+    if (max_age_ticks > 0) {
+        cdb_store_u64(v, (uint64_t)max_age_ticks, CDB_ORDER_BIG);
+        if ((s = cdb_index_put(&t->series, k, sizeof k, v, sizeof v)) != CDB_OK)
+            return s;
+    } else {
+        if ((s = cdb_index_delete(&t->series, k, sizeof k, &found)) != CDB_OK)
+            return s;
+    }
+    t->dirty = 1;
+    if (db->in_tx)
+        t->touched_tx = db->tx_id;
+    return CDB_OK;
+}
+
+cdb_status cdb_ts_get_retention(cdb_db *db, uint64_t store, uint64_t series, int64_t *max_age_ticks)
+{
+    ts_store *t;
+    srec r;
+    int found;
+    cdb_status s;
+    uint8_t k[9], v[8];
+    size_t vlen;
+
+    if (max_age_ticks == NULL)
+        return CDB_E_INVALID_ARG;
+    *max_age_ticks = 0;
+
+    if ((s = ts_get(db, store, &t)) != CDB_OK)
+        return s;
+    if ((s = db->in_tx ? tx_series(db, t, series, &r, &found) : rec_get(t, series, &r, &found)) != CDB_OK)
+        return s;
+    if (!found)
+        return CDB_E_NOT_FOUND;
+
+    k_retention(k, series);
+    s = cdb_index_get(&t->series, k, sizeof k, v, sizeof v, &vlen, &found);
+    if (s != CDB_OK && s != CDB_E_NOT_FOUND)
+        return s;
+    if (found && vlen == sizeof v)
+        *max_age_ticks = (int64_t)cdb_load_u64(v, CDB_ORDER_BIG);
+    else
+        *max_age_ticks = 0;
+    return CDB_OK;
+}
+
+cdb_status cdb_ts_apply_retention(cdb_db *db, uint64_t store, uint64_t series, int64_t now_ts, int64_t *dropped_before)
+{
+    int64_t retention = 0;
+    int64_t cutoff;
+    cdb_status s;
+
+    if (store == CDB_AUDIT_STORE_ID || (db->audit_store_id && store == db->audit_store_id))
+        return CDB_E_SECURITY;
+
+    if ((s = cdb_ts_get_retention(db, store, series, &retention)) != CDB_OK)
+        return s;
+
+    if (retention <= 0) {
+        if (dropped_before)
+            *dropped_before = INT64_MIN;
+        return CDB_OK;
+    }
+
+    cutoff = now_ts - retention;
+    if (dropped_before)
+        *dropped_before = cutoff;
+
+    return cdb_ts_drop_before(db, store, series, cutoff);
 }
 
 /* -------------------------------------------------------- blocks */
@@ -1119,10 +1220,14 @@ static cdb_status blk_for(cdb_db *db, ts_store *t, const srec *r, uint64_t serie
 
 /* -------------------------------------------------------- applying points */
 
-/* Tells the application about a collision (spec 10.6). Called from the
- * apply, so it is called again for the same point on recovery. */
-static void collided(cdb_db *db, const ts_store *t, uint64_t series, int64_t ts)
+static cdb_status write_row(const srec *r, const cdb_ts_point *p, cdb_byte_order o, uint8_t *out, size_t cap,
+                            size_t *len);
+
+/* Tells the application and the audit log about a collision (spec 10.6, 10.7).
+ * Called from the apply, so it is called again for the same point on recovery. */
+static void collided(cdb_db *db, const ts_store *t, uint64_t series, int64_t ts, const void *old_val, size_t old_len)
 {
+    (void)cdb_audit_log(db, CDB_AUDIT_COLLISION, 0, t->slot.store_id, series, old_val, old_len);
     if (db->cfg.ts_collision)
         db->cfg.ts_collision(db->cfg.ts_collision_ctx, t->slot.store_id, series, ts);
 }
@@ -1161,8 +1266,13 @@ static cdb_status merge_point(cdb_db *db, ts_store *t, srec *r, uint64_t series,
                 merged.v[f] = p->v[f];
         if (same_values(&r->def, &pts[i], &merged))
             return CDB_OK; /* nothing changes */
+        {
+            uint8_t old_buf[512];
+            size_t old_len = 0;
+            (void)write_row(r, &pts[i], db->pager.order, old_buf, sizeof old_buf, &old_len);
+            collided(db, t, series, p->ts, old_buf, old_len);
+        }
         pts[i] = merged;
-        collided(db, t, series, p->ts);
     } else {
         memmove(&pts[i + 1], &pts[i], (n - i) * sizeof *pts);
         pts[i] = *p;
@@ -1544,4 +1654,272 @@ cdb_status cdb_ts_range(cdb_db *db, uint64_t store, uint64_t series, int64_t fro
             return CDB_OK;
         at = b.first + 1;
     }
+}
+
+/* -------------------------------------------------------- downsampling */
+
+typedef struct agg_state {
+    int count;
+    double sum_f64;
+    double min_f64;
+    double max_f64;
+    int64_t sum_i64;
+    int64_t min_i64;
+    int64_t max_i64;
+    cdb_value first_val;
+    uint8_t first_payload[128];
+    int have_first;
+    cdb_value last_val;
+    uint8_t last_payload[128];
+    int have_last;
+} agg_state;
+
+static void write_agg_val(cdb_value_writer *w, const cdb_value *v)
+{
+    switch (v->type) {
+    case CDB_TYPE_INT: cdb_value_write_int(w, v->as.i64); break;
+    case CDB_TYPE_F64: cdb_value_write_f64(w, v->as.f64); break;
+    case CDB_TYPE_F32: cdb_value_write_f32(w, v->as.f32); break;
+    case CDB_TYPE_BOOL: cdb_value_write_bool(w, v->as.boolean); break;
+    case CDB_TYPE_STRING: cdb_value_write_string(w, (const char *)v->payload, v->payload_len); break;
+    case CDB_TYPE_BINARY: cdb_value_write_binary(w, v->payload, v->payload_len); break;
+    default: cdb_value_write_encoded(w, v->payload, v->payload_len); break;
+    }
+}
+
+static cdb_status flush_downsample_bucket(cdb_db *db, const cdb_ts_downsample_spec *spec,
+                                          const cdb_ts_def *dst_def, const cdb_ts_def *src_def,
+                                          int64_t bucket_ts, const agg_state *aggs)
+{
+    uint8_t enc_buf[1024];
+    cdb_value_writer w;
+    cdb_ts_in pin;
+    size_t enc_len;
+    unsigned df;
+
+    cdb_value_writer_init(&w, enc_buf, sizeof enc_buf, db->pager.order, CDB_DECIMAL_UNBOUNDED);
+    cdb_value_begin_object(&w);
+
+    for (df = 0; df < dst_def->nfields; df++) {
+        uint64_t fid = dst_def->fields[df].id;
+        uint8_t ftype = dst_def->fields[df].type;
+        int sf = -1;
+        unsigned s_idx;
+
+        for (s_idx = 0; s_idx < src_def->nfields; s_idx++) {
+            if (src_def->fields[s_idx].id == fid) {
+                sf = (int)s_idx;
+                break;
+            }
+        }
+        if (sf < 0 && df < src_def->nfields)
+            sf = (int)df;
+        if (sf < 0 || aggs[sf].count == 0)
+            continue;
+
+        cdb_value_field(&w, fid);
+        switch (spec->field_aggs[sf]) {
+        case CDB_TS_AGG_COUNT:
+            cdb_value_write_int(&w, (int64_t)aggs[sf].count);
+            break;
+        case CDB_TS_AGG_SUM:
+            if (ftype == CDB_TYPE_INT)
+                cdb_value_write_int(&w, aggs[sf].sum_i64);
+            else if (ftype == CDB_TYPE_F32)
+                cdb_value_write_f32(&w, (float)aggs[sf].sum_f64);
+            else
+                cdb_value_write_f64(&w, aggs[sf].sum_f64);
+            break;
+        case CDB_TS_AGG_MIN:
+            if (ftype == CDB_TYPE_INT)
+                cdb_value_write_int(&w, aggs[sf].min_i64);
+            else if (ftype == CDB_TYPE_F32)
+                cdb_value_write_f32(&w, (float)aggs[sf].min_f64);
+            else
+                cdb_value_write_f64(&w, aggs[sf].min_f64);
+            break;
+        case CDB_TS_AGG_MAX:
+            if (ftype == CDB_TYPE_INT)
+                cdb_value_write_int(&w, aggs[sf].max_i64);
+            else if (ftype == CDB_TYPE_F32)
+                cdb_value_write_f32(&w, (float)aggs[sf].max_f64);
+            else
+                cdb_value_write_f64(&w, aggs[sf].max_f64);
+            break;
+        case CDB_TS_AGG_FIRST:
+            if (aggs[sf].have_first)
+                write_agg_val(&w, &aggs[sf].first_val);
+            break;
+        case CDB_TS_AGG_LAST:
+            if (aggs[sf].have_last)
+                write_agg_val(&w, &aggs[sf].last_val);
+            break;
+        case CDB_TS_AGG_AVG:
+        default:
+            if (ftype == CDB_TYPE_INT)
+                cdb_value_write_int(&w, aggs[sf].sum_i64 / (int64_t)aggs[sf].count);
+            else if (ftype == CDB_TYPE_F32)
+                cdb_value_write_f32(&w, (float)(aggs[sf].sum_f64 / (double)aggs[sf].count));
+            else
+                cdb_value_write_f64(&w, aggs[sf].sum_f64 / (double)aggs[sf].count);
+            break;
+        }
+    }
+    cdb_value_end_object(&w);
+    enc_len = cdb_value_writer_len(&w);
+
+    pin.ts = bucket_ts;
+    pin.use_clock = 0;
+    pin.values = enc_buf;
+    pin.len = enc_len;
+
+    return cdb_ts_append(db, spec->dst_store, spec->dst_series, &pin, 1);
+}
+
+cdb_status cdb_ts_downsample_run(cdb_db *db, const cdb_ts_downsample_spec *spec,
+                                 int64_t from_ts, int64_t to_ts, size_t *points_generated)
+{
+    cdb_ts_def src_def, dst_def;
+    agg_state aggs[CDB_TS_MAX_FIELDS];
+    cdb_ts_row rows[32];
+    uint8_t row_buf[4096];
+    int64_t cur_from, cur_bucket = 0;
+    int in_bucket = 0, tx_opened = 0;
+    size_t generated = 0;
+    cdb_status s;
+
+    if (db == NULL || spec == NULL || points_generated == NULL)
+        return CDB_E_INVALID_ARG;
+    if (spec->bucket_step <= 0 || from_ts >= to_ts)
+        return CDB_E_INVALID_ARG;
+
+    if (spec->src_store == CDB_AUDIT_STORE_ID || spec->dst_store == CDB_AUDIT_STORE_ID)
+        return CDB_E_SECURITY;
+    if (db->audit_store_id && (spec->src_store == db->audit_store_id || spec->dst_store == db->audit_store_id))
+        return CDB_E_SECURITY;
+
+    *points_generated = 0;
+
+    if ((s = cdb_ts_describe(db, spec->src_store, spec->src_series, &src_def)) != CDB_OK)
+        return s;
+    if ((s = cdb_ts_describe(db, spec->dst_store, spec->dst_series, &dst_def)) != CDB_OK)
+        return s;
+
+    if (!db->in_tx) {
+        if ((s = cdb_tx_begin(db, CDB_DURABILITY_DEFAULT)) != CDB_OK)
+            return s;
+        tx_opened = 1;
+    }
+
+    memset(aggs, 0, sizeof aggs);
+    cur_from = from_ts;
+
+    while (cur_from < to_ts) {
+        size_t nrows = 0, i;
+        int64_t next_ts = to_ts;
+
+        s = cdb_ts_range(db, spec->src_store, spec->src_series, cur_from, to_ts,
+                         row_buf, sizeof row_buf, rows, 32, &nrows, &next_ts);
+        if (s != CDB_OK)
+            goto fail;
+        if (nrows == 0)
+            break;
+
+        for (i = 0; i < nrows; i++) {
+            int64_t pt_ts = rows[i].ts;
+            int64_t pt_bucket = window_of(pt_ts, spec->bucket_step);
+            cdb_value obj;
+            unsigned sf;
+
+            if (in_bucket && pt_bucket != cur_bucket) {
+                if ((s = flush_downsample_bucket(db, spec, &dst_def, &src_def, cur_bucket, aggs)) != CDB_OK)
+                    goto fail;
+                generated++;
+                memset(aggs, 0, sizeof aggs);
+                in_bucket = 0;
+            }
+
+            if (!in_bucket) {
+                cur_bucket = pt_bucket;
+                in_bucket = 1;
+            }
+
+            if ((s = cdb_value_read(row_buf + rows[i].off, rows[i].len, db->pager.order, &obj)) != CDB_OK)
+                goto fail;
+
+            for (sf = 0; sf < src_def.nfields; sf++) {
+                cdb_value v;
+                int found = 0;
+                if (cdb_value_object_get(&obj, db->pager.order, src_def.fields[sf].id, &v, &found) == CDB_OK && found) {
+                    int64_t ival = 0;
+                    double fval = 0.0;
+                    if (v.type == CDB_TYPE_INT) {
+                        ival = v.as.i64;
+                        fval = (double)ival;
+                    } else if (v.type == CDB_TYPE_F64) {
+                        fval = v.as.f64;
+                        ival = (int64_t)fval;
+                    } else if (v.type == CDB_TYPE_F32) {
+                        fval = (double)v.as.f32;
+                        ival = (int64_t)fval;
+                    }
+                    if (aggs[sf].count == 0) {
+                        aggs[sf].min_i64 = ival;
+                        aggs[sf].max_i64 = ival;
+                        aggs[sf].sum_i64 = ival;
+                        aggs[sf].min_f64 = fval;
+                        aggs[sf].max_f64 = fval;
+                        aggs[sf].sum_f64 = fval;
+                        aggs[sf].first_val = v;
+                        if (v.payload_len > 0 && v.payload != NULL) {
+                            size_t copy_len = v.payload_len < sizeof(aggs[sf].first_payload) ? v.payload_len : sizeof(aggs[sf].first_payload);
+                            memcpy(aggs[sf].first_payload, v.payload, copy_len);
+                            aggs[sf].first_val.payload = aggs[sf].first_payload;
+                        }
+                        aggs[sf].have_first = 1;
+                    } else {
+                        if (ival < aggs[sf].min_i64) aggs[sf].min_i64 = ival;
+                        if (ival > aggs[sf].max_i64) aggs[sf].max_i64 = ival;
+                        aggs[sf].sum_i64 += ival;
+                        if (fval < aggs[sf].min_f64) aggs[sf].min_f64 = fval;
+                        if (fval > aggs[sf].max_f64) aggs[sf].max_f64 = fval;
+                        aggs[sf].sum_f64 += fval;
+                    }
+                    aggs[sf].last_val = v;
+                    if (v.payload_len > 0 && v.payload != NULL) {
+                        size_t copy_len = v.payload_len < sizeof(aggs[sf].last_payload) ? v.payload_len : sizeof(aggs[sf].last_payload);
+                        memcpy(aggs[sf].last_payload, v.payload, copy_len);
+                        aggs[sf].last_val.payload = aggs[sf].last_payload;
+                    }
+                    aggs[sf].have_last = 1;
+                    aggs[sf].count++;
+                }
+            }
+        }
+
+        if (next_ts == to_ts || next_ts <= cur_from)
+            break;
+        cur_from = next_ts;
+    }
+
+    if (in_bucket) {
+        if ((s = flush_downsample_bucket(db, spec, &dst_def, &src_def, cur_bucket, aggs)) != CDB_OK)
+            goto fail;
+        generated++;
+    }
+
+    if (tx_opened) {
+        if ((s = cdb_tx_commit(db)) != CDB_OK) {
+            cdb_tx_abort(db);
+            return s;
+        }
+    }
+
+    *points_generated = generated;
+    return CDB_OK;
+
+fail:
+    if (tx_opened)
+        cdb_tx_abort(db);
+    return s;
 }

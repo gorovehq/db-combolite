@@ -80,6 +80,7 @@ cdb_add_test(test_security)
 cdb_add_test(test_blob)
 cdb_add_test(test_reclaim)
 cdb_add_test(test_overflow_nib)
+cdb_add_test(test_audit)
 
 # The suites that use several stores again, with one open store of each
 # model at a time, so a store closed while still in use shows up here.
