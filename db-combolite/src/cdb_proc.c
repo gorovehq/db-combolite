@@ -308,6 +308,64 @@ cdb_status cdb_proc_exec(cdb_proc_vm *vm, const uint8_t *bytecode, size_t len, c
             goto cleanup;
         }
 
+        case CDB_BC_SAVEPOINT: {
+            uint8_t sp_id;
+            size_t r;
+            if (p >= end) { st = CDB_E_TRUNCATED; goto cleanup; }
+            sp_id = *p++;
+            if (vm->n_savepoints < CDB_PROC_MAX_SAVEPOINTS) {
+                cdb_proc_savepoint *sp = &vm->savepoints[vm->n_savepoints++];
+                sp->id = sp_id;
+                sp->is_active = 1;
+                sp->n_regs = vm->n_regs;
+                for (r = 0; r < vm->n_regs; r++) {
+                    sp->saved_regs[r] = vm->regs[r];
+                }
+            }
+            break;
+        }
+
+        case CDB_BC_ROLLBACK_TO: {
+            uint8_t sp_id;
+            int found = 0;
+            int sidx;
+            if (p >= end) { st = CDB_E_TRUNCATED; goto cleanup; }
+            sp_id = *p++;
+            for (sidx = (int)vm->n_savepoints - 1; sidx >= 0; sidx--) {
+                if (vm->savepoints[sidx].is_active && vm->savepoints[sidx].id == sp_id) {
+                    size_t r;
+                    for (r = 0; r < vm->savepoints[sidx].n_regs; r++) {
+                        vm->regs[r] = vm->savepoints[sidx].saved_regs[r];
+                    }
+                    vm->n_savepoints = (uint8_t)(sidx + 1);
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                st = CDB_E_NOT_FOUND;
+                goto cleanup;
+            }
+            break;
+        }
+
+        case CDB_BC_RELEASE_SP: {
+            uint8_t sp_id;
+            int sidx;
+            if (p >= end) { st = CDB_E_TRUNCATED; goto cleanup; }
+            sp_id = *p++;
+            for (sidx = (int)vm->n_savepoints - 1; sidx >= 0; sidx--) {
+                if (vm->savepoints[sidx].is_active && vm->savepoints[sidx].id == sp_id) {
+                    vm->savepoints[sidx].is_active = 0;
+                    if ((uint8_t)(sidx + 1) == vm->n_savepoints) {
+                        vm->n_savepoints--;
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+
         case CDB_BC_HALT:
             st = CDB_OK;
             goto cleanup;
@@ -516,6 +574,30 @@ cdb_status cdb_proc_write_return(cdb_proc_writer *w, uint8_t src)
 cdb_status cdb_proc_write_halt(cdb_proc_writer *w)
 {
     w_b(w, CDB_BC_HALT);
+    update_len(w);
+    return w->error;
+}
+
+cdb_status cdb_proc_write_savepoint(cdb_proc_writer *w, uint8_t sp_id)
+{
+    w_b(w, CDB_BC_SAVEPOINT);
+    w_b(w, sp_id);
+    update_len(w);
+    return w->error;
+}
+
+cdb_status cdb_proc_write_rollback_to(cdb_proc_writer *w, uint8_t sp_id)
+{
+    w_b(w, CDB_BC_ROLLBACK_TO);
+    w_b(w, sp_id);
+    update_len(w);
+    return w->error;
+}
+
+cdb_status cdb_proc_write_release_sp(cdb_proc_writer *w, uint8_t sp_id)
+{
+    w_b(w, CDB_BC_RELEASE_SP);
+    w_b(w, sp_id);
     update_len(w);
     return w->error;
 }

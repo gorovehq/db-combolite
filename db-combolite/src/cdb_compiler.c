@@ -1415,6 +1415,47 @@ cdb_status cdb_compile_proc(const char *src, size_t len,
             continue;
         }
 
+        /* SAVEPOINT <ident>; */
+        if (cdb_token_equals_ci(&tok, "SAVEPOINT")) {
+            cdb_lexer_next(&pc.lex, &tok);
+            cdb_token sp_name;
+            if (expect((compiler_ctx *)(void *)&pc, CDB_TOK_IDENT, "Expected savepoint name", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
+            uint8_t sp_id = (uint8_t)(sp_name.len > 0 ? (uint8_t)((unsigned char)sp_name.start[0] % 8) : 1u);
+            cdb_proc_write_savepoint(&pw, sp_id);
+            match((compiler_ctx *)(void *)&pc, CDB_TOK_SEMICOLON, NULL);
+            continue;
+        }
+
+        /* ROLLBACK TO <ident>; */
+        if (cdb_token_equals_ci(&tok, "ROLLBACK")) {
+            cdb_lexer_next(&pc.lex, &tok);
+            cdb_token to_tok;
+            if (cdb_lexer_peek(&pc.lex, &to_tok) == CDB_OK && cdb_token_equals_ci(&to_tok, "TO")) {
+                cdb_lexer_next(&pc.lex, &to_tok);
+            }
+            cdb_token sp_name;
+            if (expect((compiler_ctx *)(void *)&pc, CDB_TOK_IDENT, "Expected savepoint name after ROLLBACK TO", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
+            uint8_t sp_id = (uint8_t)(sp_name.len > 0 ? (uint8_t)((unsigned char)sp_name.start[0] % 8) : 1u);
+            cdb_proc_write_rollback_to(&pw, sp_id);
+            match((compiler_ctx *)(void *)&pc, CDB_TOK_SEMICOLON, NULL);
+            continue;
+        }
+
+        /* RELEASE [SAVEPOINT] <ident>; */
+        if (cdb_token_equals_ci(&tok, "RELEASE")) {
+            cdb_lexer_next(&pc.lex, &tok);
+            cdb_token sp_kw;
+            if (cdb_lexer_peek(&pc.lex, &sp_kw) == CDB_OK && cdb_token_equals_ci(&sp_kw, "SAVEPOINT")) {
+                cdb_lexer_next(&pc.lex, &sp_kw);
+            }
+            cdb_token sp_name;
+            if (expect((compiler_ctx *)(void *)&pc, CDB_TOK_IDENT, "Expected savepoint name after RELEASE", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
+            uint8_t sp_id = (uint8_t)(sp_name.len > 0 ? (uint8_t)((unsigned char)sp_name.start[0] % 8) : 1u);
+            cdb_proc_write_release_sp(&pw, sp_id);
+            match((compiler_ctx *)(void *)&pc, CDB_TOK_SEMICOLON, NULL);
+            continue;
+        }
+
         /* Other statements */
         cdb_lexer_next(&pc.lex, &tok);
         match((compiler_ctx *)(void *)&pc, CDB_TOK_SEMICOLON, NULL);

@@ -322,11 +322,60 @@ Literal         ::= 'TRUE' | 'FALSE' | 'NULL' | IntLit | FloatLit | StringLit ;
 ```
 
 
-### M23: Transactions, Coordination & Triggers
-- **Cursor isolation during intra-transaction mutations**:
-  - Defining isolation and reentrancy guarantees when a procedure iterates a stream cursor while performing concurrent writes (`INSERT`, `LINK`, `APPEND`) to tables or indexes being scanned.
-- **Procedure error trapping & savepoints**:
-  - Error-handling model within stored procedures: whether any failed mutation (e.g. constraint violation) immediately aborts the transaction, or if savepoints / rollback-to-savepoint primitives are provided.
+### 11.12 Transactions, Triggers & Coordination (M23)
+
+This section specifies the cross-store transaction semantics, mutation reentrancy guarantees, trigger execution architecture, and savepoint error trapping mechanisms implemented in Milestone M23.
+
+#### 11.12.1 Cross-Store Multi-Model Atomic Transactions
+
+db-combolite transactions are atomic across all five companion data models (relational, document, vector, link, time series, Section 11.3):
+
+1. **Shared Transaction Identifier**: A transaction assigns a single monotonic sequence and transaction ID across all participating stores.
+2. **Atomic Commit Coordination (Section 5.9.4)**:
+   - `cdb_tx_commit` emits `CDB_RECORD_PREPARE` to the local process delta track.
+   - During the settle window, the coordinator verifies that no concurrent journal contains a conflicting write key (`CDB_RECORD_WRITE_KEY`) for any table primary key, document revision head, or link entry modified by the transaction.
+   - If a collision occurs, the transaction is rejected with `CDB_E_COLLISION` (or an opaque notification if crossing an enclave boundary, Section 11.8).
+   - When collision-free, the coordinator appends `CDB_RECORD_COMMIT`, making all multi-model mutations durable simultaneously.
+
+#### 11.12.2 Intra-Transaction Cursor Isolation & Mutation Reentrancy
+
+Stored procedures frequently iterate across query cursors while performing mutations on the stores being scanned (e.g., migrating rows, enriching documents, or creating links):
+
+1. **Snapshot at Cursor Open**: When `cdb_exec_cursor_open` is called within an open transaction, the cursor fixes its scan view to the transaction's staged mutation state at that exact instant.
+2. **Halloween Problem Prevention**: Entries inserted, updated, or deleted by the stored procedure *after* the cursor has opened are not visited by that in-flight cursor. This guarantees deterministic single-pass iteration and prevents infinite loops caused by self-feeding query streams.
+3. **Cursor State Invariants**: Closing a cursor frees its scratch arena buffers immediately; multiple cursors (up to `CDB_PROC_MAX_CURSORS = 4`) may be held open simultaneously across different stores or nested subqueries.
+
+#### 11.12.3 Procedure Error Trapping & Savepoints
+
+To allow batch workflows and data ingestion scripts to recover from individual constraint violations without discarding an entire batch:
+
+1. **Savepoint Markers**: A procedure or transaction can establish named savepoints:
+   - `SAVEPOINT <name>;` (emits bytecode opcode `CDB_BC_SAVEPOINT`)
+   - `ROLLBACK TO <name>;` (emits bytecode opcode `CDB_BC_ROLLBACK_TO`)
+   - `RELEASE <name>;`
+2. **Staged Delta Unwinding**: Rolling back to a savepoint rewinds the uncommitted transaction staging buffer and transaction index entries back to the savepoint's offset. Reconciled pages and archive commits are untouched.
+3. **Error Status Trapping**: In stored procedure bytecode, mutation opcodes (`CALL_MUTATION`) write their integer `cdb_status` return code into a destination register. A procedure can check if `$status != 0` and execute a `ROLLBACK TO` block or log error telemetry rather than terminating execution.
+
+#### 11.12.4 Event Triggers & Safety Constraints
+
+Event triggers execute stored procedures in response to data modifications:
+
+1. **Trigger Definition**:
+   ```sql
+   TRIGGER audit_books ON catalog AFTER INSERT DO PROCEDURE log_catalog_audit($old, $new);
+   ```
+2. **Post-Commit Execution (Spec 11.9)**:
+   - Triggers execute **after** the transaction that caused them has durably committed.
+   - Trigger tasks are enqueued to the background worker pool (`cdb_worker.c`), decoupling mutation latency from trigger completion.
+3. **Trigger Guardrails**:
+   - **Nesting Depth Limit**: A strict maximum depth limit (default: 8) is enforced. If a trigger sets off subsequent triggers exceeding this depth, execution is halted with `CDB_E_OUT_OF_BUDGET`.
+   - **Cascade Warning**: If an action would trigger more than an operator-defined cascade threshold *x*, the library issues a warning before execution.
+
+#### 11.12.5 Scheduled Maintenance & Background Procedures
+
+1. **Catalog Scheduling**: Procedures can be marked in the catalog with a schedule (cron interval or maintenance window).
+2. **Worker Pool Execution**: When the background heartbeat thread (`cdb_db.c`) or worker pool (`cdb_worker.c`) detects a due maintenance procedure (e.g. vector graph refresh `cdb_vec_refresh`, time-series chunk rollup, or compaction), it dispatches the procedure VM without blocking foreground readers or writers.
+
 
 ## Appendix: Worked Examples (Referenced to GutenFree Diet Demo)
 
