@@ -118,6 +118,33 @@ static void test_compile_stored_procedure(void) {
     TEST_ASSERT_EQUAL_INT64(42, ret.as.i64);
 }
 
+static void test_compile_proc_with_savepoints(void) {
+    const char *script =
+        "PROCEDURE test_sp()\n"
+        "BEGIN\n"
+        "    LET $val = 10;\n"
+        "    SAVEPOINT before_update;\n"
+        "    LET $val = 99;\n"
+        "    ROLLBACK TO before_update;\n"
+        "    RETURN $val;\n"
+        "END;";
+
+    uint8_t bc[512];
+    size_t bc_len = 0;
+    cdb_compile_error err;
+    memset(&err, 0, sizeof(err));
+
+    TEST_ASSERT_EQUAL(CDB_OK, cdb_compile_proc(script, strlen(script), NULL, bc, sizeof(bc), &bc_len, &err));
+
+    cdb_proc_vm vm;
+    cdb_proc_vm_init(&vm, NULL, CDB_ORDER_LITTLE, NULL, 0, 100);
+    cdb_value ret;
+    memset(&ret, 0, sizeof(ret));
+    TEST_ASSERT_EQUAL(CDB_OK, cdb_proc_exec(&vm, bc, bc_len, &ret));
+    TEST_ASSERT_EQUAL(CDB_TYPE_INT, ret.type);
+    TEST_ASSERT_EQUAL_INT64(10, ret.as.i64);
+}
+
 static void test_compile_error_reporting(void) {
     const char *bad_sql = "SELECT title FROM WHERE score > 0;";
     uint8_t wire[512];
@@ -138,6 +165,7 @@ int main(void) {
     RUN_TEST(test_compile_dotted_resolution);
     RUN_TEST(test_compile_math_and_dsp_calls);
     RUN_TEST(test_compile_stored_procedure);
+    RUN_TEST(test_compile_proc_with_savepoints);
     RUN_TEST(test_compile_error_reporting);
     return UNITY_END();
 }

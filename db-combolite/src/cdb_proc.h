@@ -35,6 +35,19 @@
 #define CDB_BC_CURSOR_CLOSE  0x0Bu
 #define CDB_BC_RETURN        0x0Cu
 #define CDB_BC_HALT          0x0Du
+#define CDB_BC_SAVEPOINT     0x0Eu
+#define CDB_BC_ROLLBACK_TO   0x0Fu
+#define CDB_BC_RELEASE_SP    0x10u
+
+#define CDB_PROC_MAX_SAVEPOINTS 8u
+
+/* Savepoint frame for error trapping and rollback */
+typedef struct cdb_proc_savepoint {
+    uint8_t id;
+    int is_active;
+    cdb_value saved_regs[CDB_PROC_MAX_REGISTERS];
+    uint8_t n_regs;
+} cdb_proc_savepoint;
 
 /* Mutation opcodes for CALL_MUTATION */
 #define CDB_MUT_DOC_INSERT   0x01u
@@ -65,6 +78,10 @@ typedef struct cdb_proc_vm {
     /* Instruction execution budget */
     uint64_t instruction_budget;
     uint64_t instructions_executed;
+
+    /* Savepoints for error trapping and rollback */
+    cdb_proc_savepoint savepoints[CDB_PROC_MAX_SAVEPOINTS];
+    uint8_t n_savepoints;
 
     /* Return value */
     cdb_value ret_val;
@@ -103,6 +120,9 @@ cdb_status cdb_proc_write_cursor_next(cdb_proc_writer *w, uint8_t has_row_reg, u
 cdb_status cdb_proc_write_cursor_close(cdb_proc_writer *w, uint8_t slot);
 cdb_status cdb_proc_write_return(cdb_proc_writer *w, uint8_t src);
 cdb_status cdb_proc_write_halt(cdb_proc_writer *w);
+cdb_status cdb_proc_write_savepoint(cdb_proc_writer *w, uint8_t sp_id);
+cdb_status cdb_proc_write_rollback_to(cdb_proc_writer *w, uint8_t sp_id);
+cdb_status cdb_proc_write_release_sp(cdb_proc_writer *w, uint8_t sp_id);
 cdb_status cdb_proc_writer_finish(cdb_proc_writer *w);
 
 #endif /* CDB_PROC_H */

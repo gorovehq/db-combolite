@@ -72,6 +72,8 @@ cdb_add_test(test_exec)
 cdb_add_test(test_proc)
 cdb_add_test(test_lexer)
 cdb_add_test(test_compiler)
+cdb_add_test(test_trigger)
+cdb_add_test(test_tx_cross_store)
 
 # The suites that use several stores again, with one open store of each
 # model at a time, so a store closed while still in use shows up here.
