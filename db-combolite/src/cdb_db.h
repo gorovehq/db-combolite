@@ -14,6 +14,7 @@
 #include "combolite/cdb_env.h"
 #include "combolite/cdb_crypto.h"
 #include "combolite/cdb_blob.h"
+#include "combolite/cdb_crdt.h"
 #include "cdb_audit.h"
 #include "cdb_catalog.h"
 #include "cdb_coord.h"
@@ -381,6 +382,11 @@ typedef struct cdb_db {
     uint64_t audit_seq;
     int audit_initialized;
     uint64_t audit_store_id;
+    /* CRDT & P2P Replication (backlog L19-42). */
+    uint32_t peer_id;
+    cdb_hlc hlc;
+    cdb_crdt_vector crdt_vector;
+    int in_crdt_import;
 } cdb_db;
 
 /* Re-entrant synchronization locks across threads (spec 5.9.6, M20). */
@@ -510,5 +516,19 @@ cdb_status cdb_stage_idx_put(cdb_db *db, uint64_t store, uint8_t idx_no, const u
                              uint64_t entry, int live);
 cdb_status cdb_stage_idx_get(const cdb_db *db, uint64_t store, uint8_t idx_no, const uint8_t *key, size_t klen,
                              uint64_t *entry, int *live, int *found);
+
+/* CRDT & P2P Replication (spec backlog L19-42). */
+cdb_status cdb_db_set_peer_id(cdb_db *db, uint32_t peer_id);
+cdb_status cdb_db_get_peer_id(const cdb_db *db, uint32_t *peer_id);
+cdb_status cdb_db_get_hlc(const cdb_db *db, cdb_hlc *hlc);
+cdb_status cdb_db_get_crdt_vector(const cdb_db *db, cdb_crdt_vector *vector);
+
+cdb_status cdb_db_crdt_export_slice(cdb_db *db, const cdb_crdt_vector *since_vector,
+                                    uint8_t *out_buf, size_t cap, size_t *out_len);
+cdb_status cdb_db_crdt_import_slice(cdb_db *db, const uint8_t *in_buf, size_t in_len,
+                                    size_t *applied_count);
+cdb_status cdb_db_crdt_import_deltas(cdb_db *db, uint32_t remote_peer_id,
+                                     const cdb_crdt_delta_rec *recs, size_t count,
+                                     size_t *applied_count);
 
 #endif

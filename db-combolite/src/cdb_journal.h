@@ -36,6 +36,7 @@
 #define CDB_RECORD_FLAG_ENCRYPTED 0x01u
 #define CDB_RECORD_FLAG_COMPRESSED 0x02u
 #define CDB_RECORD_FLAG_CONTINUED 0x04u
+#define CDB_RECORD_FLAG_REPLICATED 0x08u
 
 /* Data-change operation codes (spec 14.4.5). */
 #define CDB_OP_INSERT 1u

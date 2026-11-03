@@ -18,27 +18,18 @@ Features and follow-ups that were agreed and deferred. Each one becomes a milest
 
 ### Conflict-Free Replicated Data Types (CRDTs) and Multi-Master P2P Replication
 
-**What:** support deterministic, conflict-free multi-master data replication and offline-first collaboration across distributed nodes, edge devices, and micro-controllers without centralized lock coordination.
-
-**Scope and Architecture:**
-- **State and Clock Tracking:**
-  - Hybrid Logical Clocks (HLC) and compact peer version vectors (`cdb_hlc`) to order mutations deterministically across independent nodes.
-  - Fixed-size peer state vectors fitting caller-provided memory, preserving micro-controller bounds (e.g. 16–32 peer slots).
-- **CRDT Model Primitives:**
-  - **Documents (`cdb_doc`):**
-    - *LWW-Element-Set / Map CRDT:* Field-level last-write-wins resolution for JSON/CBOR document attributes, avoiding whole-document collision aborts.
-    - *Collaborative Text / Sequence CRDT:* Fractional indexing or sequence DAGs (e.g., Logoot/RGA/Fugue-style) for concurrent character/token insertions and deletions in document string fields.
-    - *Counters:* Positive-Negative (PN-Counter) and Grow-only (G-Counter) primitive types for numeric fields.
-  - **Relational Tables (`cdb_table`):**
-    - Field-level convergent resolution on concurrent row updates; tombstone-aware delete tracking across peer nodes.
-  - **Link Store / Graphs (`cdb_link`):**
-    - Add-Wins Observed-Remove Set (AWORSet) for graph relationships, allowing concurrent link creation and removal across peers to resolve deterministically.
-  - **Time Series (`cdb_ts`):**
-    - Commutative point append and deduplication via `(series_id, timestamp, peer_id)`.
+*Implemented:*
+- **State & Clock Tracking:** Hybrid Logical Clocks (`cdb_hlc`) with strict total ordering and sub-tick counters; bounded peer version vectors (`cdb_crdt_vector`) with O(1)/O(P) dominance and concurrency detection (`CDB_CRDT_CMP_DOMINATES`, `DOMINATED`, `CONCURRENT`, `EQUAL`).
+- **CRDT Primitives:**
+  - *Documents & Tables:* Field-level Last-Write-Wins (`cdb_crdt_lww_merge`) with tombstone tracking.
+  - *Distributed Counters:* Positive-Negative counters (`cdb_pn_counter`) with associative, commutative, idempotent multi-peer merges.
+  - *Graph Link Store:* Add-Wins Observed-Remove Set (`cdb_crdt_link_resolve`) for link tokens.
+  - *Time Series:* Commutative point append deduplication (`cdb_crdt_ts_same_point`).
 - **Delta-State Replication Protocol:**
-  - Transport-agnostic sync protocol: two-way state vector handshake followed by transmission of missing delta slices (works over byte streams, BLE, serial, files, or network sockets).
-  - Direct integration with transaction delta tracks (`cdb_delta`), encoding CRDT mutation payloads into standard journal records with zero heap allocations in execution paths.
-  - Multi-parent revision DAG support in document histories (`cdb_doc`), allowing peer branches to record convergence checkpoints without breaking linear read views.
+  - Transport-agnostic binary wire framing: two-way handshake (`cdb_crdt_handshake_encode`/`decode`) and delta slices (`cdb_crdt_slice_encode`/`decode`).
+  - High-level zero-allocation database export & import APIs (`cdb_db_crdt_export_slice`, `cdb_db_crdt_import_slice`, `cdb_db_crdt_import_deltas`).
+  - Replication echo suppression via `CDB_RECORD_FLAG_REPLICATED = 0x08u`.
+- **Unit test suite:** `test_crdt` verifying HLC causality, vector dominance/concurrency, PN-counter convergence, LWW document field resolution, graph link AWORSet, wire protocol codecs, and multi-peer bidirectional sync.
 
 ## Follow-ups
 

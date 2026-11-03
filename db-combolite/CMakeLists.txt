@@ -105,7 +105,8 @@ add_library(combolite
   src/cdb_compiler.c
   src/cdb_trigger.c
   src/cdb_crypto.c
-  src/cdb_audit.c)
+  src/cdb_audit.c
+  src/cdb_crdt.c)
 target_include_directories(combolite
   PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src

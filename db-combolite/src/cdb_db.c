@@ -1535,6 +1535,8 @@ cdb_status cdb_tx_put(cdb_db *db, uint64_t store_id, uint64_t entry_id, uint8_t 
     r.entry_id = entry_id;
     r.payload = payload;
     r.payload_len = (uint32_t)(len + 1u);
+    if (db->in_crdt_import)
+        r.flags |= (uint8_t)CDB_RECORD_FLAG_REPLICATED;
     db->tx_deltas++;
 
     for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
@@ -2056,6 +2058,13 @@ static cdb_status tx_commit_locked(cdb_db *db)
     if (db->fresh)
         db->applied++;
     db->last_tx = counter;
+    if (db->peer_id != 0 && !db->in_crdt_import) {
+        int64_t now_ns = 0;
+        int have_ns = 0;
+        cdb_db_now(db, &now_ns, &have_ns);
+        cdb_hlc_tick(&db->hlc, have_ns ? (uint64_t)now_ns : (db->hlc.physical + 1u));
+        cdb_crdt_vector_set(&db->crdt_vector, db->peer_id, counter, db->hlc);
+    }
     return CDB_OK;
 }
 
@@ -2903,4 +2912,342 @@ cdb_status cdb_db_blob_free(cdb_db *db, uint64_t store_id, const cdb_blob_ref *r
     if (db == NULL)
         return CDB_E_INVALID_ARG;
     return cdb_blob_free(&db->pager, store_id, ref, page_buf);
+}
+
+/* ------------------------------------------------------------ CRDT & P2P Replication */
+
+cdb_status cdb_db_set_peer_id(cdb_db *db, uint32_t peer_id)
+{
+    if (db == NULL)
+        return CDB_E_INVALID_ARG;
+    db_lock(db);
+    db->peer_id = peer_id;
+    db->hlc.peer_id = peer_id;
+    cdb_crdt_vector_set(&db->crdt_vector, peer_id, db->last_tx, db->hlc);
+    db_unlock(db);
+    return CDB_OK;
+}
+
+cdb_status cdb_db_get_peer_id(const cdb_db *db, uint32_t *peer_id)
+{
+    if (db == NULL || peer_id == NULL)
+        return CDB_E_INVALID_ARG;
+    *peer_id = db->peer_id;
+    return CDB_OK;
+}
+
+cdb_status cdb_db_get_hlc(const cdb_db *db, cdb_hlc *hlc)
+{
+    if (db == NULL || hlc == NULL)
+        return CDB_E_INVALID_ARG;
+    *hlc = db->hlc;
+    return CDB_OK;
+}
+
+cdb_status cdb_db_get_crdt_vector(const cdb_db *db, cdb_crdt_vector *vector)
+{
+    if (db == NULL || vector == NULL)
+        return CDB_E_INVALID_ARG;
+    *vector = db->crdt_vector;
+    return CDB_OK;
+}
+
+cdb_status cdb_db_crdt_export_slice(cdb_db *db, const cdb_crdt_vector *since_vector,
+                                    uint8_t *out_buf, size_t cap, size_t *out_len)
+{
+    cdb_status s;
+    uint64_t off, since_counter = 0;
+    size_t needed = 12u, out_off = 12u;
+    uint32_t count = 0;
+    cdb_crdt_peer_entry pe;
+
+    if (db == NULL || out_len == NULL)
+        return CDB_E_INVALID_ARG;
+
+    db_lock(db);
+    if ((s = usable(db)) != CDB_OK) {
+        db_unlock(db);
+        return s;
+    }
+
+    if (since_vector != NULL && db->peer_id != 0) {
+        if (cdb_crdt_vector_get(since_vector, db->peer_id, &pe) == CDB_OK)
+            since_counter = pe.counter;
+    }
+
+    /* First pass: measure needed size and count of committed records since since_counter */
+    off = CDB_JOURNAL_HEADER_SIZE;
+    while (off < db->journal.end) {
+        cdb_record r;
+        uint64_t next;
+        s = read_record(db, &db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
+        if (s != CDB_OK)
+            break;
+        if (r.kind == CDB_RECORD_DATA && !(r.flags & CDB_RECORD_FLAG_REPLICATED) &&
+            (r.tx_id & TX_COUNTER_MASK) > since_counter &&
+            (r.tx_id & TX_COUNTER_MASK) <= db->last_tx) {
+            size_t dlen = r.payload_len > 0 ? (size_t)(r.payload_len - 1u) : 0u;
+            needed += 37u + dlen;
+            count++;
+        }
+        off = next;
+    }
+
+    *out_len = needed;
+    if (out_buf == NULL || cap < needed) {
+        db_unlock(db);
+        return CDB_E_BUFFER_TOO_SMALL;
+    }
+
+    cdb_store_u32(out_buf, CDB_CRDT_WIRE_MAGIC, CDB_ORDER_BIG);
+    cdb_store_u32(out_buf + 4, db->peer_id, CDB_ORDER_BIG);
+    cdb_store_u32(out_buf + 8, count, CDB_ORDER_BIG);
+
+    /* Second pass: write delta records */
+    off = CDB_JOURNAL_HEADER_SIZE;
+    while (off < db->journal.end) {
+        cdb_record r;
+        uint64_t next;
+        s = read_record(db, &db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
+        if (s != CDB_OK)
+            break;
+        if (r.kind == CDB_RECORD_DATA && !(r.flags & CDB_RECORD_FLAG_REPLICATED) &&
+            (r.tx_id & TX_COUNTER_MASK) > since_counter &&
+            (r.tx_id & TX_COUNTER_MASK) <= db->last_tx) {
+            uint8_t op = r.payload_len > 0 ? r.payload[0] : 0;
+            const uint8_t *data = r.payload_len > 1 ? r.payload + 1 : NULL;
+            size_t dlen = r.payload_len > 0 ? (size_t)(r.payload_len - 1u) : 0u;
+            uint64_t tx_counter = r.tx_id & TX_COUNTER_MASK;
+
+            cdb_store_u64(out_buf + out_off, r.store_id, CDB_ORDER_BIG);
+            cdb_store_u64(out_buf + out_off + 8, r.entry_id, CDB_ORDER_BIG);
+            out_buf[out_off + 16] = op;
+            cdb_store_u64(out_buf + out_off + 17, tx_counter, CDB_ORDER_BIG);
+            cdb_store_u32(out_buf + out_off + 25, (uint32_t)r.seq, CDB_ORDER_BIG);
+            cdb_store_u32(out_buf + out_off + 29, db->peer_id, CDB_ORDER_BIG);
+            cdb_store_u32(out_buf + out_off + 33, (uint32_t)dlen, CDB_ORDER_BIG);
+            out_off += 37u;
+            if (dlen > 0 && data != NULL) {
+                memcpy(out_buf + out_off, data, dlen);
+                out_off += dlen;
+            }
+        }
+        off = next;
+    }
+
+    db_unlock(db);
+    return CDB_OK;
+}
+
+cdb_status cdb_db_crdt_import_deltas(cdb_db *db, uint32_t remote_peer_id,
+                                     const cdb_crdt_delta_rec *recs, size_t count,
+                                     size_t *applied_count)
+{
+    cdb_status s;
+    size_t i, applied = 0;
+    int tx_opened_by_us = 0;
+
+    if (db == NULL || applied_count == NULL || (recs == NULL && count > 0))
+        return CDB_E_INVALID_ARG;
+    *applied_count = 0;
+    if (count == 0)
+        return CDB_OK;
+
+    db_lock(db);
+    if ((s = usable(db)) != CDB_OK) {
+        db_unlock(db);
+        return s;
+    }
+
+    if (!db->in_tx) {
+        s = cdb_tx_begin(db, CDB_DURABILITY_NORMAL);
+        if (s != CDB_OK) {
+            db_unlock(db);
+            return s;
+        }
+        tx_opened_by_us = 1;
+    }
+
+    db->in_crdt_import = 1;
+
+    for (i = 0; i < count; i++) {
+        cdb_crdt_peer_entry pe;
+        int64_t now_ns = 0;
+        int have_ns = 0;
+
+        if (recs[i].hlc.peer_id == db->peer_id && db->peer_id != 0)
+            continue;
+
+        if (recs[i].hlc.peer_id != 0 && cdb_crdt_vector_get(&db->crdt_vector, recs[i].hlc.peer_id, &pe) == CDB_OK) {
+            if (cdb_hlc_compare(recs[i].hlc, pe.hlc) <= 0)
+                continue;
+        }
+
+        cdb_db_now(db, &now_ns, &have_ns);
+        cdb_hlc_update(&db->hlc, recs[i].hlc, have_ns ? (uint64_t)now_ns : (db->hlc.physical + 1u));
+
+        s = cdb_tx_put(db, recs[i].store_id, recs[i].entry_id, recs[i].op, recs[i].data, recs[i].len);
+        if (s != CDB_OK) {
+            db->in_crdt_import = 0;
+            if (tx_opened_by_us)
+                cdb_tx_abort(db);
+            db_unlock(db);
+            return s;
+        }
+
+        applied++;
+        if (recs[i].hlc.peer_id != 0)
+            cdb_crdt_vector_set(&db->crdt_vector, recs[i].hlc.peer_id, recs[i].hlc.physical, recs[i].hlc);
+    }
+
+    if (tx_opened_by_us) {
+        if (applied > 0) {
+            s = cdb_tx_commit(db);
+            db->in_crdt_import = 0;
+            if (s != CDB_OK) {
+                db_unlock(db);
+                return s;
+            }
+        } else {
+            db->in_crdt_import = 0;
+            cdb_tx_abort(db);
+        }
+    } else {
+        db->in_crdt_import = 0;
+    }
+
+    if (remote_peer_id != 0) {
+        cdb_crdt_peer_entry rpe;
+        if (cdb_crdt_vector_get(&db->crdt_vector, remote_peer_id, &rpe) != CDB_OK)
+            cdb_crdt_vector_set(&db->crdt_vector, remote_peer_id, 0, db->hlc);
+    }
+
+    *applied_count = applied;
+    db_unlock(db);
+    return CDB_OK;
+}
+
+cdb_status cdb_db_crdt_import_slice(cdb_db *db, const uint8_t *in_buf, size_t in_len,
+                                    size_t *applied_count)
+{
+    uint32_t magic, remote_peer_id, nrecs;
+    size_t off, i, applied = 0;
+    cdb_status s;
+    int tx_opened_by_us = 0;
+
+    if (db == NULL || in_buf == NULL || applied_count == NULL)
+        return CDB_E_INVALID_ARG;
+    if (in_len < 12u)
+        return CDB_E_TRUNCATED;
+
+    magic = cdb_load_u32(in_buf, CDB_ORDER_BIG);
+    if (magic != CDB_CRDT_WIRE_MAGIC)
+        return CDB_E_MALFORMED;
+
+    remote_peer_id = cdb_load_u32(in_buf + 4, CDB_ORDER_BIG);
+    nrecs = cdb_load_u32(in_buf + 8, CDB_ORDER_BIG);
+    *applied_count = 0;
+
+    if (nrecs == 0)
+        return CDB_OK;
+
+    db_lock(db);
+    if ((s = usable(db)) != CDB_OK) {
+        db_unlock(db);
+        return s;
+    }
+
+    if (!db->in_tx) {
+        s = cdb_tx_begin(db, CDB_DURABILITY_NORMAL);
+        if (s != CDB_OK) {
+            db_unlock(db);
+            return s;
+        }
+        tx_opened_by_us = 1;
+    }
+
+    db->in_crdt_import = 1;
+
+    off = 12u;
+    for (i = 0; i < nrecs; i++) {
+        uint64_t store_id, entry_id;
+        uint8_t op;
+        cdb_hlc hlc;
+        uint32_t dlen;
+        const uint8_t *data;
+        cdb_crdt_peer_entry pe;
+        int64_t now_ns = 0;
+        int have_ns = 0;
+
+        if (off + 37u > in_len) {
+            s = CDB_E_TRUNCATED;
+            goto fail;
+        }
+        dlen = cdb_load_u32(in_buf + off + 33, CDB_ORDER_BIG);
+        if (off + 37u + dlen > in_len) {
+            s = CDB_E_TRUNCATED;
+            goto fail;
+        }
+
+        store_id = cdb_load_u64(in_buf + off, CDB_ORDER_BIG);
+        entry_id = cdb_load_u64(in_buf + off + 8, CDB_ORDER_BIG);
+        op = in_buf[off + 16];
+        hlc.physical = cdb_load_u64(in_buf + off + 17, CDB_ORDER_BIG);
+        hlc.logical = cdb_load_u32(in_buf + off + 25, CDB_ORDER_BIG);
+        hlc.peer_id = cdb_load_u32(in_buf + off + 29, CDB_ORDER_BIG);
+        data = in_buf + off + 37u;
+        off += 37u + dlen;
+
+        if (hlc.peer_id == db->peer_id && db->peer_id != 0)
+            continue;
+
+        if (hlc.peer_id != 0 && cdb_crdt_vector_get(&db->crdt_vector, hlc.peer_id, &pe) == CDB_OK) {
+            if (cdb_hlc_compare(hlc, pe.hlc) <= 0)
+                continue;
+        }
+
+        cdb_db_now(db, &now_ns, &have_ns);
+        cdb_hlc_update(&db->hlc, hlc, have_ns ? (uint64_t)now_ns : (db->hlc.physical + 1u));
+
+        s = cdb_tx_put(db, store_id, entry_id, op, data, dlen);
+        if (s != CDB_OK)
+            goto fail;
+
+        applied++;
+        if (hlc.peer_id != 0)
+            cdb_crdt_vector_set(&db->crdt_vector, hlc.peer_id, hlc.physical, hlc);
+    }
+
+    if (tx_opened_by_us) {
+        if (applied > 0) {
+            s = cdb_tx_commit(db);
+            db->in_crdt_import = 0;
+            if (s != CDB_OK) {
+                db_unlock(db);
+                return s;
+            }
+        } else {
+            db->in_crdt_import = 0;
+            cdb_tx_abort(db);
+        }
+    } else {
+        db->in_crdt_import = 0;
+    }
+
+    if (remote_peer_id != 0) {
+        cdb_crdt_peer_entry rpe;
+        if (cdb_crdt_vector_get(&db->crdt_vector, remote_peer_id, &rpe) != CDB_OK)
+            cdb_crdt_vector_set(&db->crdt_vector, remote_peer_id, 0, db->hlc);
+    }
+
+    *applied_count = applied;
+    db_unlock(db);
+    return CDB_OK;
+
+fail:
+    db->in_crdt_import = 0;
+    if (tx_opened_by_us)
+        cdb_tx_abort(db);
+    db_unlock(db);
+    return s;
 }
