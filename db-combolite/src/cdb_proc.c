@@ -3,6 +3,14 @@
  */
 #include "cdb_proc.h"
 #include "cdb_varint.h"
+#include "cdb_db.h"
+#include "cdb_doc.h"
+#include "cdb_table.h"
+#include "cdb_link.h"
+#include "cdb_vec.h"
+#include "cdb_ts.h"
+#include "cdb_trigger.h"
+#include "combolite/cdb_crdt.h"
 
 #include <string.h>
 
@@ -35,6 +43,820 @@ static double to_double(const cdb_value *v)
     if (v->type == CDB_TYPE_INT) return (double)v->as.i64;
     if (v->type == CDB_TYPE_BOOL) return v->as.boolean ? 1.0 : 0.0;
     return 0.0;
+}
+
+static uint64_t reg_get_u64(const cdb_value *v)
+{
+    if (v == NULL) return 0;
+    if (v->type == CDB_TYPE_INT) return (uint64_t)v->as.i64;
+    if (v->type == CDB_TYPE_F64) return (uint64_t)v->as.f64;
+    if (v->type == CDB_TYPE_F32) return (uint64_t)v->as.f32;
+    if (v->type == CDB_TYPE_BOOL) return v->as.boolean ? 1u : 0u;
+    return 0;
+}
+
+static void reg_get_str(const cdb_value *v, const char **out_str, size_t *out_len)
+{
+    if (v != NULL && (v->type == CDB_TYPE_STRING || v->type == CDB_TYPE_BINARY)) {
+        if (out_str) *out_str = (const char *)v->payload;
+        if (out_len) *out_len = v->payload_len;
+    } else {
+        if (out_str) *out_str = "";
+        if (out_len) *out_len = 0;
+    }
+}
+
+static const char *reg_to_cstr(const cdb_value *v, char *buf, size_t buf_cap)
+{
+    const char *s = "";
+    size_t len = 0;
+    if (buf == NULL || buf_cap == 0) return "";
+    reg_get_str(v, &s, &len);
+    if (len >= buf_cap) len = buf_cap - 1;
+    if (len > 0) memcpy(buf, s, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+static uint8_t hex_digit(char c)
+{
+    if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
+    if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
+    if (c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
+    return 0;
+}
+
+static void parse_pubkey(const char *pk, size_t len, uint8_t pubkey[33])
+{
+    memset(pubkey, 0, 33);
+    if (len == 66) {
+        size_t i;
+        for (i = 0; i < 33; i++) {
+            pubkey[i] = (uint8_t)((hex_digit(pk[2 * i]) << 4) | hex_digit(pk[2 * i + 1]));
+        }
+    } else if (len >= 33) {
+        memcpy(pubkey, pk, 33);
+    }
+}
+
+static int str_eq_ci(const char *s, size_t len, const char *target)
+{
+    size_t i, tlen = strlen(target);
+    if (len != tlen) return 0;
+    for (i = 0; i < len; i++) {
+        char c1 = s[i], c2 = target[i];
+        if (c1 >= 'A' && c1 <= 'Z') c1 = (char)(c1 + 'a' - 'A');
+        if (c2 >= 'A' && c2 <= 'Z') c2 = (char)(c2 + 'a' - 'A');
+        if (c1 != c2) return 0;
+    }
+    return 1;
+}
+
+static uint32_t parse_model_type(const cdb_value *v)
+{
+    if (v == NULL) return 0;
+    if (v->type == CDB_TYPE_INT) return (uint32_t)v->as.i64;
+    if (v->type == CDB_TYPE_STRING || v->type == CDB_TYPE_BINARY) {
+        const char *s = (const char *)v->payload;
+        size_t len = v->payload_len;
+        if (str_eq_ci(s, len, "table") || str_eq_ci(s, len, "relational")) return 1;
+        if (str_eq_ci(s, len, "document") || str_eq_ci(s, len, "doc")) return 2;
+        if (str_eq_ci(s, len, "vector") || str_eq_ci(s, len, "vec")) return 3;
+        if (str_eq_ci(s, len, "timeseries") || str_eq_ci(s, len, "ts")) return 4;
+        if (str_eq_ci(s, len, "link") || str_eq_ci(s, len, "links")) return 5;
+    }
+    return 0;
+}
+
+static unsigned parse_cardinality(const cdb_value *v)
+{
+    if (v == NULL) return CDB_CARD_N_M;
+    if (v->type == CDB_TYPE_INT) return (unsigned)v->as.i64;
+    if (v->type == CDB_TYPE_STRING || v->type == CDB_TYPE_BINARY) {
+        const char *s = (const char *)v->payload;
+        size_t len = v->payload_len;
+        if (str_eq_ci(s, len, "1:1")) return CDB_CARD_1_1;
+        if (str_eq_ci(s, len, "1:n") || str_eq_ci(s, len, "1:N")) return CDB_CARD_1_N;
+        if (str_eq_ci(s, len, "n:m") || str_eq_ci(s, len, "N:M")) return CDB_CARD_N_M;
+    }
+    return CDB_CARD_N_M;
+}
+
+static uint64_t parse_rotate_target(const cdb_value *v)
+{
+    if (v == NULL) return 0;
+    if (v->type == CDB_TYPE_INT) return (uint64_t)v->as.i64;
+    if (v->type == CDB_TYPE_STRING || v->type == CDB_TYPE_BINARY) {
+        const char *s = (const char *)v->payload;
+        size_t len = v->payload_len;
+        if (str_eq_ci(s, len, "enclave")) return 1;
+        if (str_eq_ci(s, len, "master")) return 0;
+    }
+    return 0;
+}
+
+static void ensure_doc_object(cdb_db *db, const void *doc, size_t doc_len, uint8_t *obj_buf, size_t obj_cap, const void **out_body, size_t *out_len)
+{
+    cdb_value v;
+    if (doc != NULL && doc_len > 0 &&
+        cdb_value_validate((const uint8_t *)doc, doc_len, db->pager.order, CDB_DECIMAL_COMPACT, 0) == CDB_OK &&
+        cdb_value_read((const uint8_t *)doc, doc_len, db->pager.order, &v) == CDB_OK &&
+        v.type == CDB_TYPE_OBJECT) {
+        *out_body = doc;
+        *out_len = doc_len;
+        return;
+    }
+    cdb_value_writer w;
+    cdb_value_writer_init(&w, obj_buf, obj_cap, db->pager.order, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, 1);
+    cdb_value_write_string(&w, (const char *)doc, doc_len);
+    cdb_value_end_object(&w);
+    *out_body = obj_buf;
+    *out_len = cdb_value_writer_len(&w);
+}
+
+static void ensure_doc_patch(cdb_db *db, const void *patch, size_t patch_len, uint8_t *patch_buf, size_t patch_cap, const void **out_patch, size_t *out_len)
+{
+    cdb_value v;
+    if (patch != NULL && patch_len > 0 &&
+        cdb_value_validate((const uint8_t *)patch, patch_len, db->pager.order, CDB_DECIMAL_COMPACT, 0) == CDB_OK &&
+        cdb_value_read((const uint8_t *)patch, patch_len, db->pager.order, &v) == CDB_OK &&
+        v.type == CDB_TYPE_ARRAY) {
+        *out_patch = patch;
+        *out_len = patch_len;
+        return;
+    }
+    cdb_value_writer w;
+    cdb_value_writer_init(&w, patch_buf, patch_cap, db->pager.order, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_array(&w);
+    cdb_value_begin_array(&w);
+    cdb_value_write_int(&w, CDB_PATCH_SET);
+    cdb_value_begin_array(&w);
+    cdb_value_write_int(&w, 1);
+    cdb_value_end_array(&w);
+    cdb_value_write_string(&w, (const char *)patch, patch_len);
+    cdb_value_end_array(&w);
+    cdb_value_end_array(&w);
+    *out_patch = patch_buf;
+    *out_len = cdb_value_writer_len(&w);
+}
+
+static cdb_status resolve_store_id(cdb_db *db, const cdb_value *v, uint64_t *out_store_id)
+{
+    if (v == NULL || out_store_id == NULL) return CDB_E_INVALID_ARG;
+    if (v->type == CDB_TYPE_INT) {
+        *out_store_id = (uint64_t)v->as.i64;
+        return CDB_OK;
+    }
+    if (v->type == CDB_TYPE_STRING || v->type == CDB_TYPE_BINARY) {
+        const char *name = (const char *)v->payload;
+        size_t len = v->payload_len;
+        int found = 0;
+        cdb_status s;
+        if (db == NULL) return CDB_E_NOT_FOUND;
+        s = cdb_db_find_store(db, name, len, out_store_id, &found);
+        if (s != CDB_OK) return s;
+        if (!found) return CDB_E_NOT_FOUND;
+        return CDB_OK;
+    }
+    return CDB_E_INVALID_ARG;
+}
+
+static int mut_needs_tx(uint8_t op)
+{
+    switch (op) {
+    case CDB_MUT_DOC_INSERT:
+    case CDB_MUT_DOC_REPLACE:
+    case CDB_MUT_DOC_PATCH:
+    case CDB_MUT_DOC_DELETE:
+    case CDB_MUT_TABLE_INSERT:
+    case CDB_MUT_TABLE_UPDATE:
+    case CDB_MUT_TABLE_DELETE:
+    case CDB_MUT_LINK_ADD:
+    case CDB_MUT_LINK_REINFORCE:
+    case CDB_MUT_LINK_REMOVE:
+    case CDB_MUT_TS_APPEND:
+    case CDB_MUT_TS_DROP_BEFORE:
+    case CDB_MUT_TS_RETENTION:
+    case CDB_MUT_TS_APPLY_RET:
+    case CDB_MUT_VEC_INSERT:
+    case CDB_MUT_VEC_DELETE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static cdb_status proc_exec_mutation_core(cdb_proc_vm *vm, uint8_t op, uint8_t argc, const uint8_t *args, cdb_value *out_val)
+{
+    cdb_status st = CDB_OK;
+    int autocommit = 0;
+
+    if (vm == NULL || vm->db == NULL) return CDB_E_INVALID_ARG;
+    if (out_val) cdb_eval_make_null(out_val);
+
+    if (mut_needs_tx(op) && !vm->db->in_tx) {
+        st = cdb_tx_begin(vm->db, CDB_DURABILITY_DEFAULT);
+        if (st != CDB_OK) return st;
+        autocommit = 1;
+    }
+
+    switch (op) {
+    case CDB_MUT_DOC_INSERT: {
+        uint64_t store = 0, entry = 0;
+        const char *summary = NULL;
+        size_t summary_len = 0;
+        const char *doc = "";
+        size_t doc_len = 0;
+        uint8_t wrap_buf[512];
+        const void *final_doc = NULL;
+        size_t final_len = 0;
+
+        if (argc < 2) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        reg_get_str(&vm->regs[args[1]], &doc, &doc_len);
+        if (argc >= 3 && vm->regs[args[2]].type != CDB_TYPE_NULL) {
+            reg_get_str(&vm->regs[args[2]], &summary, &summary_len);
+        }
+        ensure_doc_object(vm->db, doc, doc_len, wrap_buf, sizeof(wrap_buf), &final_doc, &final_len);
+        st = cdb_doc_insert(vm->db, store, summary, summary_len, final_doc, final_len, &entry);
+        if (st == CDB_OK && out_val) {
+            cdb_eval_make_int(out_val, (int64_t)entry);
+        }
+        break;
+    }
+
+    case CDB_MUT_DOC_REPLACE: {
+        uint64_t store = 0, entry = 0;
+        const char *summary = NULL;
+        size_t summary_len = 0;
+        const char *doc = "";
+        size_t doc_len = 0;
+        uint8_t wrap_buf[512];
+        const void *final_doc = NULL;
+        size_t final_len = 0;
+
+        if (argc < 3) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        entry = reg_get_u64(&vm->regs[args[1]]);
+        reg_get_str(&vm->regs[args[2]], &doc, &doc_len);
+        if (argc >= 4 && vm->regs[args[3]].type != CDB_TYPE_NULL) {
+            reg_get_str(&vm->regs[args[3]], &summary, &summary_len);
+        }
+        ensure_doc_object(vm->db, doc, doc_len, wrap_buf, sizeof(wrap_buf), &final_doc, &final_len);
+        st = cdb_doc_replace(vm->db, store, entry, summary, summary_len, final_doc, final_len);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_DOC_PATCH: {
+        uint64_t store = 0, entry = 0;
+        const char *patch = "";
+        size_t patch_len = 0;
+        uint8_t wrap_buf[512];
+        const void *final_patch = NULL;
+        size_t final_len = 0;
+
+        if (argc < 3) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        entry = reg_get_u64(&vm->regs[args[1]]);
+        reg_get_str(&vm->regs[args[2]], &patch, &patch_len);
+        ensure_doc_patch(vm->db, patch, patch_len, wrap_buf, sizeof(wrap_buf), &final_patch, &final_len);
+        st = cdb_doc_patch(vm->db, store, entry, final_patch, final_len);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_DOC_DELETE: {
+        uint64_t store = 0, entry = 0;
+        if (argc < 2) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        entry = reg_get_u64(&vm->regs[args[1]]);
+        st = cdb_doc_delete(vm->db, store, entry);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_TABLE_INSERT: {
+        uint64_t store = 0, entry = 0;
+        const char *row = "";
+        size_t row_len = 0;
+        uint8_t wrap_buf[512];
+        const void *final_row = NULL;
+        size_t final_len = 0;
+
+        if (argc < 2) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        reg_get_str(&vm->regs[args[1]], &row, &row_len);
+        ensure_doc_object(vm->db, row, row_len, wrap_buf, sizeof(wrap_buf), &final_row, &final_len);
+        st = cdb_table_insert(vm->db, store, final_row, final_len, &entry);
+        if (st == CDB_OK && out_val) {
+            cdb_eval_make_int(out_val, (int64_t)entry);
+        }
+        break;
+    }
+
+    case CDB_MUT_TABLE_UPDATE: {
+        uint64_t store = 0, entry = 0;
+        const char *changes = "";
+        size_t ch_len = 0;
+        uint8_t wrap_buf[512];
+        const void *final_changes = NULL;
+        size_t final_len = 0;
+
+        if (argc < 3) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        entry = reg_get_u64(&vm->regs[args[1]]);
+        reg_get_str(&vm->regs[args[2]], &changes, &ch_len);
+        ensure_doc_object(vm->db, changes, ch_len, wrap_buf, sizeof(wrap_buf), &final_changes, &final_len);
+        st = cdb_table_update(vm->db, store, entry, final_changes, final_len);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_TABLE_DELETE: {
+        uint64_t store = 0, entry = 0;
+        if (argc < 2) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        entry = reg_get_u64(&vm->regs[args[1]]);
+        st = cdb_table_delete(vm->db, store, entry);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_LINK_ADD: {
+        uint64_t type = 0, s_store = 0, s_entry = 0, t_store = 0, t_entry = 0;
+        float weight = 1.0f;
+        int64_t ltime = 0;
+
+        if (argc < 5) { st = CDB_E_INVALID_ARG; break; }
+        type = reg_get_u64(&vm->regs[args[0]]);
+        st = resolve_store_id(vm->db, &vm->regs[args[1]], &s_store);
+        if (st != CDB_OK) break;
+        s_entry = reg_get_u64(&vm->regs[args[2]]);
+        st = resolve_store_id(vm->db, &vm->regs[args[3]], &t_store);
+        if (st != CDB_OK) break;
+        t_entry = reg_get_u64(&vm->regs[args[4]]);
+        if (argc >= 6) weight = (float)to_double(&vm->regs[args[5]]);
+        if (argc >= 7) ltime = (int64_t)reg_get_u64(&vm->regs[args[6]]);
+        st = cdb_link_add(vm->db, type, cdb_ref_entry(s_store, s_entry), cdb_ref_entry(t_store, t_entry), weight, ltime);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_LINK_REINFORCE: {
+        uint64_t type = 0, s_store = 0, s_entry = 0, t_store = 0, t_entry = 0;
+        float weight = 1.0f;
+        int64_t ltime = 0;
+
+        if (argc < 5) { st = CDB_E_INVALID_ARG; break; }
+        type = reg_get_u64(&vm->regs[args[0]]);
+        st = resolve_store_id(vm->db, &vm->regs[args[1]], &s_store);
+        if (st != CDB_OK) break;
+        s_entry = reg_get_u64(&vm->regs[args[2]]);
+        st = resolve_store_id(vm->db, &vm->regs[args[3]], &t_store);
+        if (st != CDB_OK) break;
+        t_entry = reg_get_u64(&vm->regs[args[4]]);
+        if (argc >= 6) weight = (float)to_double(&vm->regs[args[5]]);
+        if (argc >= 7) ltime = (int64_t)reg_get_u64(&vm->regs[args[6]]);
+        st = cdb_link_reinforce(vm->db, type, cdb_ref_entry(s_store, s_entry), cdb_ref_entry(t_store, t_entry), weight, ltime);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_LINK_REMOVE: {
+        uint64_t type = 0, s_store = 0, s_entry = 0, t_store = 0, t_entry = 0;
+
+        if (argc < 5) { st = CDB_E_INVALID_ARG; break; }
+        type = reg_get_u64(&vm->regs[args[0]]);
+        st = resolve_store_id(vm->db, &vm->regs[args[1]], &s_store);
+        if (st != CDB_OK) break;
+        s_entry = reg_get_u64(&vm->regs[args[2]]);
+        st = resolve_store_id(vm->db, &vm->regs[args[3]], &t_store);
+        if (st != CDB_OK) break;
+        t_entry = reg_get_u64(&vm->regs[args[4]]);
+        st = cdb_link_remove(vm->db, type, cdb_ref_entry(s_store, s_entry), cdb_ref_entry(t_store, t_entry));
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_LINK_DEF_TYPE: {
+        const char *name = "";
+        size_t nlen = 0;
+        unsigned card = CDB_CARD_N_M;
+        uint64_t enf = 0, inv = 0, type_id = 0;
+
+        if (argc < 3) { st = CDB_E_INVALID_ARG; break; }
+        reg_get_str(&vm->regs[args[0]], &name, &nlen);
+        card = parse_cardinality(&vm->regs[args[1]]);
+        enf = reg_get_u64(&vm->regs[args[2]]);
+        if (argc >= 4) inv = reg_get_u64(&vm->regs[args[3]]);
+        st = cdb_link_define_type(vm->db, name, nlen, card, (int)enf, (unsigned)inv, &type_id);
+        if (st == CDB_OK && out_val) {
+            cdb_eval_make_int(out_val, (int64_t)type_id);
+        }
+        break;
+    }
+
+    case CDB_MUT_TS_SERIES: {
+        uint64_t store = 0, series = 0;
+        const char *name = "";
+        size_t nlen = 0;
+        int created = 0;
+
+        if (argc < 2) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        reg_get_str(&vm->regs[args[1]], &name, &nlen);
+        st = cdb_ts_series(vm->db, store, name, nlen, NULL, 0, NULL, &series, &created);
+        if (st == CDB_OK && out_val) {
+            cdb_eval_make_int(out_val, (int64_t)series);
+        }
+        break;
+    }
+
+    case CDB_MUT_TS_APPEND: {
+        uint64_t store = 0, series = 0;
+        int64_t ts = 0;
+        cdb_ts_in pin;
+        uint8_t enc[64];
+        cdb_value_writer vw;
+
+        if (argc < 4) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        series = reg_get_u64(&vm->regs[args[1]]);
+        ts = (int64_t)reg_get_u64(&vm->regs[args[2]]);
+
+        memset(&pin, 0, sizeof pin);
+        pin.ts = ts;
+        pin.use_clock = (ts == 0) ? 1 : 0;
+
+        if (vm->regs[args[3]].type == CDB_TYPE_STRING || vm->regs[args[3]].type == CDB_TYPE_BINARY) {
+            pin.values = vm->regs[args[3]].payload;
+            pin.len = vm->regs[args[3]].payload_len;
+        } else {
+            cdb_value_writer_init(&vw, enc, sizeof enc, vm->order, CDB_DECIMAL_UNBOUNDED);
+            if (vm->regs[args[3]].type == CDB_TYPE_INT) {
+                cdb_value_write_int(&vw, vm->regs[args[3]].as.i64);
+            } else if (vm->regs[args[3]].type == CDB_TYPE_F64) {
+                cdb_value_write_f64(&vw, vm->regs[args[3]].as.f64);
+            } else if (vm->regs[args[3]].type == CDB_TYPE_F32) {
+                cdb_value_write_f32(&vw, vm->regs[args[3]].as.f32);
+            } else if (vm->regs[args[3]].type == CDB_TYPE_BOOL) {
+                cdb_value_write_bool(&vw, vm->regs[args[3]].as.boolean);
+            } else {
+                cdb_value_write_null(&vw);
+            }
+            pin.values = enc;
+            pin.len = cdb_value_writer_len(&vw);
+        }
+
+        st = cdb_ts_append(vm->db, store, series, &pin, 1);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_TS_DROP_BEFORE: {
+        uint64_t store = 0, series = 0;
+        int64_t ts = 0;
+        if (argc < 3) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        series = reg_get_u64(&vm->regs[args[1]]);
+        ts = (int64_t)reg_get_u64(&vm->regs[args[2]]);
+        st = cdb_ts_drop_before(vm->db, store, series, ts);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_TS_RETENTION: {
+        uint64_t store = 0, series = 0;
+        int64_t max_age = 0;
+        if (argc < 3) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        series = reg_get_u64(&vm->regs[args[1]]);
+        max_age = (int64_t)reg_get_u64(&vm->regs[args[2]]);
+        st = cdb_ts_set_retention(vm->db, store, series, max_age);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_TS_APPLY_RET: {
+        uint64_t store = 0, series = 0;
+        int64_t now_ts = 0, dropped = 0;
+        if (argc < 3) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        series = reg_get_u64(&vm->regs[args[1]]);
+        now_ts = (int64_t)reg_get_u64(&vm->regs[args[2]]);
+        st = cdb_ts_apply_retention(vm->db, store, series, now_ts, &dropped);
+        if (st == CDB_OK && out_val) {
+            cdb_eval_make_int(out_val, dropped);
+        }
+        break;
+    }
+
+    case CDB_MUT_TS_DOWNSAMPLE: {
+        cdb_ts_downsample_spec spec;
+        size_t points_gen = 0;
+        int64_t from_ts = 0, to_ts = 0;
+        if (argc < 7) { st = CDB_E_INVALID_ARG; break; }
+        memset(&spec, 0, sizeof spec);
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &spec.src_store);
+        if (st != CDB_OK) break;
+        spec.src_series = reg_get_u64(&vm->regs[args[1]]);
+        st = resolve_store_id(vm->db, &vm->regs[args[2]], &spec.dst_store);
+        if (st != CDB_OK) break;
+        spec.dst_series = reg_get_u64(&vm->regs[args[3]]);
+        spec.bucket_step = (int64_t)reg_get_u64(&vm->regs[args[4]]);
+        from_ts = (int64_t)reg_get_u64(&vm->regs[args[5]]);
+        to_ts = (int64_t)reg_get_u64(&vm->regs[args[6]]);
+        st = cdb_ts_downsample_run(vm->db, &spec, from_ts, to_ts, &points_gen);
+        if (st == CDB_OK && out_val) {
+            cdb_eval_make_int(out_val, (int64_t)points_gen);
+        }
+        break;
+    }
+
+    case CDB_MUT_VEC_INSERT: {
+        uint64_t store = 0, entry = 0;
+        uint64_t src_store = 0, src_entry = 0;
+        const char *vec_data = "";
+        size_t vec_len = 0;
+        if (argc < 2) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        reg_get_str(&vm->regs[args[1]], &vec_data, &vec_len);
+        if (argc >= 4) {
+            src_store = reg_get_u64(&vm->regs[args[2]]);
+            src_entry = reg_get_u64(&vm->regs[args[3]]);
+        }
+        st = cdb_vec_insert(vm->db, store, vec_data, vec_len, src_store, src_entry, &entry);
+        if (st == CDB_OK && out_val) {
+            cdb_eval_make_int(out_val, (int64_t)entry);
+        }
+        break;
+    }
+
+    case CDB_MUT_VEC_DELETE: {
+        uint64_t store = 0, entry = 0;
+        if (argc < 2) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        entry = reg_get_u64(&vm->regs[args[1]]);
+        st = cdb_vec_delete(vm->db, store, entry);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_BLOB_FREE: {
+        uint64_t store = 0;
+        cdb_blob_ref ref;
+        uint8_t page_buf[4096];
+        if (argc < 2) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store);
+        if (st != CDB_OK) break;
+        if (vm->regs[args[1]].type == CDB_TYPE_BLOB_REF) {
+            ref = vm->regs[args[1]].as.blob;
+        } else {
+            memset(&ref, 0, sizeof ref);
+            ref.first_page = reg_get_u64(&vm->regs[args[1]]);
+            if (argc >= 3) ref.page_count = reg_get_u64(&vm->regs[args[2]]);
+            if (argc >= 4) ref.total_len = reg_get_u64(&vm->regs[args[3]]);
+        }
+        st = cdb_db_blob_free(vm->db, store, &ref, page_buf);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_CREATE_STORE: {
+        const char *name = "";
+        size_t nlen = 0;
+        uint32_t model = 0;
+        uint64_t store_id = 0;
+        if (argc < 2) { st = CDB_E_INVALID_ARG; break; }
+        reg_get_str(&vm->regs[args[0]], &name, &nlen);
+        model = parse_model_type(&vm->regs[args[1]]);
+        st = cdb_db_create_store(vm->db, name, nlen, model, &store_id);
+        if (st == CDB_OK && out_val) {
+            cdb_eval_make_int(out_val, (int64_t)store_id);
+        }
+        break;
+    }
+
+    case CDB_MUT_DROP_STORE: {
+        uint64_t store_id = 0;
+        if (argc < 1) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store_id);
+        if (st != CDB_OK) break;
+        st = cdb_db_drop_store(vm->db, store_id);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_ADD_SCHEMA: {
+        uint64_t store_id = 0;
+        const char *sch = "";
+        size_t slen = 0;
+        uint32_t ver = 0;
+        if (argc < 2) { st = CDB_E_INVALID_ARG; break; }
+        st = resolve_store_id(vm->db, &vm->regs[args[0]], &store_id);
+        if (st != CDB_OK) break;
+        reg_get_str(&vm->regs[args[1]], &sch, &slen);
+        st = cdb_db_add_schema(vm->db, store_id, sch, slen, &ver);
+        if (st == CDB_OK && out_val) {
+            cdb_eval_make_int(out_val, (int64_t)ver);
+        }
+        break;
+    }
+
+    case CDB_MUT_CREATE_ENCLAVE: {
+        uint64_t eid = 0;
+        char kref_buf[256];
+        const char *kref = NULL;
+        if (argc < 2) { st = CDB_E_INVALID_ARG; break; }
+        eid = reg_get_u64(&vm->regs[args[0]]);
+        if (vm->regs[args[1]].type != CDB_TYPE_NULL) {
+            kref = reg_to_cstr(&vm->regs[args[1]], kref_buf, sizeof(kref_buf));
+        }
+        st = cdb_db_create_enclave(vm->db, eid, kref);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_OPEN_ENCLAVE: {
+        uint64_t eid = 0;
+        char kref_buf[256];
+        const char *kref = NULL;
+        if (argc < 2) { st = CDB_E_INVALID_ARG; break; }
+        eid = reg_get_u64(&vm->regs[args[0]]);
+        if (vm->regs[args[1]].type != CDB_TYPE_NULL) {
+            kref = reg_to_cstr(&vm->regs[args[1]], kref_buf, sizeof(kref_buf));
+        }
+        st = cdb_db_open_enclave(vm->db, eid, kref);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_ROTATE_KEY: {
+        uint64_t target = 0, eid = 0;
+        char uri_buf[256];
+        const char *uri = NULL;
+        if (argc < 3) { st = CDB_E_INVALID_ARG; break; }
+        target = parse_rotate_target(&vm->regs[args[0]]);
+        eid = reg_get_u64(&vm->regs[args[1]]);
+        if (vm->regs[args[2]].type != CDB_TYPE_NULL) {
+            uri = reg_to_cstr(&vm->regs[args[2]], uri_buf, sizeof(uri_buf));
+        }
+        if (target == 0) {
+            st = cdb_db_rotate_master_key(vm->db, uri);
+        } else {
+            st = cdb_db_rotate_enclave_key(vm->db, eid, uri);
+        }
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_CHECK_ROTATION: {
+        st = cdb_db_check_key_rotation(vm->db);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_REGISTER_PRIN: {
+        uint64_t pid = 0, tid = 0;
+        const char *pk = "";
+        size_t pk_len = 0;
+        uint8_t pubkey[33];
+        if (argc < 3) { st = CDB_E_INVALID_ARG; break; }
+        pid = reg_get_u64(&vm->regs[args[0]]);
+        tid = reg_get_u64(&vm->regs[args[1]]);
+        reg_get_str(&vm->regs[args[2]], &pk, &pk_len);
+        parse_pubkey(pk, pk_len, pubkey);
+        st = cdb_db_register_principal(vm->db, pid, (uint32_t)tid, pubkey);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_GRANT_ROLE: {
+        uint64_t pid = 0, rid = 0, scope = 0, perms = 0;
+        if (argc < 4) { st = CDB_E_INVALID_ARG; break; }
+        pid = reg_get_u64(&vm->regs[args[0]]);
+        rid = reg_get_u64(&vm->regs[args[1]]);
+        scope = reg_get_u64(&vm->regs[args[2]]);
+        perms = reg_get_u64(&vm->regs[args[3]]);
+        st = cdb_db_grant_role(vm->db, pid, (uint32_t)rid, scope, (uint8_t)perms);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_CHECK_PERM: {
+        uint64_t pid = 0, scope = 0, perms = 0;
+        if (argc < 3) { st = CDB_E_INVALID_ARG; break; }
+        pid = reg_get_u64(&vm->regs[args[0]]);
+        scope = reg_get_u64(&vm->regs[args[1]]);
+        perms = reg_get_u64(&vm->regs[args[2]]);
+        st = cdb_db_check_perm(vm->db, pid, scope, (uint8_t)perms);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_TRIGGER_REG: {
+        const char *name = "", *proc = "";
+        size_t nlen = 0, plen = 0;
+        uint64_t sid = 0, ev = 0, depth = 8;
+        if (argc < 4) { st = CDB_E_INVALID_ARG; break; }
+        reg_get_str(&vm->regs[args[0]], &name, &nlen);
+        st = resolve_store_id(vm->db, &vm->regs[args[1]], &sid);
+        if (st != CDB_OK) break;
+        ev = reg_get_u64(&vm->regs[args[2]]);
+        reg_get_str(&vm->regs[args[3]], &proc, &plen);
+        if (argc >= 5) depth = reg_get_u64(&vm->regs[args[4]]);
+        st = cdb_db_trigger_register(vm->db, name, nlen, sid, (uint8_t)ev, proc, plen, (uint8_t)depth);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_TRIGGER_UNREG: {
+        const char *name = "";
+        size_t nlen = 0;
+        if (argc < 1) { st = CDB_E_INVALID_ARG; break; }
+        reg_get_str(&vm->regs[args[0]], &name, &nlen);
+        st = cdb_db_trigger_unregister(vm->db, name, nlen);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_COMPACT: {
+        uint64_t max_moves = 0, moved = 0, reclaimed = 0;
+        if (argc >= 1) max_moves = reg_get_u64(&vm->regs[args[0]]);
+        st = cdb_db_compact(vm->db, max_moves, &moved, &reclaimed);
+        if (st == CDB_OK && out_val) {
+            cdb_eval_make_int(out_val, (int64_t)moved);
+        }
+        break;
+    }
+
+    case CDB_MUT_RECLAIM: {
+        uint64_t pages_freed = 0, nibs_freed = 0;
+        st = cdb_db_reclaim(vm->db, &pages_freed, &nibs_freed);
+        if (st == CDB_OK && out_val) {
+            cdb_eval_make_int(out_val, (int64_t)pages_freed);
+        }
+        break;
+    }
+
+    case CDB_MUT_RECONCILE: {
+        st = cdb_db_reconcile(vm->db);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_SET_PEER: {
+        uint64_t peer_id = 0;
+        if (argc < 1) { st = CDB_E_INVALID_ARG; break; }
+        peer_id = reg_get_u64(&vm->regs[args[0]]);
+        st = cdb_db_set_peer_id(vm->db, (uint32_t)peer_id);
+        if (out_val) cdb_eval_make_int(out_val, (int64_t)st);
+        break;
+    }
+
+    case CDB_MUT_SYNC_IMPORT: {
+        const char *slice = "";
+        size_t slen = 0, applied = 0;
+        if (argc < 1) { st = CDB_E_INVALID_ARG; break; }
+        reg_get_str(&vm->regs[args[0]], &slice, &slen);
+        st = cdb_db_crdt_import_slice(vm->db, (const uint8_t *)slice, slen, &applied);
+        if (st == CDB_OK && out_val) {
+            cdb_eval_make_int(out_val, (int64_t)applied);
+        }
+        break;
+    }
+
+    default:
+        st = CDB_E_UNSUPPORTED;
+        break;
+    }
+
+    if (autocommit) {
+        if (st == CDB_OK) {
+            st = cdb_tx_commit(vm->db);
+        } else {
+            cdb_tx_abort(vm->db);
+        }
+    }
+
+    return st;
 }
 
 cdb_status cdb_proc_exec(cdb_proc_vm *vm, const uint8_t *bytecode, size_t len, cdb_value *out_ret)
@@ -215,7 +1037,7 @@ cdb_status cdb_proc_exec(cdb_proc_vm *vm, const uint8_t *bytecode, size_t len, c
 
         case CDB_BC_CALL_MUTATION: {
             uint8_t dst, mut_op, store_r, entry_r, pay_r;
-            (void)store_r; (void)entry_r; (void)pay_r;
+            uint8_t m_args[3];
             if (p + 5 > end) { st = CDB_E_TRUNCATED; goto cleanup; }
             dst = *p++;
             mut_op = *p++;
@@ -225,10 +1047,29 @@ cdb_status cdb_proc_exec(cdb_proc_vm *vm, const uint8_t *bytecode, size_t len, c
             if (dst >= vm->n_regs || store_r >= vm->n_regs || entry_r >= vm->n_regs || pay_r >= vm->n_regs) {
                 st = CDB_E_MALFORMED; goto cleanup;
             }
+            m_args[0] = store_r;
+            m_args[1] = entry_r;
+            m_args[2] = pay_r;
+            st = proc_exec_mutation_core(vm, mut_op, 3, m_args, &vm->regs[dst]);
+            if (st != CDB_OK) goto cleanup;
+            break;
+        }
 
-            /* Record successful mutation status (CDB_OK = 0) */
-            (void)mut_op;
-            cdb_eval_make_int(&vm->regs[dst], (int64_t)CDB_OK);
+        case CDB_BC_CALL_MUTATION_EX: {
+            uint8_t dst, mut_op, argc, a_idx;
+            uint8_t m_args[16];
+            if (p + 3 > end) { st = CDB_E_TRUNCATED; goto cleanup; }
+            dst = *p++;
+            mut_op = *p++;
+            argc = *p++;
+            if (argc > 16 || p + argc > end) { st = CDB_E_MALFORMED; goto cleanup; }
+            if (dst >= vm->n_regs) { st = CDB_E_MALFORMED; goto cleanup; }
+            for (a_idx = 0; a_idx < argc; a_idx++) {
+                m_args[a_idx] = *p++;
+                if (m_args[a_idx] >= vm->n_regs) { st = CDB_E_MALFORMED; goto cleanup; }
+            }
+            st = proc_exec_mutation_core(vm, mut_op, argc, m_args, &vm->regs[dst]);
+            if (st != CDB_OK) goto cleanup;
             break;
         }
 
@@ -532,6 +1373,19 @@ cdb_status cdb_proc_write_call_mutation(cdb_proc_writer *w, uint8_t dst, uint8_t
     w_b(w, store);
     w_b(w, entry);
     w_b(w, payload);
+    return w->error;
+}
+
+cdb_status cdb_proc_write_call_mutation_ex(cdb_proc_writer *w, uint8_t dst, uint8_t op, uint8_t argc, const uint8_t *args)
+{
+    uint8_t i;
+    w_b(w, CDB_BC_CALL_MUTATION_EX);
+    w_b(w, dst);
+    w_b(w, op);
+    w_b(w, argc);
+    for (i = 0; i < argc; i++) {
+        w_b(w, args[i]);
+    }
     return w->error;
 }
 

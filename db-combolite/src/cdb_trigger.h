@@ -8,9 +8,9 @@
 
 #include "combolite/cdb_common.h"
 #include "combolite/cdb_value.h"
-#include "cdb_db.h"
-#include "cdb_proc.h"
 #include "cdb_worker.h"
+
+struct cdb_db;
 
 #define CDB_TRIGGER_AFTER_INSERT 0x01u
 #define CDB_TRIGGER_AFTER_UPDATE 0x02u
@@ -36,7 +36,7 @@ typedef struct cdb_schedule_def {
     size_t name_len;
     uint64_t interval_ns;
     int64_t last_run_ns;
-    void (*task_fn)(cdb_db *db, void *arg);
+    void (*task_fn)(struct cdb_db *db, void *arg);
     void *arg;
 } cdb_schedule_def;
 
@@ -66,16 +66,16 @@ cdb_status cdb_trigger_register(cdb_trigger_registry *reg, const char *name, siz
 cdb_status cdb_trigger_unregister(cdb_trigger_registry *reg, const char *name, size_t name_len);
 
 /* Dispatches matching event triggers for a committed store mutation */
-cdb_status cdb_trigger_dispatch(cdb_trigger_registry *reg, cdb_db *db,
+cdb_status cdb_trigger_dispatch(cdb_trigger_registry *reg, struct cdb_db *db,
                                 uint64_t store_id, uint8_t event,
                                 const cdb_value *old_val, const cdb_value *new_val,
                                 unsigned current_depth);
 
 /* Registers a scheduled maintenance task */
 cdb_status cdb_schedule_register(cdb_trigger_registry *reg, const char *name, size_t name_len,
-                                 uint64_t interval_ns, void (*task_fn)(cdb_db *db, void *arg), void *arg);
+                                 uint64_t interval_ns, void (*task_fn)(struct cdb_db *db, void *arg), void *arg);
 
 /* Evaluates and triggers any due scheduled maintenance tasks */
-cdb_status cdb_schedule_tick(cdb_trigger_registry *reg, cdb_db *db, int64_t now_ns);
+cdb_status cdb_schedule_tick(cdb_trigger_registry *reg, struct cdb_db *db, int64_t now_ns);
 
 #endif /* CDB_TRIGGER_H */

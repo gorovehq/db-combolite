@@ -1031,6 +1031,7 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
     cdb_slots_init(&db->vec_slots, sizeof(struct cdb_vec_coll), &cdb_vec_slot_ops);
     cdb_slots_init(&db->ts_slots, sizeof(struct cdb_ts_store), &cdb_ts_slot_ops);
     cdb_slots_init(&db->table_slots, sizeof(struct cdb_table_store), &cdb_table_slot_ops);
+    cdb_trigger_registry_init(&db->triggers, &db->workers, 50);
     if ((s = open_db(db, base, cfg, create)) != CDB_OK) {
         if (db->have_overlay) {
             cdb_storage_close(&db->overlay_st);
@@ -2840,6 +2841,23 @@ cdb_status cdb_db_check_perm(cdb_db *db, uint64_t principal_id, uint64_t scope_s
     }
 
     return CDB_E_SECURITY;
+}
+
+cdb_status cdb_db_trigger_register(cdb_db *db, const char *name, size_t name_len,
+                                   uint64_t store_id, uint8_t events,
+                                   const char *proc_name, size_t proc_len,
+                                   uint8_t max_depth)
+{
+    if (db == NULL)
+        return CDB_E_INVALID_ARG;
+    return cdb_trigger_register(&db->triggers, name, name_len, store_id, events, proc_name, proc_len, max_depth);
+}
+
+cdb_status cdb_db_trigger_unregister(cdb_db *db, const char *name, size_t name_len)
+{
+    if (db == NULL)
+        return CDB_E_INVALID_ARG;
+    return cdb_trigger_unregister(&db->triggers, name, name_len);
 }
 
 /* -------------------------------------------------------- streaming blobs */

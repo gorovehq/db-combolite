@@ -22,6 +22,7 @@
 #include "cdb_pager.h"
 #include "cdb_slots.h"
 #include "cdb_worker.h"
+#include "cdb_trigger.h"
 
 /* Staging hash table for transactions (spec 14.9, 14.4). */
 #define CDB_STAGE_BUCKETS 512u
@@ -387,6 +388,8 @@ typedef struct cdb_db {
     cdb_hlc hlc;
     cdb_crdt_vector crdt_vector;
     int in_crdt_import;
+    /* Event triggers (spec 11.6). */
+    cdb_trigger_registry triggers;
 } cdb_db;
 
 /* Re-entrant synchronization locks across threads (spec 5.9.6, M20). */
@@ -499,6 +502,13 @@ cdb_status cdb_db_grant_role(cdb_db *db, uint64_t principal_id, uint32_t role_id
                              uint64_t scope_store_or_enclave, uint8_t perm_mask);
 cdb_status cdb_db_check_perm(cdb_db *db, uint64_t principal_id, uint64_t scope_store_or_enclave,
                              uint8_t required_perm);
+
+/* Triggers (spec 11.6). */
+cdb_status cdb_db_trigger_register(cdb_db *db, const char *name, size_t name_len,
+                                   uint64_t store_id, uint8_t events,
+                                   const char *proc_name, size_t proc_len,
+                                   uint8_t max_depth);
+cdb_status cdb_db_trigger_unregister(cdb_db *db, const char *name, size_t name_len);
 
 /* Streaming blobs (spec 8.4, 14.15). */
 cdb_status cdb_db_blob_write_begin(cdb_db *db, uint64_t store_id, uint8_t *scratch, cdb_blob_writer *w);
