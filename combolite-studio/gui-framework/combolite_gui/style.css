@@ -1,0 +1,111 @@
+/* Combolite Studio — sits on top of libadwaita's stylesheet */
+@define-color accent_bg_color #2aa9ae;
+@define-color accent_color #3cc4c9;
+@define-color accent_fg_color #041a1b;
+
+@define-color m_table #7aa7f0;
+@define-color m_document #d9a85a;
+@define-color m_vector #b291ea;
+@define-color m_link #6fc08a;
+@define-color m_timeseries #e88aa3;
+
+.mono, .cell, .count, .code-view {
+  font-family: "JetBrains Mono", "Cascadia Code", "Fira Code", "DejaVu Sans Mono", monospace;
+  font-feature-settings: "tnum";
+}
+.cell { font-size: 0.9em; padding: 3px 8px; }
+.null-cell { opacity: 0.38; font-style: italic; }
+.count { font-size: 0.8em; }
+.code-view { font-size: 0.95em; }
+
+.sidebar-heading {
+  font-size: 0.72em; font-weight: 800; letter-spacing: 0.09em;
+  opacity: 0.5; margin: 16px 12px 4px 12px;
+}
+
+.model-icon.model-table { color: @m_table; }
+.model-icon.model-document { color: @m_document; }
+.model-icon.model-vector { color: @m_vector; }
+.model-icon.model-link { color: @m_link; }
+.model-icon.model-timeseries { color: @m_timeseries; }
+
+.view-toolbar {
+  padding: 8px 12px;
+  border-bottom: 1px solid alpha(currentColor, 0.08);
+}
+.pager { padding: 6px 12px; border-top: 1px solid alpha(currentColor, 0.08); font-size: 0.85em; }
+
+columnview.data-grid { background: transparent; }
+columnview.data-grid > header > button { font-size: 0.8em; font-weight: 700; padding: 6px 8px; }
+
+.doc-list-pane { background: alpha(currentColor, 0.025); border-right: 1px solid alpha(currentColor, 0.08); }
+
+.stat-card {
+  padding: 18px;
+  border-radius: 14px;
+  background: alpha(currentColor, 0.045);
+  border: 1px solid alpha(currentColor, 0.06);
+}
+.stat-card.small { padding: 12px 16px; border-radius: 10px; }
+.stat-card .model-icon { -gtk-icon-size: 20px; margin-bottom: 6px; }
+.stat-value { font-size: 1.9em; font-weight: 800; letter-spacing: -0.02em; }
+.stat-card.small .stat-value { font-size: 1.3em; }
+.stat-label { font-size: 0.72em; font-weight: 800; letter-spacing: 0.08em; opacity: 0.55; }
+.ts-stats { margin: 0 12px 12px 12px; }
+.chart { margin: 12px; }
+
+.pill-badge {
+  font-size: 0.72em; font-weight: 800; letter-spacing: 0.06em;
+  padding: 2px 8px; border-radius: 99px;
+  background: alpha(@accent_bg_color, 0.18); color: @accent_color;
+}
+
+.statusbar {
+  padding: 5px 12px;
+  font-size: 0.82em;
+  border-top: 1px solid alpha(currentColor, 0.08);
+}
+.status-dot { min-width: 8px; min-height: 8px; border-radius: 99px; background: @m_link; }
+
+.editable-cell { min-height: 22px; }
+.editable-cell:focus-within { background: alpha(@accent_bg_color, 0.12); border-radius: 4px; }
+
+.graph-hud {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: alpha(@window_bg_color, 0.92);
+  border: 1px solid alpha(currentColor, 0.1);
+  box-shadow: 0 6px 24px alpha(black, 0.3);
+}
+.graph-info {
+  padding: 4px 10px;
+  border-radius: 99px;
+  background: alpha(@window_bg_color, 0.85);
+  opacity: 0.8;
+}
+
+.console-msg { padding: 8px 14px; font-size: 0.85em; border-bottom: 1px solid alpha(currentColor, 0.08); }
+.console-msg.error { color: @error_color; opacity: 1; }
+
+.diag-chip { font-size: 0.75em; font-weight: 800; padding: 2px 10px; border-radius: 99px; }
+.diag-chip.ok { background: alpha(@m_link, 0.18); color: @m_link; }
+.diag-chip.warn { background: alpha(@warning_color, 0.2); color: @warning_color; }
+.diag-chip.bad { background: alpha(@error_color, 0.2); color: @error_color; }
+.diag-list { background: alpha(currentColor, 0.03); border-bottom: 1px solid alpha(currentColor, 0.08); }
+.diag-row { border-radius: 0; }
+.diag-error { color: @error_color; }
+.diag-warning { color: @warning_color; }
+.diag-info { opacity: 0.55; }
+.small-btn { min-height: 22px; padding: 0 10px; font-size: 0.85em; }
+
+.tool-rail { padding: 6px 4px; background: alpha(currentColor, 0.04); border-right: 1px solid alpha(currentColor, 0.08); }
+.rail-btn { min-width: 52px; padding: 6px 0; border-radius: 10px; }
+.rail-glyph { font-size: 1.25em; font-weight: 800; font-family: "JetBrains Mono", monospace; color: @accent_color; }
+.rail-label { font-size: 0.68em; font-weight: 700; opacity: 0.6; }
+.snippet-btn { padding: 6px 4px; font-size: 0.85em; border-radius: 8px; background: alpha(currentColor, 0.06); }
+.snippet-btn:hover { background: alpha(@accent_bg_color, 0.22); }
+
+.graph-tip > contents { border-radius: 10px; box-shadow: 0 6px 20px alpha(black, 0.35); }
+
+.heat-strip { padding: 8px 16px; background: alpha(@window_bg_color, 0.94); border-top: 1px solid alpha(currentColor, 0.1); }
+.heat-none { min-width: 10px; min-height: 10px; border-radius: 99px; background: alpha(currentColor, 0.2); }

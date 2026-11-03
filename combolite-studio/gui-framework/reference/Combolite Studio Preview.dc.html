@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<style>body{margin:0;background:#0d0e10;} *{box-sizing:border-box;} a{color:#3cc4c9;} a:hover{color:#7fdde0;}</style>
+</helmet>
+<div style="min-height:100vh; display:flex; flex-direction:column; align-items:flex-start; justify-content:center; gap:18px; padding:40px 24px; width:max-content; min-width:100%; font-family:'IBM Plex Sans',system-ui,sans-serif; color:#e8e9ec;">
+  <div style="width:1280px; height:800px; flex:none; margin:0 auto; display:grid; grid-template-columns:268px 1fr; border-radius:14px; overflow:hidden; background:#1b1c1f; box-shadow:0 0 0 1px rgba(255,255,255,0.08), 0 30px 80px rgba(0,0,0,0.55);">
+
+    <aside style="display:flex; flex-direction:column; background:#232428; border-right:1px solid rgba(255,255,255,0.06); min-height:0;">
+      <div style="height:48px; display:flex; align-items:center; gap:6px; padding:0 8px;">
+        <div title="Open database" style="width:32px; height:32px; border-radius:8px; display:grid; place-items:center; color:#c9cbd1; font-size:17px; cursor:pointer;" style-hover="background:rgba(255,255,255,0.07)">↥</div>
+        <div style="flex:1; text-align:center; line-height:1.15;">
+          <div style="font-weight:700; font-size:13.5px;">Combolite</div>
+          <div style="font-size:11.5px; color:#9a9ca3;">gutenfree.cmb</div>
+        </div>
+        <div style="width:32px; height:32px; border-radius:8px; display:grid; place-items:center; color:#c9cbd1; font-size:17px; cursor:pointer;" style-hover="background:rgba(255,255,255,0.07)">≡</div>
+      </div>
+      <div style="padding:0 10px 8px;">
+        <div style="height:34px; border-radius:8px; background:rgba(255,255,255,0.06); display:flex; align-items:center; padding:0 10px; gap:8px; color:#8b8e96; font-size:13px;">
+          <span style="flex:1;">Filter stores</span>
+          <span style="font-family:'JetBrains Mono',monospace; font-size:11px; white-space:nowrap;">Ctrl K</span>
+        </div>
+      </div>
+      <div style="flex:1; overflow:auto; padding:0 8px 12px;">
+        <div onClick="{{ openConsole }}" style="display:flex; align-items:center; gap:10px; height:34px; padding:0 10px; margin-top:6px; border-radius:8px; cursor:pointer; font-size:13.5px; background:{{ consoleBg }};" style-hover="background:rgba(255,255,255,0.06)">
+          <span style="width:10px; font-family:'JetBrains Mono',monospace; font-size:12px; color:#3cc4c9; font-weight:700;">&gt;_</span>
+          <span style="flex:1;">Query Console</span>
+          <span style="font-family:'JetBrains Mono',monospace; font-size:11px; color:#8b8e96; white-space:nowrap;">Ctrl E</span>
+        </div>
+        <sc-for list="{{ sections }}" as="sec" hint-placeholder-count="5">
+          <div style="font-size:10.5px; font-weight:700; letter-spacing:0.09em; color:#8b8e96; padding:14px 8px 5px;">{{ sec.title }}</div>
+          <sc-for list="{{ sec.items }}" as="item" hint-placeholder-count="2">
+            <div onClick="{{ item.select }}" style="display:flex; align-items:center; gap:10px; height:34px; padding:0 10px; border-radius:8px; cursor:pointer; font-size:13.5px; background:{{ item.bg }};" style-hover="background:rgba(255,255,255,0.06)">
+              <span style="width:10px; height:10px; flex:none; background:{{ item.color }}; border-radius:{{ item.radius }};"></span>
+              <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{{ item.name }}</span>
+              <span style="font-family:'JetBrains Mono',monospace; font-size:11px; color:#8b8e96;">{{ item.short }}</span>
+            </div>
+          </sc-for>
+        </sc-for>
+      </div>
+    </aside>
+
+    <main style="display:flex; flex-direction:column; min-width:0; min-height:0;">
+      <div style="height:48px; flex:none; display:flex; align-items:center; padding:0 10px; gap:8px; border-bottom:1px solid rgba(255,255,255,0.06);">
+        <div style="width:72px;"></div>
+        <div style="flex:1; text-align:center; line-height:1.15;">
+          <div style="font-weight:700; font-size:13.5px;">{{ title }}</div>
+          <div style="font-size:11.5px; color:#9a9ca3;">{{ subtitle }}</div>
+        </div>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <div title="Refresh" style="width:32px; height:32px; border-radius:8px; display:grid; place-items:center; color:#c9cbd1; cursor:pointer;" style-hover="background:rgba(255,255,255,0.07)">↻</div>
+          <div style="width:24px; height:24px; border-radius:99px; background:rgba(255,255,255,0.08); display:grid; place-items:center; font-size:12px; color:#c9cbd1;">✕</div>
+        </div>
+      </div>
+
+      <div style="flex:1; min-height:0; display:flex; flex-direction:column;">
+
+        <sc-if value="{{ isTable }}" hint-placeholder-val="{{ true }}">
+          <div style="display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid rgba(255,255,255,0.06);">
+            <div style="display:flex; background:rgba(255,255,255,0.05); border-radius:8px; padding:2px;">
+              <sc-for list="{{ tableTabs }}" as="t" hint-placeholder-count="3">
+                <div onClick="{{ t.select }}" style="padding:5px 14px; border-radius:6px; font-size:13px; font-weight:600; cursor:pointer; background:{{ t.bg }}; color:{{ t.fg }};">{{ t.label }}</div>
+              </sc-for>
+            </div>
+            <div style="flex:1;"></div>
+            <div style="width:220px; height:32px; border-radius:8px; background:rgba(255,255,255,0.06); display:flex; align-items:center; padding:0 10px; color:#8b8e96; font-size:13px;">Filter rows…</div>
+            <div title="Insert row" style="width:32px; height:32px; border-radius:8px; display:grid; place-items:center; font-size:18px; cursor:pointer;" style-hover="background:rgba(255,255,255,0.07)">+</div>
+            <div title="Delete selected" style="width:32px; height:32px; border-radius:8px; display:grid; place-items:center; font-size:14px; color:#e88aa3; cursor:pointer;" style-hover="background:rgba(255,255,255,0.07)">⌫</div>
+          </div>
+          <div style="flex:1; min-height:0; overflow:auto; font-family:'JetBrains Mono',monospace; font-size:12.5px;">
+            <div style="display:grid; grid-template-columns:{{ gridCols }}; position:sticky; top:0; background:#202125; border-bottom:1px solid rgba(255,255,255,0.08);">
+              <sc-for list="{{ gridHead }}" as="h" hint-placeholder-count="6">
+                <div style="padding:8px 10px; font-family:'IBM Plex Sans',sans-serif; font-size:11.5px; font-weight:700; color:#b5b7bd; border-right:1px solid rgba(255,255,255,0.05); text-align:{{ h.align }};">{{ h.name }}</div>
+              </sc-for>
+            </div>
+            <sc-for list="{{ gridRows }}" as="r" hint-placeholder-count="14">
+              <div onClick="{{ r.select }}" style="display:grid; grid-template-columns:{{ gridCols }}; border-bottom:1px solid rgba(255,255,255,0.04); cursor:default; background:{{ r.bg }};" style-hover="background:rgba(255,255,255,0.03)">
+                <sc-for list="{{ r.cells }}" as="c" hint-placeholder-count="6">
+                  <div style="padding:6px 10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; border-right:1px solid rgba(255,255,255,0.04); text-align:{{ c.align }}; color:{{ c.color }}; box-shadow:{{ c.ring }};">{{ c.v }}</div>
+                </sc-for>
+              </div>
+            </sc-for>
+          </div>
+          <div style="display:flex; align-items:center; gap:10px; padding:6px 12px; border-top:1px solid rgba(255,255,255,0.06); font-size:12px; color:#9a9ca3;">
+            <span style="font-family:'JetBrains Mono',monospace;">{{ pagerLeft }}</span>
+            <div style="flex:1;"></div>
+            <span>Double-click a cell to edit</span>
+            <span style="width:1px; height:14px; background:rgba(255,255,255,0.1);"></span>
+            <span style="font-family:'JetBrains Mono',monospace;">‹  {{ pagerRight }}  ›</span>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ isDoc }}">
+          <div style="flex:1; min-height:0; display:grid; grid-template-columns:320px 1fr;">
+            <div style="display:flex; flex-direction:column; min-height:0; background:rgba(255,255,255,0.02); border-right:1px solid rgba(255,255,255,0.06);">
+              <div style="display:flex; gap:6px; padding:10px;">
+                <div style="flex:1; height:32px; border-radius:8px; background:rgba(255,255,255,0.06); display:flex; align-items:center; padding:0 10px; color:#8b8e96; font-size:13px;">Full-text search (BM25)…</div>
+                <div title="New document" style="width:32px; height:32px; border-radius:8px; display:grid; place-items:center; font-size:18px; cursor:pointer;" style-hover="background:rgba(255,255,255,0.07)">+</div>
+              </div>
+              <div style="font-size:11.5px; color:#9a9ca3; padding:2px 14px 6px;">{{ docCount }}</div>
+              <div style="flex:1; overflow:auto; padding:0 8px 8px;">
+                <sc-for list="{{ docs }}" as="d" hint-placeholder-count="10">
+                  <div onClick="{{ d.select }}" style="padding:7px 10px; border-radius:8px; cursor:pointer; background:{{ d.bg }};" style-hover="background:rgba(255,255,255,0.05)">
+                    <div style="font-size:13.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{{ d.title }}</div>
+                    <div style="font-family:'JetBrains Mono',monospace; font-size:11px; color:#9a9ca3;">{{ d.sub }}</div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+            <div style="display:flex; flex-direction:column; min-height:0;">
+              <div style="display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid rgba(255,255,255,0.06);">
+                <div style="flex:1; font-weight:700; font-size:14px;">{{ docTitle }}</div>
+                <span style="font-size:12.5px; color:#9a9ca3;">Revision</span>
+                <div style="height:30px; padding:0 10px; border-radius:8px; background:rgba(255,255,255,0.07); display:flex; align-items:center; gap:8px; font-family:'JetBrains Mono',monospace; font-size:12px;">{{ docRev }} ▾</div>
+                <div style="width:32px; height:32px; border-radius:8px; display:grid; place-items:center; font-size:14px; color:#e88aa3;">⌫</div>
+                <div style="height:32px; padding:0 14px; border-radius:8px; background:#2aa9ae; color:#041a1b; font-weight:700; font-size:13px; display:flex; align-items:center;">Save Revision</div>
+              </div>
+              <pre style="flex:1; margin:0; overflow:auto; padding:16px 20px; font-family:'JetBrains Mono',monospace; font-size:12.5px; line-height:1.6; color:#d6d8dd;">{{ docJson }}</pre>
+            </div>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ isGraph }}">
+          <div style="display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid rgba(255,255,255,0.06);">
+            <div style="display:flex; background:rgba(255,255,255,0.05); border-radius:8px; padding:2px;">
+              <sc-for list="{{ graphTabs }}" as="t" hint-placeholder-count="2">
+                <div style="padding:5px 14px; border-radius:6px; font-size:13px; font-weight:600; background:{{ t.bg }}; color:{{ t.fg }};">{{ t.label }}</div>
+              </sc-for>
+            </div>
+            <div style="flex:1;"></div>
+            <span style="font-family:'JetBrains Mono',monospace; font-size:12px; color:#9a9ca3; white-space:nowrap;">{{ graphMeta }}</span>
+            <div style="display:flex; background:rgba(255,255,255,0.05); border-radius:8px; padding:2px;">
+              <sc-for list="{{ modeTabs }}" as="t" hint-placeholder-count="2">
+                <div onClick="{{ t.select }}" style="padding:4px 12px; border-radius:6px; font-size:12.5px; font-weight:700; cursor:pointer; background:{{ t.bg }}; color:{{ t.fg }};">{{ t.label }}</div>
+              </sc-for>
+            </div>
+            <div onClick="{{ toggleLabels }}" title="Show all labels" style="height:30px; padding:0 10px; border-radius:8px; display:flex; align-items:center; font-family:'JetBrains Mono',monospace; font-size:12.5px; font-weight:700; cursor:pointer; background:{{ labelsBg }}; color:{{ labelsFg }};">Aa</div>
+            <div style="width:32px; height:32px; border-radius:8px; display:grid; place-items:center; font-size:18px;">+</div>
+          </div>
+          <div onMouseMove="{{ gMove }}" onMouseDown="{{ gDown }}" onMouseUp="{{ gUp }}" onMouseLeave="{{ gUp }}" onWheel="{{ gWheel }}" onDoubleClick="{{ gReset }}" style="flex:1; min-height:0; position:relative; background-image:radial-gradient(rgba(255,255,255,0.07) 1px, transparent 1.3px); background-size:28px 28px; cursor:{{ gCursor }}; user-select:none;">
+            <svg viewBox="0 0 1012 640" preserveAspectRatio="xMidYMid meet" style="position:absolute; inset:0; width:100%; height:100%;">
+              <sc-for list="{{ gEdges }}" as="e" hint-placeholder-count="0">
+                <g onMouseEnter="{{ e.enter }}" onMouseLeave="{{ e.leave }}"><path d="{{ e.d }}" fill="none" stroke="{{ e.stroke }}" stroke-width="{{ e.w }}" stroke-opacity="{{ e.op }}" stroke-linecap="round" pointer-events="none"></path><path d="{{ e.d }}" fill="none" stroke="#000" stroke-opacity="0" stroke-width="10"></path></g>
+              </sc-for>
+              <sc-for list="{{ gNodes }}" as="n" hint-placeholder-count="0">
+                <g onClick="{{ n.select }}" onMouseDown="{{ n.down }}" onMouseEnter="{{ n.enter }}" onMouseLeave="{{ n.leave }}" style="cursor:pointer;">
+                  <circle cx="{{ n.x }}" cy="{{ n.y }}" r="{{ n.halo }}" fill="{{ n.fill }}" fill-opacity="{{ n.haloOp }}" pointer-events="none"></circle>
+                  <circle cx="{{ n.x }}" cy="{{ n.y }}" r="{{ n.ring }}" fill="none" stroke="#3cc4c9" stroke-width="2" stroke-opacity="{{ n.ringOp }}"></circle>
+                  <circle cx="{{ n.x }}" cy="{{ n.y }}" r="{{ n.r }}" fill="{{ n.fill }}" fill-opacity="{{ n.op }}"></circle>
+                </g>
+              </sc-for>
+              
+            </svg>
+            <sc-for list="{{ gLabels }}" as="l" hint-placeholder-count="0">
+              <div style="position:absolute; left:{{ l.left }}px; top:{{ l.top }}px; padding:1px 6px; border-radius:4px; background:rgba(22,23,25,0.92); color:#e8e9ec; font-family:'JetBrains Mono',monospace; font-size:11px; line-height:16px; white-space:nowrap; pointer-events:none;">{{ l.text }}</div>
+            </sc-for>
+            <sc-if value="{{ is3d }}"><div style="position:absolute; top:12px; left:50%; transform:translateX(-50%); padding:4px 12px; border-radius:99px; background:rgba(27,28,31,0.88); font-size:11.5px; color:#b5b7bd; white-space:nowrap; pointer-events:none;">{{ graphCaption }}</div></sc-if>
+            <div style="position:absolute; left:0; right:0; bottom:0; height:52px; display:flex; align-items:center; gap:20px; padding:0 18px; background:rgba(27,28,31,0.95); border-top:1px solid rgba(255,255,255,0.08); pointer-events:none; opacity:{{ heatOp }};">
+              <div title="Product of link strengths along the strongest path (log scale)" style="font-size:10.5px; font-weight:800; letter-spacing:0.08em; color:#b5b7bd; white-space:nowrap;">PATH STRENGTH</div>
+              <div style="width:300px; flex:none;">
+                <div style="height:8px; border-radius:4px; background:linear-gradient(90deg,#7aa7f0 0%,#3cc4c9 30%,#6fc08a 55%,#d9a85a 78%,#e88aa3 100%);"></div>
+                <div style="position:relative; height:16px; margin-top:3px;"><span style="position:absolute; left:0%; transform:translateX(0); font-family:'JetBrains Mono',monospace; font-size:10.5px; color:#9a9ca3; white-space:nowrap;">≤0.01</span><span style="position:absolute; left:25%; transform:translateX(-50%); font-family:'JetBrains Mono',monospace; font-size:10.5px; color:#9a9ca3; white-space:nowrap;">0.03</span><span style="position:absolute; left:50%; transform:translateX(-50%); font-family:'JetBrains Mono',monospace; font-size:10.5px; color:#9a9ca3; white-space:nowrap;">0.1</span><span style="position:absolute; left:75%; transform:translateX(-50%); font-family:'JetBrains Mono',monospace; font-size:10.5px; color:#9a9ca3; white-space:nowrap;">0.3</span><span style="position:absolute; left:100%; transform:translateX(-100%); font-family:'JetBrains Mono',monospace; font-size:10.5px; color:#9a9ca3; white-space:nowrap;">1.0</span></div>
+              </div>
+              <div style="display:flex; align-items:center; gap:6px; font-size:11.5px; color:#9a9ca3; white-space:nowrap;"><span style="width:10px; height:10px; border-radius:99px; background:rgba(255,255,255,0.2);"></span>no path in 6 hops</div>
+              <div style="font-size:11.5px; color:#9a9ca3; white-space:nowrap;">thicker line = stronger direct link</div>
+              <div style="flex:1; min-width:0; text-align:right; font-family:'JetBrains Mono',monospace; font-size:11.5px; color:#d6d8dd; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{{ heatText }}</div>
+            </div>
+            <sc-if value="{{ hasTip }}">
+              <div style="position:absolute; left:{{ tipX }}px; top:{{ tipY }}px; width:230px; padding:9px 12px; border-radius:10px; background:rgba(33,34,38,0.97); border:1px solid rgba(255,255,255,0.12); box-shadow:0 8px 24px rgba(0,0,0,0.45); pointer-events:none; z-index:6;">
+                <div style="font-family:'JetBrains Mono',monospace; font-weight:700; font-size:12.5px; margin-bottom:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{{ tipTitle }}</div>
+                <sc-for list="{{ tipRows }}" as="r" hint-placeholder-count="3">
+                  <div style="display:flex; justify-content:space-between; gap:12px; font-size:11.5px; line-height:1.6;"><span style="color:#8b8e96;">{{ r.k }}</span><span style="font-family:'JetBrains Mono',monospace;">{{ r.v }}</span></div>
+                </sc-for>
+              </div>
+            </sc-if>
+            <div style="position:absolute; top:12px; right:12px; padding:4px 10px; border-radius:99px; background:rgba(27,28,31,0.88); font-family:'JetBrains Mono',monospace; font-size:11.5px; color:#b5b7bd;">{{ graphInfo }}</div>
+            <sc-if value="{{ hasSel }}">
+              <div style="position:absolute; left:16px; bottom:68px; width:340px; padding:12px 14px; border-radius:12px; background:rgba(27,28,31,0.94); border:1px solid rgba(255,255,255,0.1); box-shadow:0 6px 24px rgba(0,0,0,0.35); display:flex; flex-direction:column; gap:6px;">
+                <div style="font-family:'JetBrains Mono',monospace; font-weight:700; font-size:13px;">{{ selTitle }}</div>
+                <div style="font-size:12px; color:#9a9ca3; line-height:1.4;">{{ selSub }}</div>
+                <div style="display:flex; gap:6px; margin-top:4px;">
+                  <div style="height:30px; padding:0 12px; border-radius:8px; background:#2aa9ae; color:#041a1b; font-weight:700; font-size:12.5px; display:flex; align-items:center;">{{ selPrimary }}</div>
+                  <div style="height:30px; padding:0 12px; border-radius:8px; background:rgba(255,255,255,0.08); font-size:12.5px; font-weight:600; display:flex; align-items:center;">Edit</div>
+                  <div style="height:30px; padding:0 12px; border-radius:8px; background:rgba(232,138,163,0.16); color:#f0a3b7; font-size:12.5px; font-weight:600; display:flex; align-items:center;">{{ selDanger }}</div>
+                </div>
+              </div>
+            </sc-if>
+            <div style="position:absolute; right:16px; bottom:68px; display:flex; flex-direction:column; gap:6px;"><div onClick="{{ zoomIn }}" title="Zoom in" onMouseDown="{{ stop }}" style="width:36px; height:36px; border-radius:99px; background:rgba(27,28,31,0.9); border:1px solid rgba(255,255,255,0.1); display:grid; place-items:center; font-size:16px; color:#c9cbd1; cursor:pointer;" style-hover="background:rgba(60,62,68,0.95)">+</div><div onClick="{{ zoomOut }}" title="Zoom out" onMouseDown="{{ stop }}" style="width:36px; height:36px; border-radius:99px; background:rgba(27,28,31,0.9); border:1px solid rgba(255,255,255,0.1); display:grid; place-items:center; font-size:16px; color:#c9cbd1; cursor:pointer;" style-hover="background:rgba(60,62,68,0.95)">−</div><div onClick="{{ gReset }}" title="Fit to view (double-click background)" onMouseDown="{{ stop }}" style="width:36px; height:36px; border-radius:99px; background:rgba(27,28,31,0.9); border:1px solid rgba(255,255,255,0.1); display:grid; place-items:center; font-size:16px; color:#c9cbd1; cursor:pointer;" style-hover="background:rgba(60,62,68,0.95)">⤢</div></div>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ isConsole }}">
+          <div style="display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid rgba(255,255,255,0.06);">
+            <span style="font-weight:700; font-size:14px;">CMBQL</span>
+            <span style="padding:2px 8px; border-radius:99px; background:rgba(42,169,174,0.18); color:#3cc4c9; font-weight:800; font-size:10.5px; letter-spacing:0.06em;">PREVIEW</span>
+            <span style="padding:2px 10px; border-radius:99px; font-size:11.5px; font-weight:800; white-space:nowrap; background:{{ chipBg }}; color:{{ chipFg }};">{{ chipText }}</span>
+            <div style="flex:1;"></div>
+            <span style="font-size:12px; color:#8b8e96;">Try:</span>
+            <sc-for list="{{ samples }}" as="s" hint-placeholder-count="3">
+              <div onClick="{{ s.pick }}" style="height:28px; padding:0 11px; border-radius:7px; display:flex; align-items:center; font-size:12.5px; font-weight:600; cursor:pointer; background:{{ s.bg }};" style-hover="background:rgba(255,255,255,0.1)">{{ s.label }}</div>
+            </sc-for>
+            <div onClick="{{ openProcs }}" style="height:32px; padding:0 12px; border-radius:8px; display:flex; align-items:center; font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap;" style-hover="background:rgba(255,255,255,0.07)">Save as Procedure</div>
+            <div onClick="{{ fixAll }}" style="height:32px; padding:0 12px; border-radius:8px; display:flex; align-items:center; font-size:13px; font-weight:600; cursor:pointer; opacity:{{ fixOp }};" style-hover="background:rgba(255,255,255,0.07)">Fix All</div>
+            <div style="height:32px; padding:0 14px; border-radius:8px; background:#2aa9ae; color:#041a1b; font-weight:700; font-size:13px; display:flex; align-items:center; gap:6px;">▶ Run</div>
+          </div>
+          <div style="flex:1; min-height:0; display:flex; position:relative;">
+          <div style="flex:none; width:64px; background:#202125; border-right:1px solid rgba(255,255,255,0.07); display:flex; flex-direction:column; align-items:center; gap:4px; padding:8px 0;">
+            <sc-for list="{{ cats }}" as="c" hint-placeholder-count="6">
+              <div onClick="{{ c.pick }}" title="{{ c.tip }}" style="width:52px; padding:7px 0 6px; border-radius:10px; display:flex; flex-direction:column; align-items:center; gap:1px; cursor:pointer; background:{{ c.bg }};" style-hover="background:rgba(255,255,255,0.09)">
+                <span style="font-family:'JetBrains Mono',monospace; font-size:17px; font-weight:800; color:#3cc4c9; line-height:22px; white-space:nowrap;">{{ c.glyph }}</span>
+                <span style="font-size:10.5px; font-weight:700; color:#9a9ca3;">{{ c.label }}</span>
+              </div>
+            </sc-for>
+          </div>
+          <div style="flex:1; min-width:0; min-height:0; overflow:auto; display:flex; padding:12px 0; font-family:'JetBrains Mono',monospace; font-size:13px; line-height:22px; background:#18191c;">
+            <div style="flex:none; width:44px; text-align:right; padding-right:12px; color:#5b5e66; user-select:none;">
+              <sc-for list="{{ codeLines }}" as="ln" hint-placeholder-count="5"><div>{{ ln.n }}</div></sc-for>
+            </div>
+            <div style="flex:1; padding-left:12px; border-left:1px solid rgba(255,255,255,0.06);">
+              <sc-for list="{{ codeLines }}" as="ln" hint-placeholder-count="5">
+                <div style="white-space:pre; min-height:22px;"><sc-for list="{{ ln.segs }}" as="g" hint-placeholder-count="4"><span style="color:{{ g.color }}; font-weight:{{ g.w }}; font-style:{{ g.fs }}; text-decoration:{{ g.deco }};" title="{{ g.tip }}">{{ g.t }}</span></sc-for></div>
+              </sc-for>
+            </div>
+          </div>
+          <sc-if value="{{ flyOpen }}">
+            <div style="position:absolute; left:70px; top:8px; width:330px; max-height:calc(100% - 16px); overflow:auto; padding:12px; border-radius:12px; background:#26272b; border:1px solid rgba(255,255,255,0.12); box-shadow:0 12px 36px rgba(0,0,0,0.5); z-index:5;">
+              <div style="font-size:10.5px; font-weight:700; letter-spacing:0.09em; color:#8b8e96; padding:0 2px 8px;">{{ flyTitle }}</div>
+              <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:5px;">
+                <sc-for list="{{ flyItems }}" as="s" hint-placeholder-count="9">
+                  <div onClick="{{ s.add }}" title="{{ s.tip }}" style="padding:8px 4px; border-radius:8px; text-align:center; font-family:'JetBrains Mono',monospace; font-size:12px; cursor:pointer; background:rgba(255,255,255,0.06); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" style-hover="background:rgba(42,169,174,0.28)">{{ s.label }}</div>
+                </sc-for>
+              </div>
+              <sc-if value="{{ isProcs }}">
+                <div style="display:flex; flex-direction:column; gap:6px;">
+                  <sc-for list="{{ procs }}" as="p" hint-placeholder-count="2">
+                    <div style="padding:8px 10px; border-radius:10px; background:rgba(255,255,255,0.05); display:flex; align-items:center; gap:6px;">
+                      <div style="flex:1; min-width:0;">
+                        <div style="font-family:'JetBrains Mono',monospace; font-size:12px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{{ p.sig }}</div>
+                        <div style="font-size:11.5px; color:#9a9ca3;">{{ p.doc }}</div>
+                      </div>
+                      <div onClick="{{ p.call }}" style="height:26px; padding:0 10px; border-radius:6px; background:#2aa9ae; color:#041a1b; font-size:12px; font-weight:700; display:flex; align-items:center; cursor:pointer;">Call</div>
+                      <div onClick="{{ p.body }}" style="height:26px; padding:0 10px; border-radius:6px; background:rgba(255,255,255,0.09); font-size:12px; font-weight:600; display:flex; align-items:center; cursor:pointer;">Body</div>
+                      <div onClick="{{ p.del }}" title="Delete" style="width:26px; height:26px; border-radius:6px; display:grid; place-items:center; color:#e88aa3; cursor:pointer;" style-hover="background:rgba(255,255,255,0.08)">⌫</div>
+                    </div>
+                  </sc-for>
+                  <div style="display:flex; gap:6px; margin-top:6px;">
+                    <input value="{{ pname }}" onInput="{{ setPname }}" placeholder="procedure_name" style="flex:1; min-width:0; height:32px; border-radius:8px; border:1px solid rgba(255,255,255,0.1); background:rgba(255,255,255,0.06); color:#e8e9ec; padding:0 10px; font-family:'JetBrains Mono',monospace; font-size:12px; outline:none;"></input>
+                    <div onClick="{{ saveProc }}" style="height:32px; padding:0 12px; border-radius:8px; background:#2aa9ae; color:#041a1b; font-weight:700; font-size:12.5px; display:flex; align-items:center; cursor:pointer; white-space:nowrap;">Save query</div>
+                  </div>
+                </div>
+              </sc-if>
+            </div>
+          </sc-if>
+          </div>
+          <div style="flex:none; max-height:150px; overflow:auto; border-top:1px solid rgba(255,255,255,0.08); background:rgba(255,255,255,0.03);">
+            <sc-for list="{{ diagRows }}" as="d" hint-placeholder-count="2">
+              <div style="display:flex; align-items:center; gap:10px; padding:5px 14px; font-size:13px; border-bottom:1px solid rgba(255,255,255,0.04);">
+                <span style="width:16px; text-align:center; font-weight:800; color:{{ d.color }};">{{ d.icon }}</span>
+                <span style="font-family:'JetBrains Mono',monospace; font-size:11.5px; color:#8b8e96; width:42px;">{{ d.pos }}</span>
+                <span style="flex:1;">{{ d.msg }}</span>
+                <sc-if value="{{ d.hasFix }}"><div onClick="{{ d.fix }}" style="height:24px; padding:0 12px; border-radius:6px; background:rgba(255,255,255,0.08); font-size:12px; font-weight:600; display:flex; align-items:center; cursor:pointer;" style-hover="background:rgba(255,255,255,0.14)">Fix</div></sc-if>
+              </div>
+            </sc-for>
+            <sc-if value="{{ noDiags }}"><div style="padding:7px 14px; font-size:12.5px; color:#6fc08a;">✓ No problems found</div></sc-if>
+          </div>
+          <div style="flex:none; padding:7px 14px; font-family:'JetBrains Mono',monospace; font-size:12px; color:#8b8e96; border-top:1px solid rgba(255,255,255,0.06);">{{ runMsg }}</div>
+        </sc-if>
+
+        <sc-if value="{{ isTs }}">
+          <div style="display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid rgba(255,255,255,0.06);">
+            <span style="flex:1; font-family:'JetBrains Mono',monospace; font-size:12px; color:#9a9ca3;">{{ tsMeta }}</span>
+            <div style="height:32px; padding:0 12px; border-radius:8px; display:flex; align-items:center; gap:6px; font-size:13px; font-weight:600;">+ Append Point</div>
+            <div style="height:32px; padding:0 12px; border-radius:8px; background:rgba(255,255,255,0.07); display:flex; align-items:center; font-size:13px;">Last 24 hours ▾</div>
+          </div>
+          <div style="flex:1; min-height:0; padding:12px;">
+            <svg viewBox="0 0 1000 420" preserveAspectRatio="none" style="width:100%; height:100%;">
+              <defs><linearGradient id="tsfill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3cc4c9" stop-opacity="0.32"></stop><stop offset="1" stop-color="#3cc4c9" stop-opacity="0"></stop></linearGradient></defs>
+              <sc-for list="{{ tsGrid }}" as="g" hint-placeholder-count="5">
+                <line x1="40" x2="1000" y1="{{ g.y }}" y2="{{ g.y }}" stroke="#ffffff" stroke-opacity="0.07"></line>
+              </sc-for>
+              <polygon points="{{ tsArea }}" fill="url(#tsfill)"></polygon>
+              <polyline points="{{ tsLine }}" fill="none" stroke="#3cc4c9" stroke-width="2" stroke-linejoin="round" vector-effect="non-scaling-stroke"></polyline>
+            </svg>
+          </div>
+          <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:12px; padding:0 12px 12px;">
+            <sc-for list="{{ tsStats }}" as="s" hint-placeholder-count="4">
+              <div style="padding:12px 16px; border-radius:10px; background:rgba(255,255,255,0.045); border:1px solid rgba(255,255,255,0.06);">
+                <div style="font-size:10.5px; font-weight:700; letter-spacing:0.08em; color:#8b8e96;">{{ s.k }}</div>
+                <div style="font-family:'JetBrains Mono',monospace; font-size:20px; font-weight:700;">{{ s.v }}</div>
+              </div>
+            </sc-for>
+          </div>
+        </sc-if>
+
+      </div>
+
+      <div style="height:28px; flex:none; display:flex; align-items:center; gap:10px; padding:0 12px; border-top:1px solid rgba(255,255,255,0.06); font-family:'JetBrains Mono',monospace; font-size:11.5px;">
+        <span style="width:8px; height:8px; border-radius:99px; background:#6fc08a;"></span>
+        <span style="flex:1; color:#c9cbd1;">~/data/gutenfree/gutenfree.cmb</span>
+        <span style="color:#9a9ca3;">18.4 MiB · 4096 B · v0 (unstable)</span>
+        <span style="padding:1px 8px; border-radius:99px; background:rgba(42,169,174,0.18); color:#3cc4c9; font-weight:700; font-size:10.5px;">MOCK</span>
+      </div>
+    </main>
+  </div>
+  <div style="font-size:12.5px; color:#8b8e96; max-width:1280px; width:100%;">Preview of the GTK4 / libadwaita skeleton in <span style="font-family:'JetBrains Mono',monospace; color:#b5b7bd;">combolite_gui/</span>. Click stores in the sidebar, and click graph nodes to select them.</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1360,&quot;height&quot;:920},&quot;initialStore&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;console&quot;,&quot;books&quot;,&quot;catalog&quot;,&quot;book_embeddings&quot;,&quot;written_by&quot;,&quot;similar_to&quot;,&quot;reads_per_min&quot;],&quot;default&quot;:&quot;console&quot;,&quot;tsType&quot;:&quot;string&quot;}}">
+const COL = { table: '#7aa7f0', document: '#d9a85a', vector: '#b291ea', link: '#6fc08a', timeseries: '#e88aa3' };
+const SHAPE = { table: '2px', document: '3px', vector: '99px', link: '99px 2px', timeseries: '1px' };
+const STORES = [
+  { name: 'authors', model: 'table', count: 3120 }, { name: 'books', model: 'table', count: 12480 }, { name: 'loans', model: 'table', count: 48213 },
+  { name: 'catalog', model: 'document', count: 9876 }, { name: 'reviews', model: 'document', count: 2210 },
+  { name: 'book_embeddings', model: 'vector', count: 220 }, { name: 'title_vecs', model: 'vector', count: 220 },
+  { name: 'similar_to', model: 'link', count: 254 }, { name: 'written_by', model: 'link', count: 60 },
+  { name: 'cache_hits', model: 'timeseries', count: 131400 }, { name: 'reads_per_min', model: 'timeseries', count: 525600 },
+];
+const HEAD = { table: 'TABLES', document: 'DOCUMENT POOLS', vector: 'VECTOR COLLECTIONS', link: 'LINKS', timeseries: 'TIME SERIES' };
+const ONE = { table: 'Table', document: 'Document pool', vector: 'Vector collection', link: 'Link set', timeseries: 'Time series' };
+const rng = (s) => { let h = 2166136261; for (const ch of s) h = Math.imul(h ^ ch.charCodeAt(0), 16777619); return () => { h = Math.imul(h ^ (h >>> 15), 2246822507); h = Math.imul(h ^ (h >>> 13), 3266489909); h ^= h >>> 16; return (h >>> 0) / 4294967296; }; };
+const W = 'river glass winter orchard lantern harbor cipher meadow ember north quiet iron silver garden letters voyage hollow tide'.split(' ');
+const FIRST = 'Ada Mary Jane Henry Edith Oscar Leo Virginia Walt Emily'.split(' '), LAST = 'Shelley Austen James Wharton Wilde Tolstoy Woolf Whitman Bronte Doyle'.split(' ');
+const pick = (r, a) => a[Math.floor(r() * a.length)];
+const title = (r) => (r() < 0.4 ? 'The ' : '') + Array.from({ length: 2 + Math.floor(r() * 3) }, () => { const w = pick(r, W); return w[0].toUpperCase() + w.slice(1); }).join(' ');
+const short = (n) => n >= 1e6 ? (n / 1e6).toFixed(1).replace('.0', '') + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1).replace('.0', '') + 'k' : String(n);
+
+function tableData(name) {
+  const r = rng(name);
+  if (name === 'authors') return { cols: ['id', 'name', 'born', 'died'], num: [1, 0, 1, 1], tmpl: '70px 1fr 110px 110px', rows: Array.from({ length: 24 }, (_, i) => { const b = 1550 + Math.floor(r() * 350); return [i + 1, pick(r, FIRST) + ' ' + pick(r, LAST), b, r() > 0.1 ? b + 25 + Math.floor(r() * 60) : null]; }) };
+  if (name === 'loans') return { cols: ['id', 'book_id', 'reader', 'started_at', 'returned'], num: [1, 1, 0, 0, 0], tmpl: '70px 100px 1fr 180px 100px', rows: Array.from({ length: 24 }, (_, i) => [i + 1, 1 + Math.floor(r() * 12480), 'reader-' + String(1 + Math.floor(r() * 900)).padStart(4, '0'), `2026-${String(1 + Math.floor(r() * 10)).padStart(2, '0')}-${String(1 + Math.floor(r() * 28)).padStart(2, '0')} 14:${String(Math.floor(r() * 60)).padStart(2, '0')}`, r() > 0.3]) };
+  return { cols: ['id', 'title', 'author_id', 'year', 'lang', 'downloads'], num: [1, 0, 1, 1, 0, 1], tmpl: '70px 1fr 100px 80px 70px 110px', rows: Array.from({ length: 24 }, (_, i) => [i + 1, title(r), 1 + Math.floor(r() * 3120), 1600 + Math.floor(r() * 325), pick(r, ['en', 'en', 'fr', 'de']), Math.floor(r() * 90000)]) };
+}
+
+function vectorGraph(name) {
+  const r = rng(name), pts = [];
+  const centers = Array.from({ length: 6 }, (_, i) => [506 + Math.cos(i * 1.05 + r()) * (180 + r() * 90), 320 + Math.sin(i * 1.05 + r()) * (150 + r() * 60)]);
+  for (let i = 0; i < 132; i++) { const c = centers[i % 6]; const a = r() * 6.283, d = Math.sqrt(r()) * 70; pts.push([c[0] + Math.cos(a) * d, c[1] + Math.sin(a) * d]); }
+  const edges = new Set();
+  pts.forEach((p, i) => { pts.map((q, j) => [j, (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2]).filter(([j]) => j !== i).sort((a, b) => a[1] - b[1]).slice(0, 3).forEach(([j]) => edges.add(Math.min(i, j) + ',' + Math.max(i, j))); });
+  return { nodes: pts.map((p, i) => ({ id: 'vec-' + String(i + 1).padStart(5, '0'), x: p[0], y: p[1], color: COL.vector, r: 4.5 })), edges: [...edges].map((e) => e.split(',').map(Number)), directed: false };
+}
+
+function linkGraph(name) {
+  const r = rng(name), ids = [], idx = {}, edges = [];
+  const node = (id) => (id in idx ? idx[id] : (idx[id] = ids.push(id) - 1));
+  if (name === 'written_by') for (let b = 1; b <= 60; b++) edges.push([node('book-' + String(b).padStart(5, '0')), node('author-' + String(1 + Math.floor(r() ** 1.6 * 14)).padStart(4, '0')), 0.2 + r() * 0.8]);
+  else for (let k = 0; k < 110; k++) { const c = Math.floor(r() * 6); const a = c * 12 + 1 + Math.floor(r() * 12); let b = c * 12 + 1 + Math.floor(r() * 12); const cross = r() < 0.08; if (cross) b = 1 + Math.floor(r() * 72); if (a !== b) edges.push([node('doc-' + String(a).padStart(5, '0')), node('doc-' + String(b).padStart(5, '0')), cross ? 0.05 + r() * 0.3 : 0.55 + r() * 0.45]); }
+  const n = ids.length, pos = ids.map(() => [r() * 500 - 250, r() * 500 - 250]), k = 34;
+  const outD = new Array(n).fill(0), inD = new Array(n).fill(0); edges.forEach(([a, b]) => { outD[a]++; inD[b]++; });
+  let t = 30;
+  for (let it = 0; it < 260; it++) {
+    const d = pos.map(() => [0, 0]);
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) { const dx = pos[i][0] - pos[j][0], dy = pos[i][1] - pos[j][1], d2 = dx * dx + dy * dy + 0.01; if (d2 > 90000) continue; const f = (k * k) / d2; d[i][0] += dx * f; d[i][1] += dy * f; d[j][0] -= dx * f; d[j][1] -= dy * f; }
+    edges.forEach(([a, b]) => { const dx = pos[a][0] - pos[b][0], dy = pos[a][1] - pos[b][1], dd = Math.hypot(dx, dy) + 0.01, f = dd / k; d[a][0] -= dx * f; d[a][1] -= dy * f; d[b][0] += dx * f; d[b][1] += dy * f; });
+    for (let i = 0; i < n; i++) { const dx = d[i][0] - pos[i][0] * 0.03, dy = d[i][1] - pos[i][1] * 0.03, m = Math.hypot(dx, dy) || 1, s = Math.min(m, t); pos[i][0] += (dx / m) * s; pos[i][1] += (dy / m) * s; }
+    t *= 0.975;
+  }
+  const xs = pos.map((p) => p[0]), ys = pos.map((p) => p[1]);
+  const sx = Math.min(900 / (Math.max(...xs) - Math.min(...xs) || 1), 540 / (Math.max(...ys) - Math.min(...ys) || 1));
+  const ox = (Math.max(...xs) + Math.min(...xs)) / 2, oy = (Math.max(...ys) + Math.min(...ys)) / 2;
+  return {
+    nodes: ids.map((id, i) => ({ id, x: 506 + (pos[i][0] - ox) * sx, y: 320 + (pos[i][1] - oy) * sx, r: 3 + Math.min(Math.sqrt(outD[i] + inD[i]) * 1.4, 9), color: outD[i] && inD[i] ? COL.vector : outD[i] ? COL.table : COL.link, out: outD[i], inn: inD[i] })),
+    edges, directed: true,
+  };
+}
+
+function ts(name) {
+  const r = rng(name), vals = Array.from({ length: 180 }, (_, i) => (name === 'cache_hits' ? 88 + 6 * Math.sin(i / 20) : 60 + 25 * Math.sin(i / 14) + 10 * Math.sin(i / 5.3)) + (r() - 0.5) * 9);
+  return vals;
+}
+
+const KWS = new Set('select from where limit offset order by group having asc desc and or not in is like between match near knn bm25 link unlink to as join on insert into values update set delete create drop table pool collection series null true false count sum avg min max distinct call procedure begin commit rollback explain pragma case when then else end exists with'.split(' '));
+const FNS = new Set('abs round floor ceil sqrt pow mod length lower upper coalesce now count sum avg min max'.split(' '));
+const STARTS = ['select', 'from', 'insert', 'update', 'delete', 'create', 'drop', 'link', 'unlink', 'match', 'call', 'explain', 'begin', 'commit', 'rollback', 'pragma', 'with'];
+const CATS = [
+  { key: 'query', glyph: 'Q', label: 'Query', tip: 'Statements', items: [['Select', 'from |books\nlimit 100', 's'], ['Insert', "insert into books (title, year)\nvalues ('|Untitled', 1900)", 's'], ['Update', 'update books\nset year = |1900\nwhere id = 1', 's'], ['Delete', 'delete from books\nwhere id = |1', 's'], ['Full-text', "from catalog\nmatch '|river lantern'\nlimit 20", 's'], ['Nearest', "from book_embeddings\nnear '|vec-00042'\nlimit 10", 's'], ['Link', "link written_by\nfrom '|book-00001' to 'author-0001'", 's'], ['Unlink', "unlink written_by\nfrom '|book-00001' to 'author-0001'", 's'], ['Series', 'from reads_per_min\nwhere ts > now() - 3600\nlimit 100', 's']] },
+  { key: 'clause', glyph: '{}', label: 'Clause', tip: 'Clauses', items: ['where ', 'order by ', 'group by ', 'having ', 'limit 100', 'offset 0', 'join ', 'as '].map((x) => [x.trim(), x, 'i']) },
+  { key: 'logic', glyph: '?', label: 'Logic', tip: 'Conditionals & comparisons', items: [['and', 'and ', 'i'], ['or', 'or ', 'i'], ['not', 'not ', 'i'], ['=', '= ', 'i'], ['!=', '!= ', 'i'], ['<', '< ', 'i'], ['<=', '<= ', 'i'], ['>', '> ', 'i'], ['>=', '>= ', 'i'], ['in ( )', 'in ()', 'i'], ['between', 'between  and ', 'i'], ['like', "like '%%'", 'i'], ['is null', 'is null', 'i'], ['is not null', 'is not null', 'i'], ['case', 'case\n  when  then \n  else \nend', 'i'], ['exists', 'exists ()', 'i']] },
+  { key: 'math', glyph: 'Σ', label: 'Math', tip: 'Operators, math & aggregates', items: [['+', '+ ', 'i'], ['−', '- ', 'i'], ['×', '* ', 'i'], ['÷', '/ ', 'i'], ['mod %', '% ', 'i'], ['abs', 'abs()', 'i'], ['round', 'round(, 2)', 'i'], ['floor', 'floor()', 'i'], ['ceil', 'ceil()', 'i'], ['sqrt', 'sqrt()', 'i'], ['pow', 'pow(, 2)', 'i'], ['count', 'count(*)', 'i'], ['sum', 'sum()', 'i'], ['avg', 'avg()', 'i'], ['min', 'min()', 'i'], ['max', 'max()', 'i'], ['coalesce', 'coalesce(, 0)', 'i'], ['now()', 'now()', 'i']] },
+  { key: 'directive', glyph: '#', label: 'Direct.', tip: 'Directives & transactions', items: [['explain', 'explain ', 'p'], ['begin', 'begin;', 's'], ['commit', 'commit;', 's'], ['rollback', 'rollback;', 's'], ['pragma', 'pragma ', 's'], ['-- note', '-- ', 'i'], ['$param', '$name', 'i']] },
+  { key: 'procs', glyph: 'ƒ', label: 'Procs', tip: 'Stored procedures', items: [] },
+];
+const PROCS0 = [
+  { name: 'recent_books', params: ['$year'], doc: 'Books since a year', body: 'from books\nwhere year >= $year\norder by year desc\nlimit 50' },
+  { name: 'popular_by_lang', params: ['$lang', '$min'], doc: 'Top downloads in a language', body: 'from books\nwhere lang = $lang and downloads > $min\norder by downloads desc\nlimit 25' },
+];
+const lev = (a, b) => { const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]); for (let j = 1; j <= b.length; j++) d[0][j] = j; for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); return d[a.length][b.length]; };
+const near = (w, opts) => { let best = null, bd = 9; for (const o of opts) { const d = lev(w, o); if (d > 0 && d < bd && d <= (w.length <= 5 ? 1 : 2)) { best = o; bd = d; } } return best; };
+function lex(t) {
+  const out = []; let i = 0; const n = t.length;
+  while (i < n) {
+    const c = t[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (t.startsWith('--', i)) { let j = t.indexOf('\n', i); if (j < 0) j = n; out.push({ k: 'comment', s: i, e: j }); i = j; continue; }
+    if (c === "'" || c === '"') { let j = i + 1; while (j < n && t[j] !== c && t[j] !== '\n') j += t[j] === '\\' ? 2 : 1; j = Math.min(j, n); const ok = t[j] === c; out.push({ k: 'str', s: i, e: ok ? j + 1 : j, bad: !ok }); i = ok ? j + 1 : j; continue; }
+    let m;
+    if ((m = /^\d+(\.\d+)?/.exec(t.slice(i)))) { out.push({ k: 'num', s: i, e: i + m[0].length }); i += m[0].length; continue; }
+    if (c === '$' && (m = /^\$[A-Za-z_]\w*/.exec(t.slice(i)))) { out.push({ k: 'param', s: i, e: i + m[0].length }); i += m[0].length; continue; }
+    if ((m = /^[A-Za-z_]\w*/.exec(t.slice(i)))) { const lw = m[0].toLowerCase(); out.push({ k: FNS.has(lw) && /^\s*\(/.test(t.slice(i + m[0].length)) ? 'fn' : KWS.has(lw) ? 'kw' : 'ident', s: i, e: i + m[0].length }); i += m[0].length; continue; }
+    const two = t.slice(i, i + 2);
+    if (['<=', '>=', '!=', '<>', '=='].includes(two)) { out.push({ k: 'op', s: i, e: i + 2 }); i += 2; continue; }
+    out.push({ k: '=<>+-*/%'.includes(c) ? 'op' : 'punct', s: i, e: i + 1 }); i++;
+  }
+  return out.map((o) => ({ ...o, x: t.slice(o.s, o.e) }));
+}
+function analyze(t, procNames = []) {
+  const toks = lex(t), d = [], names = [...STORES.map((s) => s.name), ...procNames];
+  toks.forEach((k) => { if (k.k === 'str' && k.bad) d.push({ s: k.s, e: k.e, sev: 'error', msg: 'Unterminated string literal', fix: [k.e, k.e, t[k.s]] }); });
+  const st = []; const pair = { '(': ')', '[': ']' };
+  toks.forEach((k) => { if (k.k !== 'punct') return; if (pair[k.x]) st.push(k); else if (k.x === ')' || k.x === ']') { if (st.length && pair[st[st.length - 1].x] === k.x) st.pop(); else d.push({ s: k.s, e: k.e, sev: 'error', msg: `Unmatched '${k.x}'`, fix: [k.s, k.e, ''] }); } });
+  st.forEach((k) => d.push({ s: k.s, e: k.e, sev: 'error', msg: `'${k.x}' is never closed`, fix: [t.length, t.length, pair[k.x]] }));
+  const sig = toks.filter((k) => k.k !== 'comment');
+  if (sig.length) {
+    const f = sig[0], lw = f.x.toLowerCase();
+    if (f.k === 'ident') { const m = near(lw, STARTS); d.push({ s: f.s, e: f.e, sev: 'error', msg: `Unknown keyword '${f.x}'` + (m ? ` — did you mean '${m}'?` : ''), fix: m ? [f.s, f.e, m] : null }); }
+    sig.forEach((k, i) => {
+      const p = sig[i - 1], nx = sig[i + 1];
+      if (k.k === 'ident' && p && p.k === 'kw' && ['from', 'join', 'into', 'to', 'update', 'link', 'unlink', 'call'].includes(p.x.toLowerCase()) && !names.includes(k.x.toLowerCase())) { const m = near(k.x.toLowerCase(), names); d.push({ s: k.s, e: k.e, sev: 'warning', msg: `No store named '${k.x}'` + (m ? ` — did you mean '${m}'?` : ''), fix: m ? [k.s, k.e, m] : null }); }
+      if (k.k === 'op' && ['=', '!=', '<>', '=='].includes(k.x) && nx && nx.x.toLowerCase() === 'null') d.push({ s: k.s, e: nx.e, sev: 'warning', msg: "NULL never equals anything — use 'is null'", fix: [k.s, nx.e, k.x === '=' || k.x === '==' ? 'is null' : 'is not null'] });
+      if (k.k === 'kw' && ['where', 'and', 'or', 'not', 'by'].includes(k.x.toLowerCase()) && (!nx || (nx.k === 'kw' && ['limit', 'order', 'group', 'offset'].includes(nx.x.toLowerCase())))) d.push({ s: k.s, e: k.e, sev: 'error', msg: `Expected an expression after '${k.x}'`, fix: null });
+    });
+    if (['from', 'select'].includes(lw) && !sig.some((k) => ['limit', 'count'].includes(k.x.toLowerCase()))) { const e = sig[sig.length - 1].e; d.push({ s: f.s, e: f.e, sev: 'info', msg: 'No limit — this scans the whole store', fix: [e, e, ' limit 100'] }); }
+  }
+  return { toks, diags: d.sort((a, b) => a.s - b.s) };
+}
+const SAMPLES = [
+  { label: 'Valid', text: "-- books before 1850, most downloaded first\nfrom books\nwhere year < 1850 and lang = 'en'\norder by downloads desc\nlimit 20" },
+  { label: 'Typos', text: 'selct title, year\nfrom bookz\nwhere author_id = null\nlimit 20' },
+  { label: 'Broken', text: "from books\nwhere (year < 1850 and title like 'The\nlimit 20" },
+];
+const RAMP = [[0, [122, 167, 240]], [0.3, [60, 196, 201]], [0.55, [111, 192, 138]], [0.78, [217, 168, 90]], [1, [232, 138, 163]]];
+const heatCss = (t) => { t = Math.max(0, Math.min(1, t)); for (let i = 1; i < RAMP.length; i++) if (t <= RAMP[i][0]) { const [t0, c0] = RAMP[i - 1], [t1, c1] = RAMP[i], u = (t - t0) / (t1 - t0 || 1); return 'rgb(' + c0.map((x, k) => Math.round(x + (c1[k] - x) * u)).join(',') + ')'; } return 'rgb(232,138,163)'; };
+const TOKCOL = { fn: '#4fb8e0', param: '#e88aa3', kw: '#b291ea', str: '#6fc08a', num: '#d9a85a', comment: '#7c7f87', op: '#3cc4c9', ident: '#d6d8dd', punct: '#9a9ca3' };
+const SEVCOL = { error: '#f06a7a', warning: '#e8b04a', info: '#6c7078' };
+
+class Component extends DCLogic {
+  state = { sel: this.props.initialStore ?? 'console', tab: 'data', doc: 0, node: null, row: 3, q: 1, qtext: SAMPLES[1].text, cat: null, procs: PROCS0, pname: '', flash: '', dim: '2d', blend: 0, yaw: -0.6, pitch: 0.32, labels: false, hov: null, mx: 0, my: 0, cw: 1012, ch: 640, zoom: 1, px: 0, py: 0, tick: 0 };
+  sims = {}; dn = null; ctr = null; lastP = null; raf2 = null;
+  getSim(key, g, m) {
+    if (!this.sims[key]) { const pos = g.nodes.map((n) => [n.x, n.y]); this.sims[key] = { pos, home: pos.map((p) => [...p]), vel: pos.map(() => [0, 0]), rest: g.edges.map(([a, b]) => Math.hypot(pos[a][0] - pos[b][0], pos[a][1] - pos[b][1]) || 1), anchor: m === 'vector' ? 0.05 : 0.015, pinned: null, edges: g.edges }; }
+    return this.sims[key];
+  }
+  stepSim(s) {
+    const n = s.pos.length, F = s.pos.map(() => [0, 0]);
+    s.edges.forEach(([a, b], k) => { const dx = s.pos[a][0] - s.pos[b][0], dy = s.pos[a][1] - s.pos[b][1], d = Math.hypot(dx, dy) + 1e-6, f = (0.16 * (d - s.rest[k])) / d; F[a][0] -= dx * f; F[a][1] -= dy * f; F[b][0] += dx * f; F[b][1] += dy * f; });
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) { const dx = s.pos[i][0] - s.pos[j][0], dy = s.pos[i][1] - s.pos[j][1], d = Math.hypot(dx, dy) + 0.01; if (d < 18) { const f = (18 - d) * 0.3 / d; F[i][0] += dx * f; F[i][1] += dy * f; F[j][0] -= dx * f; F[j][1] -= dy * f; } }
+    let e = 0;
+    for (let i = 0; i < n; i++) {
+      F[i][0] += (s.home[i][0] - s.pos[i][0]) * s.anchor; F[i][1] += (s.home[i][1] - s.pos[i][1]) * s.anchor;
+      let vx = (s.vel[i][0] + F[i][0] * 0.35) * 0.9, vy = (s.vel[i][1] + F[i][1] * 0.35) * 0.9; const sp = Math.hypot(vx, vy); if (sp > 30) { vx *= 30 / sp; vy *= 30 / sp; }
+      if (s.pinned === i) { vx = 0; vy = 0; }
+      s.vel[i] = [vx, vy]; s.pos[i][0] += vx; s.pos[i][1] += vy; e += sp;
+    }
+    return e > 0.05 || s.pinned !== null;
+  }
+  kick = () => {
+    if (this.raf2) return;
+    const loop = () => {
+      let busy = this.cursim ? this.stepSim(this.cursim) : false;
+      if (this.ctr !== null && this.lastP && this.lastP[this.ctr]) { const dx = 506 - this.lastP[this.ctr].x, dy = 320 - this.lastP[this.ctr].y; if (Math.abs(dx) + Math.abs(dy) > 0.6) { this.setState({ px: this.state.px + dx * 0.2, py: this.state.py + dy * 0.2 }); busy = true; } else this.ctr = null; }
+      this.setState({ tick: this.state.tick + 1 });
+      this.raf2 = busy ? requestAnimationFrame(loop) : null;
+    };
+    this.raf2 = requestAnimationFrame(loop);
+  };
+  zoomBy = (fct) => this.setState({ zoom: Math.max(0.3, Math.min(6, this.state.zoom * fct)) });
+  drag = null; moved = false;
+  setDim = (d) => { this.setState({ dim: d, hov: null }); const step = () => { const t = this.state.dim === '3d' ? 1 : 0, b = this.state.blend, nb = Math.abs(t - b) < 0.02 ? t : b + (t - b) * 0.18; this.setState({ blend: nb }); if (nb !== t) this.raf = requestAnimationFrame(step); }; cancelAnimationFrame(this.raf); this.raf = requestAnimationFrame(step); };
+  openConsole = () => this.setState({ sel: 'console' });
+  insert = (text, mode) => { const t = this.state.qtext, x = text.replace('|', ''); const n = mode === 's' ? (t.trim() ? t.replace(/\s+$/, '') + '\n\n' : '') + x : mode === 'p' ? x + t : t.replace(/[ \t]+$/, '') + (t && !/[\s(]$/.test(t) && !/^\)/.test(x) ? ' ' : '') + x; this.setState({ qtext: n, q: -1, cat: null, flash: '' }); };
+  saveProc = () => {
+    const { qtext, procs, pname } = this.state, name = (pname.trim() || 'query_' + (procs.length + 1));
+    if (!/^[A-Za-z_]\w*$/.test(name) || KWS.has(name.toLowerCase())) return this.setState({ flash: 'Name must be an identifier and not a keyword' });
+    if (analyze(qtext, procs.map((p) => p.name)).diags.some((d) => d.sev === 'error')) return this.setState({ flash: 'Fix the errors before storing the query', cat: null });
+    const params = [...new Set(qtext.match(/\$[A-Za-z_]\w*/g) || [])];
+    this.setState({ procs: [...procs.filter((p) => p.name !== name), { name, params, doc: 'Stored from console', body: qtext.trim() }], pname: '', flash: `Stored procedure ${name}(${params.join(', ')})` });
+  };
+  consoleVals() {
+    const { qtext, q, cat, procs } = this.state, { toks, diags } = analyze(qtext, procs.map((p) => p.name));
+    const names = STORES.map((s) => s.name), segs = [];
+    const decoAt = (o) => diags.find((d) => d.sev !== 'info' && o >= d.s && o < Math.max(d.e, d.s + 1));
+    let pos = 0;
+    const push = (text, o, tok) => { text.split('\n').forEach((part, i) => { if (i) segs.push({ nl: true }); if (part) { const dg = tok ? decoAt(o) : null; segs.push({ t: part, color: tok ? (tok.k === 'ident' && names.includes(tok.x.toLowerCase()) ? '#7aa7f0' : TOKCOL[tok.k]) : '#d6d8dd', w: tok?.k === 'kw' ? 700 : 400, fs: tok?.k === 'comment' ? 'italic' : 'normal', deco: dg ? `underline wavy ${SEVCOL[dg.sev]}` : 'none', tip: dg ? dg.msg : '' }); } }); };
+    toks.forEach((k) => { if (k.s > pos) push(qtext.slice(pos, k.s), pos, null); push(k.x, k.s, k); pos = k.e; });
+    if (pos < qtext.length) push(qtext.slice(pos), pos, null);
+    const lines = [{ n: 1, segs: [] }];
+    segs.forEach((s) => { if (s.nl) lines.push({ n: lines.length + 1, segs: [] }); else lines[lines.length - 1].segs.push(s); });
+    const pos2 = (o) => { const ln = qtext.slice(0, o).split('\n'); return ln.length + ':' + (ln[ln.length - 1].length + 1); };
+    const apply = (list) => { let t = qtext, edge = t.length + 1; list.filter((d) => d.fix).sort((a, b) => b.fix[0] - a.fix[0]).forEach((d) => { if (d.fix[1] <= edge) { t = t.slice(0, d.fix[0]) + d.fix[2] + t.slice(d.fix[1]); edge = d.fix[0]; } }); return t; };
+    const errs = diags.filter((d) => d.sev === 'error').length, warns = diags.filter((d) => d.sev === 'warning').length;
+    const fixable = diags.filter((d) => d.fix && d.sev !== 'info');
+    const parts = [errs && `${errs} error${errs > 1 ? 's' : ''}`, warns && `${warns} warning${warns > 1 ? 's' : ''}`].filter(Boolean);
+    return {
+      title: 'Query Console', subtitle: 'CMBQL', isConsole: true, hasSel: false,
+      codeLines: lines,
+      diagRows: diags.map((d) => ({ icon: d.sev === 'error' ? '✕' : d.sev === 'warning' ? '!' : 'i', color: SEVCOL[d.sev], pos: pos2(d.s), msg: d.msg, hasFix: !!d.fix, fix: () => this.setState({ qtext: apply([d]) }) })),
+      noDiags: diags.length === 0,
+      chipText: parts.length ? parts.join(' · ') : 'No problems', chipBg: errs ? 'rgba(240,106,122,0.2)' : warns ? 'rgba(232,176,74,0.2)' : 'rgba(111,192,138,0.18)', chipFg: errs ? '#f06a7a' : warns ? '#e8b04a' : '#6fc08a',
+      fixOp: fixable.length ? 1 : 0.35, fixAll: () => this.setState({ qtext: apply(fixable) }),
+      samples: SAMPLES.map((s, i) => ({ label: s.label, bg: i === q ? '#3a3b40' : 'rgba(255,255,255,0.05)', pick: () => this.setState({ q: i, qtext: s.text }) })),
+      cats: CATS.map((c) => ({ glyph: c.glyph, label: c.label, tip: c.tip, bg: cat === c.key ? 'rgba(42,169,174,0.22)' : 'transparent', pick: () => this.setState({ cat: cat === c.key ? null : c.key }) })),
+      flyOpen: !!cat, flyTitle: (CATS.find((c) => c.key === cat)?.tip ?? '').toUpperCase(), isProcs: cat === 'procs',
+      flyItems: (CATS.find((c) => c.key === cat)?.items ?? []).map(([label, text, mode]) => ({ label, tip: text.replace('|', ''), add: () => this.insert(text, mode) })),
+      procs: procs.map((p) => ({ sig: `${p.name}(${p.params.join(', ')})`, doc: p.doc, call: () => this.insert(`call ${p.name}(${p.params.join(', ')})`, 's'), body: () => this.insert(p.body, 's'), del: () => this.setState({ procs: procs.filter((x) => x !== p) }) })),
+      pname: this.state.pname, setPname: (e) => this.setState({ pname: e.target.value }), saveProc: this.saveProc, openProcs: () => this.setState({ cat: 'procs' }),
+      runMsg: this.state.flash ? this.state.flash : errs ? `${errs} error${errs > 1 ? 's' : ''} — not run. First: ${pos2(diags.find((d) => d.sev === 'error').s)} ${diags.find((d) => d.sev === 'error').msg}` : 'Ready · Ctrl+Enter to run',
+    };
+  }
+  cache = {};
+  memo(key, fn) { return this.cache[key] ?? (this.cache[key] = fn()); }
+  choose = (name) => this.setState({ sel: name, node: null, doc: 0, row: 3 });
+
+  renderVals() {
+    const { sel, tab, node } = this.state;
+    const store = STORES.find((s) => s.name === sel) ?? STORES[1];
+    const consoleOn = sel === 'console';
+    const sidebar = Object.keys(HEAD).map((model) => ({
+      title: HEAD[model],
+      items: STORES.filter((s) => s.model === model).map((s) => ({ name: s.name, short: short(s.count), color: COL[model], radius: SHAPE[model], bg: s.name === sel ? 'rgba(255,255,255,0.09)' : 'transparent', select: () => this.choose(s.name) })),
+    }));
+    if (consoleOn) return { sections: sidebar, consoleBg: 'rgba(255,255,255,0.09)', openConsole: this.openConsole, isTable: false, isDoc: false, isGraph: false, isTs: false, ...this.consoleVals() };
+    const m = store.model;
+    const sections = Object.keys(HEAD).map((model) => ({
+      title: HEAD[model],
+      items: STORES.filter((s) => s.model === model).map((s) => ({ name: s.name, short: short(s.count), color: COL[model], radius: SHAPE[model], bg: s.name === sel ? 'rgba(255,255,255,0.09)' : 'transparent', select: () => this.choose(s.name) })),
+    }));
+    const v = { sections, consoleBg: 'transparent', openConsole: this.openConsole, isConsole: false, title: store.name, subtitle: `${ONE[m]} · ${store.count.toLocaleString('en-US')} entries`, isTable: m === 'table', isDoc: m === 'document', isGraph: m === 'vector' || m === 'link', isTs: m === 'timeseries', hasSel: false };
+
+    if (m === 'table') {
+      const d = this.memo('t:' + sel, () => tableData(sel));
+      const fmt = (x) => (x === null ? 'NULL' : x === true ? 'true' : x === false ? 'false' : String(x));
+      v.tableTabs = ['Data', 'Schema', 'Indexes'].map((l) => ({ label: l, bg: tab === l.toLowerCase() ? '#3a3b40' : 'transparent', fg: tab === l.toLowerCase() ? '#e8e9ec' : '#9a9ca3', select: () => this.setState({ tab: l.toLowerCase() }) }));
+      if (tab === 'schema') {
+        v.gridCols = '1fr 140px 120px 1fr'; v.gridHead = ['column', 'type', 'nullable', 'constraints'].map((n) => ({ name: n, align: 'left' }));
+        v.gridRows = d.cols.map((c, i) => ({ bg: 'transparent', select: () => {}, cells: [c, d.num[i] ? 'INT' : 'TEXT', c === 'id' ? 'NO' : 'YES', c === 'id' ? 'PRIMARY KEY' : c.endsWith('_id') ? 'FOREIGN KEY' : ''].map((x) => ({ v: x, align: 'left', color: '#d6d8dd', ring: 'none' })) }));
+      } else if (tab === 'indexes') {
+        v.gridCols = '1fr 1fr 120px 100px'; v.gridHead = ['index', 'columns', 'kind', 'unique'].map((n) => ({ name: n, align: 'left' }));
+        v.gridRows = [[`${sel}_pkey`, 'id', 'btree', 'true'], ...d.cols.filter((c) => c.endsWith('_id')).map((c) => [`${sel}_${c}_idx`, c, 'btree', 'false'])].map((row) => ({ bg: 'transparent', select: () => {}, cells: row.map((x) => ({ v: x, align: 'left', color: '#d6d8dd', ring: 'none' })) }));
+      } else {
+        v.gridCols = d.tmpl; v.gridHead = d.cols.map((c, i) => ({ name: c, align: d.num[i] ? 'right' : 'left' }));
+        v.gridRows = d.rows.map((row, ri) => ({
+          bg: ri === this.state.row ? 'rgba(42,169,174,0.14)' : 'transparent', select: () => this.setState({ row: ri }),
+          cells: row.map((x, ci) => ({ v: fmt(x), align: d.num[ci] ? 'right' : 'left', color: x === null ? '#6f727a' : ci === 0 ? '#9a9ca3' : '#d6d8dd', ring: ri === this.state.row && ci === 1 ? 'inset 0 0 0 1.5px #3cc4c9' : 'none' })),
+        }));
+      }
+      v.pagerLeft = `${v.gridRows.length} rows · 0.4 ms`; v.pagerRight = `1–100 of ${store.count.toLocaleString('en-US')}`;
+    }
+
+    if (m === 'document') {
+      const docs = this.memo('d:' + sel, () => { const r = rng(sel); return Array.from({ length: 22 }, (_, i) => ({ id: 'doc-' + String(i + 1).padStart(5, '0'), title: title(r), rev: 1 + Math.floor(r() * 6), author: pick(r, FIRST) + ' ' + pick(r, LAST), subjects: [pick(r, W), pick(r, W), pick(r, W)], downloads: Math.floor(r() * 90000), excerpt: Array.from({ length: 14 }, () => pick(r, W)).join(' ') + '.' })); });
+      const cur = docs[this.state.doc];
+      v.docs = docs.map((d, i) => ({ title: d.title, sub: `${d.id} · r${d.rev}`, bg: i === this.state.doc ? 'rgba(255,255,255,0.09)' : 'transparent', select: () => this.setState({ doc: i }) }));
+      v.docCount = `Showing ${docs.length} of ${store.count.toLocaleString('en-US')}`;
+      v.docTitle = cur.title; v.docRev = 'r' + cur.rev;
+      v.docJson = JSON.stringify({ _id: cur.id, _rev: cur.rev, title: cur.title, author: cur.author, language: 'en', subjects: cur.subjects, downloads: cur.downloads, excerpt: cur.excerpt }, null, 2);
+    }
+
+    if (v.isGraph) {
+      const g = this.memo('g:' + sel, () => (m === 'vector' ? vectorGraph(sel) : linkGraph(sel)));
+      const adj = g.nodes.map(() => []); g.edges.forEach(([a, b]) => { adj[a].push(b); adj[b].push(a); });
+      const near = node !== null ? new Set([node, ...adj[node]]) : null;
+      v.graphTabs = (m === 'vector' ? ['Search', 'Graph'] : ['Edges', 'Graph']).map((l) => ({ label: l, bg: l === 'Graph' ? '#3a3b40' : 'transparent', fg: l === 'Graph' ? '#e8e9ec' : '#9a9ca3' }));
+      v.graphMeta = m === 'vector' ? '24 dims · cosine · neighbour graph' : sel === 'written_by' ? 'books → authors · n:1 · on delete restrict' : 'catalog → catalog · n:m · cascade';
+      v.graphInfo = m === 'vector' ? `PCA projection · ${g.nodes.length} entries · ${g.edges.length} neighbour edges` : `${g.nodes.length} entries · ${g.edges.length} links · drag nodes to rearrange`;
+      const sim = this.getSim(sel, g, m); this.cursim = sim; const zm = this.state.zoom;
+      const bl = this.state.blend, yaw = this.state.yaw * bl, pit = this.state.pitch * bl, hov = this.drag ? null : this.state.hov, N = g.nodes.length;
+      const ws = g.edges.map((e) => e[2] ?? 0.5), wlo = Math.min(...ws), whi = Math.max(...ws);
+      const wrel = m === 'link' ? ws.map((x) => (x - wlo) / (whi - wlo || 1)) : ws.map(() => 0.5);
+      let dep;
+      if (m === 'vector') {
+        const ref = node !== null ? g.nodes[node] : { x: g.nodes.reduce((s, q) => s + q.x, 0) / N, y: g.nodes.reduce((s, q) => s + q.y, 0) / N };
+        const ds = g.nodes.map((q) => -Math.hypot(q.x - ref.x, q.y - ref.y)), lo = Math.min(...ds), hi = Math.max(...ds);
+        dep = ds.map((x) => (x - lo) / (hi - lo || 1));
+      } else {
+        const acc = g.nodes.map(() => []);
+        g.edges.forEach((e, k) => { acc[e[0]].push(wrel[k]); acc[e[1]].push(wrel[k]); });
+        dep = acc.map((q) => (q.length ? q.reduce((s, x) => s + x, 0) / q.length : 0.5));
+      }
+      const P = g.nodes.map((n, i) => {
+        let X = sim.pos[i][0] - 506, Y = sim.pos[i][1] - 320, Z = (dep[i] - 0.5) * 420 * bl;
+        if (bl > 0.001) { const x1 = X * Math.cos(yaw) + Z * Math.sin(yaw), z1 = -X * Math.sin(yaw) + Z * Math.cos(yaw), y2 = Y * Math.cos(pit) - z1 * Math.sin(pit), z2 = Y * Math.sin(pit) + z1 * Math.cos(pit); X = x1; Y = y2; Z = z2; }
+        const k = bl > 0.001 ? 1100 / Math.max(1100 - Z, 120) : 1;
+        return { x: 506 + this.state.px + X * k * zm, y: 320 + this.state.py + Y * k * zm, k, z: Z, d: dep[i] };
+      });
+      this.lastP = P;
+      const fade = (d) => 1 - bl * (1 - d) * 0.65;
+      const eo = g.edges.map((_, k) => k).sort((p, q) => P[g.edges[p][0]].z + P[g.edges[p][1]].z - P[g.edges[q][0]].z - P[g.edges[q][1]].z);
+      const lens = sim.rest, lmin = Math.min(...lens), lmax = Math.max(...lens);
+      const es = g.edges.map((_, k) => (m === 'link' ? 0.08 + 0.92 * wrel[k] : 0.15 + 0.85 * (1 - (lens[k] - lmin) / (lmax - lmin || 1))));
+      const src = node !== null ? node : this.dn ? this.dn.i : null;
+      let heat = null; const tree = new Set();
+      if (src !== null) {
+        const eAdj = g.nodes.map(() => []); g.edges.forEach(([a, c], k) => { eAdj[a].push([c, k]); eAdj[c].push([a, k]); });
+        const best = new Array(N).fill(null), done = new Array(N).fill(false); best[src] = { c: 0, h: 0, e: null };
+        for (;;) {
+          let u = -1; for (let i = 0; i < N; i++) if (!done[i] && best[i] && (u < 0 || best[i].c < best[u].c)) u = i;
+          if (u < 0) break; done[u] = true; if (best[u].h >= 6) continue;
+          eAdj[u].forEach(([w, k]) => { const c = best[u].c - Math.log(Math.max(es[k], 1e-3)); if (!best[w] || c < best[w].c - 1e-9) best[w] = { c, h: best[u].h + 1, e: k }; });
+        }
+        heat = best.map((b) => (b ? { s: Math.exp(-b.c), h: b.h, t: Math.max(0, Math.min(1, 1 + Math.log10(Math.max(Math.exp(-b.c), 1e-6)) / 2)) } : null));
+        best.forEach((b) => { if (b && b.e !== null) tree.add(b.e); });
+      }
+      v.heatOp = src !== null ? 1 : 0.7; v.heatText = src !== null ? 'from ' + g.nodes[src].id + ' · ' + (heat.filter(Boolean).length - 1) + ' nodes reached' : 'select or drag a node';
+      v.gEdges = eo.map((k) => {
+        const [a, c] = g.edges[k], A = P[a], B = P[c], hotN = near && (a === node || c === node), hovE = hov && hov.kind === 'edge' && hov.i === k, f = fade((A.d + B.d) / 2), kk = ((A.k + B.k) / 2) * Math.sqrt(zm), wt = wrel[k], sc = m === 'link' ? 1 : 0.5;
+        const st = Math.hypot(sim.pos[a][0] - sim.pos[c][0], sim.pos[a][1] - sim.pos[c][1]) / sim.rest[k] - 1;
+        let d = 'M' + A.x.toFixed(1) + ' ' + A.y.toFixed(1) + ' L' + B.x.toFixed(1) + ' ' + B.y.toFixed(1);
+        if (st < -0.2) { const mx = (A.x + B.x) / 2, my = (A.y + B.y) / 2, nx = -(B.y - A.y), ny = B.x - A.x, ln = Math.hypot(nx, ny) || 1, sag = Math.min(-st, 0.8) * 0.35 * ln * (k % 2 ? 1 : -1); d = 'M' + A.x.toFixed(1) + ' ' + A.y.toFixed(1) + ' Q' + (mx + (nx / ln) * sag).toFixed(1) + ' ' + (my + (ny / ln) * sag).toFixed(1) + ' ' + B.x.toFixed(1) + ' ' + B.y.toFixed(1); }
+        const warm = !hovE && !hotN && st > 0.2 && !heat;
+        let hc = null, hw = null, hop = null;
+        if (heat) { const ha = heat[a], hb = heat[c]; if (ha && hb && (a === src || c === src)) { hc = heatCss(heat[a === src ? c : a].t); hw = (1.4 + 3.6 * es[k]) * kk; hop = 0.95 * f; } else if (ha && hb && tree.has(k)) { hc = heatCss(heat[ha.h > hb.h ? a : c].t); hw = (0.8 + 2 * es[k]) * kk; hop = 0.75 * f; } else { hw = 0.8 * kk; hop = 0.04 * f; } }
+        return { d, stroke: hovE ? '#3cc4c9' : hc ? hc : hotN ? '#3cc4c9' : warm ? '#ffa94d' : '#ffffff', w: hovE ? 2.4 + 2.6 * wt : hw ? hw : warm ? Math.max(0.5, (0.6 + 2 * wt) / (1 + st * 0.8)) * kk : (hovE ? 2.4 + 2.6 * wt : hotN ? 1.4 + 2.4 * wt : 0.6 + 2 * wt * (m === 'link' ? 1 : 0.4)) * kk, op: hovE ? 1 : hop !== null ? hop : warm ? Math.min(0.85, 0.2 + st * 0.5) * f : (hotN ? 0.9 : near ? 0.05 : 0.08 + 0.3 * wt * sc) * f, enter: () => this.setState({ hov: { kind: 'edge', i: k } }), leave: () => this.setState({ hov: null }) };
+      });
+      v.gNodes = g.nodes.map((_, i) => i).sort((p, q) => P[p].z - P[q].z).map((i) => {
+        const n = g.nodes[i], p = P[i], r = n.r * p.k * Math.sqrt(zm);
+        return {
+          x: p.x, y: p.y, r, ring: r + 4, ringOp: i === node ? 1 : 0, fill: heat && heat[i] ? heatCss(heat[i].t) : n.color, op: (heat ? (heat[i] ? 1 : 0.14) : !near || near.has(i) ? 1 : 0.22) * fade(p.d), halo: r * 2.2, haloOp: bl > 0.02 && p.d > 0.7 ? (0.16 * bl * (p.d - 0.7)) / 0.3 : 0,
+          select: () => { if (this.moved) return; this.ctr = i; this.kick(); this.setState({ node: i === node ? null : i }); },
+          down: (e) => { e.stopPropagation(); this.moved = false; this.dn = { i, sx: e.clientX, sy: e.clientY, x0: sim.pos[i][0], y0: sim.pos[i][1], k: p.k }; sim.pinned = i; this.ctr = null; this.kick(); },
+          enter: () => this.setState({ hov: { kind: 'node', i } }), leave: () => this.setState({ hov: null }),
+        };
+      });
+      const lab = new Set(this.state.labels ? g.nodes.map((_, i) => i) : []);
+      if (node !== null) [node, ...adj[node].slice(0, 10)].forEach((i) => lab.add(i));
+      if (hov && hov.kind === 'node') lab.add(hov.i);
+      const sc0 = Math.min(this.state.cw / 1012, this.state.ch / 640) || 1, ox = (this.state.cw - 1012 * sc0) / 2, oy = (this.state.ch - 640 * sc0) / 2;
+      v.gLabels = [...lab].map((i) => { const n = g.nodes[i], p = P[i]; return { text: n.id, left: ox + (p.x + 9) * sc0, top: oy + (p.y - 24) * sc0 }; });
+      v.modeTabs = ['2d', '3d'].map((d) => ({ label: d.toUpperCase(), bg: this.state.dim === d ? '#3a3b40' : 'transparent', fg: this.state.dim === d ? '#e8e9ec' : '#9a9ca3', select: () => this.setDim(d) }));
+      v.labelsBg = this.state.labels ? 'rgba(42,169,174,0.28)' : 'rgba(255,255,255,0.06)'; v.labelsFg = this.state.labels ? '#3cc4c9' : '#b5b7bd';
+      v.toggleLabels = () => this.setState({ labels: !this.state.labels });
+      v.is3d = this.state.dim === '3d';
+      v.graphCaption = m === 'vector' ? 'Depth = similarity to selected entry (centroid if none) · nearer = more similar · drag to orbit' : 'Depth = link weight · nearer = more reinforced · drag to orbit';
+      const scl = Math.min(this.state.cw / 1012, this.state.ch / 640) || 1;
+      v.gMove = (e) => {
+        const r = e.currentTarget.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top, base = { mx, my, cw: r.width, ch: r.height };
+        if (this.dn) {
+          const D = this.dn, fk = 1 / (scl * this.state.zoom * D.k), ddx = (e.clientX - D.sx) * fk, ddy = (e.clientY - D.sy) * fk;
+          if (Math.abs(e.clientX - D.sx) + Math.abs(e.clientY - D.sy) > 3) this.moved = true;
+          const z1 = -ddy * Math.sin(pit);
+          sim.pos[D.i][0] = D.x0 + ddx * Math.cos(yaw) - z1 * Math.sin(yaw); sim.pos[D.i][1] = D.y0 + ddy * Math.cos(pit);
+          this.setState(base);
+        } else if (this.drag) {
+          const dx = e.clientX - this.drag.x, dy = e.clientY - this.drag.y; if (Math.abs(dx) + Math.abs(dy) > 3) this.moved = true;
+          if (this.drag.mode === 'rotate') this.setState({ yaw: this.drag.yaw + dx * 0.01, pitch: Math.max(-1.4, Math.min(1.4, this.drag.pitch + dy * 0.01)), ...base });
+          else this.setState({ px: this.drag.px + dx / scl, py: this.drag.py + dy / scl, ...base });
+        } else this.setState(base);
+      };
+      v.gDown = (e) => { this.moved = false; this.ctr = null; this.drag = { x: e.clientX, y: e.clientY, mode: this.state.dim === '3d' && !e.shiftKey ? 'rotate' : 'pan', yaw: this.state.yaw, pitch: this.state.pitch, px: this.state.px, py: this.state.py }; };
+      v.gUp = () => { if (this.dn) { sim.pinned = null; this.dn = null; this.kick(); } this.drag = null; setTimeout(() => { this.moved = false; }, 0); };
+      v.gWheel = (e) => { const r = e.currentTarget.getBoundingClientRect(), sx = (e.clientX - r.left - (r.width - 1012 * scl) / 2) / scl, sy = (e.clientY - r.top - (r.height - 640 * scl) / 2) / scl, z0 = this.state.zoom, z1 = Math.max(0.3, Math.min(6, z0 * (e.deltaY > 0 ? 0.88 : 1.14))); this.setState({ zoom: z1, px: sx - 506 - ((sx - 506 - this.state.px) / z0) * z1, py: sy - 320 - ((sy - 320 - this.state.py) / z0) * z1 }); };
+      v.gReset = () => { this.ctr = null; this.setState({ zoom: 1, px: 0, py: 0, yaw: -0.6, pitch: 0.32 }); };
+      v.zoomIn = () => this.zoomBy(1.3); v.zoomOut = () => this.zoomBy(1 / 1.3); v.stop = (e) => e.stopPropagation();
+      v.gCursor = this.dn ? 'grabbing' : v.is3d ? (this.drag ? 'grabbing' : 'grab') : this.drag ? 'grabbing' : 'default';
+      v.hasTip = !!hov;
+      if (hov) {
+        const pct = (x) => Math.round(x * 100) + '% of range';
+        if (hov.kind === 'node') {
+          const n = g.nodes[hov.i];
+          v.tipTitle = n.id;
+          v.tipRows = m === 'vector' ? [{ k: 'similarity', v: pct(dep[hov.i]) }, { k: 'graph neighbours', v: String(adj[hov.i].length) }, { k: 'dimensions', v: '24' }] : [{ k: 'out / in', v: n.out + ' / ' + n.inn }, { k: 'depth (mean weight)', v: pct(dep[hov.i]) }, { k: 'linked to', v: String(adj[hov.i].length) }];
+        } else {
+          const [a, c, w] = g.edges[hov.i];
+          v.tipTitle = g.nodes[a].id + (m === 'link' ? ' → ' : ' ↔ ') + g.nodes[c].id;
+          v.tipRows = m === 'link' ? [{ k: 'weight', v: w.toFixed(3) }, { k: 'depth', v: pct(wrel[hov.i]) }, { k: 'created', v: '2026-0' + (1 + (hov.i % 9)) + '-1' + (hov.i % 9) }] : [{ k: 'edge', v: 'neighbour graph' }, { k: 'distance', v: (0.02 + ((hov.i * 37) % 60) / 1000).toFixed(4) }];
+        }
+        if (heat && hov.kind === 'node' && hov.i !== src) v.tipRows = [...v.tipRows, { k: 'path strength', v: heat[hov.i] ? heat[hov.i].s.toFixed(2) + ' · ' + heat[hov.i].h + ' hop' + (heat[hov.i].h === 1 ? '' : 's') : 'unreachable in 6 hops' }];
+        if (hov.kind === 'edge') v.tipRows = [...v.tipRows, { k: 'strength', v: es[hov.i].toFixed(2) }];
+        const { mx, my, cw, ch } = this.state;
+        v.tipX = Math.max(8, mx + 16 + 230 > cw ? mx - 246 : mx + 16); v.tipY = Math.max(8, my + 14 + 100 > ch ? my - 114 : my + 14);
+      }
+      if (node !== null) {
+        const n = g.nodes[node], nb = adj[node].map((j) => g.nodes[j].id);
+        v.hasSel = true; v.selTitle = n.id;
+        v.selSub = m === 'vector' ? `${nb.length} graph neighbours: ${nb.slice(0, 5).join(', ')}${nb.length > 5 ? '…' : ''}` : `out ${n.out} · in ${n.inn} — ${nb.slice(0, 4).join(', ')}${nb.length > 4 ? '…' : ''}`;
+        v.selPrimary = m === 'vector' ? 'Find similar' : 'Link from here…';
+        v.selDanger = m === 'vector' ? 'Delete' : 'Unlink all';
+      }
+    }
+
+    if (m === 'timeseries') {
+      const vals = this.memo('ts:' + sel, () => ts(sel));
+      const lo = Math.min(...vals) - 4, hi = Math.max(...vals) + 4;
+      const X = (i) => 40 + (i / (vals.length - 1)) * 960, Y = (x) => 10 + (1 - (x - lo) / (hi - lo)) * 400;
+      v.tsLine = vals.map((x, i) => `${X(i).toFixed(1)},${Y(x).toFixed(1)}`).join(' ');
+      v.tsArea = `40,410 ${v.tsLine} 1000,410`;
+      v.tsGrid = [0, 1, 2, 3, 4].map((i) => ({ y: 10 + i * 100 }));
+      v.tsMeta = sel === 'cache_hits' ? '% · late arrival: reject · 131,400 points' : 'reads/min · late arrival: merge · 525,600 points';
+      v.tsStats = [['MIN', Math.min(...vals)], ['MAX', Math.max(...vals)], ['AVG', vals.reduce((a, b) => a + b, 0) / vals.length], ['POINTS', 180]].map(([k, x]) => ({ k, v: k === 'POINTS' ? '180' : x.toFixed(1) }));
+    }
+    return v;
+  }
+}
+</script>
+</body>
+</html>
