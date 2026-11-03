@@ -305,6 +305,7 @@
       <a href="index.html">Overview</a>
       <a href="theory-of-operation.html">Theory of Operation</a>
       <a href="user-manual.html" class="active">User Manual</a>
+      <a href="cmbql-manual.html">CMBQL Manual</a>
       <a href="api-usage.html">API Reference</a>
       <a href="swagger.html">Swagger C99 API</a>
     </nav>
@@ -1113,6 +1114,14 @@ cdb_db_blob_write_end(&amp;bw, &amp;ref);
       <!-- Section 9: CMBQL Query Language -->
       <section id="cmbql-guide">
         <h2>9. CMBQL Query Language Guide</h2>
+
+        <div class="alert tip" style="margin-bottom: 2rem;">
+          <div class="alert-title">Dedicated Exhaustive CMBQL User Manual Available</div>
+          <p>
+            An exhaustive language manual and specification is available in <strong><a href="cmbql-manual.html" style="color:var(--accent); font-weight:700;">CMBQL User Manual &amp; Language Specification</a></strong>. It covers all declarative SQL clauses, pipeline stages (<code>|</code> and <code>|&gt;</code>), stream operator constructors, piping inside SQL queries, multi-model CRUD mutations, 4-tier dotted path resolution, stored procedures (CMBP), and all 110+ built-in scientific functions with parameter positions and concrete examples.
+          </p>
+        </div>
+
         <p>
           CMBQL supports both declarative SQL syntax and pipeline (Flux) syntax. Both compile directly into the identical binary operator wire tree (<code>CMBQ</code>).
         </p>
