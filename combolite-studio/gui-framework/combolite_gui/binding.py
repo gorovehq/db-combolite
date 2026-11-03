@@ -8,7 +8,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import (
     POINTER, Structure, c_char, c_char_p, c_double, c_float, c_int, c_int8,
-    c_int16, c_int32, c_int64, c_size_t, c_uint8, c_uint16, c_uint32,
+    c_int16, c_int32, c_int64, c_size_t, c_uint, c_uint8, c_uint16, c_uint32,
     c_uint64, c_void_p
 )
 
@@ -278,6 +278,29 @@ class cdb_index_work(Structure):
         ("bytes_size", c_size_t),
         ("entries", POINTER(cdb_index_entry)),
         ("entries_cap", c_size_t),
+    ]
+
+
+class cdb_index(Structure):
+    _fields_ = [
+        ("pager", c_void_p),
+        ("root", c_uint64),
+        ("flags", c_uint8),
+        ("store_id", c_uint64),
+        ("w", cdb_index_work),
+        ("max_key", c_size_t),
+        ("max_value", c_size_t),
+    ]
+
+
+class cdb_index_cursor(Structure):
+    _fields_ = [
+        ("ix", POINTER(cdb_index)),
+        ("depth", c_uint),
+        ("lid", c_uint64 * 16),
+        ("slot", c_uint32 * 16),
+        ("page", POINTER(c_uint8)),
+        ("done", c_int),
     ]
 
 
@@ -745,6 +768,18 @@ class ComboliteLib:
         c.cdb_index_entries_needed.argtypes = [c_size_t]
         c.cdb_index_entries_needed.restype = c_size_t
 
+        c.cdb_index_open.argtypes = [POINTER(cdb_index), c_void_p, c_uint64, POINTER(cdb_index_work)]
+        c.cdb_index_open.restype = c_int
+
+        c.cdb_index_seek.argtypes = [POINTER(cdb_index_cursor), POINTER(cdb_index), c_char_p, c_char_p, c_size_t]
+        c.cdb_index_seek.restype = c_int
+
+        c.cdb_index_next.argtypes = [
+            POINTER(cdb_index_cursor), c_char_p, c_size_t, POINTER(c_size_t),
+            c_void_p, c_size_t, POINTER(c_size_t), POINTER(c_int)
+        ]
+        c.cdb_index_next.restype = c_int
+
         c.cdb_doc_buffers_size.argtypes = [c_size_t, c_size_t]
         c.cdb_doc_buffers_size.restype = c_size_t
 
@@ -1025,6 +1060,12 @@ def get_catalog_ptr(db_ptr: POINTER(cdb_db)) -> c_void_p:
     """Offsets into cdb_db to locate the embedded cdb_catalog struct (offset 16344)."""
     base_addr = ctypes.cast(db_ptr, c_void_p).value
     return c_void_p(base_addr + 16344)
+
+
+def get_pager_ptr(db_ptr: POINTER(cdb_db)) -> c_void_p:
+    """Offsets into cdb_db to locate the embedded cdb_pager struct (offset 12640)."""
+    base_addr = ctypes.cast(db_ptr, c_void_p).value
+    return c_void_p(base_addr + 12640)
 
 
 def decode_value(val: cdb_value, lib: ComboliteLib, order: int = CDB_ORDER_LITTLE) -> object:

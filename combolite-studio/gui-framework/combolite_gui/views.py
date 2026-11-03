@@ -767,19 +767,22 @@ class LinksView(StoreView):
 
 # ---------------------------------------------------------------- time series
 class TimeSeriesView(StoreView):
-    RANGES = [("Last hour", 3600), ("Last 24 hours", 86400), ("Last 7 days", 604800), ("Last 30 days", 2592000)]
+    RANGES = [("All data", 0), ("Last hour", 3600), ("Last 24 hours", 86400), ("Last 7 days", 604800), ("Last 30 days", 2592000)]
 
     def __init__(self, toast):
         super().__init__(toast)
         self.points = []
         self.hover_x = None
+        self.series_list = []
         self.range = Gtk.DropDown.new_from_strings([r[0] for r in self.RANGES])
-        self.range.set_selected(1)
+        self.range.set_selected(0)
         self.range.connect("notify::selected", lambda *_: self.reload())
+        self.series_dropdown = Gtk.DropDown()
+        self.series_dropdown.connect("notify::selected", lambda *_: self.reload())
         self.meta = Gtk.Label(xalign=0, hexpand=True, css_classes=["mono", "dim-label"])
         append = Gtk.Button(child=Adw.ButtonContent(icon_name="list-add-symbolic", label="Append Point"), css_classes=["flat"])
         append.connect("clicked", lambda *_: self._append())
-        self.append(toolbar(self.meta, append, self.range))
+        self.append(toolbar(self.meta, self.series_dropdown, append, self.range))
         self.area = Gtk.DrawingArea(vexpand=True, hexpand=True, css_classes=["chart"])
         self.area.set_draw_func(self._draw)
         motion = Gtk.EventControllerMotion()
@@ -794,12 +797,33 @@ class TimeSeriesView(StoreView):
         self.hover_x = x
         self.area.queue_draw()
 
+    def load(self, backend, store):
+        self.backend, self.store = backend, store
+        m = store.meta or {}
+        series = m.get("series") or self.call(self.backend.ts_series_list, store.name) or []
+        self.series_list = series
+        if len(self.series_list) > 1:
+            self.series_dropdown.set_model(Gtk.StringList.new(self.series_list))
+            self.series_dropdown.set_selected(0)
+            self.series_dropdown.set_visible(True)
+        else:
+            self.series_dropdown.set_visible(False)
+        self.reload()
+
     def reload(self):
-        m = self.store.meta
-        self.meta.set_text(f"{m.get('unit', '')} · late arrival: {m.get('late_arrival', '?')} · {self.store.count:,} points")
-        self.points = self.call(self.backend.ts_points, self.store.name, self.RANGES[self.range.get_selected()][1]) or []
+        m = self.store.meta or {}
+        cur_series = None
+        if self.series_list:
+            idx = self.series_dropdown.get_selected()
+            if 0 <= idx < len(self.series_list):
+                cur_series = self.series_list[idx]
+
+        window_s = self.RANGES[self.range.get_selected()][1]
+        self.points = self.call(self.backend.ts_points, self.store.name, window_s, cur_series) or []
         while (c := self.stats.get_first_child()):
             self.stats.remove(c)
+        s_label = f"[{cur_series}] " if cur_series else ""
+        self.meta.set_text(f"{s_label}{m.get('unit', 'pts')} · late arrival: {m.get('late_arrival', '?')} · {len(self.points):,} points shown (total {self.store.count:,})")
         if self.points:
             vs = [v for _, v in self.points]
             for label, val in (("min", min(vs)), ("max", max(vs)), ("avg", sum(vs) / len(vs)), ("points", len(vs))):
@@ -810,12 +834,19 @@ class TimeSeriesView(StoreView):
         self.area.queue_draw()
 
     def _append(self):
-        form(self.win, f"Append to {self.store.name}",
+        cur_series = None
+        if self.series_list:
+            idx = self.series_dropdown.get_selected()
+            if 0 <= idx < len(self.series_list):
+                cur_series = self.series_list[idx]
+        title = f"Append to {self.store.name}" + (f" ({cur_series})" if cur_series else "")
+        form(self.win, title,
              [("t", "Timestamp (YYYY-MM-DD HH:MM or epoch seconds)", time.strftime("%Y-%m-%d %H:%M")),
               ("v", f"Value ({self.store.meta.get('unit', '')})", "")],
-             "Append", self._do_append, body=f"Late-arrival mode: {self.store.meta.get('late_arrival', '?')}.")
+             "Append", lambda vals: self._do_append(vals, cur_series),
+             body=f"Late-arrival mode: {self.store.meta.get('late_arrival', '?')}.")
 
-    def _do_append(self, vals):
+    def _do_append(self, vals, cur_series):
         try:
             ts = vals["t"].strip()
             t = float(ts) if re.fullmatch(r"\d+(\.\d+)?", ts) else time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M"))
@@ -823,13 +854,21 @@ class TimeSeriesView(StoreView):
         except ValueError:
             self.toast("Expected a timestamp and a number")
             return
-        if self.mutate(self.backend.ts_append, self.store.name, t, v):
+        if self.mutate(self.backend.ts_append, self.store.name, t, v, cur_series):
             self.toast("Point appended")
             self.reload()
 
     def _draw(self, area, cr, w, h):
         pts = self.points
         if len(pts) < 2:
+            fg = area.get_color()
+            cr.select_font_face("monospace")
+            cr.set_font_size(12)
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.4)
+            msg = "No points in selected time range" if not pts else f"1 point recorded: {pts[0][1]:.2f}"
+            ext = cr.text_extents(msg)
+            cr.move_to((w - ext.width) / 2, h / 2)
+            cr.show_text(msg)
             return
         pl, pr, pt, pb = 52, 16, 16, 26
         vs = [v for _, v in pts]
@@ -837,6 +876,8 @@ class TimeSeriesView(StoreView):
         pad = (hi - lo) * 0.1 or 1
         lo, hi = lo - pad, hi + pad
         t0, t1 = pts[0][0], pts[-1][0]
+        if t1 <= t0:
+            t1 = t0 + 1.0
         X = lambda t: pl + (t - t0) / ((t1 - t0) or 1) * (w - pl - pr)
         Y = lambda v: pt + (1 - (v - lo) / (hi - lo)) * (h - pt - pb)
         fg = area.get_color()

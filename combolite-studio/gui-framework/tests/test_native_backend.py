@@ -247,9 +247,21 @@ class TestNativeBackend(unittest.TestCase):
         self.backend.open(str(demo_path))
         stores = self.backend.list_stores()
         self.assertTrue(len(stores) > 0)
-        store_names = [s.name for s in stores]
-        self.assertIn("books", store_names)
-        self.assertIn("passages", store_names)
+        store_map = {s.name: s for s in stores}
+        self.assertIn("books", store_map)
+        self.assertIn("passages", store_map)
+        self.assertIn("passage_vec", store_map)
+        self.assertIn("similar_to", store_map)
+        self.assertIn("metrics", store_map)
+
+        # Verify accurate counts
+        self.assertEqual(store_map["books"].count, 79875)
+        self.assertEqual(store_map["passages"].count, 16033)
+        self.assertEqual(store_map["passage_vec"].count, 16033)
+        self.assertEqual(store_map["passage_bits"].count, 16033)
+        self.assertEqual(store_map["book_vec"].count, 121)
+        self.assertEqual(store_map["similar_to"].count, 715)
+        self.assertEqual(store_map["metrics"].count, 28097)
 
         # Verify reading rows from the 79k+ books table
         rows = self.backend.table_rows("books", 0, 10)
@@ -262,6 +274,17 @@ class TestNativeBackend(unittest.TestCase):
         self.assertTrue(len(docs) > 0)
         doc = self.backend.doc_get("passages", docs[0].id)
         self.assertIn("_id", doc)
+
+        # Verify reading link edges
+        edges = self.backend.link_edges("similar_to")
+        self.assertEqual(edges.total, 715)
+        self.assertTrue(len(edges.rows) > 0)
+
+        # Verify reading timeseries series and points
+        series = self.backend.ts_series_list("metrics")
+        self.assertTrue(len(series) > 0)
+        pts = self.backend.ts_points("metrics", 86400)
+        self.assertTrue(len(pts) > 0)
 
 
 

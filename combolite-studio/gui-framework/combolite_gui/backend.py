@@ -132,8 +132,9 @@ class Backend:
     def link_delete(self, name: str, pairs: list[tuple[str, str]]) -> int: self._todo("link_delete")
 
     # time series
-    def ts_points(self, name: str, window_s: int) -> list[tuple[float, float]]: self._todo("ts_points")
-    def ts_append(self, name: str, t: float, value: float) -> None: self._todo("ts_append")
+    def ts_series_list(self, name: str) -> list[str]: return []
+    def ts_points(self, name: str, window_s: int, series: str | None = None) -> list[tuple[float, float]]: self._todo("ts_points")
+    def ts_append(self, name: str, t: float, value: float, series: str | None = None) -> None: self._todo("ts_append")
 
     # query language (CMBQL)
     def execute(self, text: str) -> Result: self._todo("execute")
@@ -165,9 +166,9 @@ class NativeBackend(Backend):
         import os
         from pathlib import Path
         from .binding import (
-            ComboliteLib, status_str, get_catalog_ptr, decode_value,
+            ComboliteLib, status_str, get_catalog_ptr, get_pager_ptr, decode_value,
             cdb_db, cdb_hostenv, cdb_env, cdb_header, cdb_db_config, cdb_pager_node,
-            cdb_free_extent, cdb_index_entry, cdb_fts_token, cdb_table_column,
+            cdb_free_extent, cdb_index, cdb_index_cursor, cdb_index_entry, cdb_fts_token, cdb_table_column,
             cdb_table_column_info, cdb_table_cursor, cdb_doc_info, cdb_fts_hit,
             cdb_vec_config, cdb_vec_hit, cdb_ref, cdb_link, cdb_ts_tag, cdb_ts_def,
             cdb_ts_in, cdb_ts_row, cdb_compile_error, cdb_value_writer, cdb_value,
@@ -190,6 +191,7 @@ class NativeBackend(Backend):
         self.b_types = {
             "status_str": status_str,
             "get_catalog_ptr": get_catalog_ptr,
+            "get_pager_ptr": get_pager_ptr,
             "decode_value": decode_value,
             "cdb_db": cdb_db,
             "cdb_hostenv": cdb_hostenv,
@@ -198,6 +200,8 @@ class NativeBackend(Backend):
             "cdb_db_config": cdb_db_config,
             "cdb_pager_node": cdb_pager_node,
             "cdb_free_extent": cdb_free_extent,
+            "cdb_index": cdb_index,
+            "cdb_index_cursor": cdb_index_cursor,
             "cdb_index_entry": cdb_index_entry,
             "cdb_fts_token": cdb_fts_token,
             "cdb_table_column": cdb_table_column,
@@ -456,6 +460,136 @@ class NativeBackend(Backend):
             raise BackendError(f"No store named '{name}'")
         return sid.value
 
+    def _store_names_map(self) -> dict[int, str]:
+        if not self.is_open:
+            return {}
+        c = self.clib.lib
+        ct = self.ctypes
+        cat_ptr = self.b_types["get_catalog_ptr"](ct.byref(self._db))
+        next_id = c.cdb_catalog_next_store_id(cat_ptr)
+        mapping = {}
+        for sid in range(1, next_id):
+            info = self.b_types["cdb_store_info"]()
+            if c.cdb_catalog_get_store(cat_ptr, sid, ct.byref(info)) == self.b_types["CDB_OK"]:
+                mapping[sid] = ct.string_at(info.name, info.name_len).decode("utf-8")
+        return mapping
+
+    def _get_links_store_info(self):
+        if not self.is_open:
+            return None
+        c = self.clib.lib
+        ct = self.ctypes
+        cat_ptr = self.b_types["get_catalog_ptr"](ct.byref(self._db))
+        next_id = c.cdb_catalog_next_store_id(cat_ptr)
+        for sid in range(1, next_id):
+            info = self.b_types["cdb_store_info"]()
+            if c.cdb_catalog_get_store(cat_ptr, sid, ct.byref(info)) == self.b_types["CDB_OK"]:
+                if info.model == self.b_types["CDB_MODEL_LINK"] and not (info.flags & self.b_types["CDB_STORE_DROPPED"]):
+                    return info
+        return None
+
+    def _count_links_by_type(self, head_root: int) -> dict[int, int]:
+        c = self.clib.lib
+        ct = self.ctypes
+        counts = {}
+        pager_ptr = self.b_types["get_pager_ptr"](ct.byref(self._db))
+        fwd_ix = self.b_types["cdb_index"]()
+        if c.cdb_index_open(ct.byref(fwd_ix), pager_ptr, head_root, ct.byref(self._cfg.catalog_work)) != self.b_types["CDB_OK"]:
+            return counts
+
+        cur = self.b_types["cdb_index_cursor"]()
+        page_buf = ct.create_string_buffer(self.PAGE_SIZE)
+        if c.cdb_index_seek(ct.byref(cur), ct.byref(fwd_ix), page_buf, None, 0) != self.b_types["CDB_OK"]:
+            return counts
+
+        k_buf = ct.create_string_buffer(512)
+        v_buf = ct.create_string_buffer(128)
+        klen = ct.c_size_t()
+        vlen = ct.c_size_t()
+        done = ct.c_int(0)
+        import struct
+
+        while c.cdb_index_next(ct.byref(cur), k_buf, 512, ct.byref(klen), v_buf, 128, ct.byref(vlen), ct.byref(done)) == self.b_types["CDB_OK"] and not done.value:
+            raw_k = k_buf.raw[:klen.value]
+            if klen.value == 40:
+                lt = struct.unpack(">Q", raw_k[16:24])[0]
+            elif klen.value == 58:
+                lt = struct.unpack(">Q", raw_k[25:33])[0]
+            else:
+                continue
+            counts[lt] = counts.get(lt, 0) + 1
+        return counts
+
+    def _get_ts_store_summary(self, sid: int, info) -> dict:
+        c = self.clib.lib
+        ct = self.ctypes
+        val = self.b_types["cdb_value"]()
+        if c.cdb_value_read(ct.cast(info.vector, ct.POINTER(ct.c_uint8)), info.vector_len,
+                            self.b_types["CDB_ORDER_LITTLE"], ct.byref(val)) != self.b_types["CDB_OK"]:
+            return {"total_points": 0, "meta": {"unit": "pts", "late_arrival": "accept", "series": []}}
+
+        meta_obj = self.b_types["decode_value"](val, self.clib)
+        if not isinstance(meta_obj, dict):
+            return {"total_points": 0, "meta": {"unit": "pts", "late_arrival": "accept", "series": []}}
+
+        keys_root = meta_obj.get(3, 0)
+        blocks_root = meta_obj.get(5, 0)
+        pager_ptr = self.b_types["get_pager_ptr"](ct.byref(self._db))
+
+        series_names = []
+        series_map = {}
+        if keys_root:
+            keys_ix = self.b_types["cdb_index"]()
+            if c.cdb_index_open(ct.byref(keys_ix), pager_ptr, keys_root, ct.byref(self._cfg.catalog_work)) == self.b_types["CDB_OK"]:
+                cur = self.b_types["cdb_index_cursor"]()
+                page_buf = ct.create_string_buffer(self.PAGE_SIZE)
+                if c.cdb_index_seek(ct.byref(cur), ct.byref(keys_ix), page_buf, None, 0) == self.b_types["CDB_OK"]:
+                    k_buf = ct.create_string_buffer(512)
+                    v_buf = ct.create_string_buffer(128)
+                    klen = ct.c_size_t()
+                    vlen = ct.c_size_t()
+                    done = ct.c_int(0)
+                    import struct
+                    while c.cdb_index_next(ct.byref(cur), k_buf, 512, ct.byref(klen), v_buf, 128, ct.byref(vlen), ct.byref(done)) == self.b_types["CDB_OK"] and not done.value:
+                        ser_id = struct.unpack(">Q", v_buf.raw[:8])[0]
+                        raw_k = k_buf.raw[:klen.value]
+                        s_name = raw_k[1:].rstrip(b"\x00").decode("utf-8", errors="replace")
+                        series_map[s_name] = ser_id
+                        series_names.append(s_name)
+
+        total_pts = 0
+        series_point_counts = {}
+        if blocks_root:
+            blk_ix = self.b_types["cdb_index"]()
+            if c.cdb_index_open(ct.byref(blk_ix), pager_ptr, blocks_root, ct.byref(self._cfg.catalog_work)) == self.b_types["CDB_OK"]:
+                cur = self.b_types["cdb_index_cursor"]()
+                page_buf = ct.create_string_buffer(self.PAGE_SIZE)
+                if c.cdb_index_seek(ct.byref(cur), ct.byref(blk_ix), page_buf, None, 0) == self.b_types["CDB_OK"]:
+                    k_buf = ct.create_string_buffer(512)
+                    v_buf = ct.create_string_buffer(128)
+                    klen = ct.c_size_t()
+                    vlen = ct.c_size_t()
+                    done = ct.c_int(0)
+                    import struct
+                    while c.cdb_index_next(ct.byref(cur), k_buf, 512, ct.byref(klen), v_buf, 128, ct.byref(vlen), ct.byref(done)) == self.b_types["CDB_OK"] and not done.value:
+                        if vlen.value >= 12:
+                            ser_id = struct.unpack(">Q", k_buf.raw[:8])[0]
+                            pts = struct.unpack(">I", v_buf.raw[vlen.value - 12:vlen.value - 8])[0]
+                            total_pts += pts
+                            series_point_counts[ser_id] = series_point_counts.get(ser_id, 0) + pts
+
+        series_names.sort(key=lambda name: series_point_counts.get(series_map.get(name, 0), 0), reverse=True)
+        return {
+            "total_points": total_pts,
+            "meta": {
+                "unit": "pts",
+                "late_arrival": "accept",
+                "series": series_names,
+                "series_map": series_map,
+                "series_counts": {name: series_point_counts.get(series_map[name], 0) for name in series_names}
+            }
+        }
+
     def list_stores(self) -> list[Store]:
         if not self.is_open:
             return []
@@ -463,6 +597,21 @@ class NativeBackend(Backend):
         ct = self.ctypes
         cat_ptr = self.b_types["get_catalog_ptr"](ct.byref(self._db))
         next_id = c.cdb_catalog_next_store_id(cat_ptr)
+
+        link_counts = {}
+        links_info = self._get_links_store_info()
+        if links_info and links_info.head_root:
+            link_counts = self._count_links_by_type(links_info.head_root)
+
+        defined_link_types = []
+        for sid in range(1, next_id):
+            lt = self.b_types["cdb_link_type_info"]()
+            s = c.cdb_catalog_get_link_type(cat_ptr, sid, ct.byref(lt))
+            if s == self.b_types["CDB_OK"]:
+                lt_name = ct.string_at(lt.name, lt.name_len).decode("utf-8")
+                card = "n:m" if lt.cardinality == self.b_types["CDB_CARD_N_M"] else ("1:n" if lt.cardinality == self.b_types["CDB_CARD_1_N"] else "1:1")
+                cnt = link_counts.get(sid, 0)
+                defined_link_types.append(Store(lt_name, Model.LINK, cnt, meta={"cardinality": card}))
 
         stores = []
         for sid in range(1, next_id):
@@ -506,23 +655,16 @@ class NativeBackend(Backend):
                 mv_buf = ct.create_string_buffer(64)
                 c.cdb_vec_describe(ct.byref(self._db), sid, ct.byref(cfg_v), m_buf, mv_buf)
                 meta = {"dims": cfg_v.dims, "metric": "cosine", "index": "neighbour graph"}
-                # Count vectors (estimated up to 1000)
-                tot = min(int(info.next_entry_id) - 1, 0) if info.next_entry_id else 0
-                stores.append(Store(name, Model.VECTOR, max(0, tot), meta=meta))
+                tot = max(0, int(info.next_entry_id) - 1) if info.next_entry_id else 0
+                stores.append(Store(name, Model.VECTOR, tot, meta=meta))
             elif model_val == self.b_types["CDB_MODEL_TIME_SERIES"]:
-                stores.append(Store(name, Model.TIMESERIES, 1000, meta={"unit": "pts", "late_arrival": "accept"}))
+                ts_summary = self._get_ts_store_summary(sid, info)
+                stores.append(Store(name, Model.TIMESERIES, ts_summary["total_points"], meta=ts_summary["meta"]))
             elif model_val == self.b_types["CDB_MODEL_LINK"]:
-                stores.append(Store(name, Model.LINK, 0))
+                if not defined_link_types:
+                    stores.append(Store(name, Model.LINK, sum(link_counts.values())))
 
-        # Check for defined link types
-        for sid in range(1, next_id):
-            lt = self.b_types["cdb_link_type_info"]()
-            s = c.cdb_catalog_get_link_type(cat_ptr, sid, ct.byref(lt))
-            if s == self.b_types["CDB_OK"]:
-                lt_name = ct.string_at(lt.name, lt.name_len).decode("utf-8")
-                card = "n:m" if lt.cardinality == self.b_types["CDB_CARD_N_M"] else ("1:n" if lt.cardinality == self.b_types["CDB_CARD_1_N"] else "1:1")
-                stores.append(Store(lt_name, Model.LINK, 0, meta={"cardinality": card}))
-
+        stores.extend(defined_link_types)
         return stores
 
     # ---- DDL helpers
@@ -1199,24 +1341,50 @@ class NativeBackend(Backend):
         if s != self.b_types["CDB_OK"] or not found.value:
             return Result(["source", "target", "created", "weight"], [], 0, 0.0)
 
-        entry_ref = self.b_types["cdb_ref"]()
-        entry_ref.store = 0
-        entry_ref.entry = 0
+        store_names = self._store_names_map()
+        links_info = self._get_links_store_info()
+        if not links_info or not links_info.head_root:
+            return Result(["source", "target", "created", "weight"], [], 0, 0.0)
 
-        links = (self.b_types["cdb_link"] * limit)()
-        n = ct.c_size_t()
-        s_list = c.cdb_link_list(ct.byref(self._db), entry_ref, self.b_types["CDB_LINK_OUT"],
-                                 type_id.value, None, links, limit, ct.byref(n))
+        pager_ptr = self.b_types["get_pager_ptr"](ct.byref(self._db))
+        fwd_ix = self.b_types["cdb_index"]()
+        if c.cdb_index_open(ct.byref(fwd_ix), pager_ptr, links_info.head_root, ct.byref(self._cfg.catalog_work)) != self.b_types["CDB_OK"]:
+            return Result(["source", "target", "created", "weight"], [], 0, 0.0)
 
+        cur = self.b_types["cdb_index_cursor"]()
+        page_buf = ct.create_string_buffer(self.PAGE_SIZE)
+        if c.cdb_index_seek(ct.byref(cur), ct.byref(fwd_ix), page_buf, None, 0) != self.b_types["CDB_OK"]:
+            return Result(["source", "target", "created", "weight"], [], 0, 0.0)
+
+        k_buf = ct.create_string_buffer(512)
+        v_buf = ct.create_string_buffer(128)
+        klen = ct.c_size_t()
+        vlen = ct.c_size_t()
+        done = ct.c_int(0)
         rows = []
-        for i in range(n.value):
-            lk = links[i]
-            s_name = f"doc-{lk.source.entry:05d}"
-            t_name = f"doc-{lk.target.entry:05d}"
-            date_str = time.strftime("%Y-%m-%d", time.gmtime(lk.time / 1e9)) if lk.time > 0 else "2026-01-01"
-            rows.append((s_name, t_name, date_str, round(float(lk.weight), 3)))
+        import struct
 
-        return Result(["source", "target", "created", "weight"], rows, len(rows), (time.perf_counter() - t0) * 1000)
+        while c.cdb_index_next(ct.byref(cur), k_buf, 512, ct.byref(klen), v_buf, 128, ct.byref(vlen), ct.byref(done)) == self.b_types["CDB_OK"] and not done.value:
+            raw_k = k_buf.raw[:klen.value]
+            raw_v = v_buf.raw[:vlen.value]
+            if klen.value == 40:
+                s_store, s_entry, l_type, t_store, t_entry = struct.unpack(">QQQQQ", raw_k[:40])
+            elif klen.value == 58:
+                s_store, s_entry, s_fl, s_ts, l_type, t_store, t_entry, t_fl, t_ts = struct.unpack(">QQBQ Q QBQ", raw_k[:58])
+            else:
+                continue
+
+            if l_type != type_id.value:
+                continue
+
+            w = struct.unpack(">f", raw_v[:4])[0]
+            l_time = struct.unpack(">Q", raw_v[4:12])[0]
+            date_str = time.strftime("%Y-%m-%d", time.gmtime(l_time / 1e9)) if l_time > 0 else "2026-01-01"
+            s_pfx = store_names.get(s_store, f"store{s_store}")
+            t_pfx = store_names.get(t_store, f"store{t_store}")
+            rows.append((f"{s_pfx}-{s_entry:05d}", f"{t_pfx}-{t_entry:05d}", date_str, round(w, 3)))
+
+        return Result(["source", "target", "created", "weight"], rows[:limit], len(rows), (time.perf_counter() - t0) * 1000)
 
     def link_add(self, name: str, source: str, target: str, weight: float = 1.0) -> None:
         c = self.clib.lib
@@ -1270,64 +1438,117 @@ class NativeBackend(Backend):
         return deleted
 
     # ---- time series
-    def ts_points(self, name: str, window_s: int) -> list[tuple[float, float]]:
+    def ts_series_list(self, name: str) -> list[str]:
+        sid = self._find_store_id(name)
+        c = self.clib.lib
+        ct = self.ctypes
+        cat_ptr = self.b_types["get_catalog_ptr"](ct.byref(self._db))
+        info = self.b_types["cdb_store_info"]()
+        if c.cdb_catalog_get_store(cat_ptr, sid, ct.byref(info)) != self.b_types["CDB_OK"]:
+            return []
+        summary = self._get_ts_store_summary(sid, info)
+        return summary["meta"].get("series", [])
+
+    def ts_points(self, name: str, window_s: int, series: str | None = None) -> list[tuple[float, float]]:
         sid = self._find_store_id(name)
         c = self.clib.lib
         ct = self.ctypes
 
-        series_id = ct.c_uint64(1)
-        now = time.time()
-        from_ts = int((now - window_s) * 1e9)
-        to_ts = int((now + 3600) * 1e9)
+        cat_ptr = self.b_types["get_catalog_ptr"](ct.byref(self._db))
+        info = self.b_types["cdb_store_info"]()
+        c.cdb_catalog_get_store(cat_ptr, sid, ct.byref(info))
+        summary = self._get_ts_store_summary(sid, info)
+        series_map = summary["meta"].get("series_map", {})
+
+        target_series_id = 1
+        if series and series in series_map:
+            target_series_id = series_map[series]
+        elif series_map:
+            first_name = summary["meta"]["series"][0]
+            target_series_id = series_map[first_name]
 
         buf = ct.create_string_buffer(65536)
         rows = (self.b_types["cdb_ts_row"] * 1024)()
         n = ct.c_size_t()
         nxt = ct.c_int64()
 
-        s = c.cdb_ts_range(ct.byref(self._db), sid, series_id.value, from_ts, to_ts,
-                           ct.cast(buf, ct.POINTER(ct.c_uint8)), 65536,
-                           rows, 1024, ct.byref(n), ct.byref(nxt))
-        if s != self.b_types["CDB_OK"]:
+        raw_points = []
+        cur_from = 0
+        to_ts = 0x7FFFFFFFFFFFFFFF
+
+        while len(raw_points) < 5000:
+            s = c.cdb_ts_range(ct.byref(self._db), sid, target_series_id, cur_from, to_ts,
+                               ct.cast(buf, ct.POINTER(ct.c_uint8)), 65536,
+                               rows, 1024, ct.byref(n), ct.byref(nxt))
+            if s != self.b_types["CDB_OK"] or n.value == 0:
+                break
+
+            for i in range(n.value):
+                r = rows[i]
+                val = self.b_types["cdb_value"]()
+                s_v = c.cdb_value_read(ct.cast(ct.addressof(buf) + r.off, ct.POINTER(ct.c_uint8)),
+                                       r.len, self.b_types["CDB_ORDER_LITTLE"], ct.byref(val))
+                num_val = 0.0
+                if s_v == self.b_types["CDB_OK"]:
+                    obj = self.b_types["decode_value"](val, self.clib)
+                    if isinstance(obj, dict):
+                        for v in obj.values():
+                            if isinstance(v, (int, float)):
+                                num_val = float(v)
+                                break
+                    elif isinstance(obj, (int, float)):
+                        num_val = float(obj)
+                raw_points.append((r.ts, num_val))
+
+            if nxt.value <= cur_from:
+                break
+            cur_from = nxt.value
+
+        if not raw_points:
             return []
 
-        pts = []
-        for i in range(n.value):
-            r = rows[i]
-            t_sec = r.ts / 1e9
-            val = self.b_types["cdb_value"]()
-            c.cdb_value_read(ct.cast(ct.addressof(buf) + r.off, ct.POINTER(ct.c_uint8)),
-                             r.len, self.b_types["CDB_ORDER_LITTLE"], ct.byref(val))
-            obj = self.b_types["decode_value"](val, self.clib)
-            num_val = 0.0
-            if isinstance(obj, dict):
-                for v in obj.values():
-                    if isinstance(v, (int, float)):
-                        num_val = float(v)
-                        break
-            elif isinstance(obj, (int, float)):
-                num_val = float(obj)
-            pts.append((t_sec, num_val))
+        # Determine timestamp scale: nanoseconds (>1e16), microseconds (>1e13), milliseconds (>1e10), or seconds
+        sample_ts = raw_points[-1][0]
+        if sample_ts > 1e16:
+            scale = 1e9
+        elif sample_ts > 1e13:
+            scale = 1e6
+        elif sample_ts > 1e10:
+            scale = 1e3
+        else:
+            scale = 1.0
+
+        if window_s > 0:
+            now = time.time()
+            max_t_sec = raw_points[-1][0] / scale
+            if now - max_t_sec > window_s:
+                cutoff_sec = max_t_sec - window_s
+            else:
+                cutoff_sec = now - window_s
+            raw_points = [p for p in raw_points if (p[0] / scale) >= cutoff_sec]
+
+        pts = [(ts / scale, val) for ts, val in raw_points]
         return sorted(pts)
 
-    def ts_append(self, name: str, t: float, value: float) -> None:
+    def ts_append(self, name: str, t: float, value: float, series: str | None = None) -> None:
         sid = self._find_store_id(name)
         c = self.clib.lib
         ct = self.ctypes
 
+        series_name = (series or "default").encode("utf-8")
         series_id = ct.c_uint64(1)
         created = ct.c_int(0)
         s_def = self.b_types["cdb_ts_def"]()
-        s_def.precision = 3  # nanos
+        s_def.precision = 2  # micros (CDB_TS_MICROS)
         s_def.window = 0
         s_def.nfields = 1
         s_def.fields[0].id = 1
         s_def.fields[0].type = self.b_types["CDB_TYPE_F64"]
 
         c.cdb_tx_begin(ct.byref(self._db), self.b_types["CDB_DURABILITY_DEFAULT"])
-        c.cdb_ts_series(ct.byref(self._db), sid, b"default", 7, None, 0, ct.byref(s_def), ct.byref(series_id), ct.byref(created))
+        c.cdb_ts_series(ct.byref(self._db), sid, series_name, len(series_name), None, 0, ct.byref(s_def), ct.byref(series_id), ct.byref(created))
 
-        ts_ns = int(t * 1e9)
+        ts_micros = int(t * 1e6)
 
         w = self.b_types["cdb_value_writer"]()
         v_buf = ct.create_string_buffer(512)
@@ -1340,7 +1561,7 @@ class NativeBackend(Backend):
         v_len = c.cdb_value_writer_len(ct.byref(w))
 
         pt_in = self.b_types["cdb_ts_in"]()
-        pt_in.ts = ts_ns
+        pt_in.ts = ts_micros
         pt_in.use_clock = 0
         pt_in.values = ct.cast(v_buf, ct.c_void_p)
         pt_in.len = v_len
@@ -1349,6 +1570,7 @@ class NativeBackend(Backend):
         if s != self.b_types["CDB_OK"]:
             c.cdb_tx_abort(ct.byref(self._db))
             raise BackendError(f"TS append failed: {self.b_types['status_str'](self.clib, s)}")
+        c.cdb_tx_commit(ct.byref(self._db))
         c.cdb_tx_commit(ct.byref(self._db))
 
     # ---- query & procedures
@@ -1940,7 +2162,10 @@ class MockBackend(Backend):
         return before - len(rows)
 
     # ---- time series
-    def ts_points(self, name, window_s):
+    def ts_series_list(self, name):
+        return [name]
+
+    def ts_points(self, name, window_s, series=None):
         now, n = time.time(), 180
         r = random.Random(f"{name}:{window_s}")
         pts = []
@@ -1951,7 +2176,7 @@ class MockBackend(Backend):
         pts += [p for p in self._ts_extra.get(name, []) if now - window_s <= p[0] <= now + 3600]
         return sorted(pts)
 
-    def ts_append(self, name, t, value):
+    def ts_append(self, name, t, value, series=None):
         if name == "cache_hits" and t < time.time() - 3600:
             raise BackendError("cache_hits rejects late arrivals older than 1 h")
         self._ts_extra.setdefault(name, []).append((t, value))
