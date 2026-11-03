@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "unity.h"
+#include "combolite/cdb_crypto.h"
 #include "cdb_faultdev.h"
 #include "cdb_pager.h"
 
@@ -20,6 +21,7 @@ static cdb_pager_node nodes[NODES];
 static cdb_free_extent free_list[4096];
 static cdb_pager_config cfg;
 static uint8_t page[PAGE];
+static uint8_t test_page_cache_buf[16384];
 
 static void init_device(void)
 {
@@ -58,6 +60,8 @@ void setUp(void)
     cfg.node_cap = NODES;
     cfg.free_list = free_list;
     cfg.free_cap = sizeof free_list / sizeof free_list[0];
+    cfg.page_cache = NULL;
+    cfg.page_cache_size = 0;
 }
 
 void tearDown(void) {}
@@ -903,6 +907,105 @@ static void test_crash_sweep(void)
     TEST_ASSERT_EQUAL_UINT((unsigned)(total * 6u), runs);
 }
 
+static void test_page_cache_hits_misses_eviction(void)
+{
+    cdb_pager p;
+    uint64_t lid1, lid2;
+    cdb_anchor_entry ae;
+    cdb_page_header h;
+
+    cfg.page_cache = test_page_cache_buf;
+    cfg.page_cache_size = sizeof test_page_cache_buf;
+
+    create(&p);
+    TEST_ASSERT_TRUE(p.cache_count >= 4);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_alloc(&p, &lid1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_alloc(&p, &lid2));
+    write_text(&p, lid1, "page_one");
+    write_text(&p, lid2, "page_two");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&p));
+
+    /* First read: loads from disk and caches */
+    expect_text(&p, lid1, "page_one");
+    expect_text(&p, lid2, "page_two");
+
+    /* Corrupt the physical disk page of lid1 directly on storage */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_lookup(&p, lid1, &ae));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_faultdev_flip_bit(&dev, ae.phys * PAGE + 100, 4));
+
+    /* Reading lid1 again succeeds because it hits the in-memory page cache! */
+    expect_text(&p, lid1, "page_one");
+
+    /* Wiping the cache clears it */
+    cdb_pager_cache_wipe_domain(&p, 0);
+
+    /* Now reading lid1 must attempt reading the damaged disk page and fail with CDB_E_CORRUPT */
+    TEST_ASSERT_EQUAL_INT(CDB_E_CORRUPT, cdb_pager_read(&p, lid1, page, &h));
+
+    /* Freeing lid2 invalidates its cache slot */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_free(&p, lid2));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_pager_read(&p, lid2, page, &h));
+}
+
+static int mock_enclave_allowed = 1;
+static cdb_status mock_enclave_key_cb(void *ctx, uint64_t domain_id, uint32_t key_version, uint8_t key_out[32])
+{
+    (void)ctx;
+    (void)key_version;
+    if (domain_id == 42 && mock_enclave_allowed) {
+        memset(key_out, 0x42, 32);
+        return CDB_OK;
+    }
+    return CDB_E_SECURITY;
+}
+
+static void test_page_cache_enclave_security(void)
+{
+    cdb_pager p;
+    uint64_t lid;
+    cdb_page_header t, h;
+
+    cfg.page_cache = test_page_cache_buf;
+    cfg.page_cache_size = sizeof test_page_cache_buf;
+
+    create(&p);
+    mock_enclave_allowed = 1;
+    cdb_pager_set_crypto(&p, CDB_AEAD_AES_256_GCM, NULL, NULL, mock_enclave_key_cb, NULL);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_alloc(&p, &lid));
+    memset(&t, 0, sizeof t);
+    t.type = CDB_PAGE_TYPE_DATA_TEST;
+    t.store_id = 1;
+    t.domain_id = 42;
+    t.key_version = 1;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_write(&p, lid, &t, "secret_enclave_data", 19));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&p));
+
+    /* Authorized read: succeeds and populates cache */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&p, lid, page, &h));
+    TEST_ASSERT_EQUAL_UINT32(19, h.payload_len);
+    TEST_ASSERT_EQUAL_MEMORY("secret_enclave_data", page + cdb_page_header_size(p.fmt), 19);
+
+    /* Revoke enclave access / lock enclave */
+    mock_enclave_allowed = 0;
+
+    /* Cached read MUST re-validate through domain_key_fn and fail with CDB_E_SECURITY */
+    memset(page, 0, sizeof page);
+    TEST_ASSERT_EQUAL_INT(CDB_E_SECURITY, cdb_pager_read(&p, lid, page, &h));
+    /* Verify zero plaintext was leaked into caller's buffer */
+    TEST_ASSERT_EQUAL_UINT8(0, page[cdb_page_header_size(p.fmt)]);
+
+    /* Wipe enclave domain 42 from cache */
+    cdb_pager_cache_wipe_domain(&p, 42);
+
+    /* Re-allow enclave access */
+    mock_enclave_allowed = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&p, lid, page, &h));
+    TEST_ASSERT_EQUAL_MEMORY("secret_enclave_data", page + cdb_page_header_size(p.fmt), 19);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -928,6 +1031,8 @@ int main(void)
     RUN_TEST(test_reload_sees_other_commits);
     RUN_TEST(test_reuse_waits_for_reader);
     RUN_TEST(test_guard_stops_archive_writes);
+    RUN_TEST(test_page_cache_hits_misses_eviction);
+    RUN_TEST(test_page_cache_enclave_security);
     RUN_TEST(test_compaction_crash_sweep);
     RUN_TEST(test_crash_sweep);
     return UNITY_END();

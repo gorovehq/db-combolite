@@ -42,6 +42,16 @@ typedef struct cdb_anchor_entry {
     uint16_t extent_len; /* pages in the extent, or 0 for a single page (always 0 for now) */
 } cdb_anchor_entry;
 
+/* One cached data page slot (spec 2, backlog). */
+typedef struct cdb_page_cache_slot {
+    uint64_t lid;         /* logical page ID; 0 = empty */
+    uint64_t phys;        /* physical page number on storage */
+    uint64_t lru;         /* LRU timestamp */
+    uint8_t state;        /* CDB_ANCHOR_LIVE or CDB_ANCHOR_PRIVATE */
+    cdb_page_header hdr;  /* decoded header of verified page */
+    uint8_t *page;        /* pointer to page_size buffer */
+} cdb_page_cache_slot;
+
 /* A run of free physical pages, as kept on the free-space list
  * (spec 14.7.4). A freed_seq of 0 means "reusable now". */
 typedef struct cdb_free_extent {
@@ -75,6 +85,8 @@ typedef struct cdb_pager_config {
     size_t node_cap;
     cdb_free_extent *free_list;  /* in-memory free-space list, free_cap entries */
     size_t free_cap;
+    uint8_t *page_cache;         /* optional: data page cache memory; NULL = disabled */
+    size_t page_cache_size;      /* size of page_cache in bytes */
 } cdb_pager_config;
 
 /* An open pager. All fields are internal; other modules use the functions
@@ -130,7 +142,18 @@ typedef struct cdb_pager {
     int has_integrity_key;
     cdb_status (*domain_key_fn)(void *ctx, uint64_t domain_id, uint32_t key_version, uint8_t key_out[32]);
     void *domain_key_ctx;
+    /* Optional data page cache in caller memory. */
+    cdb_page_cache_slot *cache_slots;
+    size_t cache_count;
+    size_t cache_sets;
+    uint64_t cache_clock;
 } cdb_pager;
+
+/* Returns bytes needed for a data page cache of n_pages pages. */
+size_t cdb_pager_cache_size(size_t page_size, size_t n_pages);
+
+/* Wipes and invalidates cached data pages for domain_id (0 for all). */
+void cdb_pager_cache_wipe_domain(cdb_pager *p, uint64_t domain_id);
 
 /* Configures encryption, integrity keys, and enclave domain key resolver on the pager. */
 void cdb_pager_set_crypto(cdb_pager *p, unsigned aead_alg, const uint8_t *master_key,

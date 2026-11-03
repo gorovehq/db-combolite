@@ -285,6 +285,73 @@ static cdb_status expand(cdb_index *ix, uint64_t lid, node *n)
     return CDB_OK;
 }
 
+/* Lexicographic comparison of key1 = (pfx, plen) ++ (sfx, slen) against key2 = (key, klen).
+ * Exact drop-in equivalent of cdb_key_compare(concat(pfx, sfx), key), with no copies. */
+static int key_compare_split(const uint8_t *pfx, size_t plen,
+                             const uint8_t *sfx, size_t slen,
+                             const uint8_t *key, size_t klen)
+{
+    size_t alen = plen + slen;
+    size_t blen = klen;
+    size_t n = alen < blen ? alen : blen;
+    size_t n_pfx = n < plen ? n : plen;
+
+    if (n_pfx > 0) {
+        int c = memcmp(pfx, key, n_pfx);
+        if (c != 0)
+            return c < 0 ? -1 : 1;
+    }
+    if (n > plen) {
+        size_t n_sfx = n - plen;
+        int c = memcmp(sfx, key + plen, n_sfx);
+        if (c != 0)
+            return c < 0 ? -1 : 1;
+    }
+    return alen < blen ? -1 : (alen > blen ? 1 : 0);
+}
+
+/* Index of the first entry in node_view v whose key is >= key in [0, v->count).
+ * If corrupted page prevents reading an entry, returns v->count. */
+static size_t lower_bound_inplace(const cdb_index *ix, const node_view *v, const uint8_t *key, size_t klen)
+{
+    size_t lo = 0, hi = v->count;
+    const uint8_t *pfx = v->pl + NODE_HDR;
+    size_t plen = v->prefix_len;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const uint8_t *suffix, *val;
+        size_t slen, vlen, tlen;
+        int cmp;
+
+        if (view_entry(ix, v, mid, &suffix, &slen, &val, &vlen, &tlen) != CDB_OK)
+            return v->count;
+        cmp = key_compare_split(pfx, plen, suffix, slen, key, klen);
+        if (cmp < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+/* For interior nodes (level > 0): the child whose range holds key (last entry with key <= key).
+ * Entry 0 has an empty key, which sorts before every key, so a key smaller than every
+ * separator still lands in child 0. */
+static size_t child_slot_inplace(const cdb_index *ix, const node_view *v, const uint8_t *key, size_t klen)
+{
+    size_t lb = lower_bound_inplace(ix, v, key, klen);
+    if (lb < v->count) {
+        const uint8_t *suffix, *val;
+        size_t slen, vlen, tlen;
+        if (view_entry(ix, v, lb, &suffix, &slen, &val, &vlen, &tlen) == CDB_OK) {
+            if (key_compare_split(v->pl + NODE_HDR, v->prefix_len, suffix, slen, key, klen) == 0)
+                return lb;
+        }
+    }
+    return lb == 0 ? 0 : lb - 1;
+}
+
 /* Index of the first entry >= key in [0, count). */
 static size_t lower_bound(cdb_index *ix, const node *n, const uint8_t *key, size_t klen)
 {
@@ -298,20 +365,6 @@ static size_t lower_bound(cdb_index *ix, const node *n, const uint8_t *key, size
             hi = mid;
     }
     return lo;
-}
-
-/* Interior: the child whose range holds key (last entry with key <= key).
- * Entry 0 has an empty key, which sorts before every key, so a key smaller
- * than every separator still lands in child 0. */
-static size_t child_slot(cdb_index *ix, const node *n, const uint8_t *key, size_t klen)
-{
-    size_t lb = lower_bound(ix, n, key, klen);
-    if (lb < n->count) {
-        const cdb_index_entry *e = &ix->w.entries[lb];
-        if (cdb_key_compare(ent_key(ix, e), e->klen, key, klen) == 0)
-            return lb;
-    }
-    return lb == 0 ? 0 : lb - 1;
 }
 
 /* Length of the prefix that all keys in entries [a, b) share, capped at
@@ -551,9 +604,9 @@ typedef struct path {
 } path;
 
 /* Descends to the leaf for key; on return the leaf is expanded in work.
- * Each level is expanded in turn (overwriting the previous one), so only
- * the leaf is left in work memory; the path records how to get back up. An
- * empty interior node or a tree deeper than CDB_INDEX_MAX_DEPTH (a cycle,
+ * Interior nodes are binary-searched in place without expansion; only the
+ * leaf is left expanded in work memory. The path records how to get back up.
+ * An empty interior node or a tree deeper than CDB_INDEX_MAX_DEPTH (a cycle,
  * for instance) is CDB_E_CORRUPT. */
 static cdb_status descend(cdb_index *ix, const uint8_t *key, size_t klen, path *pt, node *leaf)
 {
@@ -562,19 +615,25 @@ static cdb_status descend(cdb_index *ix, const uint8_t *key, size_t klen, path *
 
     pt->depth = 0;
     for (;;) {
+        node_view v;
+        const uint8_t *suffix, *val;
+        size_t slen, vlen, tlen;
+
         if (pt->depth >= CDB_INDEX_MAX_DEPTH)
             return CDB_E_CORRUPT;
-        if ((s = expand(ix, lid, leaf)) != CDB_OK)
+        if ((s = read_node(ix, lid, w_page(ix), &v)) != CDB_OK)
             return s;
         pt->lid[pt->depth] = lid;
-        if (leaf->level == 0) {
+        if (v.level == 0) {
             pt->depth++;
-            return CDB_OK;
+            return expand(ix, lid, leaf);
         }
-        if (leaf->count == 0)
+        if (v.count == 0)
             return CDB_E_CORRUPT;
-        pt->slot[pt->depth] = child_slot(ix, leaf, key, klen);
-        lid = cdb_load_u64(ent_val(ix, &ix->w.entries[pt->slot[pt->depth]]), CDB_ORDER_BIG);
+        pt->slot[pt->depth] = child_slot_inplace(ix, &v, key, klen);
+        if ((s = view_entry(ix, &v, pt->slot[pt->depth], &suffix, &slen, &val, &vlen, &tlen)) != CDB_OK)
+            return s;
+        lid = child_of(ix, val);
         pt->depth++;
     }
 }
@@ -684,31 +743,52 @@ cdb_status cdb_index_put(cdb_index *ix, const uint8_t *key, size_t klen, const v
 
 /* Exact-match lookup. Note that *found is set to 1 even when the value then
  * turns out too long for vcap (CDB_E_BUFFER_TOO_SMALL); *vlen tells the
- * caller how much room is needed. */
+ * caller how much room is needed.
+ * Runs completely in place without expanding any node into the work heap. */
 cdb_status cdb_index_get(cdb_index *ix, const uint8_t *key, size_t klen,
                          void *val, size_t vcap, size_t *vlen, int *found)
 {
-    path pt;
-    node leaf;
+    uint64_t lid = ix->root;
+    unsigned depth = 0;
+    node_view v;
     size_t pos;
     cdb_status s;
 
     *found = 0;
-    if ((s = descend(ix, key, klen, &pt, &leaf)) != CDB_OK)
-        return s;
-    pos = lower_bound(ix, &leaf, key, klen);
-    if (pos < leaf.count) {
-        const cdb_index_entry *e = &ix->w.entries[pos];
-        if (cdb_key_compare(ent_key(ix, e), e->klen, key, klen) == 0) {
+    for (;;) {
+        const uint8_t *suffix, *vptr;
+        size_t slen, vl, tl;
+
+        if (depth >= CDB_INDEX_MAX_DEPTH)
+            return CDB_E_CORRUPT;
+        if ((s = read_node(ix, lid, w_page(ix), &v)) != CDB_OK)
+            return s;
+        if (v.level == 0)
+            break;
+        if (v.count == 0)
+            return CDB_E_CORRUPT;
+        size_t slot = child_slot_inplace(ix, &v, key, klen);
+        if ((s = view_entry(ix, &v, slot, &suffix, &slen, &vptr, &vl, &tl)) != CDB_OK)
+            return s;
+        lid = child_of(ix, vptr);
+        depth++;
+    }
+
+    pos = lower_bound_inplace(ix, &v, key, klen);
+    if (pos < v.count) {
+        const uint8_t *suffix, *vptr;
+        size_t slen, vl, tl;
+        if ((s = view_entry(ix, &v, pos, &suffix, &slen, &vptr, &vl, &tl)) != CDB_OK)
+            return s;
+        if (key_compare_split(v.pl + NODE_HDR, v.prefix_len, suffix, slen, key, klen) == 0) {
             *found = 1;
-            *vlen = e->tlen;
-            if (e->tlen > vcap)
+            *vlen = tl;
+            if (tl > vcap)
                 return CDB_E_BUFFER_TOO_SMALL;
-            if (in_chain(ix, e))
-                return cdb_overflow_read(ix->pager, cdb_load_u64(ent_val(ix, e), CDB_ORDER_BIG), ix->store_id, val,
-                                         e->tlen, w_page(ix));
-            if (e->vlen)
-                memcpy(val, ent_val(ix, e), e->vlen);
+            if (tl > ix->max_value)
+                return cdb_overflow_read(ix->pager, child_of(ix, vptr), ix->store_id, val, tl, w_page(ix));
+            if (vl)
+                memcpy(val, vptr, vl);
         }
     }
     return CDB_OK;
