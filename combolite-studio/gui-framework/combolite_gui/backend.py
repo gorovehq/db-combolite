@@ -269,18 +269,29 @@ class NativeBackend(Backend):
 
         resolved_lib = lib_path or os.environ.get("COMBOLITE_LIB")
         if not resolved_lib:
-            # Check standard build directory locations
+            # Check package-bundled library and standard build directory locations
+            pkg_dir = Path(__file__).resolve().parent
+            repo_root = Path(__file__).resolve().parents[3]
             candidates = [
-                Path(__file__).resolve().parents[3] / "db-combolite" / "build-shared" / "libcombolite.so",
-                Path(__file__).resolve().parents[3] / "db-combolite" / "build-rel" / "libcombolite.so",
-                Path(__file__).resolve().parents[3] / "db-combolite" / "build" / "libcombolite.so",
+                pkg_dir / "libcombolite.so",
+                pkg_dir / ".libs" / "libcombolite.so",
+                repo_root / "db-combolite" / "build-shared" / "libcombolite.so",
+                repo_root / "db-combolite" / "build-rel" / "libcombolite.so",
+                repo_root / "db-combolite" / "build" / "libcombolite.so",
+                Path("/usr/local/lib/libcombolite.so"),
+                Path("/usr/lib/libcombolite.so"),
             ]
             for c in candidates:
                 if c.exists():
                     resolved_lib = str(c)
                     break
         if not resolved_lib:
-            raise BackendError("COMBOLITE_LIB is not set and libcombolite.so was not found in build directories")
+            import ctypes.util
+            found = ctypes.util.find_library("combolite")
+            if found:
+                resolved_lib = found
+        if not resolved_lib:
+            raise BackendError("COMBOLITE_LIB is not set and libcombolite.so was not found in build or system directories")
 
         self.clib = ComboliteLib(resolved_lib)
         self.path = None

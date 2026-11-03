@@ -1,0 +1,5 @@
+include README.md
+include USAGE.md
+include combolite_gui/style.css
+recursive-include data *
+recursive-include tests *.py

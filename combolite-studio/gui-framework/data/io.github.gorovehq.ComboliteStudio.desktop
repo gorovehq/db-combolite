@@ -1,0 +1,18 @@
+[Desktop Entry]
+Name=Combolite Studio
+GenericName=Database Studio
+Comment=Desktop client for db-combolite multi-model database
+Exec=combolite-studio %F
+Icon=io.github.gorovehq.ComboliteStudio
+Terminal=false
+Type=Application
+Categories=Development;Database;IDE;GTK;
+MimeType=application/x-cdbarch;application/x-combolite;
+StartupNotify=true
+StartupWMClass=io.github.gorovehq.ComboliteStudio
+Keywords=database;combolite;cmbql;sql;vector;document;graph;timeseries;
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=New Window
+Exec=combolite-studio

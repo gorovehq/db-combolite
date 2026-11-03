@@ -13,7 +13,7 @@ from gi.repository import Adw, Gdk, Gio, Gtk
 from .backend import MockBackend, NativeBackend
 from .window import MainWindow
 
-APP_ID = "org.gorove.CombolitStudio"
+APP_ID = "io.github.gorovehq.ComboliteStudio"
 VERSION = "0.1.0"
 
 

@@ -21,9 +21,14 @@ sudo dnf install python3-gobject gtk4 libadwaita gtksourceview5 python3-numpy
 # Debian / Ubuntu 24.04+
 sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-gtksource-5 python3-numpy
 
-cd design_handoff_combolite_studio
-python3 -m combolite_gui                                          # mock data
-COMBOLITE_LIB=/path/to/libcombolite.so python3 -m combolite_gui   # native backend
+# Launch app directly:
+python3 -m combolite_gui                                          # auto-discovers native engine
+COMBOLITE_LIB=/path/to/libcombolite.so python3 -m combolite_gui   # explicit library path
+
+# Or build wheel & install desktop integration:
+make wheel
+pip install dist/combolite_studio-0.1.0-py3-none-any.whl
+make install-user                                                 # registers desktop entry & icons
 ```
 Needs GTK ≥ 4.10 and libadwaita ≥ 1.4. GtkSourceView and numpy are optional (the console falls back to a plain text view, and the graphs fall back to pure-Python math).
 

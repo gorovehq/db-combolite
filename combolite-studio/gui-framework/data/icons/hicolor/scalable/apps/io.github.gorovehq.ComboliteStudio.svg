@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#2a2c33"/>
+      <stop offset="100%" stop-color="#18191d"/>
+    </linearGradient>
+    <linearGradient id="tealGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3cc4c9"/>
+      <stop offset="100%" stop-color="#1e7e83"/>
+    </linearGradient>
+    <linearGradient id="purpleGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#cbb5f8"/>
+      <stop offset="100%" stop-color="#8a5cd6"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <!-- App Tile Base -->
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#bgGrad)" stroke="#383d47" stroke-width="2" filter="url(#shadow)"/>
+
+  <!-- Database Stack (Base Plate) -->
+  <path d="M 28 82 C 28 75 44 70 64 70 C 84 70 100 75 100 82 L 100 92 C 100 99 84 104 64 104 C 44 104 28 99 28 92 Z" fill="#242830" stroke="#3b404d" stroke-width="2"/>
+  <ellipse cx="64" cy="82" rx="36" ry="12" fill="#2d333e" stroke="#484f5f" stroke-width="2"/>
+
+  <!-- Middle Database Disc -->
+  <path d="M 32 64 C 32 58 46 54 64 54 C 82 54 96 58 96 64 L 96 74 C 96 80 82 84 64 84 C 46 84 32 80 32 74 Z" fill="url(#tealGrad)" opacity="0.85"/>
+  <ellipse cx="64" cy="64" rx="32" ry="10" fill="#3cc4c9"/>
+
+  <!-- Multi-Model Graph Constellation Overlay -->
+  <!-- Graph Edges -->
+  <line x1="38" y1="36" x2="64" y2="24" stroke="#7aa7f0" stroke-width="2.5" opacity="0.7" stroke-linecap="round"/>
+  <line x1="64" y1="24" x2="90" y2="36" stroke="#b291ea" stroke-width="2.5" opacity="0.7" stroke-linecap="round"/>
+  <line x1="38" y1="36" x2="64" y2="52" stroke="#6fc08a" stroke-width="2.5" opacity="0.7" stroke-linecap="round"/>
+  <line x1="90" y1="36" x2="64" y2="52" stroke="#e88aa3" stroke-width="2.5" opacity="0.7" stroke-linecap="round"/>
+  <line x1="64" y1="24" x2="64" y2="52" stroke="#d9a85a" stroke-width="2" opacity="0.5" stroke-dasharray="3,3"/>
+
+  <!-- Model Nodes -->
+  <!-- Center: Query / Combo Node -->
+  <circle cx="64" cy="52" r="7.5" fill="#3cc4c9" stroke="#ffffff" stroke-width="2"/>
+  <!-- Top Node: Relational Table (Blue) -->
+  <circle cx="64" cy="24" r="6.5" fill="#7aa7f0" stroke="#ffffff" stroke-width="1.8"/>
+  <!-- Left Node: Document (Gold) -->
+  <circle cx="38" cy="36" r="6" fill="#d9a85a" stroke="#ffffff" stroke-width="1.8"/>
+  <!-- Right Node: Vector Collection (Purple) -->
+  <circle cx="90" cy="36" r="6" fill="#b291ea" stroke="#ffffff" stroke-width="1.8"/>
+  <!-- Time Series Point (Pink) -->
+  <circle cx="82" cy="74" r="4.5" fill="#e88aa3" stroke="#ffffff" stroke-width="1.5"/>
+  <!-- Link Node (Green) -->
+  <circle cx="46" cy="74" r="4.5" fill="#6fc08a" stroke="#ffffff" stroke-width="1.5"/>
+</svg>

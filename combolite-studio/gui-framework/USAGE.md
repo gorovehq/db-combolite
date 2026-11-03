@@ -10,9 +10,35 @@ sudo dnf install python3-gobject gtk4 libadwaita gtksourceview5
 # Debian / Ubuntu 24.04+
 sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-gtksource-5
 
-python3 -m combolite_gui                       # mock data
-python3 -m combolite_gui path/to/file.cmb      # open a file directly
-COMBOLITE_LIB=./build/libcombolite.so python3 -m combolite_gui   # native backend
+# Quick run (auto-discovers libcombolite.so in build directories):
+python3 -m combolite_gui                       # native backend (or mock if no library)
+python3 -m combolite_gui path/to/file.cdbarch  # open a database directly
+COMBOLITE_LIB=/path/to/libcombolite.so python3 -m combolite_gui
+```
+
+## Packaging & Installation
+
+You can package and install Combolite Studio as a standard Python package or desktop application:
+
+```sh
+# Build wheel (.whl) with bundled libcombolite.so:
+make wheel
+
+# Install wheel via pip:
+pip install dist/combolite_studio-0.1.0-py3-none-any.whl
+
+# Install desktop entry, icons, and MIME types for current user:
+make install-user
+
+# Or install desktop integration system-wide:
+sudo make install-system
+```
+
+Once installed, launch it directly:
+```sh
+combolite-studio
+# or open a file
+combolite-studio database.cdbarch
 ```
 
 Needs GTK ≥ 4.10 and libadwaita ≥ 1.4. GtkSourceView is optional (the console falls back to a plain text view).

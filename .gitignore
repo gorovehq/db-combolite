@@ -18,5 +18,8 @@ db-combolite/demo/gutenfree/gutenfree
 db-combolite/demo/gutenfree/data/*
 !db-combolite/demo/gutenfree/data/README.md
 __pycache__/
+*.so
+*.egg-info/
+dist/
 # Sub-agent activity log, tailed by the user.
 db-combolite/workspace/agents.log

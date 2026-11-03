@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-cdbarch">
+    <comment>Combolite Database Archive</comment>
+    <glob pattern="*.cdbarch"/>
+    <icon name="io.github.gorovehq.ComboliteStudio"/>
+  </mime-type>
+  <mime-type type="application/x-combolite">
+    <comment>Combolite Database</comment>
+    <glob pattern="*.cmb"/>
+    <glob pattern="*.cdb"/>
+    <glob pattern="*.combolite"/>
+    <icon name="io.github.gorovehq.ComboliteStudio"/>
+  </mime-type>
+</mime-info>

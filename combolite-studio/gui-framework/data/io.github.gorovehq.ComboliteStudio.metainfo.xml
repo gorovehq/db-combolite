@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.gorovehq.ComboliteStudio</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Combolite Studio</name>
+  <summary>Multi-model database management studio for db-combolite</summary>
+  <developer id="io.github.gorovehq">
+    <name>gorove</name>
+  </developer>
+  <description>
+    <p>
+      Combolite Studio is the desktop client for db-combolite, an ultra-fast zero-heap
+      embeddable multi-model database engine supporting relational tables, document pools
+      with BM25 full-text search, vector collections with k-NN graph search, cross-model
+      graph links with cardinality enforcement, and high-throughput time series.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Browse, filter, and edit relational tables inline with primary key tracking</li>
+      <li>Document pools with JSON editor, BM25 full-text search, and revision history</li>
+      <li>Vector collections with cosine, dot, and Euclidean similarity search and PCA projection</li>
+      <li>Interactive 2D and 3D force-directed link graph visualizer with heat-map path tracing</li>
+      <li>Time series streaming charts with range inspection and append operations</li>
+      <li>CMBQL console with syntax highlighting, live diagnostics, quick-fixes, and explain plans</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.gorovehq.ComboliteStudio.desktop</launchable>
+  <url type="homepage">https://github.com/gorovehq/db-combolite</url>
+  <url type="bugtracker">https://github.com/gorovehq/db-combolite/issues</url>
+  <provides>
+    <mediatype>application/x-cdbarch</mediatype>
+    <mediatype>application/x-combolite</mediatype>
+  </provides>
+  <releases>
+    <release version="0.1.0" date="2026-11-03">
+      <description>
+        <p>Initial release with native db-combolite C99 engine integration, CMBQL query console, 2D/3D graph visualization, and multi-model store management.</p>
+      </description>
+    </release>
+  </releases>
+  <content_rating type="oars-1.1" />
+</component>
