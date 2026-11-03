@@ -38,6 +38,7 @@
 #define CDB_BC_SAVEPOINT     0x0Eu
 #define CDB_BC_ROLLBACK_TO   0x0Fu
 #define CDB_BC_RELEASE_SP    0x10u
+#define CDB_BC_CALL_MUTATION_EX 0x11u
 
 #define CDB_PROC_MAX_SAVEPOINTS 8u
 
@@ -49,13 +50,44 @@ typedef struct cdb_proc_savepoint {
     uint8_t n_regs;
 } cdb_proc_savepoint;
 
-/* Mutation opcodes for CALL_MUTATION */
-#define CDB_MUT_DOC_INSERT   0x01u
-#define CDB_MUT_DOC_REPLACE  0x02u
-#define CDB_MUT_TABLE_INSERT 0x03u
-#define CDB_MUT_TABLE_UPDATE 0x04u
-#define CDB_MUT_LINK_ADD     0x05u
-#define CDB_MUT_TS_APPEND    0x06u
+/* Mutation opcodes for CALL_MUTATION & CALL_MUTATION_EX */
+#define CDB_MUT_DOC_INSERT       0x01u
+#define CDB_MUT_DOC_REPLACE      0x02u
+#define CDB_MUT_DOC_PATCH        0x03u
+#define CDB_MUT_DOC_DELETE       0x04u
+#define CDB_MUT_TABLE_INSERT     0x05u
+#define CDB_MUT_TABLE_UPDATE     0x06u
+#define CDB_MUT_TABLE_DELETE     0x07u
+#define CDB_MUT_LINK_ADD         0x08u
+#define CDB_MUT_LINK_REINFORCE   0x09u
+#define CDB_MUT_LINK_REMOVE      0x0Au
+#define CDB_MUT_LINK_DEF_TYPE    0x0Bu
+#define CDB_MUT_TS_SERIES        0x0Cu
+#define CDB_MUT_TS_APPEND        0x0Du
+#define CDB_MUT_TS_DROP_BEFORE   0x0Eu
+#define CDB_MUT_TS_RETENTION     0x0Fu
+#define CDB_MUT_TS_APPLY_RET     0x10u
+#define CDB_MUT_TS_DOWNSAMPLE    0x11u
+#define CDB_MUT_VEC_INSERT       0x12u
+#define CDB_MUT_VEC_DELETE       0x13u
+#define CDB_MUT_BLOB_FREE        0x14u
+#define CDB_MUT_CREATE_STORE     0x15u
+#define CDB_MUT_DROP_STORE       0x16u
+#define CDB_MUT_ADD_SCHEMA       0x17u
+#define CDB_MUT_CREATE_ENCLAVE   0x18u
+#define CDB_MUT_OPEN_ENCLAVE     0x19u
+#define CDB_MUT_ROTATE_KEY       0x1Au
+#define CDB_MUT_CHECK_ROTATION   0x1Bu
+#define CDB_MUT_REGISTER_PRIN    0x1Cu
+#define CDB_MUT_GRANT_ROLE       0x1Du
+#define CDB_MUT_CHECK_PERM       0x1Eu
+#define CDB_MUT_TRIGGER_REG      0x1Fu
+#define CDB_MUT_TRIGGER_UNREG    0x20u
+#define CDB_MUT_COMPACT          0x21u
+#define CDB_MUT_RECLAIM          0x22u
+#define CDB_MUT_RECONCILE        0x23u
+#define CDB_MUT_SET_PEER         0x24u
+#define CDB_MUT_SYNC_IMPORT      0x25u
 
 /* Virtual machine context */
 typedef struct cdb_proc_vm {
@@ -115,6 +147,7 @@ cdb_status cdb_proc_write_jump_if_true(cdb_proc_writer *w, uint8_t cond_reg, int
 cdb_status cdb_proc_write_jump_if_false(cdb_proc_writer *w, uint8_t cond_reg, int16_t rel_offset);
 cdb_status cdb_proc_write_call_math(cdb_proc_writer *w, uint8_t dst, uint16_t fn_id, uint8_t argc, const uint8_t *args);
 cdb_status cdb_proc_write_call_mutation(cdb_proc_writer *w, uint8_t dst, uint8_t op, uint8_t store, uint8_t entry, uint8_t payload);
+cdb_status cdb_proc_write_call_mutation_ex(cdb_proc_writer *w, uint8_t dst, uint8_t op, uint8_t argc, const uint8_t *args);
 cdb_status cdb_proc_write_open_cursor(cdb_proc_writer *w, uint8_t slot, const uint8_t *query_wire, size_t query_len);
 cdb_status cdb_proc_write_cursor_next(cdb_proc_writer *w, uint8_t has_row_reg, uint8_t dst_row_reg, uint8_t slot);
 cdb_status cdb_proc_write_cursor_close(cdb_proc_writer *w, uint8_t slot);

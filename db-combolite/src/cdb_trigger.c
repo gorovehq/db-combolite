@@ -4,6 +4,7 @@
  * cascade mutation warnings, and background scheduled maintenance execution via cdb_worker.
  */
 #include "cdb_trigger.h"
+#include "cdb_db.h"
 #include <string.h>
 
 void cdb_trigger_registry_init(cdb_trigger_registry *reg, cdb_worker_pool *pool, uint64_t cascade_threshold)

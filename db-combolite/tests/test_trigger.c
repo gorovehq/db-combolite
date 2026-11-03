@@ -1,5 +1,6 @@
 #include "unity.h"
 #include "cdb_trigger.h"
+#include "cdb_db.h"
 #include <string.h>
 
 void setUp(void) {}

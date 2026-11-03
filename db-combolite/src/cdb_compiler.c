@@ -1359,6 +1359,1312 @@ static cdb_status proc_expect(proc_compiler *pc, cdb_token_kind kind, const char
     return CDB_OK;
 }
 
+static int proc_match_str(proc_compiler *pc, const char *s) {
+    cdb_token tok;
+    if (cdb_lexer_peek(&pc->lex, &tok) != CDB_OK) return 0;
+    if (cdb_token_equals_ci(&tok, s)) {
+        cdb_lexer_next(&pc->lex, &tok);
+        return 1;
+    }
+    return 0;
+}
+
+static uint8_t proc_alloc_temp_reg(proc_compiler *pc) {
+    if (pc->next_reg < CDB_PROC_MAX_REGISTERS) {
+        return pc->next_reg++;
+    }
+    return 0;
+}
+
+static int proc_is_ident_or_kw(cdb_token_kind k) {
+    return k == CDB_TOK_IDENT || (k >= CDB_TOK_KW_QUERY && k <= CDB_TOK_KW_FIELD);
+}
+
+static cdb_status proc_parse_val_to_reg(proc_compiler *pc, cdb_proc_writer *pw, uint8_t dst_reg) {
+    cdb_token tok;
+    if (cdb_lexer_peek(&pc->lex, &tok) != CDB_OK) return CDB_E_INVALID_ARG;
+
+    if (tok.kind == CDB_TOK_PARAM) {
+        cdb_lexer_next(&pc->lex, &tok);
+        uint8_t src_reg = proc_get_or_alloc_var(pc, tok.start, (size_t)tok.len);
+        cdb_proc_write_move(pw, dst_reg, src_reg);
+        return CDB_OK;
+    }
+    if (tok.kind == CDB_TOK_INT) {
+        cdb_lexer_next(&pc->lex, &tok);
+        uint8_t enc[16];
+        size_t elen = encode_int_val(tok.num_val.i64, enc, sizeof(enc));
+        return cdb_proc_write_load_const(pw, dst_reg, enc, elen);
+    }
+    if (tok.kind == CDB_TOK_FLOAT) {
+        cdb_lexer_next(&pc->lex, &tok);
+        uint8_t enc[16];
+        size_t elen = encode_f64_val(tok.num_val.f64, enc, sizeof(enc));
+        return cdb_proc_write_load_const(pw, dst_reg, enc, elen);
+    }
+    if (tok.kind == CDB_TOK_STRING) {
+        cdb_lexer_next(&pc->lex, &tok);
+        char sbuf[512];
+        size_t slen = 0;
+        cdb_token_unescape_string(&tok, sbuf, sizeof(sbuf), &slen);
+        uint8_t enc[512];
+        size_t elen = encode_string_val(sbuf, slen, enc, sizeof(enc));
+        return cdb_proc_write_load_const(pw, dst_reg, enc, elen);
+    }
+    if (tok.kind == CDB_TOK_KW_TRUE || tok.kind == CDB_TOK_KW_FALSE) {
+        cdb_lexer_next(&pc->lex, &tok);
+        uint8_t enc[8];
+        size_t elen = encode_bool_val(tok.kind == CDB_TOK_KW_TRUE ? 1 : 0, enc, sizeof(enc));
+        return cdb_proc_write_load_const(pw, dst_reg, enc, elen);
+    }
+    if (tok.kind == CDB_TOK_KW_NULL) {
+        cdb_lexer_next(&pc->lex, &tok);
+        uint8_t enc[8];
+        size_t elen = encode_null_val(enc, sizeof(enc));
+        return cdb_proc_write_load_const(pw, dst_reg, enc, elen);
+    }
+    if (proc_is_ident_or_kw(tok.kind)) {
+        cdb_lexer_next(&pc->lex, &tok);
+        uint8_t enc[256];
+        size_t elen = encode_string_val(tok.start, (size_t)tok.len, enc, sizeof(enc));
+        return cdb_proc_write_load_const(pw, dst_reg, enc, elen);
+    }
+    return CDB_E_INVALID_ARG;
+}
+
+static cdb_status proc_parse_arg(proc_compiler *pc, cdb_proc_writer *pw, uint8_t dst_reg) {
+    cdb_token tok, next_tok;
+    if (cdb_lexer_peek(&pc->lex, &tok) == CDB_OK && proc_is_ident_or_kw(tok.kind)) {
+        cdb_lexer save = pc->lex;
+        cdb_lexer_next(&pc->lex, &tok);
+        if (cdb_lexer_peek(&pc->lex, &next_tok) == CDB_OK && next_tok.kind == CDB_TOK_COLON) {
+            cdb_lexer_next(&pc->lex, &next_tok);
+        } else {
+            pc->lex = save;
+        }
+    }
+    return proc_parse_val_to_reg(pc, pw, dst_reg);
+}
+
+static cdb_status proc_parse_ref(proc_compiler *pc, cdb_proc_writer *pw, uint8_t r_store, uint8_t r_entry) {
+    int has_bracket = proc_match(pc, CDB_TOK_LBRACKET, NULL);
+    cdb_status s = proc_parse_arg(pc, pw, r_store);
+    if (s != CDB_OK) return s;
+    if (proc_match(pc, CDB_TOK_COLON, NULL) || proc_match(pc, CDB_TOK_COMMA, NULL)) {
+        s = proc_parse_arg(pc, pw, r_entry);
+        if (s != CDB_OK) return s;
+    }
+    if (has_bracket) {
+        proc_expect(pc, CDB_TOK_RBRACKET, "Expected ']' after reference", NULL);
+    }
+    return CDB_OK;
+}
+
+static cdb_status proc_compile_statement(proc_compiler *pc, cdb_proc_writer *pw) {
+    cdb_token tok;
+    uint8_t base_reg = pc->next_reg;
+    uint8_t out_reg = 0;
+
+    if (cdb_lexer_peek(&pc->lex, &tok) != CDB_OK) return CDB_E_INVALID_ARG;
+
+    /* LET $var = ... */
+    if (tok.kind == CDB_TOK_KW_LET) {
+        cdb_lexer_next(&pc->lex, &tok);
+        cdb_token var_tok;
+        if (proc_expect(pc, CDB_TOK_PARAM, "Expected $variable after LET", &var_tok) != CDB_OK) return CDB_E_INVALID_ARG;
+        proc_expect(pc, CDB_TOK_EQ, "Expected '=' in LET assignment", NULL);
+        out_reg = proc_get_or_alloc_var(pc, var_tok.start, (size_t)var_tok.len);
+        base_reg = pc->next_reg;
+
+        /* If assigning a literal directly without a command */
+        if (cdb_lexer_peek(&pc->lex, &tok) == CDB_OK) {
+            if (tok.kind == CDB_TOK_INT || tok.kind == CDB_TOK_FLOAT || tok.kind == CDB_TOK_STRING ||
+                tok.kind == CDB_TOK_KW_TRUE || tok.kind == CDB_TOK_KW_FALSE || tok.kind == CDB_TOK_KW_NULL) {
+                return proc_parse_val_to_reg(pc, pw, out_reg);
+            }
+        }
+    } else {
+        out_reg = proc_alloc_temp_reg(pc);
+    }
+
+    if (cdb_lexer_peek(&pc->lex, &tok) != CDB_OK) return CDB_E_INVALID_ARG;
+
+    /* RETURN expr */
+    if (tok.kind == CDB_TOK_KW_RETURN) {
+        cdb_lexer_next(&pc->lex, &tok);
+        uint8_t src_reg = 0;
+        cdb_token ret_tok;
+        if (cdb_lexer_peek(&pc->lex, &ret_tok) == CDB_OK && ret_tok.kind == CDB_TOK_PARAM) {
+            cdb_lexer_next(&pc->lex, &ret_tok);
+            src_reg = proc_get_or_alloc_var(pc, ret_tok.start, (size_t)ret_tok.len);
+        } else if (cdb_lexer_peek(&pc->lex, &ret_tok) == CDB_OK && ret_tok.kind != CDB_TOK_SEMICOLON) {
+            uint8_t r_tmp = proc_alloc_temp_reg(pc);
+            proc_parse_val_to_reg(pc, pw, r_tmp);
+            src_reg = r_tmp;
+        }
+        cdb_proc_write_return(pw, src_reg);
+        return CDB_OK;
+    }
+
+    /* SAVEPOINT */
+    if (cdb_token_equals_ci(&tok, "SAVEPOINT")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        cdb_token sp_name;
+        if (proc_expect(pc, CDB_TOK_IDENT, "Expected savepoint name", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
+        uint8_t sp_id = (uint8_t)(sp_name.len > 0 ? (uint8_t)((unsigned char)sp_name.start[0] % 8) : 1u);
+        return cdb_proc_write_savepoint(pw, sp_id);
+    }
+
+    /* ROLLBACK */
+    if (cdb_token_equals_ci(&tok, "ROLLBACK")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "TO");
+        cdb_token sp_name;
+        if (proc_expect(pc, CDB_TOK_IDENT, "Expected savepoint name after ROLLBACK TO", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
+        uint8_t sp_id = (uint8_t)(sp_name.len > 0 ? (uint8_t)((unsigned char)sp_name.start[0] % 8) : 1u);
+        return cdb_proc_write_rollback_to(pw, sp_id);
+    }
+
+    /* RELEASE */
+    if (cdb_token_equals_ci(&tok, "RELEASE")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "SAVEPOINT");
+        cdb_token sp_name;
+        if (proc_expect(pc, CDB_TOK_IDENT, "Expected savepoint name after RELEASE", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
+        uint8_t sp_id = (uint8_t)(sp_name.len > 0 ? (uint8_t)((unsigned char)sp_name.start[0] % 8) : 1u);
+        return cdb_proc_write_release_sp(pw, sp_id);
+    }
+
+    /* COMPACT / compact(...) */
+    if (cdb_token_equals_ci(&tok, "COMPACT") || cdb_token_equals_ci(&tok, "compact")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        uint8_t r_max = proc_alloc_temp_reg(pc);
+        uint8_t m_args[1];
+        uint8_t zero_enc[16];
+        size_t zlen = encode_int_val(0, zero_enc, sizeof(zero_enc));
+        cdb_proc_write_load_const(pw, r_max, zero_enc, zlen);
+
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            if (!proc_match(pc, CDB_TOK_RPAREN, NULL)) {
+                proc_parse_arg(pc, pw, r_max);
+                proc_expect(pc, CDB_TOK_RPAREN, "Expected ')' after compact(...) argument", NULL);
+            }
+        } else {
+            if (proc_match_str(pc, "MAX")) {
+                proc_parse_val_to_reg(pc, pw, r_max);
+            }
+        }
+        m_args[0] = r_max;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_COMPACT, 1, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* RECLAIM / reclaim() */
+    if (cdb_token_equals_ci(&tok, "RECLAIM") || cdb_token_equals_ci(&tok, "reclaim")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_match(pc, CDB_TOK_RPAREN, NULL);
+        }
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_RECLAIM, 0, NULL);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* RECONCILE / reconcile() */
+    if (cdb_token_equals_ci(&tok, "RECONCILE") || cdb_token_equals_ci(&tok, "reconcile")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_match(pc, CDB_TOK_RPAREN, NULL);
+        }
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_RECONCILE, 0, NULL);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* PEER / SET PEER / peer(id) */
+    if (cdb_token_equals_ci(&tok, "PEER") || cdb_token_equals_ci(&tok, "peer") || cdb_token_equals_ci(&tok, "set_peer")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        uint8_t r_peer = proc_alloc_temp_reg(pc);
+        uint8_t m_args[1];
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_peer);
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')' after peer(id)", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_peer);
+        }
+        m_args[0] = r_peer;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_SET_PEER, 1, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+    if (tok.kind == CDB_TOK_KW_SET && cdb_token_equals_ci(&tok, "SET")) {
+        cdb_lexer save = pc->lex;
+        cdb_lexer_next(&pc->lex, &tok);
+        cdb_token sub_tok;
+        if (cdb_lexer_peek(&pc->lex, &sub_tok) == CDB_OK && (cdb_token_equals_ci(&sub_tok, "PEER") || sub_tok.kind == CDB_TOK_KW_PEER)) {
+            cdb_lexer_next(&pc->lex, &sub_tok);
+            uint8_t r_peer = proc_alloc_temp_reg(pc);
+            uint8_t m_args[1];
+            proc_parse_val_to_reg(pc, pw, r_peer);
+            m_args[0] = r_peer;
+            cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_SET_PEER, 1, m_args);
+            pc->next_reg = base_reg;
+            return CDB_OK;
+        } else if (cdb_lexer_peek(&pc->lex, &sub_tok) == CDB_OK && (cdb_token_equals_ci(&sub_tok, "RETENTION") || sub_tok.kind == CDB_TOK_KW_RETENTION)) {
+            cdb_lexer_next(&pc->lex, &sub_tok);
+            proc_match_str(pc, "TIMESERIES");
+            proc_match_str(pc, "TS");
+            uint8_t r_store = proc_alloc_temp_reg(pc);
+            uint8_t r_series = proc_alloc_temp_reg(pc);
+            uint8_t r_age = proc_alloc_temp_reg(pc);
+            uint8_t m_args[3];
+            proc_parse_val_to_reg(pc, pw, r_store);
+            proc_match_str(pc, "SERIES");
+            proc_parse_val_to_reg(pc, pw, r_series);
+            proc_match_str(pc, "AGE");
+            proc_parse_val_to_reg(pc, pw, r_age);
+            m_args[0] = r_store; m_args[1] = r_series; m_args[2] = r_age;
+            cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_TS_RETENTION, 3, m_args);
+            pc->next_reg = base_reg;
+            return CDB_OK;
+        } else {
+            pc->lex = save;
+        }
+    }
+
+    /* SYNC / sync(...) */
+    if (cdb_token_equals_ci(&tok, "SYNC") || cdb_token_equals_ci(&tok, "sync") || cdb_token_equals_ci(&tok, "sync_import")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "IMPORT");
+        uint8_t r_slice = proc_alloc_temp_reg(pc);
+        uint8_t m_args[1];
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_slice);
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')' after sync(...)", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_slice);
+        }
+        m_args[0] = r_slice;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_SYNC_IMPORT, 1, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* CHECK ROTATION / CHECK PERM / check_rotation() / check_perm(...) */
+    if (cdb_token_equals_ci(&tok, "check_rotation")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) proc_match(pc, CDB_TOK_RPAREN, NULL);
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_CHECK_ROTATION, 0, NULL);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+    if (cdb_token_equals_ci(&tok, "check_perm")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_expect(pc, CDB_TOK_LPAREN, "Expected '(' after check_perm", NULL);
+        uint8_t r_pid = proc_alloc_temp_reg(pc);
+        uint8_t r_scope = proc_alloc_temp_reg(pc);
+        uint8_t r_perms = proc_alloc_temp_reg(pc);
+        uint8_t m_args[3];
+        proc_parse_arg(pc, pw, r_pid);
+        proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_parse_arg(pc, pw, r_scope);
+        proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_parse_arg(pc, pw, r_perms);
+        proc_expect(pc, CDB_TOK_RPAREN, "Expected ')' after check_perm arguments", NULL);
+        m_args[0] = r_pid; m_args[1] = r_scope; m_args[2] = r_perms;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_CHECK_PERM, 3, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+    if (tok.kind == CDB_TOK_KW_CHECK || cdb_token_equals_ci(&tok, "CHECK")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        if (proc_match_str(pc, "ROTATION")) {
+            cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_CHECK_ROTATION, 0, NULL);
+            pc->next_reg = base_reg;
+            return CDB_OK;
+        } else if (proc_match_str(pc, "PERM") || proc_match_str(pc, "PERMISSION") || proc_match_str(pc, "PERMS")) {
+            uint8_t r_pid = proc_alloc_temp_reg(pc);
+            uint8_t r_scope = proc_alloc_temp_reg(pc);
+            uint8_t r_perms = proc_alloc_temp_reg(pc);
+            uint8_t m_args[3];
+            proc_parse_val_to_reg(pc, pw, r_pid);
+            if (proc_match_str(pc, "SCOPE")) {
+                proc_parse_val_to_reg(pc, pw, r_scope);
+            } else {
+                uint8_t zenc[16]; size_t zl = encode_int_val(0, zenc, sizeof(zenc));
+                cdb_proc_write_load_const(pw, r_scope, zenc, zl);
+            }
+            if (proc_match_str(pc, "PERMS") || proc_match_str(pc, "PERM")) {
+                proc_parse_val_to_reg(pc, pw, r_perms);
+            } else {
+                uint8_t renc[16]; size_t rl = encode_int_val(1, renc, sizeof(renc));
+                cdb_proc_write_load_const(pw, r_perms, renc, rl);
+            }
+            m_args[0] = r_pid; m_args[1] = r_scope; m_args[2] = r_perms;
+            cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_CHECK_PERM, 3, m_args);
+            pc->next_reg = base_reg;
+            return CDB_OK;
+        }
+    }
+
+    /* ROTATE / rotate(...) */
+    if (cdb_token_equals_ci(&tok, "ROTATE") || cdb_token_equals_ci(&tok, "rotate") || cdb_token_equals_ci(&tok, "rotate_key")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        uint8_t r_target = proc_alloc_temp_reg(pc);
+        uint8_t r_id = proc_alloc_temp_reg(pc);
+        uint8_t r_uri = proc_alloc_temp_reg(pc);
+        uint8_t m_args[3];
+
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_target);
+            if (proc_match(pc, CDB_TOK_COMMA, NULL)) {
+                proc_parse_arg(pc, pw, r_id);
+                if (proc_match(pc, CDB_TOK_COMMA, NULL)) {
+                    proc_parse_arg(pc, pw, r_uri);
+                } else {
+                    r_uri = r_id;
+                    uint8_t zenc[16]; size_t zl = encode_int_val(0, zenc, sizeof(zenc));
+                    r_id = proc_alloc_temp_reg(pc);
+                    cdb_proc_write_load_const(pw, r_id, zenc, zl);
+                }
+            }
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')' after rotate(...)", NULL);
+        } else {
+            if (proc_match_str(pc, "MASTER")) {
+                uint8_t zenc[16]; size_t zl = encode_int_val(0, zenc, sizeof(zenc));
+                cdb_proc_write_load_const(pw, r_target, zenc, zl);
+                cdb_proc_write_load_const(pw, r_id, zenc, zl);
+                proc_match_str(pc, "KEY");
+                proc_parse_val_to_reg(pc, pw, r_uri);
+            } else if (proc_match_str(pc, "ENCLAVE")) {
+                uint8_t oenc[16]; size_t ol = encode_int_val(1, oenc, sizeof(oenc));
+                cdb_proc_write_load_const(pw, r_target, oenc, ol);
+                proc_parse_val_to_reg(pc, pw, r_id);
+                proc_match_str(pc, "KEY");
+                proc_parse_val_to_reg(pc, pw, r_uri);
+            }
+        }
+        m_args[0] = r_target; m_args[1] = r_id; m_args[2] = r_uri;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_ROTATE_KEY, 3, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* ENCLAVE / create_enclave(...) / open_enclave(...) */
+    if (cdb_token_equals_ci(&tok, "create_enclave") || cdb_token_equals_ci(&tok, "open_enclave")) {
+        uint8_t mut_op = cdb_token_equals_ci(&tok, "open_enclave") ? CDB_MUT_OPEN_ENCLAVE : CDB_MUT_CREATE_ENCLAVE;
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_expect(pc, CDB_TOK_LPAREN, "Expected '('", NULL);
+        uint8_t r_eid = proc_alloc_temp_reg(pc);
+        uint8_t r_key = proc_alloc_temp_reg(pc);
+        uint8_t m_args[2];
+        proc_parse_arg(pc, pw, r_eid);
+        proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_parse_arg(pc, pw, r_key);
+        proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        m_args[0] = r_eid; m_args[1] = r_key;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, mut_op, 2, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+    if (tok.kind == CDB_TOK_KW_OPEN || cdb_token_equals_ci(&tok, "OPEN")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "ENCLAVE");
+        uint8_t r_eid = proc_alloc_temp_reg(pc);
+        uint8_t r_key = proc_alloc_temp_reg(pc);
+        uint8_t m_args[2];
+        proc_parse_val_to_reg(pc, pw, r_eid);
+        proc_match_str(pc, "KEY");
+        proc_parse_val_to_reg(pc, pw, r_key);
+        m_args[0] = r_eid; m_args[1] = r_key;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_OPEN_ENCLAVE, 2, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* REGISTER / register_principal(...) */
+    if (cdb_token_equals_ci(&tok, "register_principal") || (tok.kind == CDB_TOK_KW_REGISTER && cdb_token_equals_ci(&tok, "REGISTER"))) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "PRINCIPAL");
+        uint8_t r_pid = proc_alloc_temp_reg(pc);
+        uint8_t r_tid = proc_alloc_temp_reg(pc);
+        uint8_t r_pk = proc_alloc_temp_reg(pc);
+        uint8_t m_args[3];
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_pid);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_tid);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_pk);
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_pid);
+            proc_match_str(pc, "TENANT");
+            proc_parse_val_to_reg(pc, pw, r_tid);
+            proc_match_str(pc, "PUBKEY");
+            proc_parse_val_to_reg(pc, pw, r_pk);
+        }
+        m_args[0] = r_pid; m_args[1] = r_tid; m_args[2] = r_pk;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_REGISTER_PRIN, 3, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* GRANT / grant_role(...) */
+    if (cdb_token_equals_ci(&tok, "grant_role") || (tok.kind == CDB_TOK_KW_GRANT && cdb_token_equals_ci(&tok, "GRANT"))) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "ROLE");
+        uint8_t r_rid = proc_alloc_temp_reg(pc);
+        uint8_t r_pid = proc_alloc_temp_reg(pc);
+        uint8_t r_scope = proc_alloc_temp_reg(pc);
+        uint8_t r_perms = proc_alloc_temp_reg(pc);
+        uint8_t m_args[4];
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_rid);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_pid);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_scope);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_perms);
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_rid);
+            proc_match_str(pc, "TO");
+            proc_parse_val_to_reg(pc, pw, r_pid);
+            if (proc_match_str(pc, "SCOPE")) {
+                proc_parse_val_to_reg(pc, pw, r_scope);
+            } else {
+                uint8_t zenc[16]; size_t zl = encode_int_val(0, zenc, sizeof(zenc));
+                cdb_proc_write_load_const(pw, r_scope, zenc, zl);
+            }
+            proc_match_str(pc, "PERMS");
+            proc_parse_val_to_reg(pc, pw, r_perms);
+        }
+        m_args[0] = r_pid; m_args[1] = r_rid; m_args[2] = r_scope; m_args[3] = r_perms;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_GRANT_ROLE, 4, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* DROP / drop_trigger(...) / drop_store(...) */
+    if (cdb_token_equals_ci(&tok, "drop_trigger")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_expect(pc, CDB_TOK_LPAREN, "Expected '('", NULL);
+        uint8_t r_name = proc_alloc_temp_reg(pc);
+        uint8_t m_args[1];
+        proc_parse_arg(pc, pw, r_name);
+        proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        m_args[0] = r_name;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_TRIGGER_UNREG, 1, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+    if (cdb_token_equals_ci(&tok, "drop_store")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_expect(pc, CDB_TOK_LPAREN, "Expected '('", NULL);
+        uint8_t r_sid = proc_alloc_temp_reg(pc);
+        uint8_t m_args[1];
+        proc_parse_arg(pc, pw, r_sid);
+        proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        m_args[0] = r_sid;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_DROP_STORE, 1, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+    if (tok.kind == CDB_TOK_KW_DROP || cdb_token_equals_ci(&tok, "DROP")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        if (proc_match_str(pc, "TRIGGER")) {
+            uint8_t r_name = proc_alloc_temp_reg(pc);
+            uint8_t m_args[1];
+            proc_parse_val_to_reg(pc, pw, r_name);
+            m_args[0] = r_name;
+            cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_TRIGGER_UNREG, 1, m_args);
+            pc->next_reg = base_reg;
+            return CDB_OK;
+        } else if (proc_match_str(pc, "STORE")) {
+            uint8_t r_sid = proc_alloc_temp_reg(pc);
+            uint8_t m_args[1];
+            proc_parse_val_to_reg(pc, pw, r_sid);
+            m_args[0] = r_sid;
+            cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_DROP_STORE, 1, m_args);
+            pc->next_reg = base_reg;
+            return CDB_OK;
+        }
+    }
+
+    /* CREATE */
+    if (tok.kind == CDB_TOK_KW_CREATE || cdb_token_equals_ci(&tok, "CREATE")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        if (proc_match_str(pc, "ENCLAVE")) {
+            uint8_t r_eid = proc_alloc_temp_reg(pc);
+            uint8_t r_key = proc_alloc_temp_reg(pc);
+            uint8_t m_args[2];
+            proc_parse_val_to_reg(pc, pw, r_eid);
+            proc_match_str(pc, "KEY");
+            proc_parse_val_to_reg(pc, pw, r_key);
+            m_args[0] = r_eid; m_args[1] = r_key;
+            cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_CREATE_ENCLAVE, 2, m_args);
+            pc->next_reg = base_reg;
+            return CDB_OK;
+        } else if (proc_match_str(pc, "TRIGGER")) {
+            uint8_t r_name = proc_alloc_temp_reg(pc);
+            uint8_t r_store = proc_alloc_temp_reg(pc);
+            uint8_t r_ev = proc_alloc_temp_reg(pc);
+            uint8_t r_proc = proc_alloc_temp_reg(pc);
+            uint8_t r_depth = proc_alloc_temp_reg(pc);
+            uint8_t m_args[5];
+            proc_parse_val_to_reg(pc, pw, r_name);
+            proc_match_str(pc, "ON");
+            proc_parse_val_to_reg(pc, pw, r_store);
+            proc_match_str(pc, "AFTER");
+            cdb_token ev_tok;
+            uint64_t ev_mask = 1;
+            if (cdb_lexer_peek(&pc->lex, &ev_tok) == CDB_OK) {
+                if (cdb_token_equals_ci(&ev_tok, "INSERT")) ev_mask = 1;
+                else if (cdb_token_equals_ci(&ev_tok, "UPDATE")) ev_mask = 2;
+                else if (cdb_token_equals_ci(&ev_tok, "DELETE")) ev_mask = 4;
+                else if (cdb_token_equals_ci(&ev_tok, "ALL")) ev_mask = 7;
+                cdb_lexer_next(&pc->lex, &ev_tok);
+            }
+            uint8_t ev_enc[16]; size_t evl = encode_int_val((int64_t)ev_mask, ev_enc, sizeof(ev_enc));
+            cdb_proc_write_load_const(pw, r_ev, ev_enc, evl);
+
+            proc_match_str(pc, "EXECUTE");
+            proc_parse_val_to_reg(pc, pw, r_proc);
+
+            uint64_t max_depth = 8;
+            if (proc_match_str(pc, "MAX")) {
+                proc_match_str(pc, "DEPTH");
+                cdb_token dtok;
+                if (cdb_lexer_peek(&pc->lex, &dtok) == CDB_OK && dtok.kind == CDB_TOK_INT) {
+                    cdb_lexer_next(&pc->lex, &dtok);
+                    max_depth = (uint64_t)dtok.num_val.i64;
+                }
+            }
+            uint8_t d_enc[16]; size_t dl = encode_int_val((int64_t)max_depth, d_enc, sizeof(d_enc));
+            cdb_proc_write_load_const(pw, r_depth, d_enc, dl);
+
+            m_args[0] = r_name; m_args[1] = r_store; m_args[2] = r_ev; m_args[3] = r_proc; m_args[4] = r_depth;
+            cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_TRIGGER_REG, 5, m_args);
+            pc->next_reg = base_reg;
+            return CDB_OK;
+        } else if (proc_match_str(pc, "LINK")) {
+            proc_match_str(pc, "TYPE");
+            uint8_t r_name = proc_alloc_temp_reg(pc);
+            uint8_t r_card = proc_alloc_temp_reg(pc);
+            uint8_t r_enf = proc_alloc_temp_reg(pc);
+            uint8_t r_inv = proc_alloc_temp_reg(pc);
+            uint8_t m_args[4];
+            proc_parse_val_to_reg(pc, pw, r_name);
+
+            uint64_t card = 3;
+            if (proc_match_str(pc, "CARDINALITY")) {
+                cdb_token ctok;
+                if (cdb_lexer_peek(&pc->lex, &ctok) == CDB_OK) {
+                    if (cdb_token_equals_ci(&ctok, "1:1")) card = 1;
+                    else if (cdb_token_equals_ci(&ctok, "1:N")) card = 2;
+                    else if (cdb_token_equals_ci(&ctok, "N:M")) card = 3;
+                    cdb_lexer_next(&pc->lex, &ctok);
+                }
+            }
+            uint8_t c_enc[16]; size_t cl = encode_int_val((int64_t)card, c_enc, sizeof(c_enc));
+            cdb_proc_write_load_const(pw, r_card, c_enc, cl);
+
+            uint64_t enf = proc_match_str(pc, "ENFORCED") ? 1 : 0;
+            uint8_t enf_enc[16]; size_t el = encode_int_val((int64_t)enf, enf_enc, sizeof(enf_enc));
+            cdb_proc_write_load_const(pw, r_enf, enf_enc, el);
+
+            uint64_t inv = 0;
+            if (proc_match_str(pc, "INVERSE")) {
+                cdb_token itok;
+                if (cdb_lexer_peek(&pc->lex, &itok) == CDB_OK && itok.kind == CDB_TOK_INT) {
+                    cdb_lexer_next(&pc->lex, &itok);
+                    inv = (uint64_t)itok.num_val.i64;
+                }
+            }
+            uint8_t inv_enc[16]; size_t il = encode_int_val((int64_t)inv, inv_enc, sizeof(inv_enc));
+            cdb_proc_write_load_const(pw, r_inv, inv_enc, il);
+
+            m_args[0] = r_name; m_args[1] = r_card; m_args[2] = r_enf; m_args[3] = r_inv;
+            cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_LINK_DEF_TYPE, 4, m_args);
+            pc->next_reg = base_reg;
+            return CDB_OK;
+        } else if (proc_match_str(pc, "STORE")) {
+            uint8_t r_name = proc_alloc_temp_reg(pc);
+            uint8_t r_model = proc_alloc_temp_reg(pc);
+            uint8_t m_args[2];
+            proc_parse_val_to_reg(pc, pw, r_name);
+            proc_match_str(pc, "MODEL");
+
+            uint64_t model = 2;
+            cdb_token mtok;
+            if (cdb_lexer_peek(&pc->lex, &mtok) == CDB_OK) {
+                if (cdb_token_equals_ci(&mtok, "relational") || cdb_token_equals_ci(&mtok, "table")) model = 1;
+                else if (cdb_token_equals_ci(&mtok, "document") || cdb_token_equals_ci(&mtok, "doc")) model = 2;
+                else if (cdb_token_equals_ci(&mtok, "vector") || cdb_token_equals_ci(&mtok, "vec")) model = 3;
+                else if (cdb_token_equals_ci(&mtok, "timeseries") || cdb_token_equals_ci(&mtok, "ts")) model = 4;
+                else if (cdb_token_equals_ci(&mtok, "link") || cdb_token_equals_ci(&mtok, "links")) model = 5;
+                else if (mtok.kind == CDB_TOK_INT) model = (uint64_t)mtok.num_val.i64;
+                cdb_lexer_next(&pc->lex, &mtok);
+            }
+            uint8_t m_enc[16]; size_t ml = encode_int_val((int64_t)model, m_enc, sizeof(m_enc));
+            cdb_proc_write_load_const(pw, r_model, m_enc, ml);
+            m_args[0] = r_name; m_args[1] = r_model;
+            cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_CREATE_STORE, 2, m_args);
+            pc->next_reg = base_reg;
+            return CDB_OK;
+        } else if (proc_match_str(pc, "SERIES")) {
+            uint8_t r_store = proc_alloc_temp_reg(pc);
+            uint8_t r_name = proc_alloc_temp_reg(pc);
+            uint8_t m_args[2];
+            proc_parse_val_to_reg(pc, pw, r_store);
+            proc_parse_val_to_reg(pc, pw, r_name);
+            m_args[0] = r_store; m_args[1] = r_name;
+            cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_TS_SERIES, 2, m_args);
+            pc->next_reg = base_reg;
+            return CDB_OK;
+        }
+    }
+
+    /* Flux create_* */
+    if (cdb_token_equals_ci(&tok, "create_trigger")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_expect(pc, CDB_TOK_LPAREN, "Expected '('", NULL);
+        uint8_t r_name = proc_alloc_temp_reg(pc);
+        uint8_t r_store = proc_alloc_temp_reg(pc);
+        uint8_t r_ev = proc_alloc_temp_reg(pc);
+        uint8_t r_proc = proc_alloc_temp_reg(pc);
+        uint8_t r_depth = proc_alloc_temp_reg(pc);
+        uint8_t m_args[5];
+        proc_parse_arg(pc, pw, r_name);
+        proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_parse_arg(pc, pw, r_store);
+        proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_parse_arg(pc, pw, r_ev);
+        proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_parse_arg(pc, pw, r_proc);
+        if (proc_match(pc, CDB_TOK_COMMA, NULL)) {
+            proc_parse_arg(pc, pw, r_depth);
+        } else {
+            uint8_t d_enc[16]; size_t dl = encode_int_val(8, d_enc, sizeof(d_enc));
+            cdb_proc_write_load_const(pw, r_depth, d_enc, dl);
+        }
+        proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        m_args[0] = r_name; m_args[1] = r_store; m_args[2] = r_ev; m_args[3] = r_proc; m_args[4] = r_depth;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_TRIGGER_REG, 5, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+    if (cdb_token_equals_ci(&tok, "create_link_type")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_expect(pc, CDB_TOK_LPAREN, "Expected '('", NULL);
+        uint8_t r_name = proc_alloc_temp_reg(pc);
+        uint8_t r_card = proc_alloc_temp_reg(pc);
+        uint8_t r_enf = proc_alloc_temp_reg(pc);
+        uint8_t r_inv = proc_alloc_temp_reg(pc);
+        uint8_t m_args[4];
+        proc_parse_arg(pc, pw, r_name);
+        proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_parse_arg(pc, pw, r_card);
+        if (proc_match(pc, CDB_TOK_COMMA, NULL)) {
+            proc_parse_arg(pc, pw, r_enf);
+        } else {
+            uint8_t e_enc[16]; size_t el = encode_int_val(0, e_enc, sizeof(e_enc));
+            cdb_proc_write_load_const(pw, r_enf, e_enc, el);
+        }
+        if (proc_match(pc, CDB_TOK_COMMA, NULL)) {
+            proc_parse_arg(pc, pw, r_inv);
+        } else {
+            uint8_t i_enc[16]; size_t il = encode_int_val(0, i_enc, sizeof(i_enc));
+            cdb_proc_write_load_const(pw, r_inv, i_enc, il);
+        }
+        proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        m_args[0] = r_name; m_args[1] = r_card; m_args[2] = r_enf; m_args[3] = r_inv;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_LINK_DEF_TYPE, 4, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+    if (cdb_token_equals_ci(&tok, "create_store")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_expect(pc, CDB_TOK_LPAREN, "Expected '('", NULL);
+        uint8_t r_name = proc_alloc_temp_reg(pc);
+        uint8_t r_model = proc_alloc_temp_reg(pc);
+        uint8_t m_args[2];
+        proc_parse_arg(pc, pw, r_name);
+        proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_parse_arg(pc, pw, r_model);
+        proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        m_args[0] = r_name; m_args[1] = r_model;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_CREATE_STORE, 2, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+    if (cdb_token_equals_ci(&tok, "create_series") || cdb_token_equals_ci(&tok, "series")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_expect(pc, CDB_TOK_LPAREN, "Expected '('", NULL);
+        uint8_t r_store = proc_alloc_temp_reg(pc);
+        uint8_t r_name = proc_alloc_temp_reg(pc);
+        uint8_t m_args[2];
+        proc_parse_arg(pc, pw, r_store);
+        proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_parse_arg(pc, pw, r_name);
+        proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        m_args[0] = r_store; m_args[1] = r_name;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_TS_SERIES, 2, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* ADD SCHEMA / add_schema(...) */
+    if (cdb_token_equals_ci(&tok, "add_schema") || cdb_token_equals_ci(&tok, "ADD")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "SCHEMA");
+        uint8_t r_store = proc_alloc_temp_reg(pc);
+        uint8_t r_sch = proc_alloc_temp_reg(pc);
+        uint8_t m_args[2];
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_store);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_sch);
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_store);
+            proc_parse_val_to_reg(pc, pw, r_sch);
+        }
+        m_args[0] = r_store; m_args[1] = r_sch;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_ADD_SCHEMA, 2, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* APPEND / append(...) */
+    if (cdb_token_equals_ci(&tok, "append") || (tok.kind == CDB_TOK_KW_APPEND && cdb_token_equals_ci(&tok, "APPEND"))) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "INTO");
+        proc_match_str(pc, "TIMESERIES");
+        proc_match_str(pc, "TS");
+        uint8_t r_store = proc_alloc_temp_reg(pc);
+        uint8_t r_series = proc_alloc_temp_reg(pc);
+        uint8_t r_ts = proc_alloc_temp_reg(pc);
+        uint8_t r_val = proc_alloc_temp_reg(pc);
+        uint8_t m_args[4];
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_store);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_series);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_ts);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_val);
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_store);
+            proc_match_str(pc, "SERIES");
+            proc_parse_val_to_reg(pc, pw, r_series);
+            proc_match_str(pc, "TIME");
+            proc_parse_val_to_reg(pc, pw, r_ts);
+            proc_match_str(pc, "VALUE");
+            proc_parse_val_to_reg(pc, pw, r_val);
+        }
+        m_args[0] = r_store; m_args[1] = r_series; m_args[2] = r_ts; m_args[3] = r_val;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_TS_APPEND, 4, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* PRUNE / prune(...) */
+    if (cdb_token_equals_ci(&tok, "prune") || (tok.kind == CDB_TOK_KW_PRUNE && cdb_token_equals_ci(&tok, "PRUNE"))) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "TIMESERIES");
+        proc_match_str(pc, "TS");
+        uint8_t r_store = proc_alloc_temp_reg(pc);
+        uint8_t r_series = proc_alloc_temp_reg(pc);
+        uint8_t r_ts = proc_alloc_temp_reg(pc);
+        uint8_t m_args[3];
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_store);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_series);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_ts);
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_store);
+            proc_match_str(pc, "SERIES");
+            proc_parse_val_to_reg(pc, pw, r_series);
+            proc_match_str(pc, "BEFORE");
+            proc_parse_val_to_reg(pc, pw, r_ts);
+        }
+        m_args[0] = r_store; m_args[1] = r_series; m_args[2] = r_ts;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_TS_DROP_BEFORE, 3, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* RETENTION / set_retention(...) */
+    if (cdb_token_equals_ci(&tok, "retention") || cdb_token_equals_ci(&tok, "set_retention")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_expect(pc, CDB_TOK_LPAREN, "Expected '('", NULL);
+        uint8_t r_store = proc_alloc_temp_reg(pc);
+        uint8_t r_series = proc_alloc_temp_reg(pc);
+        uint8_t r_age = proc_alloc_temp_reg(pc);
+        uint8_t m_args[3];
+        proc_parse_arg(pc, pw, r_store);
+        proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_parse_arg(pc, pw, r_series);
+        proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_parse_arg(pc, pw, r_age);
+        proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        m_args[0] = r_store; m_args[1] = r_series; m_args[2] = r_age;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_TS_RETENTION, 3, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* APPLY RETENTION / apply_retention(...) */
+    if (cdb_token_equals_ci(&tok, "apply_retention") || (tok.kind == CDB_TOK_KW_APPLY && cdb_token_equals_ci(&tok, "APPLY"))) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "RETENTION");
+        proc_match_str(pc, "TIMESERIES");
+        proc_match_str(pc, "TS");
+        uint8_t r_store = proc_alloc_temp_reg(pc);
+        uint8_t r_series = proc_alloc_temp_reg(pc);
+        uint8_t r_ts = proc_alloc_temp_reg(pc);
+        uint8_t m_args[3];
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_store);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_series);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_ts);
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_store);
+            proc_match_str(pc, "SERIES");
+            proc_parse_val_to_reg(pc, pw, r_series);
+            proc_match_str(pc, "TIME");
+            proc_parse_val_to_reg(pc, pw, r_ts);
+        }
+        m_args[0] = r_store; m_args[1] = r_series; m_args[2] = r_ts;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_TS_APPLY_RET, 3, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* DOWNSAMPLE / downsample(...) */
+    if (cdb_token_equals_ci(&tok, "downsample") || (tok.kind == CDB_TOK_KW_DOWNSAMPLE && cdb_token_equals_ci(&tok, "DOWNSAMPLE"))) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "TIMESERIES");
+        proc_match_str(pc, "TS");
+        proc_match_str(pc, "SOURCE");
+        uint8_t r_s_store = proc_alloc_temp_reg(pc);
+        uint8_t r_s_series = proc_alloc_temp_reg(pc);
+        uint8_t r_d_store = proc_alloc_temp_reg(pc);
+        uint8_t r_d_series = proc_alloc_temp_reg(pc);
+        uint8_t r_step = proc_alloc_temp_reg(pc);
+        uint8_t r_from = proc_alloc_temp_reg(pc);
+        uint8_t r_to = proc_alloc_temp_reg(pc);
+        uint8_t m_args[7];
+
+        int in_paren = proc_match(pc, CDB_TOK_LPAREN, NULL);
+        proc_parse_ref(pc, pw, r_s_store, r_s_series);
+        if (in_paren) proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_match_str(pc, "INTO");
+        proc_parse_ref(pc, pw, r_d_store, r_d_series);
+        if (in_paren) proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_match_str(pc, "STEP");
+        proc_parse_arg(pc, pw, r_step);
+        if (in_paren) proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_match_str(pc, "FROM");
+        proc_parse_arg(pc, pw, r_from);
+        if (in_paren) proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_match_str(pc, "TO");
+        proc_parse_arg(pc, pw, r_to);
+        if (in_paren) proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+
+        m_args[0] = r_s_store; m_args[1] = r_s_series; m_args[2] = r_d_store; m_args[3] = r_d_series;
+        m_args[4] = r_step; m_args[5] = r_from; m_args[6] = r_to;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_TS_DOWNSAMPLE, 7, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* FREE BLOB / free_blob(...) */
+    if (cdb_token_equals_ci(&tok, "free_blob") || (tok.kind == CDB_TOK_KW_FREE && cdb_token_equals_ci(&tok, "FREE"))) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "BLOB");
+        uint8_t r_store = proc_alloc_temp_reg(pc);
+        uint8_t r_page = proc_alloc_temp_reg(pc);
+        uint8_t r_cnt = proc_alloc_temp_reg(pc);
+        uint8_t r_len = proc_alloc_temp_reg(pc);
+        uint8_t m_args[4];
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_store);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_page);
+            if (proc_match(pc, CDB_TOK_COMMA, NULL)) {
+                proc_parse_arg(pc, pw, r_cnt);
+            } else {
+                uint8_t cenc[16]; size_t cl = encode_int_val(1, cenc, sizeof(cenc));
+                cdb_proc_write_load_const(pw, r_cnt, cenc, cl);
+            }
+            if (proc_match(pc, CDB_TOK_COMMA, NULL)) {
+                proc_parse_arg(pc, pw, r_len);
+            } else {
+                uint8_t lenc[16]; size_t ll = encode_int_val(0, lenc, sizeof(lenc));
+                cdb_proc_write_load_const(pw, r_len, lenc, ll);
+            }
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_store);
+            proc_match_str(pc, "PAGE");
+            proc_parse_val_to_reg(pc, pw, r_page);
+            if (proc_match_str(pc, "COUNT")) {
+                proc_parse_val_to_reg(pc, pw, r_cnt);
+            } else {
+                uint8_t cenc[16]; size_t cl = encode_int_val(1, cenc, sizeof(cenc));
+                cdb_proc_write_load_const(pw, r_cnt, cenc, cl);
+            }
+            if (proc_match_str(pc, "LEN")) {
+                proc_parse_val_to_reg(pc, pw, r_len);
+            } else {
+                uint8_t lenc[16]; size_t ll = encode_int_val(0, lenc, sizeof(lenc));
+                cdb_proc_write_load_const(pw, r_len, lenc, ll);
+            }
+        }
+        m_args[0] = r_store; m_args[1] = r_page; m_args[2] = r_cnt; m_args[3] = r_len;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_BLOB_FREE, 4, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* LINK / link(...) */
+    if (cdb_token_equals_ci(&tok, "link") || (tok.kind == CDB_TOK_KW_LINK && cdb_token_equals_ci(&tok, "LINK"))) {
+        cdb_lexer_next(&pc->lex, &tok);
+        uint8_t r_type = proc_alloc_temp_reg(pc);
+        uint8_t r_s_store = proc_alloc_temp_reg(pc);
+        uint8_t r_s_entry = proc_alloc_temp_reg(pc);
+        uint8_t r_t_store = proc_alloc_temp_reg(pc);
+        uint8_t r_t_entry = proc_alloc_temp_reg(pc);
+        uint8_t r_weight = proc_alloc_temp_reg(pc);
+        uint8_t r_time = proc_alloc_temp_reg(pc);
+        uint8_t m_args[7];
+
+        int in_paren = proc_match(pc, CDB_TOK_LPAREN, NULL);
+        proc_parse_arg(pc, pw, r_type);
+        if (in_paren) proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_match_str(pc, "FROM");
+        proc_parse_ref(pc, pw, r_s_store, r_s_entry);
+        if (in_paren) proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_match_str(pc, "TO");
+        proc_parse_ref(pc, pw, r_t_store, r_t_entry);
+
+        if (proc_match_str(pc, "WEIGHT") || (in_paren && proc_match(pc, CDB_TOK_COMMA, NULL))) {
+            proc_parse_arg(pc, pw, r_weight);
+        } else {
+            uint8_t wenc[16]; size_t wl = encode_f64_val(1.0, wenc, sizeof(wenc));
+            cdb_proc_write_load_const(pw, r_weight, wenc, wl);
+        }
+
+        if (proc_match_str(pc, "TIME") || (in_paren && proc_match(pc, CDB_TOK_COMMA, NULL))) {
+            proc_parse_arg(pc, pw, r_time);
+        } else {
+            uint8_t tenc[16]; size_t tl = encode_int_val(0, tenc, sizeof(tenc));
+            cdb_proc_write_load_const(pw, r_time, tenc, tl);
+        }
+        if (in_paren) proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+
+        m_args[0] = r_type; m_args[1] = r_s_store; m_args[2] = r_s_entry;
+        m_args[3] = r_t_store; m_args[4] = r_t_entry; m_args[5] = r_weight; m_args[6] = r_time;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_LINK_ADD, 7, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* REINFORCE / reinforce(...) */
+    if (cdb_token_equals_ci(&tok, "reinforce") || (tok.kind == CDB_TOK_KW_REINFORCE && cdb_token_equals_ci(&tok, "REINFORCE"))) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "LINK");
+        uint8_t r_type = proc_alloc_temp_reg(pc);
+        uint8_t r_s_store = proc_alloc_temp_reg(pc);
+        uint8_t r_s_entry = proc_alloc_temp_reg(pc);
+        uint8_t r_t_store = proc_alloc_temp_reg(pc);
+        uint8_t r_t_entry = proc_alloc_temp_reg(pc);
+        uint8_t r_weight = proc_alloc_temp_reg(pc);
+        uint8_t r_time = proc_alloc_temp_reg(pc);
+        uint8_t m_args[7];
+
+        int in_paren = proc_match(pc, CDB_TOK_LPAREN, NULL);
+        proc_parse_arg(pc, pw, r_type);
+        if (in_paren) proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_match_str(pc, "FROM");
+        proc_parse_ref(pc, pw, r_s_store, r_s_entry);
+        if (in_paren) proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_match_str(pc, "TO");
+        proc_parse_ref(pc, pw, r_t_store, r_t_entry);
+
+        if (proc_match_str(pc, "WEIGHT") || (in_paren && proc_match(pc, CDB_TOK_COMMA, NULL))) {
+            proc_parse_arg(pc, pw, r_weight);
+        } else {
+            uint8_t wenc[16]; size_t wl = encode_f64_val(1.0, wenc, sizeof(wenc));
+            cdb_proc_write_load_const(pw, r_weight, wenc, wl);
+        }
+
+        if (proc_match_str(pc, "TIME") || (in_paren && proc_match(pc, CDB_TOK_COMMA, NULL))) {
+            proc_parse_arg(pc, pw, r_time);
+        } else {
+            uint8_t tenc[16]; size_t tl = encode_int_val(0, tenc, sizeof(tenc));
+            cdb_proc_write_load_const(pw, r_time, tenc, tl);
+        }
+        if (in_paren) proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+
+        m_args[0] = r_type; m_args[1] = r_s_store; m_args[2] = r_s_entry;
+        m_args[3] = r_t_store; m_args[4] = r_t_entry; m_args[5] = r_weight; m_args[6] = r_time;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_LINK_REINFORCE, 7, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* UNLINK / unlink(...) */
+    if (cdb_token_equals_ci(&tok, "unlink") || (tok.kind == CDB_TOK_KW_UNLINK && cdb_token_equals_ci(&tok, "UNLINK"))) {
+        cdb_lexer_next(&pc->lex, &tok);
+        uint8_t r_type = proc_alloc_temp_reg(pc);
+        uint8_t r_s_store = proc_alloc_temp_reg(pc);
+        uint8_t r_s_entry = proc_alloc_temp_reg(pc);
+        uint8_t r_t_store = proc_alloc_temp_reg(pc);
+        uint8_t r_t_entry = proc_alloc_temp_reg(pc);
+        uint8_t m_args[5];
+
+        int in_paren = proc_match(pc, CDB_TOK_LPAREN, NULL);
+        proc_parse_arg(pc, pw, r_type);
+        if (in_paren) proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_match_str(pc, "FROM");
+        proc_parse_ref(pc, pw, r_s_store, r_s_entry);
+        if (in_paren) proc_match(pc, CDB_TOK_COMMA, NULL);
+        proc_match_str(pc, "TO");
+        proc_parse_ref(pc, pw, r_t_store, r_t_entry);
+        if (in_paren) proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+
+        m_args[0] = r_type; m_args[1] = r_s_store; m_args[2] = r_s_entry;
+        m_args[3] = r_t_store; m_args[4] = r_t_entry;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_LINK_REMOVE, 5, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* INSERT / insert(...) / table_insert(...) / vec_insert(...) */
+    if (cdb_token_equals_ci(&tok, "insert") || cdb_token_equals_ci(&tok, "table_insert") || cdb_token_equals_ci(&tok, "vec_insert") ||
+        (tok.kind == CDB_TOK_KW_INSERT && cdb_token_equals_ci(&tok, "INSERT"))) {
+        uint8_t mut_op = CDB_MUT_DOC_INSERT;
+        if (cdb_token_equals_ci(&tok, "table_insert")) mut_op = CDB_MUT_TABLE_INSERT;
+        else if (cdb_token_equals_ci(&tok, "vec_insert")) mut_op = CDB_MUT_VEC_INSERT;
+
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "INTO");
+        if (proc_match_str(pc, "TABLE")) mut_op = CDB_MUT_TABLE_INSERT;
+        else if (proc_match_str(pc, "VECTORS") || proc_match_str(pc, "VECTOR")) mut_op = CDB_MUT_VEC_INSERT;
+
+        uint8_t r_store = proc_alloc_temp_reg(pc);
+        uint8_t r_data = proc_alloc_temp_reg(pc);
+        uint8_t r_sum = proc_alloc_temp_reg(pc);
+        uint8_t m_args[3];
+        uint8_t argc = 2;
+
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_store);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_data);
+            if (proc_match(pc, CDB_TOK_COMMA, NULL)) {
+                proc_parse_arg(pc, pw, r_sum);
+                argc = 3;
+            }
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_store);
+            proc_match_str(pc, "VALUES");
+            if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+                proc_parse_val_to_reg(pc, pw, r_data);
+                if (proc_match(pc, CDB_TOK_COMMA, NULL)) {
+                    proc_parse_val_to_reg(pc, pw, r_sum);
+                    argc = 3;
+                }
+                proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+            } else {
+                proc_parse_val_to_reg(pc, pw, r_data);
+            }
+        }
+        m_args[0] = r_store; m_args[1] = r_data; m_args[2] = r_sum;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, mut_op, argc, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* UPDATE / update(...) */
+    if (cdb_token_equals_ci(&tok, "update") || (tok.kind == CDB_TOK_KW_UPDATE && cdb_token_equals_ci(&tok, "UPDATE"))) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "TABLE");
+        uint8_t r_store = proc_alloc_temp_reg(pc);
+        uint8_t r_entry = proc_alloc_temp_reg(pc);
+        uint8_t r_data = proc_alloc_temp_reg(pc);
+        uint8_t m_args[3];
+
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_store);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_entry);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_data);
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_store);
+            proc_match_str(pc, "SET");
+            proc_parse_val_to_reg(pc, pw, r_data);
+            proc_match_str(pc, "WHERE");
+            proc_match_str(pc, "ID");
+            proc_match_str(pc, "ENTRY");
+            proc_match(pc, CDB_TOK_EQ, NULL);
+            proc_parse_val_to_reg(pc, pw, r_entry);
+        }
+        m_args[0] = r_store; m_args[1] = r_entry; m_args[2] = r_data;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_TABLE_UPDATE, 3, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* PATCH / patch(...) */
+    if (cdb_token_equals_ci(&tok, "patch") || (tok.kind == CDB_TOK_KW_PATCH && cdb_token_equals_ci(&tok, "PATCH"))) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "DOCUMENT");
+        proc_match_str(pc, "DOC");
+        uint8_t r_store = proc_alloc_temp_reg(pc);
+        uint8_t r_entry = proc_alloc_temp_reg(pc);
+        uint8_t r_data = proc_alloc_temp_reg(pc);
+        uint8_t m_args[3];
+
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_store);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_entry);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_data);
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_store);
+            proc_parse_val_to_reg(pc, pw, r_entry);
+            proc_match_str(pc, "WITH");
+            proc_parse_val_to_reg(pc, pw, r_data);
+        }
+        m_args[0] = r_store; m_args[1] = r_entry; m_args[2] = r_data;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_DOC_PATCH, 3, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* REPLACE / replace(...) */
+    if (cdb_token_equals_ci(&tok, "replace") || (tok.kind == CDB_TOK_KW_REPLACE && cdb_token_equals_ci(&tok, "REPLACE"))) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "DOCUMENT");
+        proc_match_str(pc, "DOC");
+        uint8_t r_store = proc_alloc_temp_reg(pc);
+        uint8_t r_entry = proc_alloc_temp_reg(pc);
+        uint8_t r_data = proc_alloc_temp_reg(pc);
+        uint8_t r_sum = proc_alloc_temp_reg(pc);
+        uint8_t m_args[4];
+        uint8_t argc = 3;
+
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_store);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_entry);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_data);
+            if (proc_match(pc, CDB_TOK_COMMA, NULL)) {
+                proc_parse_arg(pc, pw, r_sum);
+                argc = 4;
+            }
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_store);
+            proc_parse_val_to_reg(pc, pw, r_entry);
+            proc_match_str(pc, "WITH");
+            proc_parse_val_to_reg(pc, pw, r_data);
+            if (proc_match_str(pc, "SUMMARY")) {
+                proc_parse_val_to_reg(pc, pw, r_sum);
+                argc = 4;
+            }
+        }
+        m_args[0] = r_store; m_args[1] = r_entry; m_args[2] = r_data; m_args[3] = r_sum;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_DOC_REPLACE, argc, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* DELETE / delete(...) */
+    if (cdb_token_equals_ci(&tok, "delete") || (tok.kind == CDB_TOK_KW_DELETE && cdb_token_equals_ci(&tok, "DELETE"))) {
+        uint8_t mut_op = CDB_MUT_DOC_DELETE;
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_match_str(pc, "FROM");
+        if (proc_match_str(pc, "TABLE")) mut_op = CDB_MUT_TABLE_DELETE;
+        else if (proc_match_str(pc, "VECTORS") || proc_match_str(pc, "VECTOR")) mut_op = CDB_MUT_VEC_DELETE;
+
+        uint8_t r_store = proc_alloc_temp_reg(pc);
+        uint8_t r_entry = proc_alloc_temp_reg(pc);
+        uint8_t m_args[2];
+
+        if (proc_match(pc, CDB_TOK_LPAREN, NULL)) {
+            proc_parse_arg(pc, pw, r_store);
+            proc_match(pc, CDB_TOK_COMMA, NULL);
+            proc_parse_arg(pc, pw, r_entry);
+            proc_expect(pc, CDB_TOK_RPAREN, "Expected ')'", NULL);
+        } else {
+            proc_parse_val_to_reg(pc, pw, r_store);
+            proc_match_str(pc, "WHERE");
+            proc_match_str(pc, "ID");
+            proc_match_str(pc, "ENTRY");
+            proc_match(pc, CDB_TOK_EQ, NULL);
+            proc_parse_val_to_reg(pc, pw, r_entry);
+        }
+        m_args[0] = r_store; m_args[1] = r_entry;
+        cdb_proc_write_call_mutation_ex(pw, out_reg, mut_op, 2, m_args);
+        pc->next_reg = base_reg;
+        return CDB_OK;
+    }
+
+    /* Piped Flux source expressions: yield(...) | into(...) */
+    if (cdb_token_equals_ci(&tok, "yield")) {
+        cdb_lexer_next(&pc->lex, &tok);
+        proc_expect(pc, CDB_TOK_LPAREN, "Expected '(' after yield", NULL);
+        uint8_t r_val = proc_alloc_temp_reg(pc);
+        proc_parse_arg(pc, pw, r_val);
+        proc_expect(pc, CDB_TOK_RPAREN, "Expected ')' after yield argument", NULL);
+
+        if (proc_match(pc, CDB_TOK_PIPE, NULL) || proc_match(pc, CDB_TOK_PIPE_FWD, NULL)) {
+            cdb_token sink_tok;
+            if (cdb_lexer_next(&pc->lex, &sink_tok) == CDB_OK) {
+                if (cdb_token_equals_ci(&sink_tok, "into") || sink_tok.kind == CDB_TOK_KW_INTO) {
+                    proc_expect(pc, CDB_TOK_LPAREN, "Expected '(' after into", NULL);
+                    uint8_t r_store = proc_alloc_temp_reg(pc);
+                    proc_parse_arg(pc, pw, r_store);
+                    proc_expect(pc, CDB_TOK_RPAREN, "Expected ')' after into argument", NULL);
+
+                    uint8_t m_args[2];
+                    m_args[0] = r_store;
+                    m_args[1] = r_val;
+                    cdb_proc_write_call_mutation_ex(pw, out_reg, CDB_MUT_DOC_INSERT, 2, m_args);
+                    pc->next_reg = base_reg;
+                    return CDB_OK;
+                }
+            }
+        }
+    }
+
+    /* Fallback: consume token */
+    cdb_lexer_next(&pc->lex, &tok);
+    return CDB_OK;
+}
+
 cdb_status cdb_compile_proc(const char *src, size_t len,
                             cdb_catalog *cat,
                             uint8_t *bc_buf, size_t bc_cap,
@@ -1403,95 +2709,15 @@ cdb_status cdb_compile_proc(const char *src, size_t len,
             break;
         }
 
-        /* LET $var = expr; */
-        if (tok.kind == CDB_TOK_KW_LET) {
+        if (tok.kind == CDB_TOK_SEMICOLON) {
             cdb_lexer_next(&pc.lex, &tok);
-            cdb_token var_tok;
-            if (proc_expect(&pc, CDB_TOK_PARAM, "Expected $variable after LET", &var_tok) != CDB_OK) return CDB_E_INVALID_ARG;
-            proc_expect(&pc, CDB_TOK_EQ, "Expected '=' in LET assignment", NULL);
-
-            uint8_t r = proc_get_or_alloc_var(&pc, var_tok.start, (size_t)var_tok.len);
-
-            /* Check if assigning literal int */
-            cdb_token val_tok;
-            if (cdb_lexer_peek(&pc.lex, &val_tok) == CDB_OK && val_tok.kind == CDB_TOK_INT) {
-                cdb_lexer_next(&pc.lex, &val_tok);
-                uint8_t enc[16];
-                size_t elen = encode_int_val(val_tok.num_val.i64, enc, sizeof(enc));
-                cdb_proc_write_load_const(&pw, r, enc, elen);
-            } else if (val_tok.kind == CDB_TOK_STRING) {
-                cdb_lexer_next(&pc.lex, &val_tok);
-                char sbuf[256];
-                size_t slen = 0;
-                cdb_token_unescape_string(&val_tok, sbuf, sizeof(sbuf), &slen);
-                uint8_t enc[256];
-                size_t elen = encode_string_val(sbuf, slen, enc, sizeof(enc));
-                cdb_proc_write_load_const(&pw, r, enc, elen);
-            } else {
-                /* Other expressions or math calls */
-                cdb_lexer_next(&pc.lex, &val_tok);
-            }
-            proc_match(&pc, CDB_TOK_SEMICOLON, NULL);
             continue;
         }
 
-        /* RETURN expr; */
-        if (tok.kind == CDB_TOK_KW_RETURN) {
-            cdb_lexer_next(&pc.lex, &tok);
-            cdb_token ret_tok;
-            uint8_t src_reg = 0;
-            if (cdb_lexer_peek(&pc.lex, &ret_tok) == CDB_OK && ret_tok.kind == CDB_TOK_PARAM) {
-                cdb_lexer_next(&pc.lex, &ret_tok);
-                src_reg = proc_get_or_alloc_var(&pc, ret_tok.start, (size_t)ret_tok.len);
-            }
-            cdb_proc_write_return(&pw, src_reg);
-            proc_match(&pc, CDB_TOK_SEMICOLON, NULL);
-            continue;
+        cdb_status st = proc_compile_statement(&pc, &pw);
+        if (st != CDB_OK) {
+            return st;
         }
-
-        /* SAVEPOINT <ident>; */
-        if (cdb_token_equals_ci(&tok, "SAVEPOINT")) {
-            cdb_lexer_next(&pc.lex, &tok);
-            cdb_token sp_name;
-            if (proc_expect(&pc, CDB_TOK_IDENT, "Expected savepoint name", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
-            uint8_t sp_id = (uint8_t)(sp_name.len > 0 ? (uint8_t)((unsigned char)sp_name.start[0] % 8) : 1u);
-            cdb_proc_write_savepoint(&pw, sp_id);
-            proc_match(&pc, CDB_TOK_SEMICOLON, NULL);
-            continue;
-        }
-
-        /* ROLLBACK TO <ident>; */
-        if (cdb_token_equals_ci(&tok, "ROLLBACK")) {
-            cdb_lexer_next(&pc.lex, &tok);
-            cdb_token to_tok;
-            if (cdb_lexer_peek(&pc.lex, &to_tok) == CDB_OK && cdb_token_equals_ci(&to_tok, "TO")) {
-                cdb_lexer_next(&pc.lex, &to_tok);
-            }
-            cdb_token sp_name;
-            if (proc_expect(&pc, CDB_TOK_IDENT, "Expected savepoint name after ROLLBACK TO", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
-            uint8_t sp_id = (uint8_t)(sp_name.len > 0 ? (uint8_t)((unsigned char)sp_name.start[0] % 8) : 1u);
-            cdb_proc_write_rollback_to(&pw, sp_id);
-            proc_match(&pc, CDB_TOK_SEMICOLON, NULL);
-            continue;
-        }
-
-        /* RELEASE [SAVEPOINT] <ident>; */
-        if (cdb_token_equals_ci(&tok, "RELEASE")) {
-            cdb_lexer_next(&pc.lex, &tok);
-            cdb_token sp_kw;
-            if (cdb_lexer_peek(&pc.lex, &sp_kw) == CDB_OK && cdb_token_equals_ci(&sp_kw, "SAVEPOINT")) {
-                cdb_lexer_next(&pc.lex, &sp_kw);
-            }
-            cdb_token sp_name;
-            if (proc_expect(&pc, CDB_TOK_IDENT, "Expected savepoint name after RELEASE", &sp_name) != CDB_OK) return CDB_E_INVALID_ARG;
-            uint8_t sp_id = (uint8_t)(sp_name.len > 0 ? (uint8_t)((unsigned char)sp_name.start[0] % 8) : 1u);
-            cdb_proc_write_release_sp(&pw, sp_id);
-            proc_match(&pc, CDB_TOK_SEMICOLON, NULL);
-            continue;
-        }
-
-        /* Other statements */
-        cdb_lexer_next(&pc.lex, &tok);
         proc_match(&pc, CDB_TOK_SEMICOLON, NULL);
     }
 
