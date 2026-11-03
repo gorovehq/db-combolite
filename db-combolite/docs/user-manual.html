@@ -1,0 +1,1313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>db-combolite — Comprehensive User Manual</title>
+  <style>
+    :root {
+      --bg-primary: #0f172a;
+      --bg-secondary: #1e293b;
+      --bg-card: #1e293b;
+      --bg-card-hover: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-green: #4ade80;
+      --accent-purple: #c084fc;
+      --accent-amber: #fbbf24;
+      --accent-rose: #fb7185;
+      --border: #334155;
+      --code-bg: #0b1120;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background-color: var(--bg-primary);
+      color: var(--text-main);
+      line-height: 1.65;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+    header.site-header {
+      background-color: rgba(15, 23, 42, 0.95);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 1000;
+      padding: 0.75rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: var(--text-main);
+      text-decoration: none;
+    }
+    .brand .logo-badge {
+      background: linear-gradient(135deg, #0284c7, #38bdf8);
+      color: #fff;
+      padding: 0.25rem 0.6rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+    }
+    nav.top-nav {
+      display: flex;
+      gap: 1.25rem;
+      align-items: center;
+    }
+    nav.top-nav a {
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: color 0.15s ease;
+      padding: 0.35rem 0.65rem;
+      border-radius: 4px;
+    }
+    nav.top-nav a:hover, nav.top-nav a.active {
+      color: var(--text-main);
+      background-color: var(--bg-card);
+    }
+    nav.top-nav a.active {
+      color: var(--accent);
+      border-bottom: 2px solid var(--accent);
+    }
+    .layout-container {
+      display: flex;
+      flex: 1;
+      max-width: 1600px;
+      margin: 0 auto;
+      width: 100%;
+    }
+    aside.sidebar {
+      width: 300px;
+      flex-shrink: 0;
+      background-color: var(--bg-secondary);
+      border-right: 1px solid var(--border);
+      padding: 1.5rem 1rem;
+      position: sticky;
+      top: 57px;
+      height: calc(100vh - 57px);
+      overflow-y: auto;
+    }
+    aside.sidebar h3 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      margin-bottom: 0.75rem;
+      padding-left: 0.5rem;
+    }
+    aside.sidebar ul {
+      list-style: none;
+      margin-bottom: 1.5rem;
+    }
+    aside.sidebar li {
+      margin-bottom: 0.25rem;
+    }
+    aside.sidebar a {
+      display: block;
+      padding: 0.4rem 0.6rem;
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.85rem;
+      border-radius: 6px;
+      transition: all 0.15s;
+    }
+    aside.sidebar a:hover {
+      color: var(--text-main);
+      background-color: var(--bg-card-hover);
+    }
+    aside.sidebar a.subitem {
+      padding-left: 1.25rem;
+      font-size: 0.8rem;
+    }
+    main.content {
+      flex: 1;
+      padding: 2.5rem 3.5rem;
+      overflow-x: hidden;
+      max-width: 1200px;
+    }
+    .hero-title {
+      font-size: 2.5rem;
+      font-weight: 800;
+      margin-bottom: 0.5rem;
+      background: linear-gradient(135deg, #f8fafc 40%, #38bdf8 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .hero-subtitle {
+      font-size: 1.15rem;
+      color: var(--text-muted);
+      margin-bottom: 2rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1.5rem;
+    }
+    h2 {
+      font-size: 1.75rem;
+      font-weight: 700;
+      margin-top: 3rem;
+      margin-bottom: 1rem;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 0.5rem;
+    }
+    h3 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin-top: 2rem;
+      margin-bottom: 0.75rem;
+      color: var(--accent);
+    }
+    h4 {
+      font-size: 1.05rem;
+      font-weight: 600;
+      margin-top: 1.5rem;
+      margin-bottom: 0.5rem;
+      color: #e2e8f0;
+    }
+    p { margin-bottom: 1rem; }
+    ul, ol {
+      margin-left: 1.5rem;
+      margin-bottom: 1rem;
+    }
+    li { margin-bottom: 0.4rem; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1.5rem 0;
+      background-color: var(--bg-secondary);
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      font-size: 0.9rem;
+    }
+    th, td {
+      padding: 0.75rem 1rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      background-color: #0b1329;
+      color: var(--accent);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      letter-spacing: 0.05em;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background-color: rgba(255, 255, 255, 0.02); }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 0.85em;
+      background-color: var(--code-bg);
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+      color: #38bdf8;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    pre {
+      background-color: var(--code-bg);
+      padding: 1.25rem;
+      border-radius: 8px;
+      overflow-x: auto;
+      margin: 1.25rem 0;
+      border: 1px solid var(--border);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.85rem;
+      line-height: 1.5;
+    }
+    pre code {
+      background: none;
+      padding: 0;
+      border: none;
+      color: #e2e8f0;
+    }
+    .alert {
+      background-color: rgba(56, 189, 248, 0.08);
+      border-left: 4px solid var(--accent);
+      padding: 1rem 1.25rem;
+      border-radius: 0 8px 8px 0;
+      margin: 1.5rem 0;
+    }
+    .alert.important {
+      background-color: rgba(251, 191, 36, 0.08);
+      border-left-color: var(--accent-amber);
+    }
+    .alert.tip {
+      background-color: rgba(74, 222, 128, 0.08);
+      border-left-color: var(--accent-green);
+    }
+    .alert-title {
+      font-weight: 700;
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.25rem;
+      color: var(--accent);
+    }
+    .alert.important .alert-title { color: var(--accent-amber); }
+    .alert.tip .alert-title { color: var(--accent-green); }
+    .diagram-container {
+      background-color: #0b1120;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.5rem;
+      margin: 2rem 0;
+      text-align: center;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+    }
+    .diagram-caption {
+      margin-top: 1rem;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      font-weight: 500;
+      text-align: center;
+    }
+    svg.process-diagram {
+      max-width: 100%;
+      height: auto;
+      display: inline-block;
+    }
+    footer {
+      background-color: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      padding: 2rem;
+      text-align: center;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-top: 4rem;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Site Header -->
+  <header class="site-header">
+    <a href="index.html" class="brand">
+      <span class="logo-badge">CDB</span>
+      <span>db-combolite Docs</span>
+    </a>
+    <nav class="top-nav">
+      <a href="index.html">Overview</a>
+      <a href="theory-of-operation.html">Theory of Operation</a>
+      <a href="user-manual.html" class="active">User Manual</a>
+      <a href="api-usage.html">API Reference</a>
+      <a href="swagger.html">Swagger C99 API</a>
+    </nav>
+  </header>
+
+  <div class="layout-container">
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar">
+      <h3>User Manual</h3>
+      <ul>
+        <li><a href="#quickstart">1. Quick Start Guide</a></li>
+        <li><a href="#embedding" class="subitem">1.1 Embedding &amp; CMake</a></li>
+        <li><a href="#memory-model" class="subitem">1.2 Memory Sizing &amp; Buffers</a></li>
+        <li><a href="#database-lifecycle" class="subitem">1.3 Opening &amp; Closing</a></li>
+        <li><a href="#transactions" class="subitem">1.4 Transactions &amp; Durability</a></li>
+        <li><a href="#stores-schemas">2. Stores &amp; Catalog Management</a></li>
+        <li><a href="#crud-guide">3. Multi-Model CRUD Guide</a></li>
+        <li><a href="#crud-matrix" class="subitem">3.1 Universal CRUD Matrix</a></li>
+        <li><a href="#crud-relational" class="subitem">3.2 Relational CRUD</a></li>
+        <li><a href="#crud-document" class="subitem">3.3 Document CRUD</a></li>
+        <li><a href="#crud-vector" class="subitem">3.4 Vector CRUD</a></li>
+        <li><a href="#crud-ts" class="subitem">3.5 Time Series CRUD</a></li>
+        <li><a href="#crud-links" class="subitem">3.6 Graph Links CRUD</a></li>
+        <li><a href="#crud-blobs" class="subitem">3.7 Streaming Blobs CRUD</a></li>
+        <li><a href="#crud-cmbql" class="subitem">3.8 CMBQL &amp; VM Mutations</a></li>
+        <li><a href="#relational-guide">4. Relational Tables Deep Dive</a></li>
+        <li><a href="#document-guide">5. Document Pools &amp; BM25 FTS</a></li>
+        <li><a href="#vector-guide">6. Vector Collections &amp; Search</a></li>
+        <li><a href="#timeseries-guide">7. Time Series Engine</a></li>
+        <li><a href="#links-guide">8. Graph Links &amp; Cardinality</a></li>
+        <li><a href="#blob-guide">9. Streaming Large Blobs</a></li>
+        <li><a href="#cmbql-guide">10. CMBQL Query Language Guide</a></li>
+        <li><a href="#procs-triggers">11. Stored Procedures &amp; Triggers</a></li>
+        <li><a href="#crdt-guide">12. CRDT Peer Synchronization</a></li>
+        <li><a href="#security-guide">13. Security, Enclaves &amp; Auditing</a></li>
+      </ul>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="content">
+      <h1 class="hero-title">db-combolite User Manual</h1>
+      <p class="hero-subtitle">
+        A practical, hands-on developer manual for integrating, configuring, modeling, and querying multi-model data within <code>db-combolite</code> applications.
+      </p>
+
+      <!-- Section 1: Quickstart -->
+      <section id="quickstart">
+        <h2>1. Quick Start Guide</h2>
+        <p>
+          <code>db-combolite</code> is delivered as an embeddable C99 library. It requires no separate installation of database daemons, system services, or socket servers. A single database is represented on disk as an archive file (e.g. <code>app_data.cdbarch</code>).
+        </p>
+
+        <h3 id="embedding">1.1 Embedding &amp; CMake Integration</h3>
+        <p>
+          Add <code>db-combolite</code> to your project's <code>CMakeLists.txt</code>:
+        </p>
+        <pre><code># Include the combolite subdirectory
+add_subdirectory(path/to/db-combolite)
+
+# Link your application against the static library
+target_link_libraries(my_application PRIVATE combolite)
+target_include_directories(my_application PRIVATE path/to/db-combolite/include)</code></pre>
+
+        <h3 id="memory-model">1.2 Memory Sizing &amp; Caller-Owned Buffers</h3>
+        <p>
+          Because <code>db-combolite</code> operates under a <strong>strict zero-heap policy</strong>, the host application supplies memory buffers at initialization via <code>cdb_db_config</code>. The library provides helper functions to calculate exact buffer dimensions:
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Buffer Field</th>
+              <th>Calculation Helper</th>
+              <th>Purpose</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>doc_buffers</code></td>
+              <td><code>cdb_doc_buffers_size(page_size, doc_max)</code></td>
+              <td>Working memory for document revisions, JSON patches, and nibblet packing.</td>
+            </tr>
+            <tr>
+              <td><code>fts_buffers</code></td>
+              <td><code>cdb_fts_buffers_size(page_size)</code></td>
+              <td>Inverted index postings and BM25 term dictionary working pages.</td>
+            </tr>
+            <tr>
+              <td><code>table_buffers</code></td>
+              <td><code>cdb_table_buffers_size(page_size)</code></td>
+              <td>Row object decoding, constraint verification, and secondary index maintenance.</td>
+            </tr>
+            <tr>
+              <td><code>vec_buffers</code></td>
+              <td><code>3 * page_size</code></td>
+              <td>Vector packing, block indexing, and distance metric calculations.</td>
+            </tr>
+            <tr>
+              <td><code>vec_work</code></td>
+              <td><code>cdb_vec_work_size(k_neighbours)</code></td>
+              <td>Priority queue scratchpad for approximate nearest neighbour graph traversals.</td>
+            </tr>
+            <tr>
+              <td><code>ts_buffers</code></td>
+              <td><code>3 * page_size</code></td>
+              <td>Time-series block compression, delta-of-delta bit packing, and Gorilla XOR.</td>
+            </tr>
+            <tr>
+              <td><code>ts_work</code></td>
+              <td><code>cdb_ts_work_size()</code></td>
+              <td>Staging memory for out-of-order/late arrivals and time-window queries.</td>
+            </tr>
+            <tr>
+              <td><code>slot_mem</code></td>
+              <td><code>cdb_db_slot_mem_size(max_open)</code></td>
+              <td>Pre-allocated cache slots for open stores (tables, documents, vectors).</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3 id="database-lifecycle">1.3 Opening &amp; Closing a Database</h3>
+        <p>
+          Opening a database requires initializing the host environment (<code>cdb_hostenv</code>), setting configuration options, and calling <code>cdb_db_open</code>:
+        </p>
+        <pre><code>#include &lt;combolite/cdb_common.h&gt;
+#include &lt;combolite/cdb_env.h&gt;
+#include &lt;cdb_db.h&gt;
+#include &lt;cdb_hostenv.h&gt;
+
+cdb_hostenv host;
+cdb_env env = cdb_hostenv_make(&amp;host);
+cdb_db db;
+cdb_db_config cfg;
+memset(&amp;cfg, 0, sizeof(cfg));
+
+/* Configure standard 4096-byte pages */
+cfg.pager.page_size = 4096;
+
+/* Allocate caller buffers */
+uint8_t doc_buf[65536];
+cfg.doc_buffers = doc_buf;
+
+/* Open database (creates archive if not present) */
+cdb_status s = cdb_db_open(&amp;db, &amp;env, "my_database.cdbarch", &amp;cfg, NULL);
+if (s != CDB_OK) {
+    fprintf(stderr, "Failed to open database: %s\n", cdb_status_str(s));
+    return -1;
+}
+
+/* Perform database operations ... */
+
+/* Close and flush companion tracks */
+cdb_db_close(&amp;db);</code></pre>
+
+        <h3 id="transactions">1.4 Transactions &amp; Durability Settings</h3>
+        <p>
+          All mutating operations (documents, tables, links, vectors, and time-series) occur within explicit ACID transactions:
+        </p>
+        <pre><code>/* Begin transaction with NORMAL durability (fast, durable at checkpoints) */
+s = cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+
+/* Stage mutations ... */
+
+/* Commit transaction */
+s = cdb_tx_commit(&amp;db);
+if (s != CDB_OK) {
+    cdb_tx_abort(&amp;db);
+}</code></pre>
+      </section>
+
+      <!-- Section 2: Stores & Catalog -->
+      <section id="stores-schemas">
+        <h2>2. Stores &amp; Catalog Management</h2>
+        <p>
+          An archive can host hundreds of individual stores across different data paradigms. Stores are tracked by the internal <strong>Catalog</strong>.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Model Constant</th>
+              <th>Numeric ID</th>
+              <th>Paradigm</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>CDB_MODEL_DOCUMENT</code></td><td><code>1</code></td><td>Document pool (schemaless or validated JSON-like objects).</td></tr>
+            <tr><td><code>CDB_MODEL_VECTOR</code></td><td><code>2</code></td><td>Dense embedding collections (F32, F16, BF16, I8, Binary).</td></tr>
+            <tr><td><code>CDB_MODEL_TIME_SERIES</code></td><td><code>3</code></td><td>Bit-compressed metric and event streams.</td></tr>
+            <tr><td><code>CDB_MODEL_TABLE</code></td><td><code>4</code></td><td>Relational row-oriented or column-oriented tables.</td></tr>
+            <tr><td><code>CDB_MODEL_LINK</code></td><td><code>5</code></td><td>Inter-entity graph relationships (reserved <code>$links</code> store).</td></tr>
+          </tbody>
+        </table>
+
+        <pre><code>uint64_t store_id = 0;
+/* Create or find an existing document store */
+s = cdb_db_create_store(&amp;db, "users", 5, CDB_MODEL_DOCUMENT, &amp;store_id);
+if (s == CDB_E_EXISTS) {
+    int found = 0;
+    cdb_db_find_store(&amp;db, "users", 5, &amp;store_id, &amp;found);
+}</code></pre>
+      </section>
+
+      <!-- Section 3: Comprehensive Multi-Model CRUD Guide -->
+      <section id="crud-guide">
+        <h2>3. Comprehensive Multi-Model CRUD Guide</h2>
+        <p>
+          Data manipulation across <code>db-combolite</code> follows a unified architectural principle: <strong>Create</strong>, <strong>Read</strong>, <strong>Update</strong>, and <strong>Delete</strong> operations are natively adapted for each storage paradigm while maintaining strict ACID isolation under caller transactions.
+        </p>
+
+        <h3 id="crud-matrix">3.1 The Universal Multi-Model CRUD Matrix</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Model Paradigm</th>
+              <th>Create (C)</th>
+              <th>Read (R)</th>
+              <th>Update (U)</th>
+              <th>Delete (D)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Relational Tables</strong></td>
+              <td><code>cdb_table_insert()</code></td>
+              <td><code>cdb_table_find()</code><br><code>cdb_table_get()</code><br><code>cdb_table_scan()</code></td>
+              <td><code>cdb_table_update()</code> (delta)<br><code>cdb_table_replace()</code> (full)</td>
+              <td><code>cdb_table_delete()</code></td>
+            </tr>
+            <tr>
+              <td><strong>Document Pools</strong></td>
+              <td><code>cdb_doc_insert()</code></td>
+              <td><code>cdb_doc_get()</code><br><code>cdb_doc_head()</code><br><code>cdb_fts_search()</code></td>
+              <td><code>cdb_doc_replace()</code><br><code>cdb_doc_patch()</code></td>
+              <td><code>cdb_doc_delete()</code> (tombstone)</td>
+            </tr>
+            <tr>
+              <td><strong>Vector Collections</strong></td>
+              <td><code>cdb_vec_insert()</code></td>
+              <td><code>cdb_vec_get()</code><br><code>cdb_vec_search()</code></td>
+              <td><code>cdb_vec_replace()</code></td>
+              <td><code>cdb_vec_delete()</code></td>
+            </tr>
+            <tr>
+              <td><strong>Time Series</strong></td>
+              <td><code>cdb_ts_append()</code></td>
+              <td><code>cdb_ts_range()</code><br><code>cdb_ts_series()</code></td>
+              <td>Timestamp collision overwrite</td>
+              <td><code>cdb_ts_drop_before()</code></td>
+            </tr>
+            <tr>
+              <td><strong>Graph Links</strong></td>
+              <td><code>cdb_link_add()</code></td>
+              <td><code>cdb_link_get()</code><br><code>cdb_link_list()</code></td>
+              <td><code>cdb_link_reinforce()</code></td>
+              <td><code>cdb_link_remove()</code></td>
+            </tr>
+            <tr>
+              <td><strong>Streaming Blobs</strong></td>
+              <td><code>cdb_db_blob_write_*()</code></td>
+              <td><code>cdb_db_blob_read_*()</code></td>
+              <td>Append new chunk or content hash</td>
+              <td><code>cdb_db_blob_free()</code></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <!-- 3.2 Relational CRUD -->
+        <h3 id="crud-relational">3.2 Relational Tables CRUD</h3>
+        <p>
+          Rows are encoded as objects keyed by column field IDs. Primary and secondary unique indexes are checked inside the open transaction before journaling.
+        </p>
+        <pre><code>/* --- CREATE: Insert a new row --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+uint8_t row_buf[256];
+cdb_value_writer w;
+cdb_value_writer_init(&amp;w, row_buf, sizeof(row_buf));
+cdb_value_begin_object(&amp;w);
+cdb_value_field_id(&amp;w, col_id);
+cdb_value_put_string(&amp;w, "Alice", 5);
+cdb_value_end_object(&amp;w);
+
+uint64_t entry_id = 0;
+cdb_status s = cdb_table_insert(&amp;db, table_id, row_buf, cdb_value_writer_len(&amp;w), &amp;entry_id);
+cdb_tx_commit(&amp;db);
+
+/* --- READ: Find by Primary Key or Scan --- */
+int found = 0;
+uint64_t found_entry = 0;
+s = cdb_table_find(&amp;db, table_id, pk_bytes, pk_len, &amp;found_entry, &amp;found);
+
+uint8_t read_buf[512];
+size_t row_len = 0;
+s = cdb_table_get(&amp;db, table_id, found_entry, read_buf, sizeof(read_buf), &amp;row_len);
+
+/* --- UPDATE: Partial column update --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+uint8_t update_buf[128];
+cdb_value_writer uw;
+cdb_value_writer_init(&amp;uw, update_buf, sizeof(update_buf));
+cdb_value_begin_object(&amp;uw);
+cdb_value_field_id(&amp;uw, score_col_id);
+cdb_value_put_f64(&amp;uw, 99.5);
+cdb_value_end_object(&amp;uw);
+
+s = cdb_table_update(&amp;db, table_id, found_entry, update_buf, cdb_value_writer_len(&amp;uw));
+cdb_tx_commit(&amp;db);
+
+/* --- DELETE: Remove row by entry ID --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+s = cdb_table_delete(&amp;db, table_id, found_entry);
+cdb_tx_commit(&amp;db);</code></pre>
+
+        <!-- 3.3 Document CRUD -->
+        <h3 id="crud-document">3.3 Document Pools CRUD</h3>
+        <p>
+          Documents maintain append-only revision histories. Deletions write <code>CDB_REV_TOMBSTONE</code> revisions, enabling historical time-travel queries.
+        </p>
+        <pre><code>/* --- CREATE: Insert document --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+uint64_t doc_entry = 0;
+s = cdb_doc_insert(&amp;db, pool_id, "Article summary", 15, json_buf, json_len, &amp;doc_entry);
+cdb_tx_commit(&amp;db);
+
+/* --- READ: Read head revision --- */
+uint8_t doc_out[4096];
+size_t doc_len = 0;
+cdb_doc_info info;
+s = cdb_doc_get(&amp;db, pool_id, doc_entry, 0 /* 0 = latest */, doc_out, sizeof(doc_out), &amp;doc_len, &amp;info);
+
+/* --- UPDATE: Apply JSON patch --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+/* Patch operation: [CDB_PATCH_SET, [path...], new_val] */
+s = cdb_doc_patch(&amp;db, pool_id, doc_entry, patch_bytes, patch_len);
+cdb_tx_commit(&amp;db);
+
+/* --- DELETE: Tombstone document --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+s = cdb_doc_delete(&amp;db, pool_id, doc_entry);
+cdb_tx_commit(&amp;db);</code></pre>
+
+        <!-- 3.4 Vector CRUD -->
+        <h3 id="crud-vector">3.4 Vector Collections CRUD</h3>
+        <pre><code>/* --- CREATE: Insert embedding linked to source document --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+uint64_t vec_id = 0;
+s = cdb_vec_insert(&amp;db, vec_store_id, float_coords, sizeof(float_coords), pool_id, doc_entry, &amp;vec_id);
+cdb_tx_commit(&amp;db);
+
+/* --- READ: Fetch raw vector or similarity search --- */
+float out_vec[384];
+size_t out_len = 0;
+uint64_t src_store = 0, src_entry = 0, src_rev = 0;
+s = cdb_vec_get(&amp;db, vec_store_id, vec_id, out_vec, sizeof(out_vec), &amp;out_len, &amp;src_store, &amp;src_entry, &amp;src_rev);
+
+/* --- UPDATE: Replace embedding coordinates --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+s = cdb_vec_replace(&amp;db, vec_store_id, vec_id, new_coords, sizeof(new_coords));
+cdb_tx_commit(&amp;db);
+
+/* --- DELETE: Remove vector from block & queue graph refresh --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+s = cdb_vec_delete(&amp;db, vec_store_id, vec_id);
+cdb_tx_commit(&amp;db);</code></pre>
+
+        <!-- 3.5 Time Series CRUD -->
+        <h3 id="crud-ts">3.5 Time Series Telemetry CRUD</h3>
+        <pre><code>/* --- CREATE: Append points --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+cdb_ts_in pts[1];
+pts[0].ts = 1714567890000ULL;
+pts[0].payload = encoded_pt_values;
+pts[0].len = encoded_pt_len;
+s = cdb_ts_append(&amp;db, ts_store_id, series_id, pts, 1);
+cdb_tx_commit(&amp;db);
+
+/* --- READ: Range query over time interval [from, to] --- */
+uint8_t range_buf[16384];
+size_t actual_bytes = 0;
+s = cdb_ts_range(&amp;db, ts_store_id, series_id, from_ts, to_ts, range_buf, sizeof(range_buf), &amp;actual_bytes);
+
+/* --- UPDATE: Collision overwrite --- */
+/* Ingesting a point with an identical timestamp replaces matching fields */
+
+/* --- DELETE: Drop points older than timestamp --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+s = cdb_ts_drop_before(&amp;db, ts_store_id, series_id, cutoff_ts);
+cdb_tx_commit(&amp;db);</code></pre>
+
+        <!-- 3.6 Graph Links CRUD -->
+        <h3 id="crud-links">3.6 Graph Links CRUD</h3>
+        <pre><code>/* --- CREATE: Establish link --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+s = cdb_link_add(&amp;db, type_id, source_ref, target_ref, 1.0f /* initial weight */, 0 /* auto time */);
+cdb_tx_commit(&amp;db);
+
+/* --- READ: Point check or scan --- */
+cdb_link link_out;
+int link_found = 0;
+s = cdb_link_get(&amp;db, type_id, source_ref, target_ref, &amp;link_out, &amp;link_found);
+
+/* --- UPDATE: Reinforce link weight --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+s = cdb_link_reinforce(&amp;db, type_id, source_ref, target_ref, 0.5f /* delta weight */, 0);
+cdb_tx_commit(&amp;db);
+
+/* --- DELETE: Remove link --- */
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+s = cdb_link_remove(&amp;db, type_id, source_ref, target_ref);
+cdb_tx_commit(&amp;db);</code></pre>
+
+        <!-- 3.7 Streaming Blobs CRUD -->
+        <h3 id="crud-blobs">3.7 Streaming Large Blobs CRUD</h3>
+        <pre><code>/* --- CREATE: Stream write blob --- */
+cdb_blob_writer bw;
+uint8_t scratch[4096];
+cdb_blob_ref ref;
+s = cdb_db_blob_write_begin(&amp;db, store_id, scratch, &amp;bw);
+while ((n = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+    cdb_db_blob_write_chunk(&amp;bw, chunk, n);
+}
+s = cdb_db_blob_write_end(&amp;bw, &amp;ref);
+
+/* --- READ: Stream read blob --- */
+cdb_blob_reader br;
+uint8_t page_buf[4096];
+s = cdb_db_blob_read_begin(&amp;db, store_id, &amp;ref, page_buf, 1 /* verify hash */, &amp;br);
+while ((s = cdb_db_blob_read_chunk(&amp;br, dest_buf, sizeof(dest_buf), &amp;out_len)) == CDB_OK &amp;&amp; out_len > 0) {
+    fwrite(dest_buf, 1, out_len, out_fp);
+}
+cdb_db_blob_read_end(&amp;br);
+
+/* --- DELETE: Free blob pages --- */
+s = cdb_db_blob_free(&amp;db, store_id, &amp;ref, page_buf);</code></pre>
+
+        <!-- 3.8 CMBQL CRUD -->
+        <h3 id="crud-cmbql">3.8 CMBQL Language &amp; Virtual Machine CRUD Reference</h3>
+        <p>
+          While the structured operator tree (<code>CMBQ</code>) is strictly read-only for plan composability, <strong>CMBQL</strong> provides full declarative statements and stored procedure bytecode (<code>CMBP</code>) to execute atomic multi-model CRUD mutations.
+        </p>
+
+        <h4>3.8.1 CMBQL Declarative CRUD Statements</h4>
+        <table>
+          <thead>
+            <tr><th>CRUD Operation</th><th>CMBQL Syntax</th><th>Target Model</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>CREATE</strong></td>
+              <td><code>INSERT INTO TABLE catalog (ebook_id, title) VALUES (101, 'Moby Dick');</code></td>
+              <td>Relational Table</td>
+            </tr>
+            <tr>
+              <td><strong>CREATE</strong></td>
+              <td><code>LET $ref = INSERT INTO POOL passages { book_id: 101, text: 'Call me Ishmael.' };</code></td>
+              <td>Document Pool</td>
+            </tr>
+            <tr>
+              <td><strong>CREATE</strong></td>
+              <td><code>INSERT INTO VECTOR book_vec ($vector, source_ref) VALUES (@embedding, $ref);</code></td>
+              <td>Vector Collection</td>
+            </tr>
+            <tr>
+              <td><strong>CREATE</strong></td>
+              <td><code>APPEND TO TIMESERIES metrics (timestamp: clock_now(), tags: {host: 'srv1'}, values: {cpu: 45.2});</code></td>
+              <td>Time Series</td>
+            </tr>
+            <tr>
+              <td><strong>CREATE</strong></td>
+              <td><code>LINK REF(catalog, 101) TO REF(catalog, 102) TYPE "similar_to" PROPERTIES {score: 0.92};</code></td>
+              <td>Graph Links</td>
+            </tr>
+            <tr>
+              <td><strong>READ</strong></td>
+              <td><code>SELECT title, author FROM catalog WHERE downloads &gt; 500 ORDER BY title ASC LIMIT 20;</code></td>
+              <td>Declarative SQL</td>
+            </tr>
+            <tr>
+              <td><strong>READ</strong></td>
+              <td><code>scan("passages") |&gt; text_search("whale", mode: "ALL") |&gt; hybrid_rank(fuse: "RRF") |&gt; limit(10);</code></td>
+              <td>Pipeline Operator Flux</td>
+            </tr>
+            <tr>
+              <td><strong>UPDATE</strong></td>
+              <td><code>UPDATE TABLE catalog SET downloads = downloads + 1 WHERE ebook_id = 101;</code></td>
+              <td>Relational Table</td>
+            </tr>
+            <tr>
+              <td><strong>UPDATE</strong></td>
+              <td><code>UPDATE POOL passages SET status = 'verified' WHERE book_id = 101;</code></td>
+              <td>Document Pool</td>
+            </tr>
+            <tr>
+              <td><strong>UPDATE</strong></td>
+              <td><code>PATCH POOL passages { op: "set", path: ["metadata", "reviewed"], value: true };</code></td>
+              <td>Document Delta Patch</td>
+            </tr>
+            <tr>
+              <td><strong>UPDATE</strong></td>
+              <td><code>REINFORCE LINK REF(catalog, 101) TO REF(catalog, 102) TYPE "similar_to" WEIGHT 0.05;</code></td>
+              <td>Neuron Weight Adjust</td>
+            </tr>
+            <tr>
+              <td><strong>DELETE</strong></td>
+              <td><code>DELETE FROM TABLE catalog WHERE ebook_id = 101;</code></td>
+              <td>Relational Table</td>
+            </tr>
+            <tr>
+              <td><strong>DELETE</strong></td>
+              <td><code>DELETE FROM POOL passages WHERE book_id = 101;</code></td>
+              <td>Document Tombstone</td>
+            </tr>
+            <tr>
+              <td><strong>DELETE</strong></td>
+              <td><code>UNLINK REF(catalog, 101) FROM REF(catalog, 102) TYPE "similar_to";</code></td>
+              <td>Graph Link Removal</td>
+            </tr>
+            <tr>
+              <td><strong>DELETE</strong></td>
+              <td><code>DROP FROM TIMESERIES metrics BEFORE (clock_now() - 2592000000000000);</code></td>
+              <td>Time Series Pruning</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h4>3.8.2 Atomic Multi-Model Ingestion Procedure (Worked Example)</h4>
+        <p>
+          This stored procedure demonstrates cross-model atomic CRUD: inserting metadata into a relational table, storing passages in a document pool, indexing dense vector embeddings, searching nearest neighbors, establishing graph links, and appending telemetry metrics within a single ACID transaction:
+        </p>
+        <pre><code>PROCEDURE ingest_gutenberg_book(
+    $ebook_id    INT,
+    $title       STRING,
+    $author      STRING,
+    $language    STRING,
+    $passages    ARRAY,   -- Array of { seq: INT, text: STRING, vector: VECTOR(F32, 384) }
+    $book_vector VECTOR(F32, 384),
+    $client_id   STRING
+)
+BEGIN TRANSACTION;
+    LET $start_time = clock_now();
+
+    -- 1. [CREATE] Relational Table Insert with PK check
+    INSERT INTO TABLE catalog (
+        ebook_id, title, author, language, downloads, indexed_at
+    ) VALUES (
+        $ebook_id, $title, $author, $language, 0, $start_time
+    );
+
+    -- 2. [CREATE] Document Pool + Full-Text Search and Vector Ingestion
+    FOR $p IN $passages DO
+        -- Insert document revision (triggers BM25 inverted index update)
+        LET $doc_ref = INSERT INTO POOL passages {
+            ebook_id: $ebook_id,
+            seq:      $p.seq,
+            text:     $p.text
+        };
+
+        -- Insert vector embedding linked to source passage document
+        INSERT INTO VECTOR passage_vec ($vector, source_ref)
+        VALUES ($p.vector, $doc_ref);
+    END FOR;
+
+    -- 3. [READ] Search Nearest Neighbours using VectorSearch operator
+    LET $similar_books = (
+        SELECT $target_ref
+        FROM VectorSearch(
+            Scan("book_vec"),
+            Field("$vector"),
+            near: $book_vector,
+            k: 5,
+            metric: "cosine"
+        )
+        PROJECT {
+            $target_ref: Field("source_ref"),
+            similarity:  Field("$score")
+        }
+        FILTER Field("similarity") >= 0.82
+           AND Field("$target_ref") != REF(catalog, $ebook_id)
+    );
+
+    -- 4. [CREATE] Establish Directed Graph Links with Cosine Weights
+    FOR $sim IN $similar_books DO
+        LINK REF(catalog, $ebook_id)
+          TO $sim.$target_ref
+        TYPE "similar_to"
+        PROPERTIES { score: $sim.similarity };
+    END FOR;
+
+    -- 5. [CREATE] Append Time Series Telemetry Metrics
+    LET $duration_ms = (clock_now() - $start_time) / 1000000;
+    APPEND TO TIMESERIES ingest_metrics (
+        timestamp,
+        tags: {
+            ebook_id: $ebook_id,
+            client:   $client_id
+        },
+        values: {
+            passage_count: $passages.length,
+            duration_ms:   $duration_ms,
+            status_code:   200
+        }
+    );
+
+COMMIT;</code></pre>
+
+        <h4>3.8.3 Stored Procedure Bytecode Mutation Opcodes (Spec 14.20)</h4>
+        <p>
+          At compile time, CMBQL mutation statements compile to <code>CDB_BC_CALL_MUTATION</code> (opcode <code>0x08</code>):
+        </p>
+        <pre><code>/* CALL_MUTATION instruction operands:
+ * [0x08, dst_reg, mut_op, store_reg, entry_reg, payload_reg]
+ *
+ * Supported Mutation Operations (mut_op):
+ *   CDB_MUT_DOC_INSERT   (0x01) - Ingests document revision & triggers BM25
+ *   CDB_MUT_DOC_REPLACE  (0x02) - Overwrites document body revision
+ *   CDB_MUT_TABLE_INSERT (0x03) - Inserts row with unique constraint enforcement
+ *   CDB_MUT_TABLE_UPDATE (0x04) - Partially updates row columns
+ *   CDB_MUT_LINK_ADD     (0x05) - Connects entities with cardinality checks
+ *   CDB_MUT_TS_APPEND    (0x06) - Appends bit-compressed telemetry point
+ */</code></pre>
+      </section>
+
+      <!-- Section 4: Relational Tables Deep Dive -->
+      <section id="relational-guide">
+        <h2>4. Relational Tables Deep Dive</h2>
+        <p>
+          Tables combine strict column definitions, primary keys, and secondary B+Tree indexes with the flexibility of automatic schema evolution.
+        </p>
+        <h3>Defining Columns &amp; Creating Tables</h3>
+        <pre><code>cdb_table_column cols[3];
+
+cols[0].name = "user_id";
+cols[0].name_len = 7;
+cols[0].type = CDB_TYPE_INT;
+cols[0].not_null = 1;
+cols[0].default_value = NULL;
+
+cols[1].name = "username";
+cols[1].name_len = 8;
+cols[1].type = CDB_TYPE_STRING;
+cols[1].not_null = 1;
+cols[1].default_value = NULL;
+
+cols[2].name = "score";
+cols[2].name_len = 5;
+cols[2].type = CDB_TYPE_F64;
+cols[2].not_null = 0;
+cols[2].default_value = NULL;
+
+uint64_t table_id = 0;
+cdb_table_create(&amp;db, "accounts", 8, cols, 3, 0 /* keep all history */, &amp;table_id);</code></pre>
+
+        <h3>Row Insertion &amp; Secondary Indexes</h3>
+        <p>
+          Rows are encoded using <code>cdb_value_writer</code> and inserted via <code>cdb_table_insert</code>. Adding a secondary index on <code>username</code> enables instantaneous $O(\log N)$ exact lookups:
+        </p>
+        <pre><code>uint32_t col_indices[1] = { 1 }; /* column 1: username */
+uint32_t index_no = 0;
+cdb_table_create_index(&amp;db, table_id, "idx_username", 12, col_indices, 1, 1 /* unique */, &amp;index_no);</code></pre>
+      </section>
+
+      <!-- Section 4: Document Pools & BM25 -->
+      <section id="document-guide">
+        <h2>4. Document Pools &amp; BM25 Full-Text Search</h2>
+        <p>
+          Document pools store flexible JSON objects with linear revision chains and integrated text search.
+        </p>
+
+        <h3>Inserting Documents &amp; Delta Patches</h3>
+        <pre><code>/* 1. Build document payload */
+uint8_t doc_bytes[1024];
+cdb_value_writer w;
+cdb_value_writer_init(&amp;w, doc_bytes, sizeof(doc_bytes));
+cdb_value_begin_object(&amp;w);
+cdb_value_field(&amp;w, "title", 5);
+cdb_value_put_string(&amp;w, "Clean Architecture", 18);
+cdb_value_field(&amp;w, "author", 6);
+cdb_value_put_string(&amp;w, "Robert Martin", 13);
+cdb_value_end_object(&amp;w);
+
+size_t doc_len = cdb_value_writer_len(&amp;w);
+
+/* 2. Insert into document pool */
+uint64_t doc_entry_id = 0;
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+cdb_doc_insert(&amp;db, pool_id, doc_bytes, doc_len, NULL, 0, &amp;doc_entry_id);
+cdb_tx_commit(&amp;db);</code></pre>
+
+        <h3>BM25 Full-Text Search</h3>
+        <p>
+          Configure indexed text paths using <code>cdb_fts_config</code>. Once indexed, query with <code>cdb_fts_search</code>:
+        </p>
+        <pre><code>cdb_fts_hit hits[10];
+size_t hit_count = 0;
+
+/* Searches for 'Architecture' across indexed text fields */
+cdb_fts_search(&amp;db, pool_id, "Architecture", 12, hits, 10, &amp;hit_count);
+for (size_t i = 0; i &lt; hit_count; i++) {
+    printf("Match: Doc ID %llu, BM25 Score: %.4f\n", 
+           (unsigned long long)hits[i].entry, hits[i].score);
+}</code></pre>
+      </section>
+
+      <!-- Section 5: Vector Collections -->
+      <section id="vector-guide">
+        <h2>5. Vector Collections &amp; Semantic Retrieval</h2>
+        <p>
+          Vector collections pack dense embedding arrays for AI agent memory, semantic clustering, and retrieval-augmented generation (RAG).
+        </p>
+
+        <h3>Configuring Collections &amp; Ingestion</h3>
+        <pre><code>uint64_t vec_coll_id = 0;
+/* Create 384-dimensional F32 vector collection with Cosine distance */
+cdb_vec_create(&amp;db, "doc_embeddings", 14, CDB_VEC_F32, 384, CDB_VEC_COSINE,
+               "all-MiniLM-L6-v2", 16, &amp;vec_coll_id);
+
+/* Enable Approximate Nearest Neighbour Graph */
+cdb_vec_create_graph(&amp;db, vec_coll_id, 16 /* K neighbours */);
+
+/* Insert vector and link to source document */
+float embedding[384] = { /* ... */ };
+uint64_t vec_entry_id = 0;
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+cdb_vec_insert(&amp;db, vec_coll_id, embedding, sizeof(embedding),
+               pool_id, doc_entry_id, &amp;vec_entry_id);
+cdb_tx_commit(&amp;db);</code></pre>
+
+        <h3>Searching Vectors</h3>
+        <pre><code>cdb_vec_hit hits[5];
+size_t n_hits = 0;
+cdb_vec_search(&amp;db, vec_coll_id, query_embedding, sizeof(query_embedding),
+               CDB_VEC_AUTO, 5, hits, &amp;n_hits);
+
+for (size_t i = 0; i &lt; n_hits; i++) {
+    printf("Vec ID: %llu, Dist: %.4f, Stale Source: %s\n",
+           (unsigned long long)hits[i].entry, hits[i].distance,
+           hits[i].stale ? "YES" : "NO");
+}</code></pre>
+      </section>
+
+      <!-- Section 6: Time Series -->
+      <section id="timeseries-guide">
+        <h2>6. Time Series Engine &amp; Bit Codecs</h2>
+        <p>
+          The time-series engine is engineered for high-frequency IoT sensors, financial tick streams, and infrastructure telemetry.
+        </p>
+        <pre><code>cdb_ts_tag tags[2] = {
+    { "sensor", 6, "temp_kitchen", 12 },
+    { "device", 6, "esp32_node1", 10 }
+};
+
+cdb_ts_def def;
+def.precision = CDB_TS_MILLIS;
+def.window = 3600000; /* 1-hour blocks */
+def.change_of_value = 1;
+def.nfields = 1;
+def.fields[0].id = 1;
+def.fields[0].type = CDB_TYPE_F64;
+
+uint64_t ts_store_id = 0;
+cdb_ts_create(&amp;db, "telemetry", 9, &amp;ts_store_id);
+
+/* Append metric point */
+cdb_ts_point pt;
+pt.ts = 1714567890000ULL;
+pt.use_clock = 0;
+/* ... encode value object ... */
+cdb_ts_append(&amp;db, ts_store_id, tags, 2, &amp;def, &amp;pt, CDB_TS_LATE_HOLD);</code></pre>
+      </section>
+
+      <!-- Section 7: Graph Links -->
+      <section id="links-guide">
+        <h2>7. Graph Links &amp; Associative Memory</h2>
+        <p>
+          Connect any two entities across different stores with enforced relationship cardinalities:
+        </p>
+        <pre><code>uint32_t link_type_id = 0;
+cdb_catalog_create_link_type(&amp;db, "AUTHOR_OF", 9, CDB_CARD_1_N, 
+                             CDB_LINK_ON_DELETE_CASCADE, &amp;link_type_id);
+
+cdb_ref author_ref = { .store = authors_table_id, .entry = 1, .flags = 0 };
+cdb_ref book_ref   = { .store = books_pool_id,     .entry = 42, .flags = 0 };
+
+cdb_tx_begin(&amp;db, CDB_DURABILITY_NORMAL);
+cdb_link_add(&amp;db, author_ref, link_type_id, book_ref, 1.0f /* weight */);
+cdb_tx_commit(&amp;db);</code></pre>
+      </section>
+
+      <!-- Section 8: Large Blobs -->
+      <section id="blob-guide">
+        <h2>8. Streaming Large Blobs</h2>
+        <p>
+          Blobs stream piece-by-piece with zero memory pressure on caller RAM:
+        </p>
+        <pre><code>cdb_blob_writer bw;
+uint8_t scratch[4096];
+cdb_blob_ref ref;
+
+cdb_db_blob_write_begin(&amp;db, pool_id, scratch, &amp;bw);
+while ((bytes_read = fread(chunk, 1, sizeof(chunk), fp)) &gt; 0) {
+    cdb_db_blob_write_chunk(&amp;bw, chunk, bytes_read);
+}
+cdb_db_blob_write_end(&amp;bw, &amp;ref);
+
+/* ref.hash contains SHA-256 digest; ref.first_page anchors overflow chain */</code></pre>
+      </section>
+
+      <!-- Section 9: CMBQL Query Language -->
+      <section id="cmbql-guide">
+        <h2>9. CMBQL Query Language Guide</h2>
+        <p>
+          CMBQL supports both declarative SQL syntax and pipeline (Flux) syntax. Both compile directly into the identical binary operator wire tree (<code>CMBQ</code>).
+        </p>
+
+        <h3>Declarative SQL Syntax Example</h3>
+        <pre><code>SELECT title, author, score
+FROM accounts
+WHERE score &gt; 85.0
+ORDER BY score DESC
+LIMIT 10;</code></pre>
+
+        <h3>Pipeline (Flux) Multi-Model Fusion Example</h3>
+        <pre><code>scan("documents")
+|&gt; text_search(query: "reinforcement learning", mode: "ALL")
+|&gt; vector_search(near: @user_embedding, k: 20, metric: "cosine")
+|&gt; hybrid_rank(fuse: "RRF", weight_text: 0.5, weight_vec: 0.5)
+|&gt; traverse(link_type: "CITED_BY", hops: 2)
+|&gt; limit(10);</code></pre>
+      </section>
+
+      <!-- Section 10: Stored Procedures & Triggers -->
+      <section id="procs-triggers">
+        <h2>10. Stored Procedures &amp; Triggers</h2>
+        <p>
+          Stored procedures compile to sandboxed bytecode (<code>CMBP</code>) with 64 registers:
+        </p>
+        <pre><code>PROCEDURE adjust_credits(user_id INT, delta INT) {
+    VAR current = SELECT credits FROM accounts WHERE id = user_id;
+    IF current + delta &lt; 0 THEN
+        RETURN -1;
+    END IF;
+    UPDATE accounts SET credits = current + delta WHERE id = user_id;
+    RETURN 0;
+}</code></pre>
+      </section>
+
+      <!-- Section 11: CRDT Guide -->
+      <section id="crdt-guide">
+        <h2>11. CRDT Peer Synchronization</h2>
+        <p>
+          Configure node IDs and export synchronization slices for distributed mesh networking:
+        </p>
+        <pre><code>/* Configure unique peer ID */
+cdb_db_set_peer_id(&amp;db, 42);
+
+/* Export mutations since last known peer state vector */
+uint8_t slice[32768];
+size_t slice_len = 0;
+cdb_db_crdt_export_slice(&amp;db, &amp;remote_vector, slice, sizeof(slice), &amp;slice_len);
+
+/* Transmit slice over transport (BLE / HTTP / LoRa) ... */
+
+/* On receiving peer: import and merge without conflicts */
+cdb_db_crdt_import_slice(&amp;db, slice, slice_len, &amp;imported_count);</code></pre>
+      </section>
+
+      <!-- Section 12: Security & Governance -->
+      <section id="security-guide">
+        <h2>12. Security, Enclaves &amp; Cryptographic Audit</h2>
+        <p>
+          Protect tenant enclaves with AEAD encryption and verify governance integrity:
+        </p>
+        <pre><code>/* Create encrypted enclave */
+cdb_db_create_enclave(&amp;db, 1001 /* tenant_id */, "vault://enclave-key-1001");
+
+/* Verify cryptographic SHA-256 hash-chain of audit log */
+int audit_valid = 0;
+cdb_audit_verify(&amp;db, 0, INT64_MAX, &amp;audit_valid);
+if (!audit_valid) {
+    fprintf(stderr, "SECURITY ALERT: Tampering detected in audit trail!\n");
+}</code></pre>
+      </section>
+          <!-- Section 13: Mathematical, Scientific & DSP Computing Guide -->
+      <section id="math-manual">
+        <h2>13. Mathematical, Scientific &amp; DSP Computing Guide</h2>
+        <p>
+          <code>db-combolite</code> includes an embedded 110-function scientific computing engine (<code>cdb_math.h</code>). It executes mathematics directly inside database queries and stored procedures without heap allocation or external math libraries.
+        </p>
+
+        <h3>13.1 Using Math Functions in Declarative CMBQL Queries</h3>
+        <p>
+          Every built-in math function is directly available inside CMBQL <code>SELECT</code> projection expressions, <code>WHERE</code> filtering clauses, and <code>ORDER BY</code> sort specifications:
+        </p>
+        <pre><code>-- 1. Proximity search: find vehicles within 5000 meters of San Francisco
+SELECT id, driver, haversine(lat, lon, 37.7749, -122.4194) AS dist_meters
+FROM vehicles
+WHERE haversine(lat, lon, 37.7749, -122.4194) &lt; 5000.0
+ORDER BY dist_meters ASC;
+
+-- 2. Neural activation: compute sigmoid probability and GELU activation
+SELECT user_id, sigmoid(score) AS win_probability, gelu(raw_weight) AS activated_weight
+FROM model_predictions
+WHERE sigmoid(score) &gt;= 0.75;
+
+-- 3. Atmospheric telemetry: compute altitude and dew point from weather station sensors
+SELECT station_id, 
+       atmo_pressure_to_alt(pressure_hpa, 1013.25) AS alt_m,
+       atmo_dew_point(temp_c, humidity_pct) AS dew_point_c
+FROM weather_readings;</code></pre>
+
+        <h3>13.2 Worked Recipe 1: Geofencing &amp; Spatial Navigation</h3>
+        <p>
+          Check whether GPS coordinates fall within circular delivery zones or arbitrary polygon administrative boundaries:
+        </p>
+        <pre><code>/* C99 Recipe: Geofencing and destination calculation */
+double sfo_lat = 37.7749, sfo_lon = -122.4194;
+double drone_lat = 37.7800, drone_lon = -122.4100;
+
+/* Check if drone is within 1500m circular delivery geofence */
+int inside_geofence = cdb_math_point_in_circle(drone_lat, drone_lon, sfo_lat, sfo_lon, 1500.0);
+if (inside_geofence) {
+    printf("Drone is authorized inside delivery zone.\n");
+}
+
+/* Calculate initial compass heading and distance */
+double bearing_deg = cdb_math_bearing(drone_lat, drone_lon, sfo_lat, sfo_lon);
+double distance_m = cdb_math_haversine(drone_lat, drone_lon, sfo_lat, sfo_lon);
+printf("Fly bearing: %.1f degrees, distance: %.1f meters\n", bearing_deg, distance_m);
+
+/* Compute destination waypoint 2000m ahead */
+double waypoint_lat = 0, waypoint_lon = 0;
+cdb_math_destination(drone_lat, drone_lon, bearing_deg, 2000.0, &amp;waypoint_lat, &amp;waypoint_lon);
+
+/* Generate 64-bit Morton code for secondary B+Tree spatial indexing */
+uint64_t spatial_key = cdb_math_morton2d(drone_lat, drone_lon);</code></pre>
+
+        <h3>13.3 Worked Recipe 2: Software-Defined Radio (SDR) &amp; DSP Spectral Analysis</h3>
+        <p>
+          Process raw I/Q baseband samples, apply a Hann window, compute in-place Fast Fourier Transform, and inspect spectral magnitude:
+        </p>
+        <pre><code>/* C99 Recipe: SDR baseband FFT power spectral density */
+#define FFT_SIZE 1024
+float signal[FFT_SIZE];
+/* ... populate signal with raw ADC/SDR baseband audio samples ... */
+
+/* Step 1: Pre-compute and apply Hann window to minimize spectral leakage */
+float window[FFT_SIZE];
+cdb_math_window_hann(window, FFT_SIZE);
+for (size_t i = 0; i &lt; FFT_SIZE; i++) {
+    signal[i] *= window[i];
+}
+
+/* Step 2: Compute single-sided magnitude spectrum (zero-heap) */
+float work_r[FFT_SIZE], work_i[FFT_SIZE];
+float magnitude[FFT_SIZE / 2 + 1];
+
+cdb_status s = cdb_math_fft_magnitude(signal, FFT_SIZE, work_r, work_i, magnitude);
+if (s == CDB_OK) {
+    /* Find peak frequency bin */
+    float peak_mag = 0.0f;
+    size_t peak_bin = 0;
+    for (size_t k = 0; k &lt; FFT_SIZE / 2 + 1; k++) {
+        if (magnitude[k] &gt; peak_mag) {
+            peak_mag = magnitude[k];
+            peak_bin = k;
+        }
+    }
+    printf("Dominant tone detected at FFT bin %zu, magnitude: %.2f (%.1f dBFS)\n", 
+           peak_bin, peak_mag, cdb_math_dbfs(peak_mag * peak_mag));
+}
+
+/* Step 3: Demodulate FM audio from I/Q stream */
+double audio_sample = cdb_math_iq_demod_fm(i_curr, q_curr, i_prev, q_prev);</code></pre>
+
+        <h3>13.4 Worked Recipe 3: Linear Algebra &amp; Vector Cosine Similarity</h3>
+        <p>
+          Perform dense matrix transformations and compute embedding cosine similarity without external BLAS:
+        </p>
+        <pre><code>/* C99 Recipe: Dense matrix multiplication and vector cosine */
+float emb_a[384] = { /* ... */ };
+float emb_b[384] = { /* ... */ };
+
+/* Compute cosine similarity */
+float similarity = 0.0f;
+cdb_math_vec_cosine(emb_a, emb_b, 384, &amp;similarity);
+printf("Vector embedding cosine similarity: %.4f\n", similarity);
+
+/* 3x3 Transformation matrix multiplication (Row-major layout) */
+float rot_x[9] = { 1, 0, 0,  0, 0, -1,  0, 1, 0 };
+float rot_y[9] = { 0, 0, 1,  0, 1,  0, -1, 0, 0 };
+float combined[9];
+
+cdb_math_mat_mul(rot_x, 3, 3, rot_y, 3, combined);
+
+/* Compute matrix determinant */
+float det = 0.0f;
+cdb_math_mat_det(combined, 3, &amp;det);
+printf("Combined rotation determinant: %.2f (orthogonal: %s)\n", det, det == 1.0f ? "YES" : "NO");</code></pre>
+      </section>
+
+    </main>
+  </div>
+
+  <footer>
+    <p>db-combolite User Manual &bull; Released under the MIT License.</p>
+  </footer>
+</body>
+</html>

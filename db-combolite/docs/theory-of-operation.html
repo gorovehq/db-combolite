@@ -1,0 +1,1348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>db-combolite — Theory of Operation Guidebook</title>
+  <style>
+    :root {
+      --bg-primary: #0f172a;
+      --bg-secondary: #1e293b;
+      --bg-card: #1e293b;
+      --bg-card-hover: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-glow: rgba(56, 189, 248, 0.2);
+      --accent-green: #4ade80;
+      --accent-purple: #c084fc;
+      --accent-amber: #fbbf24;
+      --accent-rose: #fb7185;
+      --border: #334155;
+      --border-focus: #38bdf8;
+      --code-bg: #0b1120;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background-color: var(--bg-primary);
+      color: var(--text-main);
+      line-height: 1.65;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+    header.site-header {
+      background-color: rgba(15, 23, 42, 0.95);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 1000;
+      padding: 0.75rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: var(--text-main);
+      text-decoration: none;
+    }
+    .brand .logo-badge {
+      background: linear-gradient(135deg, #0284c7, #38bdf8);
+      color: #fff;
+      padding: 0.25rem 0.6rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+    }
+    nav.top-nav {
+      display: flex;
+      gap: 1.25rem;
+      align-items: center;
+    }
+    nav.top-nav a {
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: color 0.15s ease;
+      padding: 0.35rem 0.65rem;
+      border-radius: 4px;
+    }
+    nav.top-nav a:hover, nav.top-nav a.active {
+      color: var(--text-main);
+      background-color: var(--bg-card);
+    }
+    nav.top-nav a.active {
+      color: var(--accent);
+      border-bottom: 2px solid var(--accent);
+    }
+    .layout-container {
+      display: flex;
+      flex: 1;
+      max-width: 1600px;
+      margin: 0 auto;
+      width: 100%;
+    }
+    aside.sidebar {
+      width: 300px;
+      flex-shrink: 0;
+      background-color: var(--bg-secondary);
+      border-right: 1px solid var(--border);
+      padding: 1.5rem 1rem;
+      position: sticky;
+      top: 57px;
+      height: calc(100vh - 57px);
+      overflow-y: auto;
+    }
+    aside.sidebar h3 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      margin-bottom: 0.75rem;
+      padding-left: 0.5rem;
+    }
+    aside.sidebar ul {
+      list-style: none;
+      margin-bottom: 1.5rem;
+    }
+    aside.sidebar li {
+      margin-bottom: 0.25rem;
+    }
+    aside.sidebar a {
+      display: block;
+      padding: 0.4rem 0.6rem;
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.85rem;
+      border-radius: 6px;
+      transition: all 0.15s;
+    }
+    aside.sidebar a:hover {
+      color: var(--text-main);
+      background-color: var(--bg-card-hover);
+    }
+    aside.sidebar a.subitem {
+      padding-left: 1.25rem;
+      font-size: 0.8rem;
+    }
+    main.content {
+      flex: 1;
+      padding: 2.5rem 3.5rem;
+      overflow-x: hidden;
+      max-width: 1200px;
+    }
+    .hero-title {
+      font-size: 2.5rem;
+      font-weight: 800;
+      margin-bottom: 0.5rem;
+      background: linear-gradient(135deg, #f8fafc 40%, #38bdf8 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .hero-subtitle {
+      font-size: 1.15rem;
+      color: var(--text-muted);
+      margin-bottom: 2rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1.5rem;
+    }
+    h2 {
+      font-size: 1.75rem;
+      font-weight: 700;
+      margin-top: 3rem;
+      margin-bottom: 1rem;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 0.5rem;
+    }
+    h3 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin-top: 2rem;
+      margin-bottom: 0.75rem;
+      color: var(--accent);
+    }
+    h4 {
+      font-size: 1.05rem;
+      font-weight: 600;
+      margin-top: 1.5rem;
+      margin-bottom: 0.5rem;
+      color: #e2e8f0;
+    }
+    p { margin-bottom: 1rem; }
+    ul, ol {
+      margin-left: 1.5rem;
+      margin-bottom: 1rem;
+    }
+    li { margin-bottom: 0.4rem; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1.5rem 0;
+      background-color: var(--bg-secondary);
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      font-size: 0.9rem;
+    }
+    th, td {
+      padding: 0.75rem 1rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      background-color: #0b1329;
+      color: var(--accent);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      letter-spacing: 0.05em;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background-color: rgba(255, 255, 255, 0.02); }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 0.85em;
+      background-color: var(--code-bg);
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+      color: #38bdf8;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    pre {
+      background-color: var(--code-bg);
+      padding: 1.25rem;
+      border-radius: 8px;
+      overflow-x: auto;
+      margin: 1.25rem 0;
+      border: 1px solid var(--border);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.85rem;
+      line-height: 1.5;
+    }
+    pre code {
+      background: none;
+      padding: 0;
+      border: none;
+      color: #e2e8f0;
+    }
+    .alert {
+      background-color: rgba(56, 189, 248, 0.08);
+      border-left: 4px solid var(--accent);
+      padding: 1rem 1.25rem;
+      border-radius: 0 8px 8px 0;
+      margin: 1.5rem 0;
+    }
+    .alert.important {
+      background-color: rgba(251, 191, 36, 0.08);
+      border-left-color: var(--accent-amber);
+    }
+    .alert.tip {
+      background-color: rgba(74, 222, 128, 0.08);
+      border-left-color: var(--accent-green);
+    }
+    .alert-title {
+      font-weight: 700;
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.25rem;
+      color: var(--accent);
+    }
+    .alert.important .alert-title { color: var(--accent-amber); }
+    .alert.tip .alert-title { color: var(--accent-green); }
+    .diagram-container {
+      background-color: #0b1120;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.5rem;
+      margin: 2rem 0;
+      text-align: center;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+    }
+    .diagram-caption {
+      margin-top: 1rem;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      font-weight: 500;
+      text-align: center;
+    }
+    svg.process-diagram {
+      max-width: 100%;
+      height: auto;
+      display: inline-block;
+    }
+    .badge {
+      display: inline-block;
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .badge-blue { background-color: rgba(56, 189, 248, 0.2); color: #38bdf8; border: 1px solid #38bdf8; }
+    .badge-green { background-color: rgba(74, 222, 128, 0.2); color: #4ade80; border: 1px solid #4ade80; }
+    .badge-amber { background-color: rgba(251, 191, 36, 0.2); color: #fbbf24; border: 1px solid #fbbf24; }
+    footer {
+      background-color: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      padding: 2rem;
+      text-align: center;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-top: 4rem;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Header Navigation -->
+  <header class="site-header">
+    <a href="index.html" class="brand">
+      <span class="logo-badge">CDB</span>
+      <span>db-combolite Docs</span>
+    </a>
+    <nav class="top-nav">
+      <a href="index.html">Overview</a>
+      <a href="theory-of-operation.html" class="active">Theory of Operation</a>
+      <a href="user-manual.html">User Manual</a>
+      <a href="api-usage.html">API Reference</a>
+      <a href="swagger.html">Swagger C99 API</a>
+    </nav>
+  </header>
+
+  <div class="layout-container">
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar">
+      <h3>Theory of Operation</h3>
+      <ul>
+        <li><a href="#principles">1. Architecture & Principles</a></li>
+        <li><a href="#storage-engine">2. Low-Level Storage Engine</a></li>
+        <li><a href="#file-header" class="subitem">2.1 File Header & Epochs</a></li>
+        <li><a href="#pages-cow" class="subitem">2.2 Copy-on-Write Pager</a></li>
+        <li><a href="#anchor-map" class="subitem">2.3 Physical Anchor Map</a></li>
+        <li><a href="#nibblets" class="subitem">2.4 Nibblets (Small Records)</a></li>
+        <li><a href="#overflow-chains" class="subitem">2.5 Overflow Pages</a></li>
+        <li><a href="#ordered-index" class="subitem">2.6 B+Tree Index Engine</a></li>
+        <li><a href="#concurrency">3. Concurrency & Coordination</a></li>
+        <li><a href="#coordinator-election" class="subitem">3.1 Primary & Subordinates</a></li>
+        <li><a href="#baton-protocol" class="subitem">3.2 The Baton Protocol</a></li>
+        <li><a href="#delta-tracks" class="subitem">3.3 Delta Tracks & Durability</a></li>
+        <li><a href="#reconciliation" class="subitem">3.4 Reconciliation & Recovery</a></li>
+        <li><a href="#multimodel">4. Native Multi-Model Engines</a></li>
+        <li><a href="#model-relational" class="subitem">4.1 Relational (Row & Column)</a></li>
+        <li><a href="#model-document" class="subitem">4.2 Document Pools & BM25</a></li>
+        <li><a href="#model-vector" class="subitem">4.3 Vector Collections & ANN</a></li>
+        <li><a href="#model-ts" class="subitem">4.4 Time Series & Bit Codecs</a></li>
+        <li><a href="#model-links" class="subitem">4.5 Graph Links & Neurons</a></li>
+        <li><a href="#model-blobs" class="subitem">4.6 Streaming Blobs</a></li>
+        <li><a href="#query-engine">5. CMBQL Query Engine & VM</a></li>
+        <li><a href="#crdt-p2p">6. CRDTs & Multi-Master Replication</a></li>
+        <li><a href="#security-governance">7. Security, Crypto & Audit</a></li>
+        <li><a href="#crud-lifecycle">8. CRUD Mutation &amp; Deletion Lifecycle</a></li>
+        <li><a href="#crud-create-arch" class="subitem">8.1 Create &amp; Allocation Path</a></li>
+        <li><a href="#crud-read-arch" class="subitem">8.2 Read Isolation &amp; Zero-Copy</a></li>
+        <li><a href="#crud-update-arch" class="subitem">8.3 Update Mechanics &amp; Patches</a></li>
+        <li><a href="#crud-delete-arch" class="subitem">8.4 Deletion, Tombstones &amp; Reclaim</a></li>
+        <li><a href="#process-flows">9. Process Flow Visualizations</a></li>
+      </ul>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="content">
+      <h1 class="hero-title">Theory of Operation Guidebook</h1>
+      <p class="hero-subtitle">
+        A deep architectural analysis of the internal mechanics, memory model, crash invariants, multi-process coordination, and storage subsystems of the <code>db-combolite</code> engine.
+      </p>
+
+      <!-- Section 1 -->
+      <section id="principles">
+        <h2>1. Architectural Design & Philosophy</h2>
+        <p>
+          <code>db-combolite</code> is an embeddable, serverless, multi-model database engine engineered in pure C99. It bridges the operational footprint of SQLite with the polymorphic modeling power of modern distributed multi-model engines (Relational, JSON Documents, Embeddings/Vectors, Graph Links, Bit-Packed Time Series, and Content-Addressed Blobs).
+        </p>
+
+        <div class="alert tip">
+          <div class="alert-title">Core Design Tenet: Zero Core Heap Allocation</div>
+          All runtime scratchpads, working buffers, slot structures, and page caches are supplied directly by the caller or through the explicit <code>cdb_env</code> memory hooks. The core library never invokes <code>malloc</code>, <code>realloc</code>, or <code>free</code> directly, making it strictly determinable for microcontrollers, safety-critical systems, and constrained RTOS environments.
+        </div>
+
+        <h3>Key Guiding Invariants</h3>
+        <ul>
+          <li><strong>Serverless & Self-Coordinating:</strong> There is never a daemon, server daemon, background broker, or listener port. Multiple OS processes accessing the same database coordinate purely via physical disk files (the archive and ephemeral companion delta tracks) using deterministic lock-free state machines.</li>
+          <li><strong>Single File at Rest:</strong> When idle or closed, a database is exactly one durable file on disk (<code>.cdbarch</code> or <code>.cdb</code>). Companion files exist only while sessions are actively unsealed.</li>
+          <li><strong>Strict Append-Only Merges & Copy-on-Write (CoW):</strong> The committed historical state of the archive is never overwritten in place. Logical pages are relocated on write; anchor maps point logical IDs to physical page offsets, ensuring crash-safe atomic swaps.</li>
+          <li><strong>Clean-Room Architecture:</strong> All structures—B+Tree pager, vector neighbour graphs, bitwise time-series compressors, and CMBQL bytecode VM—are clean-room specifications optimized for embedded predictability.</li>
+        </ul>
+      </section>
+
+      <!-- Section 2 -->
+      <section id="storage-engine">
+        <h2>2. Low-Level Storage Engine</h2>
+        <p>
+          Storage in <code>db-combolite</code> is abstracted behind <code>cdb_storage</code>, an abstract vector table representing block devices, memory-mapped flash, or host OS files.
+        </p>
+
+        <h3 id="file-header">2.1 File Header & Epochs (Spec 1.9, 14.1)</h3>
+        <p>
+          The archive file begins with a <strong>512-byte dual header slot system</strong> (Slot A at offset 0, Slot B at offset 512). On host disks with 512-byte sectors, updating a slot is an atomic single-sector operation.
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Offset</th>
+              <th>Size</th>
+              <th>Field</th>
+              <th>Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>0</code></td>
+              <td>8 B</td>
+              <td><code>Magic</code></td>
+              <td><code>\x89CDB\r\n\x1A\n</code> (0x89 0x43 0x44 0x42 0x0D 0x0A 0x1A 0x0A) — detects text-mode corruptions.</td>
+            </tr>
+            <tr>
+              <td><code>8</code></td>
+              <td>1 B</td>
+              <td><code>Byte Order</code></td>
+              <td><code>'L'</code> (0x4C) for Little-Endian or <code>'B'</code> (0x42) for Big-Endian.</td>
+            </tr>
+            <tr>
+              <td><code>9</code></td>
+              <td>1 B</td>
+              <td><code>Epoch</code></td>
+              <td>Format epoch (currently <code>1</code>).</td>
+            </tr>
+            <tr>
+              <td><code>10</code></td>
+              <td>1 B</td>
+              <td><code>Slot Role</code></td>
+              <td><code>0</code> = Working slot; <code>1</code> = Committed snapshot.</td>
+            </tr>
+            <tr>
+              <td><code>11</code></td>
+              <td>1 B</td>
+              <td><code>Layout Flags</code></td>
+              <td>Bit 0: 64-bit addresses; Bit 1: compact header; Bit 2: danger mode; Bit 3: governance mode.</td>
+            </tr>
+            <tr>
+              <td><code>12</code></td>
+              <td>4 B</td>
+              <td><code>Order Check</code></td>
+              <td><code>0x01020304</code> written in declared byte order to verify endianness.</td>
+            </tr>
+            <tr>
+              <td><code>16</code></td>
+              <td>16 B</td>
+              <td><code>Database ID</code></td>
+              <td>Random 128-bit UUID identifying this database. Companion files must match.</td>
+            </tr>
+            <tr>
+              <td><code>32</code></td>
+              <td>8 B</td>
+              <td><code>Committed Seq</code></td>
+              <td>Monotonically increasing sequence number promoted during reconciliation.</td>
+            </tr>
+            <tr>
+              <td><code>56</code></td>
+              <td>8 B</td>
+              <td><code>Anchor Root</code></td>
+              <td>Physical page location of the primary Anchor Map B+Tree.</td>
+            </tr>
+            <tr>
+              <td><code>64</code></td>
+              <td>8 B</td>
+              <td><code>Append Point</code></td>
+              <td>Next free physical page offset at the end of the archive.</td>
+            </tr>
+            <tr>
+              <td><code>72-75</code></td>
+              <td>4 B</td>
+              <td><code>Page Config</code></td>
+              <td>Min page size, max page size (log2), mode (uniform vs per-store), and default page size.</td>
+            </tr>
+            <tr>
+              <td><code>128</code></td>
+              <td>128 B</td>
+              <td><code>Master Key URI</code></td>
+              <td>External URI pointing to the master encryption key (e.g. <code>vault://db-key</code>).</td>
+            </tr>
+            <tr>
+              <td><code>256</code></td>
+              <td>144 B</td>
+              <td><code>Companions</code></td>
+              <td>12 slots &times; 12 bytes tracking companion delta tracks and watermarks.</td>
+            </tr>
+            <tr>
+              <td><code>508</code></td>
+              <td>4 B</td>
+              <td><code>CRC32C</code></td>
+              <td>Castagnoli CRC32C over bytes 0–507.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3 id="pages-cow">2.2 Copy-on-Write (CoW) Logical Pager</h3>
+        <p>
+          The pager exposes logical pages (numbered 1 .. $N$) that never change their logical identity. When page contents are mutated:
+        </p>
+        <ol>
+          <li>The pager allocates a fresh physical page at the file's append point (or from the reusable free list).</li>
+          <li>The modified payload is written to this new physical location.</li>
+          <li>The <strong>Anchor Map</strong> is updated in memory so that the logical page ID maps to the new physical page number.</li>
+          <li>Old physical pages are placed into a pending free list and become <em>reusable</em> only after a succeeding commit sequence fences out all read snapshots that referenced the old page.</li>
+        </ol>
+
+        <h3 id="anchor-map">2.3 Physical Anchor Map & Mirrored Roots</h3>
+        <p>
+          The Anchor Map is a specialized B+Tree that translates <code>logical_page_id &rarr; physical_offset</code>. To guarantee that a crash while updating the anchor map cannot destroy database navigation, the header maintains two roots: <code>anchor_root</code> and <code>anchor_mirror_root</code>. Writes are flushed and synchronized to the alternate root before the primary header commits.
+        </p>
+
+        <h3 id="nibblets">2.4 Nibblets: Sub-Page Small Record Allocator (Spec 16, 14.18)</h3>
+        <p>
+          Storing small records (such as small JSON delta revisions, table row revisions, or sparse time-series blocks) in dedicated 4KB pages causes catastrophic internal fragmentation. <code>db-combolite</code> solves this via <strong>Nibblets</strong>:
+        </p>
+        <ul>
+          <li><strong>Shared Slotted Pages:</strong> Dedicated pages (Type <code>0x0009</code>) pack multiple small records (&le; 1/4 page size) across arbitrary stores.</li>
+          <li><strong>Packed 64-bit Address:</strong> A nibblet address encodes <code>(physical_page &lt;&lt; 16) | slot_index</code> with the high bit set, seamlessly distinguished from standard logical page IDs.</li>
+          <li><strong>Two-Way Back References:</strong> Every nibblet record contains a reverse pointer <code>[store_id, kind, index_key]</code>, enabling the engine to move or compact records without store coordination.</li>
+          <li><strong>Reconciliation Merging:</strong> During reconciliation, pages under 50% utilization are merged together, updating the owner's index via <code>cdb_doc_nib_moved</code> or <code>cdb_ts_nib_moved</code>.</li>
+        </ul>
+
+        <h3 id="overflow-chains">2.5 Overflow Page Chains (Spec 14.15)</h3>
+        <p>
+          When a document body, relational text column, or large BLOB exceeds the payload room of a single page (or nibblet limit), it overflows into a linked chain of <strong>Overflow Pages</strong> (Type <code>0x0007</code>). The owning page records the <code>total_byte_length</code> and <code>first_overflow_page_id</code>. Overflow pages link linearly through a 64-bit <code>next_page</code> pointer in their header.
+        </p>
+
+        <h3 id="ordered-index">2.6 Ordered B+Tree Index Engine (Spec 14.8)</h3>
+        <p>
+          All secondary indexes, catalog bodies, document head indexes, and link stores utilize a zero-heap B+Tree with order-preserving binary keys. Keys are sorted lexicographically via unsigned byte comparison (<code>memcmp</code>), supporting prefix queries, exact point lookups, and bidirectional cursor scanning.
+        </p>
+      </section>
+
+      <!-- Section 3 -->
+      <section id="concurrency">
+        <h2>3. Concurrency, Multi-Process Coordination & Crash Safety</h2>
+        <p>
+          <code>db-combolite</code> achieves ACID transactions and multi-process concurrency without requiring background server daemons or OS-level advisory file locks.
+        </p>
+
+        <h3 id="coordinator-election">3.1 In-Process Coordinator & Leader Election (Spec 5.2)</h3>
+        <p>
+          Each application process opening the database initializes an in-process <strong>Coordinator</strong> (<code>cdb_coord</code>). Coordinators claim slots in the coordination companion file:
+        </p>
+        <ul>
+          <li><strong>Append &rarr; Settle &rarr; Choose:</strong> When multiple processes open the database concurrently, each appends a reservation ticket with its unique session ID and monotonic start time. After a settling interval, the process with the lowest session ID / start time assumes the <strong>Primary Coordinator</strong> role.</li>
+          <li><strong>Heartbeat Monitoring:</strong> The primary maintains a periodic monotonic heartbeat in its slot. Subordinates monitor this timestamp. If the primary crashes or stalls beyond the heartbeat timeout, subordinates automatically execute an election to promote a new primary.</li>
+          <li><strong>Background Heartbeat Thread (M20):</strong> On multi-threaded systems with thread hooks supplied, an autonomous worker thread keeps idle databases alive and renews heartbeats without stalling application loops.</li>
+        </ul>
+
+        <h3 id="baton-protocol">3.2 The Baton Protocol & Reconciliation Fencing (Spec 5.3)</h3>
+        <p>
+          While all processes may append transaction deltas to their own private delta tracks simultaneously, only one process at a time may merge and fold deltas into the master archive. This exclusive right is called the <strong>Baton</strong>:
+        </p>
+        <ul>
+          <li><strong>CTS Fencing:</strong> The baton is guarded by a monotonically increasing Commit Token Sequence (CTS). Every write pass during reconciliation checks the current CTS. If a process experiences a long OS suspension and attempts to write with an expired CTS, the write is immediately rejected by the pager.</li>
+          <li><strong>Fair Handoff:</strong> The primary coordinator distributes the baton using round-robin queuing with early congestion detection (RED) under write-heavy loads.</li>
+        </ul>
+
+        <h3 id="delta-tracks">3.3 Delta Tracks & Durability Levels</h3>
+        <p>
+          Writes are initially journaled to companion delta tracks (Write-Ahead Logs) allocated per coordinator slot (e.g. <code>rel.0.wal</code>).
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>Durability Level</th>
+              <th>Commit Guarantee</th>
+              <th>Recovery Behavior</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>CDB_DURABILITY_FULL</code></td>
+              <td>Durable flush (<code>fsync</code> barrier) on both the delta record and commit record before returning.</td>
+              <td>Zero acknowledged data loss after abrupt power cut.</td>
+            </tr>
+            <tr>
+              <td><code>CDB_DURABILITY_NORMAL</code> (Default)</td>
+              <td>Written to OS buffer cache; periodic sync barriers during checkpoint intervals.</td>
+              <td>May lose transactions acknowledged in the last checkpoint window, but file is guaranteed uncorrupted.</td>
+            </tr>
+            <tr>
+              <td><code>CDB_DURABILITY_OFF</code></td>
+              <td>Pure in-memory buffering without sync barriers. Designed for scratch/temporary datasets.</td>
+              <td>Fastest throughput; vulnerable to power loss.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3 id="reconciliation">3.4 Crash Recovery & Reconciliation Protocol</h3>
+        <p>
+          When opening an archive after an abrupt termination, the coordinator executes a 4-phase recovery:
+        </p>
+        <ol>
+          <li><strong>Torn Write Truncation:</strong> Scans each companion delta track. Every record carries an independent CRC32C or AEAD auth tag. The track is truncated at the first record failing verification.</li>
+          <li><strong>Transaction Filtering:</strong> Only transactions containing an intact <code>COMMIT</code> record are preserved. Incomplete or aborted transactions are discarded.</li>
+          <li><strong>Baton Replay:</strong> Committed deltas are replayed in global commit order, dispatching mutations through the store apply hooks (<code>cdb_doc_apply</code>, <code>cdb_vec_apply</code>, etc.).</li>
+          <li><strong>Snapshot Promotion:</strong> Updated pages are synced to disk, the anchor map is updated, and the committed header slot is toggled atomically.</li>
+        </ol>
+      </section>
+
+      <!-- Section 4 -->
+      <section id="multimodel">
+        <h2>4. Native Multi-Model Engines</h2>
+        <p>
+          Rather than wrapping external formats, <code>db-combolite</code> implements tailored, highly optimized native structures for each paradigm within a single unified archive.
+        </p>
+
+        <h3 id="model-relational">4.1 Relational Tables (Row & Column-Oriented)</h3>
+        <p>
+          Tables exist in two storage layouts sharing a common catalog schema:
+        </p>
+        <ul>
+          <li><strong>Row-Oriented Tables (<code>cdb_table</code>):</strong> Stored as specialized document pools where each row is an encoded binary object keyed by column IDs. Columns support strict types, <code>NOT NULL</code> constraints, default values, primary keys, and secondary B+Tree indexes.
+            <div class="alert tip">
+              <div class="alert-title">Schema Evolution Without Table Rewrites</div>
+              Adding, dropping, or widening a column (e.g. <code>INT32 &rarr; DECIMAL</code>) writes a new schema version record to the catalog. Historical rows are read through the current schema definition on-the-fly: dropped columns are masked, new columns yield default values, and types are converted dynamically in memory.
+            </div>
+          </li>
+          <li><strong>Column-Oriented Tables (<code>cdb_rowgroup</code>):</strong> Ingested rows are batched into columnar row groups. Column chunks are compressed using LZMA2/xz (via <code>third-party/xz</code>) or bit-packing, offering high-ratio analytical compression (OLAP) on embedded devices.</li>
+        </ul>
+
+        <h3 id="model-document">4.2 Document Pools & BM25 Full-Text Search</h3>
+        <p>
+          A Document Pool stores schemaless or semi-structured JSON-like hierarchical values:
+        </p>
+        <ul>
+          <li><strong>Revision Chains:</strong> Documents maintain a linear history: <code>CDB_REV_ORIGINAL &rarr; CDB_REV_DELTA (patches) &rarr; CDB_REV_CHECKPOINT</code>. Revisions are never discarded unless configured with a retention cap.</li>
+          <li><strong>Built-In BM25 FTS Engine (<code>cdb_fts</code>):</strong> Configured document fields are tokenized into a term dictionary, inverted postings B+Tree <code>(term, doc_id) &rarr; tf</code>, and document length index. Searches compute exact BM25 probabilistic relevance rankings.</li>
+        </ul>
+
+        <h3 id="model-vector">4.3 Vector Collections & Approximate Nearest Neighbor Graph</h3>
+        <p>
+          Vector collections manage dense embeddings for semantic search and agent memory:
+        </p>
+        <ul>
+          <li><strong>Supported Types:</strong> <code>F32</code>, <code>F16</code>, <code>BF16</code>, <code>I8</code>, and 1-bit <code>BINARY</code> vectors across up to 65,535 dimensions.</li>
+          <li><strong>Distance Metrics:</strong> Euclidean ($L_2$), Cosine Similarity, Inner Product (Dot), and Hamming Distance.</li>
+          <li><strong>Neighbour Graph (HNSW-Class ANN):</strong> When enabled via <code>cdb_vec_create_graph</code>, collections maintain a graph of $K$ nearest neighbours. Search starts from <strong>Spread Points</strong> (&approx; $\sqrt{N}$) and <strong>Reach Points</strong>, performing a best-first priority queue walk with direct traversal of pending mutations.</li>
+          <li><strong>Source Tracking:</strong> Vectors track their source document version; query hits indicate if the underlying document has changed (staleness indicator).</li>
+        </ul>
+
+        <h3 id="model-ts">4.4 Time Series Engine & Bit Codecs</h3>
+        <p>
+          Optimized for IoT telemetry and sensor streams, series are keyed by metric names and sorted tag sets:
+        </p>
+        <ul>
+          <li><strong>Bit Codecs (<code>cdb_tsbits</code>):</strong> Timestamps are compressed using Gorilla-style delta-of-delta encoding. Float values are compressed using XOR bitwise difference packing. Categorical values use run-length dictionary compression.</li>
+          <li><strong>Late Arrival Handling:</strong> Configurable policies per store: <code>REJECT</code>, <code>ACCEPT</code> (overwrite/merge), or <code>HOLD</code> (diverted to a held index and folded in during reconciliation).</li>
+        </ul>
+
+        <h3 id="model-links">4.5 Graph Links & Learned Neuron Weights</h3>
+        <p>
+          Links connect entities across any store (document &rarr; vector, table row &rarr; document, etc.):
+        </p>
+        <ul>
+          <li><strong>Dual Mirrored Indexes:</strong> Maintained in forward <code>(source, type, target)</code> and reverse <code>(target, type, source)</code> indexes in the <code>$links</code> store.</li>
+          <li><strong>Cardinality Enforcement:</strong> Validates 1:1, 1:N, and N:M constraints on commit.</li>
+          <li><strong>Cascade Rules:</strong> <code>CDB_LINK_ON_DELETE_TOMBSTONE</code>, <code>CASCADE</code>, or <code>REFUSE</code>.</li>
+          <li><strong>Neuron Weights:</strong> Links carry 32-bit floating point weights that can be reinforced or decayed dynamically, providing a substrate for learned associative memory graphs.</li>
+        </ul>
+
+        <h3 id="model-blobs">4.6 Content-Addressed Streaming Blobs</h3>
+        <p>
+          Arbitrary large binary objects are streamed chunk-by-chunk through <code>cdb_blob_writer</code>, bypassing memory limits by streaming directly into overflow page chains. Each blob is content-addressed by its cryptographic SHA-256 (or HMAC-SHA-256) digest, providing automated deduplication within encryption boundaries.
+        </p>
+      </section>
+
+      <!-- Section 5 -->
+      <section id="query-engine">
+        <h2>5. Structured Query Engine & Virtual Machine (CMBQL)</h2>
+        <p>
+          Queries and mutations are executed through a unified two-tier architecture: declarative/pipeline CMBQL compiling into a binary operator tree (CMBQ), and stored procedures compiling into register-based virtual machine bytecode (CMBP).
+        </p>
+
+        <h3>5.1 The 15 CMBQL Operator Nodes</h3>
+        <p>
+          Execution is Volcano-style: operators implement streaming cursors that pull tuples on demand under bounded memory:
+        </p>
+        <table>
+          <thead>
+            <tr><th>Tag</th><th>Operator</th><th>Functionality</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>0x01</code></td><td><code>Scan</code></td><td>Sequential or index-backed scan of a table, document pool, or series.</td></tr>
+            <tr><td><code>0x02</code></td><td><code>Filter</code></td><td>Evaluates boolean expression tree predicates per row.</td></tr>
+            <tr><td><code>0x03</code></td><td><code>Project</code></td><td>Calculates computed columns, field renaming, and alias extraction.</td></tr>
+            <tr><td><code>0x04</code></td><td><code>Join</code></td><td>Inner and Left-Outer hash or nested-loop joins with match predicates.</td></tr>
+            <tr><td><code>0x05</code></td><td><code>Sort</code></td><td>Sorts bounded row streams by multiple keys (ASC/DESC, NULLs First/Last).</td></tr>
+            <tr><td><code>0x06</code></td><td><code>Limit</code></td><td>Paginates result streams via <code>offset</code> and <code>count</code>.</td></tr>
+            <tr><td><code>0x07</code></td><td><code>Union</code></td><td>Concatenates multiple result streams.</td></tr>
+            <tr><td><code>0x08</code></td><td><code>Aggregate</code></td><td>Computes grouped summaries (<code>COUNT</code>, <code>SUM</code>, <code>AVG</code>, <code>MIN</code>, <code>MAX</code>).</td></tr>
+            <tr><td><code>0x09</code></td><td><code>Traverse</code></td><td>Graph BFS/DFS link traversal across $min \dots max$ hops with cycle detection.</td></tr>
+            <tr><td><code>0x0A</code></td><td><code>TextSearch</code></td><td>Evaluates BM25 full-text queries against indexed document pools.</td></tr>
+            <tr><td><code>0x0B</code></td><td><code>VectorSearch</code></td><td>Performs top-$k$ exact or approximate nearest neighbor similarity retrieval.</td></tr>
+            <tr><td><code>0x0C</code></td><td><code>HybridRank</code></td><td>Fuses full-text and vector result rankings using Reciprocal Rank Fusion (RRF).</td></tr>
+            <tr><td><code>0x0D</code></td><td><code>Window</code></td><td>Tumbling, sliding, and hopping time windows over time-series streams.</td></tr>
+            <tr><td><code>0x0E</code></td><td><code>AsofJoin</code></td><td>Joins high-frequency streams by closest historical or nearest timestamp.</td></tr>
+            <tr><td><code>0x0F</code></td><td><code>Unnest</code></td><td>Flattens nested JSON arrays into individual row tuples.</td></tr>
+          </tbody>
+        </table>
+
+        <h3>5.2 Stored Procedure Virtual Machine (CMBP Bytecode)</h3>
+        <p>
+          Stored procedures run in a sandboxed, zero-heap virtual machine (<code>cdb_proc_vm</code>) featuring 64 registers ($R_0 \dots R_{63}$), 4 streaming query cursors, 8 nested savepoint frames, and instruction execution budgets to prevent infinite loops. The VM includes built-in dispatch for mathematical routines, signal processing (FFT, FIR filters), GIS geodesic distances (Haversine, Cross-track), and mutation operations.
+        </p>
+      </section>
+
+      <!-- Section 6 -->
+      <section id="crdt-p2p">
+        <h2>6. CRDTs & Multi-Master Peer Replication</h2>
+        <p>
+          For decentralized, offline-first, and mesh deployments, <code>db-combolite</code> implements conflict-free replication primitives without requiring central locks:
+        </p>
+        <ul>
+          <li><strong>Hybrid Logical Clocks (HLC):</strong> Combines physical wall-clock nanoseconds with a logical sub-tick counter and node ID (<code>cdb_hlc</code>) to provide strict total ordering of all distributed mutations.</li>
+          <li><strong>Peer Version Vectors:</strong> Compact vectors track the synchronization high-water mark of up to 32 participating peers.</li>
+          <li><strong>Conflict Resolution Rules:</strong>
+            <ul>
+              <li><strong>Documents & Tables:</strong> Field-level Last-Write-Wins (LWW) based on HLC timestamps.</li>
+              <li><strong>Graph Links:</strong> Add-Wins Observed-Remove Sets (AWORSet) ensuring concurrent additions dominate deletions.</li>
+              <li><strong>Telemetry:</strong> Commutative idempotent point appends.</li>
+            </ul>
+          </li>
+          <li><strong>Transport-Agnostic Slices:</strong> The engine exports compact binary replication delta slices (<code>cdb_db_crdt_export_slice</code>) that can be transported over BLE, MQTT, HTTP, or sneakernet.</li>
+        </ul>
+      </section>
+
+      <!-- Section 7 -->
+      <section id="security-governance">
+        <h2>7. Security, Cryptography & Tamper Governance</h2>
+        <p>
+          Enterprise security and multi-tenancy are built into the physical disk format:
+        </p>
+        <ul>
+          <li><strong>Envelope Encryption:</strong> Authenticated Encryption with Associated Data (AEAD) via AES-256-GCM or ChaCha20-Poly1305. Master keys unlock the file; per-enclave subkeys protect individual tenant stores. Plaintext is never exposed in swap or temporary files.</li>
+          <li><strong>Deterministic Nonce Construction:</strong> Nonces are synthesized from <code>(track_id &lt;&lt; 64) | sequence_number</code>, where sequence numbers are reserved durably to guarantee that a nonce is never reused across crashes.</li>
+          <li><strong>Role-Based Access Control (RBAC):</strong> Principal identities are granted bitmask permissions (<code>READ</code>, <code>WRITE</code>, <code>EXEC</code>, <code>ADMIN</code>) scoped to specific stores or enclaves.</li>
+          <li><strong>Tamper-Evident SHA-256 Hash Chaining:</strong> Critical governance events (key rotations, schema mutations, crash recoveries, and transaction revisions) are recorded to the reserved public audit series (<code>CDB_AUDIT_STORE_ID</code>). Each event incorporates the SHA-256 hash of its predecessor, creating a cryptographic audit trail that immediately detects retro-active modifications.</li>
+        </ul>
+      </section>
+
+      <!-- Section 8: CRUD Mutation & Deletion Engine Lifecycle -->
+      <section id="crud-lifecycle">
+        <h2>8. The CRUD Mutation &amp; Deletion Engine Lifecycle</h2>
+        <p>
+          Every CRUD operation (Create, Read, Update, Delete) in <code>db-combolite</code> is governed by rigorous storage invariants that maintain crash safety, zero core heap allocation, and copy-on-write integrity.
+        </p>
+
+        <h3 id="crud-create-arch">8.1 Create Lifecycle &amp; Sub-Page Allocation</h3>
+        <p>
+          When an entity is created (<code>cdb_table_insert</code>, <code>cdb_doc_insert</code>, <code>cdb_vec_insert</code>, <code>cdb_link_add</code>):
+        </p>
+        <ol>
+          <li><strong>Constraint &amp; Schema Pre-Flight:</strong> The engine checks <code>NOT NULL</code> and <code>UNIQUE</code> constraints against both committed B+Tree secondary indexes and uncommitted modifications staged in the open transaction (via <code>cdb_doc_get_in_tx</code> and <code>cdb_table_live_in_tx</code>). Any violation aborts the call with <code>CDB_E_SCHEMA</code> or <code>CDB_E_EXISTS</code> before writing to disk.</li>
+          <li><strong>Entry ID Generation:</strong> The owning store allocates a strictly increasing 64-bit Entry ID from the catalog counter (persisted in the store's catalog record).</li>
+          <li><strong>Transaction Journaling:</strong> The mutation is appended to the current process's private delta track (e.g. <code>rel.0.wal</code>) alongside its CRC32C or AEAD auth tag.</li>
+          <li><strong>Reconciliation Placement:</strong>
+            <ul>
+              <li><strong>Small Records (&le; 1/4 Page):</strong> Packed into shared slotted <strong>Nibblet Pages</strong> (Type <code>0x0009</code>). A tagged 64-bit address <code>(page &lt;&lt; 16) | slot</code> is recorded in the store's B+Tree index.</li>
+              <li><strong>Medium Records (&gt; 1/4 Page):</strong> Allocated dedicated CoW logical pages.</li>
+              <li><strong>Large Records (&gt; Page Size):</strong> Anchored in a revision head page with excess content chained into <strong>Overflow Pages</strong> (Type <code>0x0007</code>).</li>
+            </ul>
+          </li>
+        </ol>
+
+        <h3 id="crud-read-arch">8.2 Read Lifecycle, Snapshot Isolation &amp; Zero-Copy Views</h3>
+        <p>
+          Readers in <code>db-combolite</code> require no read locks and never block concurrent writers:
+        </p>
+        <ul>
+          <li><strong>Snapshot Visibility:</strong> Readers traverse B+Tree indexes using the physical page pointers committed in the latest active header slot. They are completely isolated from uncommitted deltas written by other processes.</li>
+          <li><strong>Transaction-Local Reads:</strong> Inside an active write transaction, reading an entry checks the caller's staging cache (<code>doc_stage</code>) first. If the cache overflowed, it scans backwards through the transaction's own journal delta records to present a consistent read-your-own-writes view.</li>
+          <li><strong>Zero-Copy Semantics:</strong> Readers decode byte slices directly into caller-owned page buffers. Dynamic string and binary fields point directly into the caller's buffer rather than copying memory to the heap.</li>
+        </ul>
+
+        <h3 id="crud-update-arch">8.3 Update Lifecycle, Delta Patches &amp; Index Upkeep</h3>
+        <p>
+          Updating records differs by model to balance write amplification against history preservation:
+        </p>
+        <ul>
+          <li><strong>Document Pools:</strong> Supports full replacement (<code>cdb_doc_replace</code>) and fine-grained delta patching (<code>cdb_doc_patch</code>). A patch stores an array of operations:
+            <code>[CDB_PATCH_SET / CDB_PATCH_REMOVE, field_path, new_value]</code>. A new revision ID is issued (<code>CDB_REV_DELTA</code>), preserving previous revisions for auditability. Periodic full checkpoints (<code>CDB_REV_CHECKPOINT</code>) bound replay time.</li>
+          <li><strong>Relational Tables:</strong> Supports delta column updates (<code>cdb_table_update</code>) and full replacements (<code>cdb_table_replace</code>). Only modified columns are processed; unchanged secondary indexes remain untouched, minimizing B+Tree churn. If <code>keep_revisions = 0</code>, older revisions are freed immediately.</li>
+          <li><strong>Vector Collections:</strong> Embeddings are updated in-place inside their vector block slot. The entry is automatically registered in the neighbour graph's <code>pending</code> index for asynchronous priority queue re-linking.</li>
+          <li><strong>Time Series Collisions:</strong> Ingesting a point with an existing timestamp overwrites differing fields in place, triggers the user's collision callback, and writes an audit event to the tamper-evident series.</li>
+        </ul>
+
+        <h3 id="crud-delete-arch">8.4 Deletion, Tombstones &amp; Space Reclaim</h3>
+        <p>
+          Deleting an entry enforces referential integrity before freeing physical media:
+        </p>
+        <ul>
+          <li><strong>Referential Checks:</strong> Before deleting a document or table row, the engine calls <code>cdb_link_check_delete</code>. If a live link with <code>CDB_LINK_ON_DELETE_REFUSE</code> points to the entry, the deletion is rejected with <code>CDB_E_STATE</code>.</li>
+          <li><strong>Tombstone Emission:</strong>
+            <ul>
+              <li><strong>Documents:</strong> Appends a <code>CDB_REV_TOMBSTONE</code> revision to the chain. Links in both directions are tombstoned with flags indicating which entity was removed.</li>
+              <li><strong>Tables:</strong> If retention is active, a tombstone revision is stored; if history is disabled, the head entry is erased from the primary index.</li>
+              <li><strong>Vectors:</strong> The slot in the vector block is marked empty, the source index mapping is dropped, and the reverse neighbour graph unlinks the vector.</li>
+            </ul>
+          </li>
+          <li><strong>Nibblet Compaction &amp; Page Freeing:</strong> Superseded nibblets leave dead slots. At reconciliation, pages with under 50% utilization are merged by <code>cdb_doc_flush_pools</code>, informing owners of new 64-bit addresses. Vacated pages are added to the reusable list once fenced by a subsequent commit.</li>
+        </ul>
+      </section>
+
+      <!-- Section 9 -->
+            <!-- Section 9: Mathematical, DSP & Scientific Computing Engine -->
+      <section id="math-engine">
+        <h2>9. Embedded Mathematical &amp; DSP Engine Architecture</h2>
+        <p>
+          The <code>db-combolite</code> core includes a zero-heap, high-performance mathematical, digital signal processing (DSP), geodesic navigation, and linear algebra computing engine (<code>cdb_math.h</code>, <code>cdb_math.c</code>). Comprising 110 built-in scalar and vectorized functions, it allows mathematical evaluations to execute directly within the storage engine process boundary, eliminating the overhead of deserializing database records to external Python or R runtimes.
+        </p>
+
+        <h3>9.1 Zero-Allocation Memory &amp; Numerical Stability Principles</h3>
+        <p>
+          Adhering to the engine's strict embedded memory philosophy, <strong>every function in the math engine is completely zero-heap</strong>. Operations requiring scratch memory (such as the Radix-2 Fast Fourier Transform, FIR convolution filters, and matrix multiplication) mandate caller-provided stack or static buffers.
+        </p>
+        <ul>
+          <li><strong>Catastrophic Cancellation Protection:</strong> Functions like <code>cdb_math_expm1(x)</code> and <code>cdb_math_log1p(x)</code> use specialized Chebyshev and Taylor expansions to evaluate \(e^x - 1\) and \(\ln(1 + x)\) without loss of significance when \(|x| \ll 1\).</li>
+          <li><strong>Euclidean Scaled Norms:</strong> <code>cdb_math_hypot(x, y)</code> and <code>cdb_math_hypot3(x, y, z)</code> compute distances by dynamically factoring out \(\max(|x|, |y|, |z|)\), preventing intermediate arithmetic overflow even when coordinate values approach \(10^{154}\).</li>
+          <li><strong>Canonical Floating-Point Invariants:</strong> Quiet NaNs, negative zeros, and subnormal floats are sanitized according to Spec 14.6.5 to guarantee bitwise reproducibility across Little-Endian and Big-Endian architectures.</li>
+        </ul>
+
+        <h3>9.2 Geodesics, Spatial Indexing &amp; GIS Projections</h3>
+        <p>
+          The geodesic subsystem operates on the WGS84 Earth reference ellipsoid model (spherical mean radius \(R = 6,371,000\) meters):
+        </p>
+        <ul>
+          <li><strong>Haversine &amp; Great-Circle Mechanics:</strong> <code>cdb_math_haversine</code> computes spherical distances using the numerically stable haversine formulation, while <code>cdb_math_bearing</code> calculates forward compass azimuths [0, 360) degrees.</li>
+          <li><strong>Cross-Track &amp; Along-Track Vectoring:</strong> <code>cdb_math_cross_track_distance</code> determines the perpendicular deviation in meters from a reference great-circle route, enabling real-time navigation cross-track error alerts.</li>
+          <li><strong>Morton 2D Z-Order Bit Interleaving:</strong> <code>cdb_math_morton2d</code> normalizes latitude and longitude into 32-bit unsigned integers, then interleaves their bits into a single 64-bit integer. This maps 2D spatial coordinates onto a 1D space-filling Z-order curve, allowing standard B+Tree secondary indexes to perform bounded 2D spatial window queries with standard one-dimensional index scans.</li>
+          <li><strong>Web Mercator &amp; Tile Geometry:</strong> <code>cdb_math_wgs84_to_mercator_x/y</code> and <code>cdb_math_lon/lat_to_tile_x/y</code> project spherical geodetic coordinates to planar EPSG:3857 coordinates and OpenStreetMap slippy map tile raster grids.</li>
+        </ul>
+
+        <h3>9.3 Digital Signal Processing (DSP) &amp; SDR Baseband Demodulation</h3>
+        <p>
+          Designed for Software-Defined Radio (SDR) and IoT time-series sensor streams, the DSP subsystem handles complex I/Q baseband data:
+        </p>
+        <ul>
+          <li><strong>Instantaneous Polar Discriminator:</strong> <code>cdb_math_iq_demod_fm</code> demodulates frequency-modulated signals from successive I/Q sample pairs using a differential polar discriminator \(	ext{atan2}(I_{t-1} Q_t - Q_{t-1} I_t, I_{t-1} I_t + Q_{t-1} Q_t)\), returning instantaneous frequency deviation in radians per sample.</li>
+          <li><strong>Windowing Functions:</strong> <code>cdb_math_window_hann</code>, <code>cdb_math_window_hamming</code>, and <code>cdb_math_window_blackman</code> generate pre-computed spectral window tap arrays into caller buffers, reducing spectral leakage in subsequent FFT operations.</li>
+          <li><strong>In-Place Radix-2 Cooley-Tukey FFT:</strong> <code>cdb_math_fft</code> executes complex discrete Fourier transforms in \(O(N \log N)\) time using in-place bit-reversal permutations, while <code>cdb_math_fft_magnitude</code> and <code>cdb_math_fft_power</code> compute single-sided spectral density across \(N/2 + 1\) bins.</li>
+        </ul>
+
+        <h3>9.4 Linear Algebra, ML Activations &amp; Scientific Domains</h3>
+        <p>
+          The engine provides a complete suite of linear algebra and applied physics kernels:
+        </p>
+        <ul>
+          <li><strong>BLAS-Class Vector &amp; Matrix Operations:</strong> Dot product (<code>cdb_math_vec_dot</code>), Euclidean norm, cosine similarity, vector scaling, matrix multiplication (<code>cdb_math_mat_mul</code>), transposition, trace, and Gaussian elimination determinant calculation (<code>cdb_math_mat_det</code>).</li>
+          <li><strong>Transformer &amp; Neural Activations:</strong> In-engine activation functions including Sigmoid, ReLU, Error Function (<code>erf</code>), and GELU (Gaussian Error Linear Unit: \(0.5x(1 + 	anh(\sqrt{2/\pi}(x + 0.044715x^3)))\)).</li>
+          <li><strong>Physical Science Kernels:</strong>
+            <ul>
+              <li><em>Astronomy:</em> Topocentric pointing angles (Az/Alt/Range), equatorial RA/Dec conversions with sidereal time correction, Bennett optical refraction, and angular separation.</li>
+              <li><em>Electronics:</em> NTC thermistor Steinhart-Hart and Beta models, ADC voltage conversions, RC low-pass cutoffs, LC resonance, and dBm/Watts power conversions.</li>
+              <li><em>Atmospheric &amp; Fluids:</em> ICAO barometric pressure-to-altitude hypsometry, Magnus dew point, humid air density, Pitot tube airspeed, Reynolds number, and Venturi flow rates.</li>
+            </ul>
+          </li>
+        </ul>
+
+        <h3>9.5 Query Engine &amp; Bytecode VM Integration</h3>
+        <p>
+          Math functions are seamlessly integrated across both query execution layers:
+        </p>
+        <ul>
+          <li><strong>CMBQL Query Expressions:</strong> The SQL compiler matches function names during lexing and emits a <code>CDB_QUERY_EXPR_CALL</code> AST node bound to a 16-bit function ID (<code>CDB_FN_*</code>). Volcano operator trees evaluate expressions row-by-row with zero heap overhead.</li>
+          <li><strong>CMBP Bytecode Virtual Machine:</strong> The 64-register stored procedure VM features a dedicated opcode <code>CDB_BC_CALL_MATH</code> (opcode <code>0x0B</code>). The opcode fetches arguments from up to 8 input registers, calls the C99 math kernel, and deposits the result into a destination register in a single instruction cycle.</li>
+        </ul>
+      </section>
+
+      <section id="process-flows">
+        <h2>10. Architectural Process Flow Diagrams</h2>
+        <p>
+          The diagrams below visualize the exact operational pipelines executed inside the engine.
+        </p>
+
+        <!-- Diagram 1 -->
+        <div class="diagram-container">
+          <svg class="process-diagram" viewBox="0 0 950 480" width="950" height="480" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="g-blue" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#0284c7"/>
+                <stop offset="100%" stop-color="#38bdf8"/>
+              </linearGradient>
+              <linearGradient id="g-purple" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#7c3aed"/>
+                <stop offset="100%" stop-color="#c084fc"/>
+              </linearGradient>
+              <linearGradient id="g-green" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#059669"/>
+                <stop offset="100%" stop-color="#4ade80"/>
+              </linearGradient>
+              <filter id="shadow" x="-5%" y="-5%" width="110%" height="115%">
+                <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000" flood-opacity="0.4"/>
+              </filter>
+            </defs>
+
+            <!-- Background boundary -->
+            <rect x="10" y="10" width="930" height="460" rx="12" fill="#1e293b" stroke="#334155" stroke-width="2"/>
+            <text x="35" y="42" fill="#94a3b8" font-size="14" font-weight="700" letter-spacing="1">FIGURE 1: COMBOLITE STORAGE &amp; ENGINE LAYER STACK</text>
+
+            <!-- Layer 1: Public Interface -->
+            <rect x="40" y="65" width="870" height="60" rx="8" fill="url(#g-blue)" filter="url(#shadow)"/>
+            <text x="475" y="95" fill="#fff" font-size="16" font-weight="700" text-anchor="middle">Public Application API (C99 Zero-Heap Library)</text>
+            <text x="475" y="114" fill="#e0f2fe" font-size="12" text-anchor="middle">cdb_db_open | cdb_tx_begin | cdb_doc_* | cdb_table_* | cdb_vec_* | cdb_ts_* | cdb_link_* | cdb_compile_*</text>
+
+            <!-- Layer 2: Coordinator & Models -->
+            <g transform="translate(40, 145)">
+              <!-- Multi-Model dispatch -->
+              <rect x="0" y="0" width="580" height="90" rx="8" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+              <text x="290" y="24" fill="#38bdf8" font-size="13" font-weight="700" text-anchor="middle">Native Multi-Model Storage Dispatchers</text>
+              <rect x="15" y="38" width="80" height="40" rx="5" fill="#1e293b" stroke="#334155"/>
+              <text x="55" y="62" fill="#f8fafc" font-size="11" text-anchor="middle">Relational</text>
+              <rect x="105" y="38" width="85" height="40" rx="5" fill="#1e293b" stroke="#334155"/>
+              <text x="147" y="62" fill="#f8fafc" font-size="11" text-anchor="middle">Documents</text>
+              <rect x="200" y="38" width="85" height="40" rx="5" fill="#1e293b" stroke="#334155"/>
+              <text x="242" y="62" fill="#f8fafc" font-size="11" text-anchor="middle">Vectors &amp; ANN</text>
+              <rect x="295" y="38" width="85" height="40" rx="5" fill="#1e293b" stroke="#334155"/>
+              <text x="337" y="62" fill="#f8fafc" font-size="11" text-anchor="middle">Time Series</text>
+              <rect x="390" y="38" width="85" height="40" rx="5" fill="#1e293b" stroke="#334155"/>
+              <text x="432" y="62" fill="#f8fafc" font-size="11" text-anchor="middle">Graph Links</text>
+              <rect x="485" y="38" width="80" height="40" rx="5" fill="#1e293b" stroke="#334155"/>
+              <text x="525" y="62" fill="#f8fafc" font-size="11" text-anchor="middle">Blobs/CRDT</text>
+
+              <!-- In-Process Coordinator -->
+              <rect x="600" y="0" width="270" height="90" rx="8" fill="#0f172a" stroke="#c084fc" stroke-width="1.5"/>
+              <text x="735" y="24" fill="#c084fc" font-size="13" font-weight="700" text-anchor="middle">In-Process Coordinator (cdb_coord)</text>
+              <text x="735" y="48" fill="#e2e8f0" font-size="11" text-anchor="middle">Primary/Subordinate Election</text>
+              <text x="735" y="68" fill="#94a3b8" font-size="10" text-anchor="middle">Baton Protocol &amp; Heartbeat Monitor</text>
+            </g>
+
+            <!-- Layer 3: Pager & Allocation -->
+            <g transform="translate(40, 255)">
+              <rect x="0" y="0" width="870" height="85" rx="8" fill="#0f172a" stroke="#4ade80" stroke-width="1.5"/>
+              <text x="435" y="24" fill="#4ade80" font-size="14" font-weight="700" text-anchor="middle">Copy-on-Write Pager &amp; Allocation Subsystems</text>
+              <rect x="20" y="38" width="185" height="36" rx="4" fill="#1e293b" stroke="#334155"/>
+              <text x="112" y="60" fill="#f8fafc" font-size="11" text-anchor="middle">Logical Anchor Map (CoW)</text>
+              <rect x="230" y="38" width="185" height="36" rx="4" fill="#1e293b" stroke="#334155"/>
+              <text x="322" y="60" fill="#f8fafc" font-size="11" text-anchor="middle">Nibblets Sub-Allocator (0x0009)</text>
+              <rect x="440" y="38" width="185" height="36" rx="4" fill="#1e293b" stroke="#334155"/>
+              <text x="532" y="60" fill="#f8fafc" font-size="11" text-anchor="middle">Overflow Pager Chains (0x0007)</text>
+              <rect x="650" y="38" width="195" height="36" rx="4" fill="#1e293b" stroke="#334155"/>
+              <text x="747" y="60" fill="#f8fafc" font-size="11" text-anchor="middle">Free Space &amp; Compaction Engine</text>
+            </g>
+
+            <!-- Layer 4: Storage Abstraction -->
+            <g transform="translate(40, 360)">
+              <rect x="0" y="0" width="870" height="90" rx="8" fill="#0b1120" stroke="#64748b" stroke-width="1.5"/>
+              <text x="435" y="24" fill="#cbd5e1" font-size="13" font-weight="700" text-anchor="middle">Storage Abstraction &amp; Cryptographic Physical Media (cdb_storage)</text>
+              <rect x="25" y="38" width="250" height="40" rx="5" fill="#1e293b" stroke="#334155"/>
+              <text x="150" y="62" fill="#94a3b8" font-size="11" text-anchor="middle">POSIX Host File (cdb_hostfile)</text>
+              <rect x="310" y="38" width="250" height="40" rx="5" fill="#1e293b" stroke="#334155"/>
+              <text x="435" y="62" fill="#94a3b8" font-size="11" text-anchor="middle">AEAD Enclave (AES-256-GCM / ChaCha)</text>
+              <rect x="595" y="38" width="250" height="40" rx="5" fill="#1e293b" stroke="#334155"/>
+              <text x="720" y="62" fill="#94a3b8" font-size="11" text-anchor="middle">Embedded Raw Flash Partition (MCU)</text>
+            </g>
+          </svg>
+          <div class="diagram-caption">Figure 1: Full Architecture Stack — from Caller Applications down to Cryptographic Storage Media</div>
+        </div>
+
+        <!-- Diagram 2 -->
+        <div class="diagram-container">
+          <svg class="process-diagram" viewBox="0 0 950 260" width="950" height="260" xmlns="http://www.w3.org/2000/svg">
+            <!-- Background -->
+            <rect x="10" y="10" width="930" height="240" rx="12" fill="#1e293b" stroke="#334155" stroke-width="2"/>
+            <text x="35" y="38" fill="#94a3b8" font-size="13" font-weight="700" letter-spacing="1">FIGURE 2: TRANSACTION WRITE &amp; RECONCILIATION PIPELINE</text>
+
+            <!-- Step 1: Begin Tx -->
+            <g transform="translate(30, 60)">
+              <rect x="0" y="0" width="140" height="150" rx="8" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+              <circle cx="70" cy="35" r="16" fill="#0284c7"/>
+              <text x="70" y="41" fill="#fff" font-size="13" font-weight="700" text-anchor="middle">1</text>
+              <text x="70" y="75" fill="#38bdf8" font-size="13" font-weight="700" text-anchor="middle">cdb_tx_begin</text>
+              <text x="70" y="100" fill="#94a3b8" font-size="10" text-anchor="middle">Acquires Slot</text>
+              <text x="70" y="118" fill="#94a3b8" font-size="10" text-anchor="middle">Durability Level</text>
+              <text x="70" y="136" fill="#94a3b8" font-size="10" text-anchor="middle">Allocates Tx ID</text>
+            </g>
+
+            <!-- Arrow 1 -->
+            <path d="M 175 135 L 205 135" stroke="#38bdf8" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+            <!-- Step 2: In-Tx Mutations -->
+            <g transform="translate(210, 60)">
+              <rect x="0" y="0" width="150" height="150" rx="8" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+              <circle cx="75" cy="35" r="16" fill="#0284c7"/>
+              <text x="75" y="41" fill="#fff" font-size="13" font-weight="700" text-anchor="middle">2</text>
+              <text x="75" y="75" fill="#38bdf8" font-size="13" font-weight="700" text-anchor="middle">Mutations (Puts)</text>
+              <text x="75" y="100" fill="#94a3b8" font-size="10" text-anchor="middle">Schema Validation</text>
+              <text x="75" y="118" fill="#94a3b8" font-size="10" text-anchor="middle">Staging Cache Fill</text>
+              <text x="75" y="136" fill="#94a3b8" font-size="10" text-anchor="middle">Unique Check</text>
+            </g>
+
+            <!-- Arrow 2 -->
+            <path d="M 365 135 L 395 135" stroke="#38bdf8" stroke-width="2.5"/>
+
+            <!-- Step 3: Delta WAL Append -->
+            <g transform="translate(400, 60)">
+              <rect x="0" y="0" width="150" height="150" rx="8" fill="#0f172a" stroke="#c084fc" stroke-width="1.5"/>
+              <circle cx="75" cy="35" r="16" fill="#7c3aed"/>
+              <text x="75" y="41" fill="#fff" font-size="13" font-weight="700" text-anchor="middle">3</text>
+              <text x="75" y="75" fill="#c084fc" font-size="13" font-weight="700" text-anchor="middle">Delta WAL Write</text>
+              <text x="75" y="100" fill="#94a3b8" font-size="10" text-anchor="middle">Write to slot WAL</text>
+              <text x="75" y="118" fill="#94a3b8" font-size="10" text-anchor="middle">CRC32C / AEAD Tag</text>
+              <text x="75" y="136" fill="#94a3b8" font-size="10" text-anchor="middle">Commit Record</text>
+            </g>
+
+            <!-- Arrow 3 -->
+            <path d="M 555 135 L 585 135" stroke="#c084fc" stroke-width="2.5"/>
+
+            <!-- Step 4: Baton Reconciliation -->
+            <g transform="translate(590, 60)">
+              <rect x="0" y="0" width="150" height="150" rx="8" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+              <circle cx="75" cy="35" r="16" fill="#d97706"/>
+              <text x="75" y="41" fill="#fff" font-size="13" font-weight="700" text-anchor="middle">4</text>
+              <text x="75" y="75" fill="#fbbf24" font-size="13" font-weight="700" text-anchor="middle">Baton Fold</text>
+              <text x="75" y="100" fill="#94a3b8" font-size="10" text-anchor="middle">Acquire Baton</text>
+              <text x="75" y="118" fill="#94a3b8" font-size="10" text-anchor="middle">Replay Commits</text>
+              <text x="75" y="136" fill="#94a3b8" font-size="10" text-anchor="middle">Apply to Models</text>
+            </g>
+
+            <!-- Arrow 4 -->
+            <path d="M 745 135 L 775 135" stroke="#fbbf24" stroke-width="2.5"/>
+
+            <!-- Step 5: Archive Commit -->
+            <g transform="translate(780, 60)">
+              <rect x="0" y="0" width="140" height="150" rx="8" fill="#0f172a" stroke="#4ade80" stroke-width="1.5"/>
+              <circle cx="70" cy="35" r="16" fill="#059669"/>
+              <text x="70" y="41" fill="#fff" font-size="13" font-weight="700" text-anchor="middle">5</text>
+              <text x="70" y="75" fill="#4ade80" font-size="13" font-weight="700" text-anchor="middle">Header Commit</text>
+              <text x="70" y="100" fill="#94a3b8" font-size="10" text-anchor="middle">Anchor CoW Flush</text>
+              <text x="70" y="118" fill="#94a3b8" font-size="10" text-anchor="middle">Sync Barrier</text>
+              <text x="70" y="136" fill="#94a3b8" font-size="10" text-anchor="middle">Flip Header Slot</text>
+            </g>
+          </svg>
+          <div class="diagram-caption">Figure 2: End-to-End Write Progression — from Transaction Staging to Durable Archive Promotion</div>
+        </div>
+
+        <!-- Diagram 3 -->
+        <div class="diagram-container">
+          <svg class="process-diagram" viewBox="0 0 950 320" width="950" height="320" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="930" height="300" rx="12" fill="#1e293b" stroke="#334155" stroke-width="2"/>
+            <text x="35" y="38" fill="#94a3b8" font-size="13" font-weight="700" letter-spacing="1">FIGURE 3: MULTI-PROCESS COORDINATOR &amp; BATON PROTOCOL</text>
+
+            <!-- Process 1 (Primary) -->
+            <g transform="translate(40, 65)">
+              <rect x="0" y="0" width="260" height="220" rx="8" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+              <text x="130" y="28" fill="#38bdf8" font-size="14" font-weight="700" text-anchor="middle">Process A (Primary Coord)</text>
+              <rect x="20" y="45" width="220" height="30" rx="4" fill="#1e293b"/>
+              <text x="130" y="65" fill="#f8fafc" font-size="11" text-anchor="middle">Slot 0 (PRIMARY_COORD)</text>
+              <rect x="20" y="85" width="220" height="30" rx="4" fill="#1e293b"/>
+              <text x="130" y="105" fill="#4ade80" font-size="11" text-anchor="middle">Heartbeat Clock: Running</text>
+              <rect x="20" y="125" width="220" height="30" rx="4" fill="#1e293b"/>
+              <text x="130" y="145" fill="#e2e8f0" font-size="11" text-anchor="middle">Own Delta: rel.0.wal</text>
+              <rect x="20" y="165" width="220" height="40" rx="4" fill="#0284c7"/>
+              <text x="130" y="188" fill="#fff" font-size="12" font-weight="700" text-anchor="middle">Currently Holds Baton</text>
+            </g>
+
+            <!-- Baton Token flow -->
+            <g transform="translate(320, 110)">
+              <rect x="0" y="0" width="290" height="130" rx="8" fill="#0b1120" stroke="#fbbf24" stroke-width="1.5"/>
+              <text x="145" y="28" fill="#fbbf24" font-size="13" font-weight="700" text-anchor="middle">Baton Claim Ticket State</text>
+              <text x="145" y="55" fill="#cbd5e1" font-size="11" text-anchor="middle">CTS Marker: 104289</text>
+              <text x="145" y="75" fill="#cbd5e1" font-size="11" text-anchor="middle">Service Window: 50 ms</text>
+              <text x="145" y="95" fill="#94a3b8" font-size="10" text-anchor="middle">Congestion Queue: 0 requesters</text>
+              <path d="M -15 65 L -3 65" stroke="#fbbf24" stroke-width="2"/>
+              <path d="M 293 65 L 305 65" stroke="#fbbf24" stroke-width="2"/>
+            </g>
+
+            <!-- Process 2 (Subordinate) -->
+            <g transform="translate(630, 65)">
+              <rect x="0" y="0" width="260" height="220" rx="8" fill="#0f172a" stroke="#c084fc" stroke-width="1.5"/>
+              <text x="130" y="28" fill="#c084fc" font-size="14" font-weight="700" text-anchor="middle">Process B (Subordinate)</text>
+              <rect x="20" y="45" width="220" height="30" rx="4" fill="#1e293b"/>
+              <text x="130" y="65" fill="#f8fafc" font-size="11" text-anchor="middle">Slot 1 (SUBORDINATE)</text>
+              <rect x="20" y="85" width="220" height="30" rx="4" fill="#1e293b"/>
+              <text x="130" y="105" fill="#cbd5e1" font-size="11" text-anchor="middle">Watches Primary Heartbeat</text>
+              <rect x="20" y="125" width="220" height="30" rx="4" fill="#1e293b"/>
+              <text x="130" y="145" fill="#e2e8f0" font-size="11" text-anchor="middle">Own Delta: rel.1.wal</text>
+              <rect x="20" y="165" width="220" height="40" rx="4" fill="#334155"/>
+              <text x="130" y="188" fill="#94a3b8" font-size="11" text-anchor="middle">Queued for Next Baton</text>
+            </g>
+          </svg>
+          <div class="diagram-caption">Figure 3: Multi-Process Coordination, Slot Allocation, and Baton Handoff Mechanics</div>
+        </div>
+
+        <!-- Diagram 4 -->
+        <div class="diagram-container">
+          <svg class="process-diagram" viewBox="0 0 950 300" width="950" height="300" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="930" height="280" rx="12" fill="#1e293b" stroke="#334155" stroke-width="2"/>
+            <text x="35" y="38" fill="#94a3b8" font-size="13" font-weight="700" letter-spacing="1">FIGURE 4: VECTOR COLLECTION ANN NEIGHBOUR GRAPH SEARCH</text>
+
+            <!-- Step 1: Entry Points -->
+            <g transform="translate(40, 65)">
+              <rect x="0" y="0" width="260" height="195" rx="8" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+              <text x="130" y="28" fill="#38bdf8" font-size="13" font-weight="700" text-anchor="middle">Phase 1: Seed Entry Points</text>
+              <rect x="15" y="45" width="230" height="40" rx="4" fill="#1e293b"/>
+              <text x="130" y="70" fill="#f8fafc" font-size="11" text-anchor="middle">Spread Points (~&radic;N entries)</text>
+              <rect x="15" y="95" width="230" height="40" rx="4" fill="#1e293b"/>
+              <text x="130" y="120" fill="#f8fafc" font-size="11" text-anchor="middle">Reach Points (Clustered data)</text>
+              <rect x="15" y="145" width="230" height="35" rx="4" fill="#0284c7"/>
+              <text x="130" y="167" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">Populate Priority Queue</text>
+            </g>
+
+            <!-- Arrow 1 -->
+            <path d="M 305 160 L 335 160" stroke="#38bdf8" stroke-width="2.5"/>
+
+            <!-- Step 2: Best-First Walk -->
+            <g transform="translate(340, 65)">
+              <rect x="0" y="0" width="270" height="195" rx="8" fill="#0f172a" stroke="#c084fc" stroke-width="1.5"/>
+              <text x="135" y="28" fill="#c084fc" font-size="13" font-weight="700" text-anchor="middle">Phase 2: Best-First Graph Walk</text>
+              <rect x="15" y="45" width="240" height="40" rx="4" fill="#1e293b"/>
+              <text x="135" y="70" fill="#f8fafc" font-size="11" text-anchor="middle">Explore K Nearest Neighbours</text>
+              <rect x="15" y="95" width="240" height="40" rx="4" fill="#1e293b"/>
+              <text x="135" y="120" fill="#f8fafc" font-size="11" text-anchor="middle">Compute Distance (L2 / Cosine)</text>
+              <rect x="15" y="145" width="240" height="35" rx="4" fill="#7c3aed"/>
+              <text x="135" y="167" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">Prune Worse than K-th Candidate</text>
+            </g>
+
+            <!-- Arrow 2 -->
+            <path d="M 615 160 L 645 160" stroke="#c084fc" stroke-width="2.5"/>
+
+            <!-- Step 3: Pending Drain & Result -->
+            <g transform="translate(650, 65)">
+              <rect x="0" y="0" width="250" height="195" rx="8" fill="#0f172a" stroke="#4ade80" stroke-width="1.5"/>
+              <text x="125" y="28" fill="#4ade80" font-size="13" font-weight="700" text-anchor="middle">Phase 3: Pending &amp; Staleness</text>
+              <rect x="15" y="45" width="220" height="40" rx="4" fill="#1e293b"/>
+              <text x="125" y="70" fill="#f8fafc" font-size="11" text-anchor="middle">Linear Scan of Pending Updates</text>
+              <rect x="15" y="95" width="220" height="40" rx="4" fill="#1e293b"/>
+              <text x="125" y="120" fill="#f8fafc" font-size="11" text-anchor="middle">Check Source Doc Revision</text>
+              <rect x="15" y="145" width="220" height="35" rx="4" fill="#059669"/>
+              <text x="125" y="167" fill="#fff" font-size="11" font-weight="600" text-anchor="middle">Emit Top-K with Stale Flags</text>
+            </g>
+          </svg>
+          <div class="diagram-caption">Figure 4: Hybrid Vector Search Flow — Bridging Pre-Computed Graph Traversal with Pending Unindexed Vectors</div>
+        </div>
+
+        <!-- Diagram 5: CRUD Lifecycle -->
+        <div class="diagram-container">
+          <svg class="process-diagram" viewBox="0 0 950 360" width="950" height="360" xmlns="http://www.w3.org/2000/svg">
+            <rect x="10" y="10" width="930" height="340" rx="12" fill="#1e293b" stroke="#334155" stroke-width="2"/>
+            <text x="35" y="38" fill="#94a3b8" font-size="13" font-weight="700" letter-spacing="1">FIGURE 5: MULTI-MODEL CRUD MUTATION &amp; DELETION LIFECYCLE</text>
+
+            <!-- Box 1: CREATE -->
+            <g transform="translate(30, 65)">
+              <rect x="0" y="0" width="205" height="260" rx="8" fill="#0f172a" stroke="#4ade80" stroke-width="1.5"/>
+              <rect x="15" y="15" width="70" height="24" rx="4" fill="#059669"/>
+              <text x="50" y="31" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">CREATE</text>
+              <text x="15" y="65" fill="#f8fafc" font-size="12" font-weight="700">1. Constraint Check</text>
+              <text x="15" y="85" fill="#94a3b8" font-size="10">Validate NOT NULL, UNIQUE</text>
+              <text x="15" y="100" fill="#94a3b8" font-size="10">Checks tx staging cache</text>
+              <text x="15" y="130" fill="#f8fafc" font-size="12" font-weight="700">2. Delta WAL Log</text>
+              <text x="15" y="150" fill="#94a3b8" font-size="10">Appends to rel.X.wal</text>
+              <text x="15" y="180" fill="#f8fafc" font-size="12" font-weight="700">3. Allocation</text>
+              <text x="15" y="200" fill="#4ade80" font-size="10">&le; 1/4 page: Nibblet (0x0009)</text>
+              <text x="15" y="218" fill="#38bdf8" font-size="10">&gt; 1/4 page: CoW Page</text>
+              <text x="15" y="236" fill="#c084fc" font-size="10">&gt; Page: Overflow (0x0007)</text>
+            </g>
+
+            <!-- Box 2: READ -->
+            <g transform="translate(255, 65)">
+              <rect x="0" y="0" width="205" height="260" rx="8" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+              <rect x="15" y="15" width="60" height="24" rx="4" fill="#0284c7"/>
+              <text x="45" y="31" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">READ</text>
+              <text x="15" y="65" fill="#f8fafc" font-size="12" font-weight="700">1. Isolation Check</text>
+              <text x="15" y="85" fill="#94a3b8" font-size="10">Reads committed header</text>
+              <text x="15" y="100" fill="#94a3b8" font-size="10">Overlay tx-local changes</text>
+              <text x="15" y="130" fill="#f8fafc" font-size="12" font-weight="700">2. Index Lookup</text>
+              <text x="15" y="150" fill="#94a3b8" font-size="10">B+Tree order-preserving key</text>
+              <text x="15" y="165" fill="#94a3b8" font-size="10">Resolves 64-bit Nibblet/Page</text>
+              <text x="15" y="195" fill="#f8fafc" font-size="12" font-weight="700">3. Zero-Copy View</text>
+              <text x="15" y="215" fill="#38bdf8" font-size="10">Direct pointer into caller buf</text>
+              <text x="15" y="235" fill="#94a3b8" font-size="10">No heap allocation</text>
+            </g>
+
+            <!-- Box 3: UPDATE -->
+            <g transform="translate(480, 65)">
+              <rect x="0" y="0" width="210" height="260" rx="8" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+              <rect x="15" y="15" width="70" height="24" rx="4" fill="#d97706"/>
+              <text x="50" y="31" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">UPDATE</text>
+              <text x="15" y="65" fill="#f8fafc" font-size="12" font-weight="700">1. Delta vs Replace</text>
+              <text x="15" y="85" fill="#94a3b8" font-size="10">Doc: [SET/REMOVE, path, val]</text>
+              <text x="15" y="100" fill="#94a3b8" font-size="10">Table: modified columns only</text>
+              <text x="15" y="130" fill="#f8fafc" font-size="12" font-weight="700">2. Version Emission</text>
+              <text x="15" y="150" fill="#fbbf24" font-size="10">New rev ID (CDB_REV_DELTA)</text>
+              <text x="15" y="165" fill="#94a3b8" font-size="10">Checkpoint every N deltas</text>
+              <text x="15" y="195" fill="#f8fafc" font-size="12" font-weight="700">3. Index Upkeep</text>
+              <text x="15" y="215" fill="#94a3b8" font-size="10">Secondary index updated</text>
+              <text x="15" y="230" fill="#94a3b8" font-size="10">Vectors: mark graph pending</text>
+            </g>
+
+            <!-- Box 4: DELETE -->
+            <g transform="translate(710, 65)">
+              <rect x="0" y="0" width="205" height="260" rx="8" fill="#0f172a" stroke="#fb7185" stroke-width="1.5"/>
+              <rect x="15" y="15" width="65" height="24" rx="4" fill="#e11d48"/>
+              <text x="47" y="31" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">DELETE</text>
+              <text x="15" y="65" fill="#f8fafc" font-size="12" font-weight="700">1. Link Cascade</text>
+              <text x="15" y="85" fill="#94a3b8" font-size="10">Checks cdb_link rules</text>
+              <text x="15" y="100" fill="#fb7185" font-size="10">REFUSE / CASCADE / TOMB</text>
+              <text x="15" y="130" fill="#f8fafc" font-size="12" font-weight="700">2. Tombstoning</text>
+              <text x="15" y="150" fill="#94a3b8" font-size="10">Doc: CDB_REV_TOMBSTONE</text>
+              <text x="15" y="165" fill="#94a3b8" font-size="10">Table: erase if keep = 0</text>
+              <text x="15" y="195" fill="#f8fafc" font-size="12" font-weight="700">3. Space Reclaim</text>
+              <text x="15" y="215" fill="#94a3b8" font-size="10">Nibblet page merge &lt; 50%</text>
+              <text x="15" y="230" fill="#4ade80" font-size="10">Fenced CoW page reuse</text>
+            </g>
+          </svg>
+          <div class="diagram-caption">Figure 5: Complete CRUD Mutation &amp; Deletion Lifecycle Across All Engine Layers</div>
+        </div>
+
+              <!-- Diagram 6: Mathematical & DSP Engine Execution Pipeline -->
+        <div class="diagram-container">
+          <svg class="process-diagram" viewBox="0 0 950 480" width="950" height="480" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="g-math-purple" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#7c3aed"/>
+                <stop offset="100%" stop-color="#a855f7"/>
+              </linearGradient>
+              <linearGradient id="g-math-blue" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#0284c7"/>
+                <stop offset="100%" stop-color="#38bdf8"/>
+              </linearGradient>
+              <linearGradient id="g-math-teal" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#0d9488"/>
+                <stop offset="100%" stop-color="#2dd4bf"/>
+              </linearGradient>
+              <linearGradient id="g-math-amber" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#d97706"/>
+                <stop offset="100%" stop-color="#fbbf24"/>
+              </linearGradient>
+            </defs>
+
+            <!-- Background boundary -->
+            <rect x="10" y="10" width="930" height="460" rx="12" fill="#1e293b" stroke="#334155" stroke-width="2"/>
+            <text x="35" y="42" fill="#94a3b8" font-size="14" font-weight="700" letter-spacing="1">FIGURE 6: EMBEDDED MATHEMATICAL, DSP &amp; SCIENTIFIC EXECUTION PIPELINE</text>
+
+            <!-- Stage 1: Ingestion / Invocation -->
+            <g transform="translate(40, 65)">
+              <rect x="0" y="0" width="190" height="375" rx="8" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+              <rect x="15" y="15" width="85" height="24" rx="4" fill="#0284c7"/>
+              <text x="57" y="31" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">INPUT LAYER</text>
+              <text x="15" y="65" fill="#f8fafc" font-size="13" font-weight="700">1. CMBQL Query</text>
+              <text x="15" y="85" fill="#94a3b8" font-size="11">SELECT haversine(...)</text>
+              <text x="15" y="102" fill="#94a3b8" font-size="11">SELECT fft_magnitude(..)</text>
+              <text x="15" y="119" fill="#94a3b8" font-size="11">SELECT gelu(weight)</text>
+
+              <text x="15" y="155" fill="#f8fafc" font-size="13" font-weight="700">2. CMBP Bytecode</text>
+              <text x="15" y="175" fill="#c084fc" font-size="11">Opcode 0x0B (CALL_MATH)</text>
+              <text x="15" y="192" fill="#94a3b8" font-size="11">dst_reg &lt;- fn_id(args)</text>
+
+              <text x="15" y="230" fill="#f8fafc" font-size="13" font-weight="700">3. Direct C99 API</text>
+              <text x="15" y="250" fill="#4ade80" font-size="11">cdb_math_fir_filter()</text>
+              <text x="15" y="267" fill="#4ade80" font-size="11">cdb_math_mat_mul()</text>
+              <text x="15" y="284" fill="#4ade80" font-size="11">cdb_math_morton2d()</text>
+
+              <rect x="15" y="325" width="160" height="35" rx="6" fill="#1e293b" stroke="#334155"/>
+              <text x="95" y="347" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle">Zero-Copy Pass-Through</text>
+            </g>
+
+            <!-- Arrow 1 -> 2 -->
+            <path d="M 235 250 L 265 250" stroke="#38bdf8" stroke-width="2.5" marker-end="url(#arrow)" fill="none"/>
+
+            <!-- Stage 2: Function Dispatcher -->
+            <g transform="translate(270, 65)">
+              <rect x="0" y="0" width="190" height="375" rx="8" fill="#0f172a" stroke="#c084fc" stroke-width="1.5"/>
+              <rect x="15" y="15" width="85" height="24" rx="4" fill="#7c3aed"/>
+              <text x="57" y="31" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">DISPATCH</text>
+              <text x="15" y="65" fill="#f8fafc" font-size="13" font-weight="700">16-bit Opcode Table</text>
+              <text x="15" y="85" fill="#94a3b8" font-size="11">0x01xx: Trig &amp; Hyperbolic</text>
+              <text x="15" y="102" fill="#94a3b8" font-size="11">0x02xx: Geodesic &amp; GIS</text>
+              <text x="15" y="119" fill="#94a3b8" font-size="11">0x03xx: Algebra &amp; ML</text>
+              <text x="15" y="136" fill="#94a3b8" font-size="11">0x04xx: Calculus / Diff</text>
+              <text x="15" y="153" fill="#94a3b8" font-size="11">0x05xx: Linear Algebra</text>
+              <text x="15" y="170" fill="#94a3b8" font-size="11">0x06xx: SDR / DSP Spectral</text>
+              <text x="15" y="187" fill="#94a3b8" font-size="11">0x07xx: Astronomy Mount</text>
+              <text x="15" y="204" fill="#94a3b8" font-size="11">0x08xx: Electronics / RF</text>
+              <text x="15" y="221" fill="#94a3b8" font-size="11">0x09xx: Atmo &amp; Gas Laws</text>
+              <text x="15" y="238" fill="#94a3b8" font-size="11">0x0Axx: Fluid Dynamics</text>
+
+              <rect x="15" y="325" width="160" height="35" rx="6" fill="#1e293b" stroke="#334155"/>
+              <text x="95" y="347" fill="#c084fc" font-size="11" font-weight="700" text-anchor="middle">O(1) Branch Dispatch</text>
+            </g>
+
+            <!-- Arrow 2 -> 3 -->
+            <path d="M 465 250 L 495 250" stroke="#c084fc" stroke-width="2.5" fill="none"/>
+
+            <!-- Stage 3: Execution Engine -->
+            <g transform="translate(500, 65)">
+              <rect x="0" y="0" width="200" height="375" rx="8" fill="#0f172a" stroke="#2dd4bf" stroke-width="1.5"/>
+              <rect x="15" y="15" width="95" height="24" rx="4" fill="#0d9488"/>
+              <text x="62" y="31" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">COMPUTATION</text>
+              <text x="15" y="65" fill="#f8fafc" font-size="13" font-weight="700">Numeric Kernels</text>
+              <text x="15" y="85" fill="#2dd4bf" font-size="11">Cooley-Tukey Radix-2</text>
+              <text x="15" y="102" fill="#94a3b8" font-size="11">In-place O(N log N) FFT</text>
+              <text x="15" y="125" fill="#2dd4bf" font-size="11">Polar Discriminator</text>
+              <text x="15" y="142" fill="#94a3b8" font-size="11">Differential atan2 FM demod</text>
+              <text x="15" y="165" fill="#2dd4bf" font-size="11">WGS84 Haversine</text>
+              <text x="15" y="182" fill="#94a3b8" font-size="11">R = 6,371,000 m sphere</text>
+              <text x="15" y="205" fill="#2dd4bf" font-size="11">Matrix Product / Det</text>
+              <text x="15" y="222" fill="#94a3b8" font-size="11">Row-major unrolled loops</text>
+              <text x="15" y="245" fill="#2dd4bf" font-size="11">Transformer GELU / Erf</text>
+              <text x="15" y="262" fill="#94a3b8" font-size="11">Chebyshev rational approx</text>
+
+              <rect x="15" y="325" width="170" height="35" rx="6" fill="#1e293b" stroke="#334155"/>
+              <text x="100" y="347" fill="#2dd4bf" font-size="11" font-weight="700" text-anchor="middle">Zero-Heap Stack Memory</text>
+            </g>
+
+            <!-- Arrow 3 -> 4 -->
+            <path d="M 705 250 L 735 250" stroke="#2dd4bf" stroke-width="2.5" fill="none"/>
+
+            <!-- Stage 4: Output Destination -->
+            <g transform="translate(740, 65)">
+              <rect x="0" y="0" width="175" height="375" rx="8" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+              <rect x="15" y="15" width="75" height="24" rx="4" fill="#d97706"/>
+              <text x="52" y="31" fill="#fff" font-size="11" font-weight="700" text-anchor="middle">OUTPUTS</text>
+              <text x="15" y="65" fill="#f8fafc" font-size="13" font-weight="700">1. VM Registers</text>
+              <text x="15" y="85" fill="#94a3b8" font-size="11">R0..R63 register file</text>
+              <text x="15" y="102" fill="#fbbf24" font-size="11">IEEE-754 double or i64</text>
+
+              <text x="15" y="140" fill="#f8fafc" font-size="13" font-weight="700">2. Volcano Stream</text>
+              <text x="15" y="160" fill="#94a3b8" font-size="11">Row projected values</text>
+              <text x="15" y="177" fill="#94a3b8" font-size="11">WHERE filter predicate</text>
+
+              <text x="15" y="215" fill="#f8fafc" font-size="13" font-weight="700">3. Buffer Return</text>
+              <text x="15" y="235" fill="#94a3b8" font-size="11">FFT power spectrum</text>
+              <text x="15" y="252" fill="#94a3b8" font-size="11">FIR filtered audio array</text>
+              <text x="15" y="269" fill="#94a3b8" font-size="11">Matrix output array</text>
+
+              <rect x="15" y="325" width="145" height="35" rx="6" fill="#1e293b" stroke="#334155"/>
+              <text x="87" y="347" fill="#fbbf24" font-size="11" font-weight="700" text-anchor="middle">Caller Allocated</text>
+            </g>
+          </svg>
+          <div class="diagram-caption">Figure 6: Embedded Mathematical, DSP &amp; Scientific Execution Pipeline</div>
+        </div>
+
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    <p>db-combolite Specification &amp; Theory of Operation Guidebook &bull; Released under the MIT License.</p>
+  </footer>
+</body>
+</html>

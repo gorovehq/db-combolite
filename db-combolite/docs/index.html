@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>db-combolite — Official Documentation Hub</title>
+  <style>
+    :root {
+      --bg-primary: #0f172a;
+      --bg-secondary: #1e293b;
+      --bg-card: #1e293b;
+      --bg-card-hover: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-glow: rgba(56, 189, 248, 0.25);
+      --accent-green: #4ade80;
+      --accent-purple: #c084fc;
+      --accent-amber: #fbbf24;
+      --border: #334155;
+      --code-bg: #0b1120;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background-color: var(--bg-primary);
+      color: var(--text-main);
+      line-height: 1.6;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+    header.site-header {
+      background-color: rgba(15, 23, 42, 0.95);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 1000;
+      padding: 0.75rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: var(--text-main);
+      text-decoration: none;
+    }
+    .brand .logo-badge {
+      background: linear-gradient(135deg, #0284c7, #38bdf8);
+      color: #fff;
+      padding: 0.25rem 0.6rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+    }
+    nav.top-nav {
+      display: flex;
+      gap: 1.25rem;
+      align-items: center;
+    }
+    nav.top-nav a {
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: color 0.15s ease;
+      padding: 0.35rem 0.65rem;
+      border-radius: 4px;
+    }
+    nav.top-nav a:hover, nav.top-nav a.active {
+      color: var(--text-main);
+      background-color: var(--bg-card);
+    }
+    nav.top-nav a.active {
+      color: var(--accent);
+      border-bottom: 2px solid var(--accent);
+    }
+    .hero-banner {
+      background: radial-gradient(circle at 50% 20%, rgba(56, 189, 248, 0.15), transparent 70%),
+                  linear-gradient(180deg, var(--bg-primary), var(--bg-secondary));
+      padding: 5rem 2rem 4rem;
+      text-align: center;
+      border-bottom: 1px solid var(--border);
+    }
+    .hero-banner h1 {
+      font-size: 3.25rem;
+      font-weight: 800;
+      letter-spacing: -0.025em;
+      margin-bottom: 1rem;
+      background: linear-gradient(135deg, #ffffff 40%, #38bdf8 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .hero-banner p {
+      font-size: 1.25rem;
+      color: var(--text-muted);
+      max-width: 800px;
+      margin: 0 auto 2rem;
+    }
+    .badge-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      background-color: rgba(56, 189, 248, 0.1);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      color: var(--accent);
+      padding: 0.35rem 0.85rem;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      margin-bottom: 1.5rem;
+    }
+    .container {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 3.5rem 2rem;
+      width: 100%;
+    }
+    .grid-guides {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.75rem;
+      margin-bottom: 4rem;
+    }
+    .guide-card {
+      background-color: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 2rem;
+      text-decoration: none;
+      color: inherit;
+      display: flex;
+      flex-direction: column;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      position: relative;
+      overflow: hidden;
+    }
+    .guide-card:hover {
+      transform: translateY(-4px);
+      border-color: var(--accent);
+      box-shadow: 0 12px 24px -10px var(--accent-glow);
+      background-color: var(--bg-card-hover);
+    }
+    .guide-icon {
+      font-size: 2rem;
+      margin-bottom: 1rem;
+      display: inline-block;
+    }
+    .guide-card h3 {
+      font-size: 1.35rem;
+      font-weight: 700;
+      color: #fff;
+      margin-bottom: 0.75rem;
+    }
+    .guide-card p {
+      font-size: 0.95rem;
+      color: var(--text-muted);
+      flex: 1;
+      margin-bottom: 1.5rem;
+    }
+    .guide-card-action {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      color: var(--accent);
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+    .specs-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 1.25rem;
+      margin: 2rem 0;
+    }
+    .spec-item {
+      background-color: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+    }
+    .spec-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 0.35rem;
+    }
+    .spec-value {
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: #f8fafc;
+    }
+    footer {
+      background-color: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      padding: 2.5rem 2rem;
+      text-align: center;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-top: auto;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Site Header -->
+  <header class="site-header">
+    <a href="index.html" class="brand">
+      <span class="logo-badge">CDB</span>
+      <span>db-combolite Docs</span>
+    </a>
+    <nav class="top-nav">
+      <a href="index.html" class="active">Overview</a>
+      <a href="theory-of-operation.html">Theory of Operation</a>
+      <a href="user-manual.html">User Manual</a>
+      <a href="api-usage.html">API Reference</a>
+      <a href="swagger.html">Swagger C99 API</a>
+    </nav>
+  </header>
+
+  <!-- Hero Banner -->
+  <div class="hero-banner">
+    <div class="badge-pill">
+      <span>●</span> Single-File Embeddable Multi-Model Database
+    </div>
+    <h1>db-combolite Documentation Suite</h1>
+    <p>
+      High-performance C99 engine natively unifying Relational Tables, Schemaless Document Pools with BM25, Vector Collections with HNSW-class ANN Graphs, Bit-Packed Time Series, and Graph Links.
+    </p>
+  </div>
+
+  <div class="container">
+    <!-- Four Primary Guides -->
+    <h2 style="font-size: 1.5rem; margin-bottom: 1.5rem; color: #fff;">Documentation Guides</h2>
+    <div class="grid-guides">
+
+      <!-- Card 1 -->
+      <a href="theory-of-operation.html" class="guide-card">
+        <div class="guide-icon">⚙️</div>
+        <h3>Theory of Operation</h3>
+        <p>
+          Deep dive into the internal mechanics: Copy-on-Write logical pager, Anchor Maps, 64-bit Nibblet sub-allocator, multi-process coordinator election, baton reconciliation protocol, and crash invariants.
+        </p>
+        <div class="guide-card-action">
+          <span>Explore Architecture</span> &rarr;
+        </div>
+      </a>
+
+      <!-- Card 2 -->
+      <a href="user-manual.html" class="guide-card">
+        <div class="guide-icon">📖</div>
+        <h3>User Manual</h3>
+        <p>
+          Developer-focused manual for embedding Combolite in C/C++ applications: CMake setup, memory buffer sizing, data modeling, CMBQL query syntax, transactions, and CRDT synchronization.
+        </p>
+        <div class="guide-card-action">
+          <span>Read User Manual</span> &rarr;
+        </div>
+      </a>
+
+      <!-- Card 3 -->
+      <a href="api-usage.html" class="guide-card">
+        <div class="guide-icon">💻</div>
+        <h3>API Reference &amp; Cookbook</h3>
+        <p>
+          Exhaustive C99 API reference detailing all function signatures, structs, error status codes (<code>cdb_status</code>), and complete copy-pasteable implementation recipes for every subsystem.
+        </p>
+        <div class="guide-card-action">
+          <span>Browse C API</span> &rarr;
+        </div>
+      </a>
+
+      <!-- Card 4 -->
+      <a href="swagger.html" class="guide-card">
+        <div class="guide-icon">⚡</div>
+        <h3>Swagger C99 API Specification</h3>
+        <p>
+          Interactive Swagger UI-styled specification for the native C99 engine interface: function signatures, parameter tables, cdb_status return codes, caller memory contracts, and live operation search.
+        </p>
+        <div class="guide-card-action">
+          <span>Explore Swagger C99 API</span> &rarr;
+        </div>
+      </a>
+
+    </div>
+
+    <!-- Quick Specifications -->
+    <h2 style="font-size: 1.5rem; margin-bottom: 1rem; color: #fff;">System Architecture at a Glance</h2>
+    <div class="specs-grid">
+      <div class="spec-item">
+        <div class="spec-label">Language &amp; Standard</div>
+        <div class="spec-value">Pure C99</div>
+      </div>
+      <div class="spec-item">
+        <div class="spec-label">Core Memory Allocation</div>
+        <div class="spec-value">Zero Heap (Caller-Owned)</div>
+      </div>
+      <div class="spec-item">
+        <div class="spec-label">Archive Format</div>
+        <div class="spec-value">Single File at Rest</div>
+      </div>
+      <div class="spec-item">
+        <div class="spec-label">Crash Invariant</div>
+        <div class="spec-value">Copy-on-Write + Dual Headers</div>
+      </div>
+      <div class="spec-item">
+        <div class="spec-label">Durability Levels</div>
+        <div class="spec-value">NORMAL, FULL, OFF</div>
+      </div>
+      <div class="spec-item">
+        <div class="spec-label">Vector Retrieval</div>
+        <div class="spec-value">Exact &amp; HNSW-Class ANN</div>
+      </div>
+      <div class="spec-item">
+        <div class="spec-label">Text Search</div>
+        <div class="spec-value">Native Inverted BM25</div>
+      </div>
+      <div class="spec-item">
+        <div class="spec-label">Query Core</div>
+        <div class="spec-value">15 Volcano Operators + VM</div>
+              <div class="card">
+          <div class="card-icon">∑</div>
+          <h3 class="card-title">Embedded Math &amp; DSP Engine</h3>
+          <p class="card-desc">
+            110 zero-allocation scientific functions: Trigonometry, Geodesics (WGS84 Haversine &amp; Morton 2D), SDR/DSP (Radix-2 FFT, FIR, FM demod), Linear Algebra (Matrix product/det), ML activations (GELU, Sigmoid), and Physical Sciences.
+          </p>
+          <a href="api-usage.html#math-api" class="card-link">Explore Math Engine &rarr;</a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <p>db-combolite Documentation Suite &bull; Clean-Room C99 Embedded Database &bull; MIT License.</p>
+  </footer>
+</body>
+</html>
