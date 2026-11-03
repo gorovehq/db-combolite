@@ -7,7 +7,8 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk, Pango
 
 from .backend import MODEL_INFO, Model
-from .views import (ConsoleView, DocumentView, LinksView, OverviewView, TableView,
+from .console import ConsoleView
+from .views import (DocumentView, LinksView, OverviewView, TableView,
                     TimeSeriesView, VectorView, short)
 
 

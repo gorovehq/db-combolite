@@ -997,4 +997,4 @@ class OverviewView(Gtk.ScrolledWindow):
             self._rows.append((row, self.file_group))
 
 
-from .console import ConsoleView  # noqa: E402,F401  (defined in console.py)
+

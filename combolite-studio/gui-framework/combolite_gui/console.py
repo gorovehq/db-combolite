@@ -63,7 +63,9 @@ class ConsoleView(Gtk.Box):
             self.view = Gtk.TextView(buffer=self.buf, monospace=True)
         self.view.add_css_class("code-view")
         self.view.set_top_margin(12)
+        self.view.set_bottom_margin(12)
         self.view.set_left_margin(12)
+        self.view.set_right_margin(12)
         self.view.set_has_tooltip(True)
         self.view.connect("query-tooltip", self._tooltip)
 
@@ -97,16 +99,23 @@ class ConsoleView(Gtk.Box):
         explain.connect("clicked", lambda *_: self.explain())
         self.append(toolbar(Gtk.Label(label="CMBQL", css_classes=["heading"]),
                             Gtk.Label(label="PREVIEW", css_classes=["pill-badge"]), self.chip, spacer(),
-                            icon_button("edit-clear-all-symbolic", "Clear editor", lambda: self.buf.set_text("")),
+                            icon_button("edit-clear-all-symbolic", "Clear editor", self.clear_editor),
                             self.fix_btn, save_proc, explain, run))
 
         # editor / diagnostics / results
-        paned = Gtk.Paned(orientation=V, position=250, vexpand=True)
-        editor = Gtk.Box()
-        editor.append(self._build_rail())
-        editor.append(Gtk.ScrolledWindow(child=self.view, hexpand=True, min_content_height=120))
-        paned.set_start_child(editor)
-        bottom = Gtk.Box(orientation=V)
+        self.paned = Gtk.Paned(orientation=V, position=340, vexpand=True, wide_handle=True,
+                               shrink_start_child=False, shrink_end_child=False,
+                               resize_start_child=True, resize_end_child=True)
+        self.paned.add_css_class("console-paned")
+        editor = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True)
+        rail_sw = Gtk.ScrolledWindow(child=self._build_rail(), hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                     vscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
+        editor.append(rail_sw)
+        editor_sw = Gtk.ScrolledWindow(child=self.view, hexpand=True, vexpand=True, min_content_height=140)
+        editor.append(editor_sw)
+        self.paned.set_start_child(editor)
+
+        bottom = Gtk.Box(orientation=V, vexpand=True)
         self.diag_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["diag-list"])
         self.diag_list.connect("row-activated", lambda _l, row: self._jump(row.diag))
         self.revealer = Gtk.Revealer(child=Gtk.ScrolledWindow(child=self.diag_list, max_content_height=130,
@@ -117,10 +126,14 @@ class ConsoleView(Gtk.Box):
         bottom.append(self.msg)
         self.grid = ResultGrid()
         bottom.append(self.grid)
-        paned.set_end_child(bottom)
-        self.append(paned)
+        self.paned.set_end_child(bottom)
+        self.append(self.paned)
 
         self.buf.set_text(SAMPLE)
+
+    def clear_editor(self):
+        self.buf.set_text("")
+        self.view.grab_focus()
 
     # ---- tool rail (Photoshop-style palette)
     def _build_rail(self):
