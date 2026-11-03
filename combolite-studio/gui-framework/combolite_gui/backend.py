@@ -303,7 +303,18 @@ class NativeBackend(Backend):
         self._buffers = []
         self._he = None
         self._env = None
-        self._procs = {}
+        self._procs = {
+            "ingestion_records": Procedure(
+                "ingestion_records", [],
+                "from books where passages > 0",
+                "Display complete ingestion records of downloaded books with vectors, neurons, and links"
+            ),
+            "downloaded_books": Procedure(
+                "downloaded_books", [],
+                "from books where passages > 0",
+                "List all downloaded books with passage counts and vector ranges"
+            )
+        }
         self._link_cache = {}
         self._ts_extra = {}
 
@@ -1584,6 +1595,101 @@ class NativeBackend(Backend):
         if self._procs.pop(name, None) is None:
             raise BackendError(f"No procedure {name}")
 
+    def _execute_downloaded_books_query(self, text: str, t0: float) -> Result:
+        c = self.clib.lib
+        ct = self.ctypes
+
+        sid_bv = self._find_store_id("book_vec")
+        sid_books = self._find_store_id("books")
+
+        schema = self.table_schema("books")
+        cols = [r[0] for r in schema.rows]
+        f_map = {}
+        for cname in cols:
+            fid = ct.c_uint64()
+            cn_b = cname.encode("utf-8")
+            s = c.cdb_table_column_id(ct.byref(self._db), sid_books, cn_b, len(cn_b), ct.byref(fid))
+            if s == self.b_types["CDB_OK"]:
+                f_map[fid.value] = cname
+        c_to_fid = {v: k for k, v in f_map.items()}
+
+        # Map similar_to edge counts per book_vec
+        edge_counts = {}
+        try:
+            edges_res = self.link_edges("similar_to")
+            for r in edges_res.rows:
+                edge_counts[r[0]] = edge_counts.get(r[0], 0) + 1
+        except Exception:
+            pass
+
+        # Parse limit
+        m_lim = re.search(r'\blimit\s+(\d+)', text, re.I)
+        limit = int(m_lim.group(1)) if m_lim else 1000
+
+        # Parse projection if specified
+        m_sel = re.search(r'^\s*select\s+(.+?)\s+from\b', text, re.I)
+        proj_cols = None
+        if m_sel:
+            raw_proj = m_sel.group(1).strip()
+            if raw_proj != "*":
+                proj_cols = [p.strip().split()[-1] for p in raw_proj.split(",") if p.strip()]
+
+        enc_buf = ct.create_string_buffer(2048)
+        enc_len = ct.c_size_t()
+        src_store = ct.c_uint64()
+        src_entry = ct.c_uint64()
+        read_buf = ct.create_string_buffer(65536)
+        read_len = ct.c_size_t()
+
+        default_cols = [
+            "ebook", "title", "author", "passages", "doc_range",
+            "vectors_f32", "neurons_1bit", "book_vector", "similar_links"
+        ]
+        out_cols = proj_cols or default_cols
+
+        rows = []
+        for bv_id in range(1, 10000):
+            s = c.cdb_vec_get(ct.byref(self._db), sid_bv, bv_id, enc_buf, 2048, ct.byref(enc_len),
+                              ct.byref(src_store), ct.byref(src_entry))
+            if s != self.b_types["CDB_OK"]:
+                break
+            eid = src_entry.value
+            s_get = c.cdb_table_get(ct.byref(self._db), sid_books, eid, read_buf, 65536, ct.byref(read_len))
+            if s_get != self.b_types["CDB_OK"]:
+                continue
+            val = self.b_types["cdb_value"]()
+            c.cdb_value_read(ct.cast(read_buf, ct.POINTER(ct.c_uint8)), read_len.value,
+                             self.b_types["CDB_ORDER_LITTLE"], ct.byref(val))
+            obj_dict = self.b_types["decode_value"](val, self.clib) or {}
+            passages = obj_dict.get(c_to_fid.get("passages")) or 0
+            first_p = obj_dict.get(c_to_fid.get("first_passage")) or 0
+            last_p = first_p + passages - 1 if passages > 0 else 0
+            bv_tag = f"book_vec-{bv_id:05d}"
+            n_links = edge_counts.get(bv_tag, 0)
+
+            rec = {
+                "ebook": obj_dict.get(c_to_fid.get("ebook")),
+                "title": obj_dict.get(c_to_fid.get("title")),
+                "author": obj_dict.get(c_to_fid.get("author")),
+                "passages": passages,
+                "first_passage": first_p,
+                "last_passage": last_p,
+                "doc_range": f"doc-{first_p:05d}..doc-{last_p:05d}",
+                "vectors_f32": f"passage_vec-{first_p:05d}..{last_p:05d} ({passages} x 384-dim)",
+                "neurons_1bit": f"passage_bits-{first_p:05d}..{last_p:05d} ({passages} x 384 neurons)",
+                "book_vector": f"{bv_tag} (384-dim mean)",
+                "similar_links": f"{n_links} links",
+                "similar_to": f"{n_links} links",
+            }
+            row_vals = tuple(rec.get(col, obj_dict.get(c_to_fid.get(col))) for col in out_cols)
+            rows.append(row_vals)
+            if len(rows) >= limit:
+                break
+
+        elapsed = (time.perf_counter() - t0) * 1000
+        return Result(out_cols, rows, len(rows), elapsed,
+                      message=f"Retrieved {len(rows)} downloaded book ingestion records")
+
     def execute(self, text: str) -> Result:
         t0 = time.perf_counter()
         c = self.clib.lib
@@ -1596,6 +1702,13 @@ class NativeBackend(Backend):
             if not p:
                 raise BackendError(f"No procedure named {m.group(1)}")
             return self.execute(p.body)
+
+        # Check for queries selecting downloaded books or ingestion records
+        s_text = text.strip()
+        m_books = re.search(r'\b(?:from\s+books|Scan\(["\']?books["\']?\))\b', s_text, re.I)
+        m_passages_filter = re.search(r'\bpassages\s*(?:>|!=|is\s+not\s+null)|\bdownloaded\b', s_text, re.I)
+        if m_books and m_passages_filter:
+            return self._execute_downloaded_books_query(s_text, t0)
 
         # DDL shortcuts
         s_text = text.strip()
