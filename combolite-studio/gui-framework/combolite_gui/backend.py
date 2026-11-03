@@ -154,9 +154,9 @@ class NativeBackend(Backend):
 
     name = "native"
     PAGE_SIZE = 4096
-    NODES = 64
-    DOC_MAX = 1048576       # 1 MiB per document body
-    DOC_STAGE = 524288      # 512 KiB doc staging
+    NODES = 512
+    DOC_MAX = 2097152       # 2 MiB per document body
+    DOC_STAGE = 1048576     # 1 MiB doc staging
     VEC_DIMS = 384
     VEC_K = 16
 
@@ -334,7 +334,7 @@ class NativeBackend(Backend):
         cfg.pager.arena = self._alloc(cfg.pager.arena_size)
         cfg.pager.nodes = ct.cast(self._alloc(nodes * ct.sizeof(self.b_types["cdb_pager_node"])),
                                   ct.POINTER(self.b_types["cdb_pager_node"]))
-        cfg.pager.free_cap = 8192
+        cfg.pager.free_cap = 65536
         cfg.pager.free_list = ct.cast(self._alloc(cfg.pager.free_cap * ct.sizeof(self.b_types["cdb_free_extent"])),
                                       ct.POINTER(self.b_types["cdb_free_extent"]))
 

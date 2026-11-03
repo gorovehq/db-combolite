@@ -239,6 +239,31 @@ class TestNativeBackend(unittest.TestCase):
         self.assertIn("SCAN", ops)
         self.assertIn("LIMIT", ops)
 
+    def test_09_open_large_demo_database(self):
+        demo_path = Path(__file__).resolve().parents[3] / "db-combolite" / "demo" / "gutenfree" / "data" / "gutenfree.cdbarch"
+        if not demo_path.exists():
+            self.skipTest("gutenfree.cdbarch demo database not found")
+
+        self.backend.open(str(demo_path))
+        stores = self.backend.list_stores()
+        self.assertTrue(len(stores) > 0)
+        store_names = [s.name for s in stores]
+        self.assertIn("books", store_names)
+        self.assertIn("passages", store_names)
+
+        # Verify reading rows from the 79k+ books table
+        rows = self.backend.table_rows("books", 0, 10)
+        self.assertTrue(len(rows.rows) > 0)
+        self.assertIn("title", rows.columns)
+        self.assertIn("author", rows.columns)
+
+        # Verify reading document
+        docs = self.backend.doc_list("passages", limit=10)
+        self.assertTrue(len(docs) > 0)
+        doc = self.backend.doc_get("passages", docs[0].id)
+        self.assertIn("_id", doc)
+
+
 
 if __name__ == "__main__":
     unittest.main()
