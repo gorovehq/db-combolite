@@ -2433,6 +2433,7 @@ static void db_wipe_crypto(cdb_db *db)
             db->enclaves[i].in_use = 0;
         }
     }
+    cdb_pager_cache_wipe_domain(&db->pager, 0);
 }
 
 /* Close is a final reconciliation under the baton, followed by removing
@@ -2711,6 +2712,8 @@ cdb_status cdb_db_rotate_enclave_key(cdb_db *db, uint64_t enclave_id, const char
         s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, db->enclaves[idx].index_key);
 
     cdb_crypto_wipe(raw_key, sizeof raw_key);
+    if (s == CDB_OK)
+        cdb_pager_cache_wipe_domain(&db->pager, enclave_id);
     return s;
 }
 

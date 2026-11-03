@@ -932,6 +932,30 @@ static cdb_status setup(cdb_pager *p, const cdb_storage *st, const cdb_pager_con
     }
     p->scratch = cfg->arena + p->node_count * per_node;
     p->page2 = p->scratch + p->page_size;
+
+    /* Optional data page cache in caller memory. */
+    p->cache_slots = NULL;
+    p->cache_count = 0;
+    p->cache_sets = 0;
+    p->cache_clock = 0;
+    if (cfg->page_cache != NULL && cfg->page_cache_size >= sizeof(cdb_page_cache_slot) + p->page_size) {
+        size_t slot_bytes = sizeof(cdb_page_cache_slot) + p->page_size;
+        size_t n_pages = cfg->page_cache_size / slot_bytes;
+        if (n_pages > 0) {
+            size_t i;
+            uint8_t *page_mem = cfg->page_cache + n_pages * sizeof(cdb_page_cache_slot);
+            p->cache_slots = (cdb_page_cache_slot *)(void *)cfg->page_cache;
+            p->cache_count = n_pages;
+            p->cache_sets = n_pages / 4u;
+            if (p->cache_sets == 0)
+                p->cache_sets = 1u;
+            for (i = 0; i < n_pages; i++) {
+                memset(&p->cache_slots[i], 0, sizeof p->cache_slots[i]);
+                p->cache_slots[i].page = page_mem + i * p->page_size;
+            }
+        }
+    }
+
     return CDB_OK;
 }
 
@@ -1270,10 +1294,57 @@ static cdb_status pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header 
     return entry_set(p, leaf, slot, &e);
 }
 
+size_t cdb_pager_cache_size(size_t page_size, size_t n_pages)
+{
+    return n_pages * (sizeof(cdb_page_cache_slot) + page_size);
+}
+
+void cdb_pager_cache_wipe_domain(cdb_pager *p, uint64_t domain_id)
+{
+    size_t i;
+    if (p == NULL || p->cache_slots == NULL)
+        return;
+    for (i = 0; i < p->cache_count; i++) {
+        cdb_page_cache_slot *s = &p->cache_slots[i];
+        if (s->lid != 0 && (domain_id == 0 || s->hdr.domain_id == domain_id)) {
+            cdb_crypto_wipe(s->page, p->page_size);
+            memset(&s->hdr, 0, sizeof s->hdr);
+            s->lid = 0;
+            s->phys = 0;
+            s->state = 0;
+            s->lru = 0;
+        }
+    }
+}
+
+static void cache_invalidate(cdb_pager *p, uint64_t lid)
+{
+    if (p->cache_slots != NULL && p->cache_count > 0) {
+        size_t set_idx = (size_t)((lid * 2654435761ULL) % (uint64_t)p->cache_sets);
+        size_t base = set_idx * 4u;
+        size_t count = p->cache_sets == 1 ? p->cache_count : 4u;
+        size_t i;
+        for (i = 0; i < count; i++) {
+            if (p->cache_slots[base + i].lid == lid) {
+                cdb_crypto_wipe(p->cache_slots[base + i].page, p->page_size);
+                memset(&p->cache_slots[base + i].hdr, 0, sizeof p->cache_slots[base + i].hdr);
+                p->cache_slots[base + i].lid = 0;
+                p->cache_slots[base + i].phys = 0;
+                p->cache_slots[base + i].state = 0;
+                p->cache_slots[base + i].lru = 0;
+                break;
+            }
+        }
+    }
+}
+
 cdb_status cdb_pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header *tmpl,
                            const void *payload, size_t len)
 {
-    return pager_write(p, lid, tmpl, payload, len, 1);
+    cdb_status s = pager_write(p, lid, tmpl, payload, len, 1);
+    if (s == CDB_OK)
+        cache_invalidate(p, lid);
+    return s;
 }
 
 /* Reads the current version of lid, including changes not yet committed.
@@ -1290,12 +1361,71 @@ cdb_status cdb_pager_read(cdb_pager *p, uint64_t lid, uint8_t *page, cdb_page_he
         return s;
     if (e.state != CDB_ANCHOR_LIVE && e.state != CDB_ANCHOR_PRIVATE)
         return CDB_E_NOT_FOUND;
+
+    if (p->cache_slots != NULL && p->cache_count > 0) {
+        size_t set_idx = (size_t)((lid * 2654435761ULL) % (uint64_t)p->cache_sets);
+        size_t base = set_idx * 4u;
+        size_t count = p->cache_sets == 1 ? p->cache_count : 4u;
+        size_t i;
+        for (i = 0; i < count; i++) {
+            cdb_page_cache_slot *cs = &p->cache_slots[base + i];
+            if (cs->lid == lid && cs->phys == e.phys && cs->state == e.state) {
+                if (cs->hdr.domain_id > 0 && p->aead_alg != CDB_AEAD_NONE) {
+                    uint8_t key_buf[32];
+                    if (p->domain_key_fn == NULL
+                        || p->domain_key_fn(p->domain_key_ctx, cs->hdr.domain_id, cs->hdr.key_version, key_buf) != CDB_OK) {
+                        cdb_crypto_wipe(key_buf, sizeof key_buf);
+                        return CDB_E_SECURITY;
+                    }
+                    cdb_crypto_wipe(key_buf, sizeof key_buf);
+                } else if (cs->hdr.flags & CDB_PAGE_FLAG_TAMPER_EVIDENT) {
+                    if (!p->has_integrity_key)
+                        return CDB_E_SECURITY;
+                }
+                cs->lru = ++p->cache_clock;
+                memcpy(page, cs->page, p->page_size);
+                if (h != NULL)
+                    *h = cs->hdr;
+                return CDB_OK;
+            }
+        }
+    }
+
     if ((s = cdb_storage_read(e.state == CDB_ANCHOR_PRIVATE ? &p->overlay : &p->st, phys_offset(p, e.phys), page,
                               p->page_size)) != CDB_OK)
         return s == CDB_E_TRUNCATED ? CDB_E_CORRUPT : s;
     if ((s = pager_open_page(p, page, h)) != CDB_OK)
         return s;
-    return h->logical_id == lid ? CDB_OK : CDB_E_CORRUPT;
+    if (h->logical_id != lid)
+        return CDB_E_CORRUPT;
+
+    if (p->cache_slots != NULL && p->cache_count > 0) {
+        size_t set_idx = (size_t)((lid * 2654435761ULL) % (uint64_t)p->cache_sets);
+        size_t base = set_idx * 4u;
+        size_t count = p->cache_sets == 1 ? p->cache_count : 4u;
+        size_t best_i = 0;
+        uint64_t min_lru = UINT64_MAX;
+        size_t i;
+        for (i = 0; i < count; i++) {
+            cdb_page_cache_slot *cs = &p->cache_slots[base + i];
+            if (cs->lid == 0) {
+                best_i = i;
+                break;
+            }
+            if (cs->lru < min_lru) {
+                min_lru = cs->lru;
+                best_i = i;
+            }
+        }
+        cdb_page_cache_slot *victim = &p->cache_slots[base + best_i];
+        victim->lid = lid;
+        victim->phys = e.phys;
+        victim->state = e.state;
+        victim->hdr = *h;
+        victim->lru = ++p->cache_clock;
+        memcpy(victim->page, page, p->page_size);
+    }
+    return CDB_OK;
 }
 
 /* Marks lid released and puts its physical page on the free list. The page
@@ -1320,6 +1450,7 @@ cdb_status cdb_pager_free(cdb_pager *p, uint64_t lid)
         return s;
     e.phys = 0;
     e.state = CDB_ANCHOR_RELEASED;
+    cache_invalidate(p, lid);
     return entry_set(p, leaf, slot, &e);
 }
 
@@ -1543,8 +1674,12 @@ cdb_status cdb_pager_reclaim_tail(cdb_pager *p, uint64_t *reclaimed)
             return CDB_OK; /* this medium keeps its size */
         if (s != CDB_OK)
             return s;
-        return cdb_storage_sync(&p->st);
+        s = cdb_storage_sync(&p->st);
+        if (s != CDB_OK)
+            return s;
     }
+    if (*reclaimed > 0)
+        cdb_pager_cache_wipe_domain(p, 0);
     return CDB_OK;
 }
 
@@ -1665,7 +1800,10 @@ cdb_status cdb_pager_compact(cdb_pager *p, uint64_t max_moves, uint64_t *moved, 
             return s;
     }
     /* Step 4: release the freed tail. */
-    return cdb_pager_reclaim_tail(p, reclaimed);
+    s = cdb_pager_reclaim_tail(p, reclaimed);
+    if (*moved > 0)
+        cdb_pager_cache_wipe_domain(p, 0);
+    return s;
 }
 
 /* -------------------------------------------------------- sharing */
@@ -1674,6 +1812,7 @@ cdb_status cdb_pager_set_private(cdb_pager *p, const cdb_storage *overlay)
 {
     if (p->dirty)
         return CDB_E_STATE;
+    cdb_pager_cache_wipe_domain(p, 0);
     if (overlay == NULL) {
         p->private_mode = 0;
         return CDB_OK;
