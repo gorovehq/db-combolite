@@ -10,6 +10,9 @@ import math
 import random
 
 import cairo
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, GLib, Gtk, Pango
 
 try:
@@ -37,16 +40,29 @@ def project_2d(vectors, size=320.0):
         return []
     if n == 1:
         return [(0.0, 0.0)]
+    pts = None
     if np is not None:
-        X = np.asarray(vectors, dtype=float)
-        X = X - X.mean(axis=0)
-        _, _, vt = np.linalg.svd(X, full_matrices=False)
-        P = X @ vt[:2].T
-        if P.shape[1] < 2:
-            P = np.column_stack([P, np.zeros(n)])
-        pts = [tuple(p) for p in P.tolist()]
-    else:
-        d = len(vectors[0])
+        try:
+            X = np.asarray(vectors, dtype=float)
+            if X.ndim != 2 or X.shape[0] == 0 or X.shape[1] == 0:
+                return [(0.0, 0.0)] * n
+            X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+            X = X - X.mean(axis=0)
+            if np.all(X == 0):
+                pts = [(math.cos(2 * math.pi * i / n) * size * 0.5,
+                        math.sin(2 * math.pi * i / n) * size * 0.5) for i in range(n)]
+            else:
+                _, _, vt = np.linalg.svd(X, full_matrices=False)
+                P = X @ vt[:2].T
+                if P.shape[1] < 2:
+                    P = np.column_stack([P, np.zeros(n)])
+                pts = [tuple(p) for p in P.tolist()]
+        except Exception:
+            pts = None
+    if pts is None:
+        d = len(vectors[0]) if len(vectors) > 0 else 0
+        if d == 0:
+            return [(0.0, 0.0)] * n
         mean = [sum(v[k] for v in vectors) / n for k in range(d)]
         X = [[v[k] - mean[k] for k in range(d)] for v in vectors]
         comps = []
@@ -102,13 +118,19 @@ def similarity_depths(vectors, ref=None):
     n = len(vectors)
     if n == 0:
         return []
-    d = len(vectors[0])
+    d = len(vectors[0]) if len(vectors) > 0 else 0
+    if d == 0:
+        return [0.5] * n
     r = vectors[ref] if ref is not None else [sum(v[k] for v in vectors) / n for k in range(d)]
     rn = math.sqrt(sum(x * x for x in r)) or 1
     sims = []
     for v in vectors:
         vn = math.sqrt(sum(x * x for x in v)) or 1
-        sims.append(sum(a * b for a, b in zip(v, r)) / (vn * rn))
+        dot = sum(a * b for a, b in zip(v, r))
+        sim = dot / (vn * rn)
+        if math.isnan(sim):
+            sim = 0.0
+        sims.append(sim)
     lo, hi = min(sims), max(sims)
     span = (hi - lo) or 1
     return [(s - lo) / span for s in sims]
@@ -790,6 +812,28 @@ class GraphPanel(Gtk.Overlay):
         self.tip.set_parent(self.canvas)
         self.canvas.connect("destroy", lambda *_: self.tip.unparent())
 
+        self.caption = Gtk.Label(css_classes=["graph-info", "caption"], halign=Gtk.Align.CENTER, valign=Gtk.Align.START,
+                                 margin_top=12, visible=False)
+        self.add_overlay(self.caption)
+
+        # colour scale strip along the bottom
+        self.legend = Gtk.Box(spacing=20, css_classes=["heat-strip"], halign=Gtk.Align.FILL, valign=Gtk.Align.END)
+        self.legend.append(Gtk.Label(label="PATH STRENGTH", css_classes=["stat-label"],
+                                     tooltip_text="Product of link strengths along the strongest path (log scale)"))
+        bar = Gtk.DrawingArea(content_width=300, content_height=30, valign=Gtk.Align.CENTER)
+        bar.set_draw_func(self._draw_legend)
+        self.legend.append(bar)
+        none = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+        none.append(Gtk.Box(css_classes=["heat-none"], valign=Gtk.Align.CENTER))
+        none.append(Gtk.Label(label="no path in 6 hops", css_classes=["caption", "dim-label"]))
+        self.legend.append(none)
+        self.legend.append(Gtk.Label(label="thicker line = stronger direct link", css_classes=["caption", "dim-label"]))
+        self.legend_lbl = Gtk.Label(label="select or drag a node", css_classes=["caption", "mono"], hexpand=True, xalign=1,
+                                    ellipsize=Pango.EllipsizeMode.END)
+        self.legend.append(self.legend_lbl)
+        self.add_overlay(self.legend)
+        self.canvas.on_heat = self._heat_changed
+
     def _labels(self, on):
         self.canvas.show_labels = on
         self.canvas.queue_draw()
@@ -818,27 +862,6 @@ class GraphPanel(Gtk.Overlay):
         rect.x, rect.y, rect.width, rect.height = int(x) + 14, int(y) + 10, 1, 1
         self.tip.set_pointing_to(rect)
         self.tip.popup()
-        self.caption = Gtk.Label(css_classes=["graph-info", "caption"], halign=Gtk.Align.CENTER, valign=Gtk.Align.START,
-                                 margin_top=12, visible=False)
-        self.add_overlay(self.caption)
-
-        # colour scale strip along the bottom
-        self.legend = Gtk.Box(spacing=20, css_classes=["heat-strip"], halign=Gtk.Align.FILL, valign=Gtk.Align.END)
-        self.legend.append(Gtk.Label(label="PATH STRENGTH", css_classes=["stat-label"],
-                                     tooltip_text="Product of link strengths along the strongest path (log scale)"))
-        bar = Gtk.DrawingArea(content_width=300, content_height=30, valign=Gtk.Align.CENTER)
-        bar.set_draw_func(self._draw_legend)
-        self.legend.append(bar)
-        none = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
-        none.append(Gtk.Box(css_classes=["heat-none"], valign=Gtk.Align.CENTER))
-        none.append(Gtk.Label(label="no path in 6 hops", css_classes=["caption", "dim-label"]))
-        self.legend.append(none)
-        self.legend.append(Gtk.Label(label="thicker line = stronger direct link", css_classes=["caption", "dim-label"]))
-        self.legend_lbl = Gtk.Label(label="select or drag a node", css_classes=["caption", "mono"], hexpand=True, xalign=1,
-                                    ellipsize=Pango.EllipsizeMode.END)
-        self.legend.append(self.legend_lbl)
-        self.add_overlay(self.legend)
-        self.canvas.on_heat = self._heat_changed
 
     @staticmethod
     def _draw_legend(area, cr, w, h):

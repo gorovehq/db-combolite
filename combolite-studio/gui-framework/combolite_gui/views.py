@@ -550,7 +550,9 @@ class VectorView(StoreView):
         sims = []
         for a, b in g.edges:
             va, vb = g.vectors[a], g.vectors[b]
-            sims.append(sum(x * y for x, y in zip(va, vb)) / ((math.sqrt(sum(x * x for x in va)) * math.sqrt(sum(y * y for y in vb))) or 1))
+            denom = (math.sqrt(sum(x * x for x in va)) * math.sqrt(sum(y * y for y in vb)))
+            s = sum(x * y for x, y in zip(va, vb)) / denom if denom else 0.0
+            sims.append(0.0 if math.isnan(s) else s)
         lo, hi = min(sims, default=0.0), max(sims, default=1.0)
         es = [0.15 + 0.85 * (s - lo) / ((hi - lo) or 1) for s in sims]
         self.panel.canvas.set_graph(nodes, g.edges, layout=ForceLayout(len(nodes), g.edges, home=pts, anchor=0.06), edge_strengths=es)

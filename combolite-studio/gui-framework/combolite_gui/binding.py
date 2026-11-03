@@ -1051,9 +1051,31 @@ def decode_value(val: cdb_value, lib: ComboliteLib, order: int = CDB_ORDER_LITTL
             return b""
         return bytes(ctypes.string_at(val.payload, val.payload_len))
     elif t == CDB_TYPE_VECTOR:
+        elem = val.as_.vector.elem
         dims = val.as_.vector.dims
-        data_ptr = ctypes.cast(val.as_.vector.data, POINTER(c_float))
-        return [float(data_ptr[i]) for i in range(dims)]
+        data = val.as_.vector.data
+        if not data or dims == 0:
+            return []
+        if elem == 0:  # CDB_VEC_F32
+            data_ptr = ctypes.cast(data, POINTER(c_float))
+            return [float(data_ptr[i]) for i in range(dims)]
+        elif elem == 3:  # CDB_VEC_I8
+            data_ptr = ctypes.cast(data, POINTER(c_int8))
+            return [float(data_ptr[i]) for i in range(dims)]
+        elif elem == 4:  # CDB_VEC_BINARY (packed bits, LSB first)
+            data_ptr = ctypes.cast(data, POINTER(c_uint8))
+            return [float((data_ptr[i // 8] >> (i % 8)) & 1) for i in range(dims)]
+        elif elem == 1:  # CDB_VEC_F16
+            try:
+                import numpy as _np
+                raw = ctypes.string_at(data, dims * 2)
+                return [float(x) for x in _np.frombuffer(raw, dtype=_np.float16)]
+            except Exception:
+                data_ptr = ctypes.cast(data, POINTER(c_uint16))
+                return [float(data_ptr[i]) for i in range(dims)]
+        else:
+            data_ptr = ctypes.cast(data, POINTER(c_float))
+            return [float(data_ptr[i]) for i in range(dims)]
     elif t == CDB_TYPE_OBJECT:
         out = {}
         it = cdb_value_iter()
