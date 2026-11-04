@@ -437,6 +437,8 @@ cdb_status cdb_vec_create(cdb_db *db, const char *name, size_t len, const cdb_ve
     if (s == CDB_OK)
         s = cdb_index_create(&c.changes, &db->pager, *id, CDB_INDEX_FLAG_UNIQUE, &db->cfg.catalog_work);
     c.changes_on = 1; /* no trimmed-through row yet: the log holds every change */
+    /* A writer that would not keep the log may only read this file (spec 14.12.5). */
+    db->pager.hs.record.rocompat_flags |= CDB_FEATURE_RO_VEC_CHANGES;
     if (s == CDB_OK)
         s = encode_settings(db, cfg, &c, settings, sizeof settings, &slen);
     if (s == CDB_OK)
@@ -2770,6 +2772,7 @@ cdb_status cdb_vec_track_changes(cdb_db *db, uint64_t store)
     if (s == CDB_OK)
         s = cdb_index_put(&c->changes, k, k_pair(k, 0, 0), v, sizeof v);
     c->changes_on = 1;
+    db->pager.hs.record.rocompat_flags |= CDB_FEATURE_RO_VEC_CHANGES; /* spec 14.12.5 */
     if (s == CDB_OK)
         s = cdb_catalog_get_store(&db->catalog, store, &info);
     if (s == CDB_OK)

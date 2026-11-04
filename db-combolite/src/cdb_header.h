@@ -29,10 +29,13 @@
 #define CDB_LAYOUT_GOVERNANCE 0x08u
 #define CDB_LAYOUT_KNOWN 0x0Fu
 
-/* Feature flags this build understands, per class (spec 1.2). None are
- * assigned yet; each feature adds its bit here as it is implemented. */
+/* Assigned feature flags (spec 14.1.10). */
+#define CDB_FEATURE_RO_VEC_CHANGES (UINT64_C(1) << 0) /* read-only compatible: vector change logs (14.12.5) */
+
+/* Feature flags this build understands, per class (spec 1.2). Each feature
+ * adds its bit here as it is implemented. */
 #define CDB_FEATURES_COMPAT_KNOWN UINT64_C(0)
-#define CDB_FEATURES_ROCOMPAT_KNOWN UINT64_C(0)
+#define CDB_FEATURES_ROCOMPAT_KNOWN CDB_FEATURE_RO_VEC_CHANGES
 #define CDB_FEATURES_INCOMPAT_KNOWN UINT64_C(0)
 
 typedef struct cdb_companion_slot {

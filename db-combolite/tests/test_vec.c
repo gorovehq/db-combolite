@@ -850,8 +850,11 @@ static void test_change_log_and_cursors(void)
 
     rng = 41u;
     TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_EQUAL_UINT64(0, db.pager.hs.record.rocompat_flags & CDB_FEATURE_RO_VEC_CHANGES);
     coll = make_coll("c", CDB_VEC_F32, CDB_VEC_COSINE);
     TEST_ASSERT_EQUAL_INT(CDB_E_EXISTS, cdb_vec_track_changes(&db, coll)); /* new collections keep one */
+    /* The file now says its writers must keep change logs (spec 14.1.10). */
+    TEST_ASSERT_TRUE(db.pager.hs.record.rocompat_flags & CDB_FEATURE_RO_VEC_CHANGES);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
     for (i = 1; i <= 5; i++) {
         v[i] = make_vec(CDB_VEC_F32, 0);
@@ -916,6 +919,7 @@ static void test_change_log_and_cursors(void)
     /* Cursors persist; a dropped one no longer exists. */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
     TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_TRUE(db.pager.hs.record.rocompat_flags & CDB_FEATURE_RO_VEC_CHANGES); /* durable */
     TEST_ASSERT_EQUAL_UINT64(later, cursor_at(coll, "agent"));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_cursor_drop(&db, coll, "agent", 5));
     TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_vec_cursor_drop(&db, coll, "agent", 5));
