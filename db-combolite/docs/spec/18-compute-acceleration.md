@@ -61,14 +61,22 @@ A search runs outside any transaction, so it sees the archive at a committed seq
   - A process that reconciled the changes itself applied them through the hook, so it records the new stamps without dropping anything.
 - **A stale or empty mirror.** A request that finds its collection's mirror stale, or not filled yet, takes the CPU path, so its results and latency are those of a build without an accelerator. The mirror is filled again from the vector blocks on the worker pool (5.9.6), for later requests. Results are the same either way (18.3).
 
+### 18.7 The accelerator's calls
+
+- **Placement.** The environment (`cdb_env`) carries an optional accelerator next to its operations: a table of calls, `cdb_accel_ops`, and the accelerator's own state, passed back on every call. The accelerator library keeps its state apart from the environment's, so it combines with any environment, for example the host environment with CUDA, or a test environment with a fake accelerator.
+- **Calls.** Every buffer belongs to the caller, and every fallible call returns `cdb_status`:
+  - `mirror_open` creates a mirror for one collection, given its store, element type, dimensions and measure, and how many vectors to expect.
+  - `mirror_put` inserts or replaces a batch of vectors, given their entry IDs. `mirror_del` removes a batch of entry IDs.
+  - `mirror_close` drops a mirror.
+  - `nearest` is given a batch of query vectors and a number of candidates wanted. For each query it returns up to that many entry IDs, nearest first, with the accelerator's distances. The distances are used only to measure the shortlist margin, never stored or returned: the CPU rescores (18.3).
+- **Synchronous.** `nearest` returns when the shortlists are ready; the engine then rescores them. A refresh batch or a bulk search sends many queries in one call, which keeps the device busy.
+- **Updates in batches.** During a commit, a rebase or a reconciliation, the engine lists the entry IDs of each mirrored collection that the run changes. When the run ends it sends one `mirror_put` batch, with the vectors read back from the blocks, and one `mirror_del` batch. If the list outgrows its memory, the mirror is marked stale instead and refilled (18.6).
+- **Declining.** An accelerator may decline any call. A declined `mirror_open` leaves that collection on the CPU path. A failed `nearest` sends that request to the CPU path. A failed `mirror_put` or `mirror_del` marks the mirror stale. No accelerator failure ever reaches the caller of the engine.
+- **Refilling and threads.** A stale mirror is refilled as a new mirror on the worker pool while the old one, if any, keeps serving requests; then the engine swaps them and closes the old one. So calls on different mirrors may overlap, and the accelerator must allow that. The engine never calls one mirror from two threads at once.
+
 ## Open questions
 
 - **The shortlist margin.** How many candidates beyond K, fixed or as a factor of K, to be set by measuring how often a true neighbour falls outside it on real data, such as GutenFree's passages.
-- **The hook's signature.** The calls in `cdb_env`:
-  - creating and dropping a mirror
-  - applying a change
-  - a top-K request
-  - how a request is declined
 - **Device memory.** A budget for mirrors, like `vec_mem` (17.4). What happens when one collection doesn't fit: the CPU path, or a partial mirror?
 - **Where the change stamp lives (18.6).** Its place in a vector collection's on-disk state (14.12), and how a reader without the accelerator treats it (it can ignore it).
 - **Refilling without a worker pool.** On a host whose environment has no thread hooks, the worker pool runs tasks at once (5.9.6), so an asynchronous refill would block the request after all. Whether such a host refills at the next reconciliation or `cdb_db_tick` instead.
