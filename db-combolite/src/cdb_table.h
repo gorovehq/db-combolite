@@ -142,7 +142,8 @@ cdb_status cdb_table_update(cdb_db *db, uint64_t store, uint64_t entry, const vo
 cdb_status cdb_table_delete(cdb_db *db, uint64_t store, uint64_t entry);
 
 /* Reads see committed rows only, through the current columns.
- * get: CDB_E_NOT_FOUND for no such row; CDB_E_BUFFER_TOO_SMALL with *len set.
+ * get: CDB_E_NOT_FOUND for no such row; CDB_E_BUFFER_TOO_SMALL with *len set
+ * to a buffer size that will do (the row's length or a little more).
  * find: the row whose primary key is `key`, an encoded array of values in
  * key-column order; *found 0 if none.
  * scan: entries in index order (or entry order with CDB_TABLE_NO_INDEX)
