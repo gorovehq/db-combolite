@@ -33,10 +33,11 @@ Embedding, which turns text into vectors, is not engine work. An application com
 
 GPU arithmetic adds in a different order from the CPU, so its distances can differ in the last bits.
 
-- **Shortlist.** The accelerator returns more candidates than were asked for: K plus a margin.
+- **Shortlist.** The accelerator returns more candidates than were asked for (18.10).
 - **Rescoring.** The engine reads each candidate's vector from the vector blocks, computes its distance on the CPU exactly as the CPU path does, and chooses the final K.
+- **Certifying.** The engine proves that no vector left out of the shortlist could have been among the K nearest, and widens the shortlist until it can (18.10).
 
-So stored neighbour lists and their distances, and search results, are the same as a CPU-only build would produce. The one exception is when a true neighbour falls outside the shortlist. The margin is sized to make that rare (18.6), and the coverage checks of 14.12.4 run on the CPU as before.
+So stored neighbour lists and their distances, and search results, are always the same as a CPU-only build would produce. The coverage checks of 14.12.4 run on the CPU as before.
 
 ### 18.4 What may be accelerated
 
@@ -68,7 +69,7 @@ A search runs outside any transaction, so it sees the archive at a committed seq
   - `mirror_open` creates a mirror for one collection, given its store, element type, dimensions and measure, and how many vectors to expect.
   - `mirror_put` inserts or replaces a batch of vectors, given their entry IDs. `mirror_del` removes a batch of entry IDs.
   - `mirror_close` drops a mirror.
-  - `nearest` is given a batch of query vectors and a number of candidates wanted. For each query it returns up to that many entry IDs, nearest first, with the accelerator's distances. The distances are used only to measure the shortlist margin, never stored or returned: the CPU rescores (18.3).
+  - `nearest` is given a batch of query vectors and a number of candidates wanted. For each query it returns up to that many entry IDs, nearest first, with the accelerator's distances and a bound on their error. The engine uses these only to certify the shortlist (18.10), never stores or returns them: the CPU rescores (18.3).
 - **Synchronous.** `nearest` returns when the shortlists are ready; the engine then rescores them. A refresh batch or a bulk search sends many queries in one call, which keeps the device busy.
 - **Updates in batches.** During a commit, a rebase or a reconciliation, the engine lists the entry IDs of each mirrored collection that the run changes. When the run ends it sends one `mirror_put` batch, with the vectors read back from the blocks, and one `mirror_del` batch. If the list outgrows its memory, the mirror is marked stale instead and refilled (18.6).
 - **Declining.** An accelerator may decline any call. A declined `mirror_open` leaves that collection on the CPU path. A failed `nearest` sends that request to the CPU path. A failed `mirror_put` or `mirror_del` marks the mirror stale. No accelerator failure ever reaches the caller of the engine.
@@ -89,11 +90,18 @@ The device may be shared with the application's own work, such as computing embe
   - **f32, f16, bf16 and i8** with cosine, dot product and Euclidean distance. All three are the matrix product of 18.5 with the vectors' norms.
   - **Binary** with Hamming distance, through a bit-count kernel of its own.
 - **Device support.** A device that cannot compute a type, such as a Vulkan device without 16-bit floats, declines it, and those collections use the CPU path. The others are unaffected.
-- **Precision.** The device may compute in its own precision, for example accumulating f16 products in f32. Rescoring on the CPU makes the stored and returned distances those of the CPU path (18.3); the shortlist margin absorbs the difference in ranking.
+- **Precision.** The device may compute in its own precision, for example accumulating f16 products in f32. Rescoring on the CPU makes the stored and returned distances those of the CPU path (18.3); the error bound and certification (18.10) catch any difference in ranking.
+
+### 18.10 Certified shortlists
+
+- **The error bound.** With each shortlist, `nearest` returns a bound *e* on how far any distance it computed, for that query, can be from the CPU's distance for the same pair. The accelerator derives it from the element type's precision, the dimensions and the vectors' norms. A bound that is too small breaks the guarantee below, so an accelerator that cannot bound its error declines (18.7).
+- **The check.** Let *g* be the accelerator's distance for the last candidate in the shortlist, and *d* the CPU's distance for the K-th nearest after rescoring. Every vector left out had an accelerator distance of at least *g*, so a CPU distance of at least *g* − *e*. If *g* − *e* > *d*, none of them could be among the K nearest: the result is the CPU path's. Ties at *d* go to the lower entry ID, as on the CPU path, so equality does not certify.
+- **Widening.** If the check fails, the engine asks again for a shortlist twice as long, and repeats until the check passes or the shortlist holds the whole collection, when every vector has been rescored and the result is exact by construction.
+- **The first size.** A shortlist starts at 2K candidates, at least K + 8. This is provisional: measuring on real data, such as GutenFree's passages, may give the lower-precision types (f16, bf16, i8, binary) a larger factor.
 
 ## Open questions
 
-- **The shortlist margin.** How many candidates beyond K, fixed or as a factor of K, to be set by measuring how often a true neighbour falls outside it on real data, such as GutenFree's passages.
+- **First shortlist sizes by element type (18.10).** The factor for each type, measured by how often a first shortlist fails its check.
 - **Mirrors and growth.** A collection keeps growing after its mirror is made. Whether a `mirror_put` that would pass the budget evicts other mirrors first, or marks this mirror stale so the next fill decides again (18.8).
 - **Where the change stamp lives (18.6).** Its place in a vector collection's on-disk state (14.12), and how a reader without the accelerator treats it (it can ignore it).
 - **Refilling without a worker pool.** On a host whose environment has no thread hooks, the worker pool runs tasks at once (5.9.6), so an asynchronous refill would block the request after all. Whether such a host refills at the next reconciliation or `cdb_db_tick` instead.
