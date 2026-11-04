@@ -23,11 +23,6 @@
 #define GF_DOC_STAGE (1024u * 1024u)   /* per-transaction staging */
 #define GF_VEC_DIMS 384u               /* bge-small-en-v1.5 */
 #define GF_VEC_K 16u                   /* neighbour-graph fan-out */
-/* Neighbour-graph working memory. The minimum (cdb_vec_work_size) holds a
- * few vectors and 8 entry points, so every refresh slice overflows its
- * coverage list and walks from every entry; this much refreshes the whole
- * collection in one pass per slice and keeps about sqrt(N) entry points. */
-#define GF_VEC_WORK (64u * 1024u * 1024u)
 #define GF_MAX_BUFS 24
 #define GF_ORDER CDB_ORDER_LITTLE      /* the byte order gf_db_open creates */
 

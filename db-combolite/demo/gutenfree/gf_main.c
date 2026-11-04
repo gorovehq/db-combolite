@@ -360,6 +360,33 @@ static int graph_cli(gf_db *g)
     return refresh_graph(g, &v) == CDB_OK ? 0 : 1;
 }
 
+/* Times a whole graph build: every passage vector copied into graph_bench,
+ * then its graph refreshed as embed does. Run it on a copy of the
+ * database; it refuses when graph_bench exists. */
+static int bench_graph_cli(gf_db *g)
+{
+    gf_vec v, bv;
+    uint64_t copied = 0;
+    double t0;
+    cdb_status s = gf_vec_open(g, &v);
+
+    if (s != CDB_OK) {
+        fprintf(stderr, "gutenfree: open stores: %s\n", cdb_status_str(s));
+        return 1;
+    }
+    t0 = gf_now_ms();
+    bv = v;
+    if ((s = gf_vec_bench_copy(g, &v, &bv.passages, &copied)) != CDB_OK) {
+        fprintf(stderr, "gutenfree: graph_bench: %s (use a fresh copy of the database)\n", cdb_status_str(s));
+        return 1;
+    }
+    printf("graph_bench: %llu vectors copied in %.0f ms (vec_work %zu bytes, vec_mem %zu, 0: default)\n",
+           (unsigned long long)copied, gf_now_ms() - t0, g->db.cfg.vec_work_size, g->db.cfg.vec_mem);
+    s = refresh_graph(g, &bv); /* bv: the passages' handles, with graph_bench in place of passage_vec */
+    printf("graph_bench: refreshes that checked every entry: %llu\n", (unsigned long long)g->db.vec_full_checks);
+    return s == CDB_OK ? 0 : 1;
+}
+
 /* Runs the diagnostics screen's probe load for a number of seconds. */
 static int probe_cli(gf_db *g, double seconds)
 {
@@ -469,11 +496,13 @@ int main(int argc, char **argv)
     int cli_text = argc > 1 && strcmp(argv[1], "ingest-text") == 0;
     int cli_embed = argc > 1 && strcmp(argv[1], "embed") == 0;
     int cli_graph = argc > 1 && strcmp(argv[1], "graph") == 0;
+    int cli_bench = argc > 1 && strcmp(argv[1], "bench-graph") == 0;
     int cli_metrics = argc > 1 && strcmp(argv[1], "metrics") == 0;
     int cli_probe = argc > 1 && strcmp(argv[1], "probe") == 0;
     int cli_merge = argc > 1 && strcmp(argv[1], "merge-csv") == 0;
     int cli_filter = argc > 1 && strcmp(argv[1], "filter") == 0;
-    int a = cli_filter ? argc : cli || cli_books || cli_text || cli_embed || cli_graph || cli_metrics || cli_probe || cli_merge
+    int a = cli_filter ? argc : cli || cli_books || cli_text || cli_embed || cli_graph || cli_bench || cli_metrics || cli_probe
+                                        || cli_merge
                                 ? 2
                                 : 1;
     const char *pgcsv = GF_DEFAULT_PGCSV;
@@ -503,7 +532,7 @@ int main(int argc, char **argv)
     if (argc > 1 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
         printf("gutenfree [base] | ingest-index [--batch N] [gutindex] [base] | merge-csv [csv] [base]\n"
                "          | ingest-books [dir] [base] | ingest-text [dir] [base] | embed [model.gguf] [base]\n"
-               "          | graph [base] | filter key=value ...\n"
+               "          | graph [base] | bench-graph [copy-of-base] | filter key=value ...\n"
                "          | probe [seconds] [base] | metrics [base]\n"
                "base: database path without extension (default %s, or $GUTENFREE_DB).\n"
                "Run from demo/gutenfree/; see README.md there.\n", GF_DEFAULT_BASE);
@@ -540,12 +569,13 @@ int main(int argc, char **argv)
         rc = merge_cli(&g, pgcsv);
     } else if (cli_filter) {
         rc = filter_cli(&g, argc, argv, 2);
-    } else if (cli || cli_books || cli_text || cli_embed || cli_graph) {
+    } else if (cli || cli_books || cli_text || cli_embed || cli_graph || cli_bench) {
         printf("build: %s\nopen: %.1f ms\n", GF_BUILD_LABEL, open_ms);
         rc = cli ? ingest_cli(&g, gutindex, batch)
              : cli_books ? ingest_books_cli(&g, books)
              : cli_text ? ingest_text_cli(&g, books)
              : cli_graph ? graph_cli(&g)
+             : cli_bench ? bench_graph_cli(&g)
              : embed_cli(&g, model);
     } else {
         app.g = &g;

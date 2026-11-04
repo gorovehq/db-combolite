@@ -191,6 +191,45 @@ cdb_status gf_vec_embed_book(gf_db *g, const gf_catalog *c, const gf_books *b, c
     return s;
 }
 
+cdb_status gf_vec_bench_copy(gf_db *g, const gf_vec *v, uint64_t *bench, uint64_t *copied)
+{
+    static uint8_t enc[VEC_BYTES];
+    uint64_t entry, src_store, src_entry, id, misses = 0;
+    size_t len;
+    cdb_status s;
+    int found;
+
+    *copied = 0;
+    if ((s = cdb_db_find_store(&g->db, "graph_bench", 11, bench, &found)) != CDB_OK)
+        return s;
+    if (found)
+        return CDB_E_EXISTS;
+    if ((s = collection(g, "graph_bench", CDB_VEC_F32, CDB_VEC_COSINE, 1, bench)) != CDB_OK)
+        return s;
+    if ((s = cdb_tx_begin(&g->db, CDB_DURABILITY_DEFAULT)) != CDB_OK)
+        return s;
+    /* Entry IDs are claimed in blocks, so there can be gaps: stop once
+     * more are missing in a row than every block a process holds. */
+    for (entry = 1; misses < (uint64_t)CDB_COORD_ID_BLOCK * CDB_COORD_MAX_BLOCKS; entry++) {
+        s = cdb_vec_get(&g->db, v->passages, entry, enc, sizeof enc, &len, &src_store, &src_entry);
+        if (s == CDB_E_NOT_FOUND) {
+            misses++;
+            continue;
+        }
+        misses = 0;
+        if (s != CDB_OK || (s = cdb_vec_insert(&g->db, *bench, enc, len, src_store, src_entry, &id)) != CDB_OK)
+            break;
+        if (++*copied % 500u == 0
+            && ((s = cdb_tx_commit(&g->db)) != CDB_OK || (s = cdb_tx_begin(&g->db, CDB_DURABILITY_DEFAULT)) != CDB_OK))
+            return s;
+    }
+    if (s != CDB_OK && s != CDB_E_NOT_FOUND) {
+        cdb_tx_abort(&g->db);
+        return s;
+    }
+    return cdb_tx_commit(&g->db);
+}
+
 cdb_status gf_vec_refresh_graph(gf_db *g, const gf_vec *v, gf_graph_progress_fn progress, void *ctx,
                                 size_t *remaining)
 {

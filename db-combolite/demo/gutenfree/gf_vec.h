@@ -72,6 +72,12 @@ typedef void (*gf_graph_progress_fn)(size_t done, size_t pending, double ms, voi
 cdb_status gf_vec_refresh_graph(gf_db *g, const gf_vec *v, gf_graph_progress_fn progress, void *ctx,
                                 size_t *remaining);
 
+/* For measuring a whole graph build (run it on a copy of the database):
+ * copies every passage vector into a new collection, graph_bench, with a
+ * neighbour graph, so all of them are pending. *bench is its store ID,
+ * *copied how many were copied. CDB_E_EXISTS if graph_bench exists. */
+cdb_status gf_vec_bench_copy(gf_db *g, const gf_vec *v, uint64_t *bench, uint64_t *copied);
+
 /* Encodes a vector value: f32, or with bits set, its sign bits. */
 size_t gf_vec_encode(const float *f, int bits, uint8_t *out, size_t cap);
 

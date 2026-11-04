@@ -89,9 +89,7 @@ cdb_status gf_db_open(gf_db *g, const char *base)
     cfg.table_buffers = take(g, cdb_table_buffers_size(GF_PAGE, GF_DOC_MAX));
 
     cfg.vec_buffers = take(g, 3u * GF_PAGE);
-    cfg.vec_work_size = cdb_vec_work_size(CDB_VEC_F32, GF_VEC_DIMS, GF_VEC_K);
-    if (cfg.vec_work_size < GF_VEC_WORK)
-        cfg.vec_work_size = GF_VEC_WORK;
+    cfg.vec_work_size = cdb_vec_work_size(CDB_VEC_F32, GF_VEC_DIMS, GF_VEC_K); /* refreshes grow (vec_mem) */
     cfg.vec_work = take(g, cfg.vec_work_size);
 
     cfg.ts_buffers = take(g, 3u * GF_PAGE);
