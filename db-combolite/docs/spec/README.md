@@ -22,7 +22,7 @@ This is a clean-room specification for a portable, serverless, multi-model embed
 | 14 | [Byte layouts](14-byte-layouts.md) | all | — |
 | 15 | [Compression](15-compression.md) | 1, 2, 9, 12, 13, 14 | the performance budget for page and journal compression (set after M18's benchmarks) |
 | 16 | [Small records (nibblets)](16-nibblets.md) | 2, 3, 8, 9, 12, 14 | — |
-| 17 | [Build profiles](17-build-profiles.md) | 4, 5, 11, 14 | the host query memory budget's default; host limit values (set by benchmark) |
+| 17 | [Build profiles](17-build-profiles.md) | 4, 5, 11, 14 | to measure with the host benchmark: query_mem and vec_mem defaults, host limit values |
 | 18 | [Compute acceleration](18-compute-acceleration.md) | 6, 7, 14, 17 | the shortlist margin; the hook's signature; device memory; mirror staleness across processes; element types; shader build; testing |
 
 ## Reviews

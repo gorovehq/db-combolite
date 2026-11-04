@@ -26,7 +26,7 @@ A **format limit** decides what a file may contain, so every reader has to accep
 - tables: at most 64 columns, 8 indexes, 8 columns per index or primary key, and 1 KB of default values (14.10)
 - full-text settings: at most 8 paths, 8 deep (14.14)
 - the coordinator slot, including its 21 entry-ID blocks (14.5)
-- value nesting (32 levels) and index tree depth (16), which the code sets today (`cdb_value.h`, `cdb_index.h`) and Section 14 does not state yet
+- value nesting (32 levels, 14.6.3) and index tree depth (16, 14.8.1)
 
 Raising a format limit is a format change and is done in the section that defines it.
 
@@ -53,7 +53,8 @@ A **profile limit** bounds only what one running process does: its working memor
 
 - **mcu.** All working memory comes from the caller, as before: buffers passed in, and the environment's optional `alloc`/`free` hooks only where the engine already uses them (the open-store slots).
 - **host.** Working memory may also grow through the environment's `alloc`/`free` hooks, which the host environment backs with `malloc`. The core still never calls `malloc` itself. A query's growth is bounded by a **query memory budget** in the database configuration. Reaching the budget is `CDB_E_OUT_OF_BUDGET` (17.3).
-- **host, neighbour-graph maintenance.** A refresh starts from the caller's `vec_work` and grows the same way, bounded by a separate **maintenance memory budget** (`vec_mem`) in the database configuration. It is separate from the query budget because refreshes run at reconciliation, not inside a query. With enough memory, a refresh handles its pending entries in one pass over the vectors, checks only the entries it touched, and keeps about √N entry points. Reaching this budget is not an error (17.3).
+- **host, neighbour-graph maintenance.** A refresh starts from the caller's `vec_work` and grows the same way, bounded by a separate **maintenance memory budget** (`vec_mem`) in the database configuration. It is separate from the query budget because refreshes run at reconciliation, not inside a query. With enough memory, a refresh handles its pending entries in one pass over the vectors, checks only the entries it touched, and keeps about √N entry points. Reaching this budget is not an error (17.3). The memory is sized for each refresh's own pending entries and freed when the refresh ends, so an idle database holds none of it.
+- **mcu, sizing `vec_work`.** The mcu profile never grows, so `cdb_vec.h` provides a sizing function: the `vec_work` a refresh of a given number of entries, in a collection of a given size, needs in order to avoid checking every entry (14.12.4). It is the same estimate the host uses to grow, so a caller can size a static pool from it.
 
 ### 17.5 Code paths may differ; results may not
 
@@ -72,9 +73,8 @@ The whole test suite, including crash sweeps, runs under both profiles. Tests th
 
 ## Open questions
 
-- **The host query memory budget's default.** The proposal is 256 MB, to be confirmed by measurement.
-- **The maintenance memory budget's default (`vec_mem`).** The proposal is 64 MB, to be confirmed by measurement. GutenFree Diet's 16,033 passages (384 dimensions, K 16) refreshed in one pass in 64 MB.
-- **Whether grown maintenance memory is kept between refreshes** or freed after each one.
-- **Sizing `vec_work` for the mcu profile.** `cdb_vec.h` should say how large `vec_work` must be for a collection of N vectors to avoid the check-everything fallback.
-- **The exact host values in 17.3**, to be tuned by benchmark. The values in the table are the starting point.
-- **Writing the value-nesting and index-depth limits into Section 14**, where the other format limits are.
+These need measuring, not deciding. The values stand, marked provisional, until the host benchmarking tool (BACKLOG) settles them in one pass, with the open-store cap, the vector search-path threshold and the device-class table:
+
+- **The host query memory budget's default.** The proposal is 256 MB.
+- **The maintenance memory budget's default (`vec_mem`).** The proposal is 64 MB. GutenFree Diet's 16,033 passages (384 dimensions, K 16) refreshed in one pass in 64 MB, and a full build of their graph took 926 s in slices of 256 with no refresh checking every entry.
+- **The exact host values in 17.3.** The values in the table are the starting point.
