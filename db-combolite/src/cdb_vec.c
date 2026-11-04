@@ -1634,7 +1634,9 @@ static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *proce
     checks chk;
     cdb_status s;
 
-    /* The last eighth of vec_work lists the entries to check. */
+    /* The last eighth of vec_work lists the entries to check; whole 8-byte
+     * words, so the list is aligned (items is). */
+    avail &= ~(size_t)7u;
     chk.cap = avail / 8u / sizeof(uint64_t);
     chk.n = 0;
     chk.overflow = 0;
