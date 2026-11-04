@@ -101,6 +101,14 @@ Delta tracks belong to individual processes (Section 1.3), so the header can't h
 - The header **always** uses CRC32C, whatever the file's checksum flag says. A reader can therefore verify the header before relying on any field in it.
 - In tamper-evident mode, the keyed tag at offset 492 is checked as well.
 
+### 14.1.10 Assigned feature flags
+
+The bits of the three feature-flag fields (offsets 80, 88 and 96) that are assigned, with their class (1.2). Every other bit is unassigned and must be zero.
+
+| Class | Bit | Feature | Set when |
+|---|---|---|---|
+| read-only compatible | 0 | vector change logs (14.12.5) | the first change log in the file is created |
+
 ## 14.2 Page header and trailer
 
 The fields are defined in Section 13. 8-byte fields are aligned to 8-byte boundaries.
@@ -493,6 +501,7 @@ A reader that meets an unknown variable-size tag reads the length and skips that
 - **Canonical form:**
   - each width is the **smallest** that fits the largest field ID, or the largest offset, in that object;
   - an empty object has the width byte `0x00`.
+- **Nesting limit.** Arrays and objects nest at most **32** deep, the top-level value counting as one. This is a format limit (17.2): a writer never produces a deeper value, and a reader rejects one.
 
 ### 14.6.4 Exact decimals: unbounded or compact
 
@@ -637,7 +646,7 @@ At every commit, the whole list is written as a new chain. The pages of the prev
 
 ### 14.8.1 Structure
 
-The ordered index is a **copy-on-write B+tree** (Section 9.5):
+The ordered index is a **copy-on-write B+tree** (Section 9.5). A tree is at most **16** levels deep, the root counting as one; this is a format limit (17.2), and a reader treats a deeper tree as corrupt.
 
 - **Interior pages** hold separator keys and child logical IDs.
 - **Leaf pages** hold keys together with their values.
@@ -1042,8 +1051,9 @@ An ordered index maps each entry ID to *(block logical ID, slot)*.
   | 9 | bool: blocks cache norms |
   | 10 | K, neighbours kept per entry (1–64), present once a neighbour graph exists (14.12.4) |
   | 11, 12, 13 | root page IDs of the graph, reverse and pending indexes (14.12.4) |
+  | 14 | root page ID of the changes index (14.12.5), present once the collection has a change log |
 
-  Fields 10–13 are added when the graph is created; the rest never change.
+  Fields 10–13 are added when the graph is created, and field 14 when a change log is added to an older collection; the rest never change.
 
 - **Indexes.**
 
@@ -1054,7 +1064,7 @@ An ordered index maps each entry ID to *(block logical ID, slot)*.
   | sources | source store · source entry · entry ID | empty |
 
 - **Sources.** A vector may name the entry it was computed from. When the source is a document, its head revision at the vector's commit is recorded; a replace (re-embedding) records it again. A search reports each hit's source as *current*, *outdated* (the document has a newer revision), *deleted* (the document or its pool is gone), *unchecked* (the source is not a document) or *none*. Vectors are not removed with their source: references are kept by default (Section 6.7); cascading belongs with link types.
-- **Change payloads** (14.4.5). Insert and replace: flags (1 byte; bit 0 = a source follows) · source store and entry (varints) · the vector, an encoded vector value of the collection's type and dimensions. A replace keeps the source. Delete: empty. Vectors keep no history.
+- **Change payloads** (14.4.5). Insert and replace: flags (1 byte; bit 0 = a source follows) · source store and entry (varints) · the vector, an encoded vector value of the collection's type and dimensions. A replace keeps the source. Delete: empty. Patch: advances a named change cursor, keyed by the cursor number, with the new sequence (8, big-endian) (14.12.5). Vectors keep no history.
 - **Distances** (smaller is closer): cosine 1 − cos (a zero vector is at distance 1 from everything); dot product −dot; Euclidean the L2 distance; Hamming the number of differing bits. Ties are ordered by entry ID. f16 and bf16 are widened to f32 for arithmetic.
 - **Size.** One vector must fit in a block of one page, so the page size bounds the dimensions until per-store page sizes (Section 2.1) exist.
 
@@ -1093,6 +1103,27 @@ One record per entry:
   - **Reach** (kind 2) cover the pieces the spread points miss: an exact neighbour graph can fall apart into more pieces than there are spread points. A refresh checks the entries it touched: each refreshed entry, each entry it dropped from a list or from a list it rewrote, and every reach entry point. A check walks from the other entry points with the entry's own vector and stops once a list leads to it. An entry the walk doesn't reach becomes a reach entry point; a reach entry point the walk does reach stops being one. Pending entries are not checked, since searches measure them directly. When the entries to check don't fit the working memory, every entry with a list and every entry point is checked.
 - **Approximate search** (Section 7.4). A best-first walk under the base measure starts from the nearest entry points and keeps the *ef* best vectors found (default 64, at least the number asked for). Pending vectors are not in the graph, so each one is measured directly. What was found is ranked with the requested measure.
 - **Neighbour lookup.** Returns an entry's stored list, and whether it is current (the entry is not pending).
+
+### 14.12.5 Change log (Section 18.12)
+
+- **Creation.** A collection created with this layout has a change log from the start. An explicit call adds one to a collection created before it. Settings field 14 (14.12.3) is the root page ID of the changes index, present once the collection has a log.
+- **Feature flag.** Creating the first change log in a file sets read-only-compatible feature flag 0, *vector change logs* (14.1.10). A build that does not know the flag opens the file read-only (1.2), so no writer that would not keep a log ever writes to a file that has one. The flag is never cleared.
+- **Index.**
+
+  | Index | Key (big-endian) | Value |
+  |---|---|---|
+  | changes | sequence · entry ID | kind (1): 1 inserted or replaced, 2 deleted |
+  | changes | 0 · 0 | trimmed-through sequence (8, big-endian): the log holds every change after it |
+  | changes | 0 · cursor number | a named cursor: read-up-to sequence (8, big-endian) · name (1–64 bytes, UTF-8) |
+
+  Entry ID 0 and sequence 0 are never used, so the rows under sequence 0 can't be mistaken for changes.
+- **Named cursors** (Section 18.12). Cursor numbers start at 1; a new cursor takes one above the highest in use, and names are unique within a collection. Opening a cursor sets its sequence to the collection's change stamp. Opening and dropping one are catalog changes (4.7), so each commits at once.
+- **Advancing a cursor** is a data change in a transaction (14.4.5): the *patch* operation on the collection, keyed by the cursor number as its entry ID, with the new sequence (8, big-endian) as its payload. It reaches the index when it is applied, and reconciliation applies every replayed change before it trims, so the log is never trimmed past an advance. A cursor's sequence never moves backwards: an advance to a lower sequence, or of a cursor that no longer exists, changes nothing.
+- **The sequence.** A change is keyed by the committed sequence of the archive commit that makes it durable: the committed sequence of the archive the change is applied to, plus one. A process whose archive moves before then rebases and applies the change again (5.9.1), so its key follows. Two changes to one entry under one sequence share a row, and the later one's kind stands.
+- **The change stamp** of a collection (18.6) is the sequence of its newest row, or the trimmed-through sequence when the log has no change rows.
+- **Trimming.** At reconciliation, the baton holder deletes the change rows whose sequence is at or below the trim point, and raises the trimmed-through sequence to it. The trim point is the lower of the readers' floor (5.9.7) and the lowest named cursor's sequence.
+- **Reading.** Changes after a sequence *s* are the rows whose key is above *s* · the largest entry ID. They are complete only when *s* is at or above the trimmed-through sequence.
+- **Readers without the accelerator** need not read the log. Every writer keeps it up to date.
 
 ---
 
