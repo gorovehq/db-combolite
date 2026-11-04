@@ -493,6 +493,7 @@ A reader that meets an unknown variable-size tag reads the length and skips that
 - **Canonical form:**
   - each width is the **smallest** that fits the largest field ID, or the largest offset, in that object;
   - an empty object has the width byte `0x00`.
+- **Nesting limit.** Arrays and objects nest at most **32** deep, the top-level value counting as one. This is a format limit (17.2): a writer never produces a deeper value, and a reader rejects one.
 
 ### 14.6.4 Exact decimals: unbounded or compact
 
@@ -637,7 +638,7 @@ At every commit, the whole list is written as a new chain. The pages of the prev
 
 ### 14.8.1 Structure
 
-The ordered index is a **copy-on-write B+tree** (Section 9.5):
+The ordered index is a **copy-on-write B+tree** (Section 9.5). A tree is at most **16** levels deep, the root counting as one; this is a format limit (17.2), and a reader treats a deeper tree as corrupt.
 
 - **Interior pages** hold separator keys and child logical IDs.
 - **Leaf pages** hold keys together with their values.
