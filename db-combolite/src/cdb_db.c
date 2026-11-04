@@ -614,6 +614,45 @@ static cdb_status prune_held_blocks(cdb_db *db)
     return CDB_OK;
 }
 
+/* Gives back the unused rest of held blocks. After a reconciliation with no
+ * transaction open, the catalog records every entry ID this process has
+ * used, so a block whose used part the catalog already covers can be
+ * dropped with its in-memory range: no one has used the IDs left in it, and
+ * the store's next claim starts from the catalog counter (spec 5.9.3).
+ * Without this, a process that writes a few entries into each of more than
+ * CDB_COORD_MAX_BLOCKS stores could not continue until it closed. */
+static cdb_status release_held_blocks(cdb_db *db)
+{
+    unsigned i = 0, r;
+    cdb_status s;
+    if (!db->has_catalog || db->in_tx)
+        return CDB_OK;
+    while (i < db->coord.me.nblocks) {
+        uint64_t store = db->coord.me.blocks[i].store;
+        uint64_t first = db->coord.me.blocks[i].first;
+        uint64_t used_to = first + CDB_COORD_ID_BLOCK; /* no range left: used up */
+        int range = -1;
+        cdb_store_info info;
+        for (r = 0; r < db->nid_ranges; r++)
+            if (db->id_ranges[r].store == store && db->id_ranges[r].next >= first
+                && db->id_ranges[r].next <= first + CDB_COORD_ID_BLOCK) {
+                used_to = db->id_ranges[r].next;
+                range = (int)r;
+            }
+        if ((s = cdb_catalog_get_store(&db->catalog, store, &info)) != CDB_OK && s != CDB_E_NOT_FOUND)
+            return s;
+        if (s == CDB_OK && info.next_entry_id < used_to) {
+            i++; /* not recorded yet: keep it */
+            continue;
+        }
+        if ((s = cdb_coord_drop_block(&db->coord, store, first)) != CDB_OK)
+            return s;
+        if (range >= 0)
+            db->id_ranges[range] = db->id_ranges[--db->nid_ranges];
+    }
+    return CDB_OK;
+}
+
 /* Merges every slot's committed transactions above its mark onto the
  * archive in (stamp, slot, counter) order, commits them with the new marks,
  * and cleans up any dead slots whose journals are now folded in (spec 5.9.1,
@@ -1627,7 +1666,7 @@ cdb_status cdb_db_peek_entry(cdb_db *db, uint64_t store, const uint64_t *next_en
             }
         }
         if (db->nid_ranges == CDB_COORD_MAX_BLOCKS)
-            return CDB_E_BUFFER_TOO_SMALL;
+            return CDB_E_OUT_OF_BUDGET;
     }
     floor = *next_entry ? *next_entry : 1u;
     if (db->has_catalog) {
@@ -1638,8 +1677,11 @@ cdb_status cdb_db_peek_entry(cdb_db *db, uint64_t store, const uint64_t *next_en
         else if (s != CDB_OK && s != CDB_E_NOT_FOUND)
             return s;
     }
+    /* The slot holds CDB_COORD_MAX_BLOCKS: this transaction has claimed more
+     * new entry IDs than one process may hold before it reconciles. It is a
+     * limit on the transaction, not on a value, so not CDB_E_OVERFLOW. */
     if ((s = cdb_coord_claim_block(&db->coord, store, floor, &first)) != CDB_OK)
-        return s;
+        return s == CDB_E_OVERFLOW ? CDB_E_OUT_OF_BUDGET : s;
     db->id_ranges[db->nid_ranges].store = store;
     db->id_ranges[db->nid_ranges].next = first;
     db->id_ranges[db->nid_ranges].end = first + CDB_COORD_ID_BLOCK;
@@ -2075,6 +2117,23 @@ cdb_status cdb_tx_commit(cdb_db *db)
     db_lock(db);
     s = tx_commit_locked(db);
     db_unlock(db);
+    /* A used-up entry-ID block is released only once reconciliation has
+     * recorded its store's next entry ID (prune_held_blocks), and the slot
+     * holds at most CDB_COORD_MAX_BLOCKS (spec 5.9.3). Reconcile when half
+     * are held, so a long run of commits never runs out; not inside an
+     * operation scope, whose slot pointers reconciliation may free. Another
+     * process holding the baton (BUSY) only defers it to a later commit;
+     * the commit itself has succeeded either way. */
+    if (s == CDB_OK && !db->in_tx && db->op_depth == 0 && db->coord.me.nblocks > CDB_COORD_MAX_BLOCKS / 2) {
+        cdb_status r = cdb_db_reconcile(db);
+        if (r == CDB_OK) {
+            db_lock(db);
+            r = release_held_blocks(db);
+            db_unlock(db);
+        }
+        if (r != CDB_OK && r != CDB_E_BUSY)
+            s = r;
+    }
     return s;
 }
 
