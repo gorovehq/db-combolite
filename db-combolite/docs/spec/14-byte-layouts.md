@@ -101,6 +101,14 @@ Delta tracks belong to individual processes (Section 1.3), so the header can't h
 - The header **always** uses CRC32C, whatever the file's checksum flag says. A reader can therefore verify the header before relying on any field in it.
 - In tamper-evident mode, the keyed tag at offset 492 is checked as well.
 
+### 14.1.10 Assigned feature flags
+
+The bits of the three feature-flag fields (offsets 80, 88 and 96) that are assigned, with their class (1.2). Every other bit is unassigned and must be zero.
+
+| Class | Bit | Feature | Set when |
+|---|---|---|---|
+| read-only compatible | 0 | vector change logs (14.12.5) | the first change log in the file is created |
+
 ## 14.2 Page header and trailer
 
 The fields are defined in Section 13. 8-byte fields are aligned to 8-byte boundaries.
@@ -1098,6 +1106,7 @@ One record per entry:
 ### 14.12.5 Change log (Section 18.12)
 
 - **Creation.** A collection created with this layout has a change log from the start. An explicit call adds one to a collection created before it. Settings field 14 (14.12.3) is the root page ID of the changes index, present once the collection has a log.
+- **Feature flag.** Creating the first change log in a file sets read-only-compatible feature flag 0, *vector change logs* (14.1.10). A build that does not know the flag opens the file read-only (1.2), so no writer that would not keep a log ever writes to a file that has one. The flag is never cleared.
 - **Index.**
 
   | Index | Key (big-endian) | Value |
