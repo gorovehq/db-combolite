@@ -832,6 +832,26 @@ static cdb_status start_session(cdb_db *db)
 /* Caller memory for n slots of each kind, laid out the way the slot code
  * carves it: full chunks of CDB_SLOTS_CHUNK, then one smaller chunk for the
  * remainder. */
+size_t cdb_db_struct_size(void)
+{
+    return sizeof(cdb_db);
+}
+
+size_t cdb_db_config_size(void)
+{
+    return sizeof(cdb_db_config);
+}
+
+cdb_catalog *cdb_db_catalog(cdb_db *db)
+{
+    return &db->catalog;
+}
+
+cdb_pager *cdb_db_pager(cdb_db *db)
+{
+    return &db->pager;
+}
+
 size_t cdb_db_slot_mem_size(unsigned n)
 {
     unsigned chunks = (n + CDB_SLOTS_CHUNK - 1u) / CDB_SLOTS_CHUNK, last = n - (chunks - 1u) * CDB_SLOTS_CHUNK;
