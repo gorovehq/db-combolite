@@ -328,13 +328,13 @@ class cdb_fts_config(Structure):
 
 
 class cdb_coord_config(Structure):
+    # As in cdb_coord.h; zeros take the defaults
     _fields_ = [
-        ("slots", c_uint32),
-        ("dead_timeout_ms", c_uint32),
-        ("lock_wait_cap_ms", c_uint32),
-        ("poll_interval_ms", c_uint32),
-        ("scratch", POINTER(c_uint8)),
-        ("scratch_size", c_size_t),
+        ("max_coords", c_uint32),
+        ("beat_ns", c_int64),
+        ("dead_after", c_uint32),
+        ("settle_ns", c_int64),
+        ("baton_wait_ns", c_int64),
     ]
 
 
@@ -389,13 +389,15 @@ class cdb_db_config(Structure):
         ("rotation_policy", c_uint32),
         ("signing_policy", c_uint32),
         ("identity", c_void_p),
+        ("query_mem", c_size_t),   # host profile: a query's memory budget (spec 17.4); 0 = default
     ]
 
 
 class cdb_db(Structure):
-    # cdb_db is 30896 bytes in total
+    # Opaque, and at least cdb_db_struct_size() bytes (about 31 KB today):
+    # ComboliteLib checks, so the engine growing it can't overrun this
     _fields_ = [
-        ("_opaque", c_uint8 * 30896),
+        ("_opaque", c_uint8 * 65536),
     ]
 
 
@@ -726,15 +728,21 @@ class cdb_exec_row(Structure):
         ("vector_dim", c_size_t),
         ("record_data", POINTER(c_uint8)),
         ("record_len", c_size_t),
-        ("fields", cdb_exec_field * 16),
+        ("has_right", c_int),
+        ("right_store_id", c_uint64),
+        ("right_entry_id", c_uint64),
+        ("right_model", c_uint32),
+        ("right_record_data", POINTER(c_uint8)),
+        ("right_record_len", c_size_t),
         ("n_fields", c_size_t),
-        ("_rest", c_uint8 * (2040 - 1992)),
+        ("fields", cdb_exec_field * 16),   # CDB_EXEC_MAX_FIELDS; last, as in cdb_exec.h
     ]
 
 
 class cdb_exec_cursor(Structure):
+    # Opaque, and at least cdb_exec_cursor_size() bytes: ComboliteLib checks
     _fields_ = [
-        ("_opaque", c_uint8 * 2432),
+        ("_opaque", c_uint8 * 4096),
     ]
 
 
@@ -753,6 +761,33 @@ class ComboliteLib:
     def __init__(self, lib_path: str):
         self.lib = ctypes.CDLL(lib_path)
         self._bind()
+        self._check_layouts()
+        global _db_catalog_fn, _db_pager_fn
+        for name in ("cdb_db_catalog", "cdb_db_pager"):
+            fn = getattr(self.lib, name, None)
+            if fn is not None:
+                fn.argtypes = [c_void_p]
+                fn.restype = c_void_p
+        _db_catalog_fn = getattr(self.lib, "cdb_db_catalog", None)
+        _db_pager_fn = getattr(self.lib, "cdb_db_pager", None)
+
+    def _check_layouts(self):
+        """The structs mirrored here must match the library: a mismatch would
+        make the engine read and write past them. Libraries too old to export
+        their sizes are taken as they are."""
+        c = self.lib
+        checks = [("cdb_db_config_size", cdb_db_config, "exact"), ("cdb_exec_row_size", cdb_exec_row, "exact"),
+                  ("cdb_db_struct_size", cdb_db, "fits"), ("cdb_exec_cursor_size", cdb_exec_cursor, "fits")]
+        for fn_name, cls, how in checks:
+            fn = getattr(c, fn_name, None)
+            if fn is None:
+                continue
+            fn.argtypes = []
+            fn.restype = c_size_t
+            want, have = fn(), ctypes.sizeof(cls)
+            if (how == "exact" and want != have) or (how == "fits" and want > have):
+                raise RuntimeError(f"libcombolite and the studio disagree on {cls.__name__}: "
+                                   f"the library's is {want} bytes, the binding's {have}. Update binding.py.")
 
     def _bind(self):
         c = self.lib
@@ -1056,16 +1091,26 @@ def status_str(lib: ComboliteLib, status: int) -> str:
     return f"Status {status}"
 
 
+# cdb_db_catalog / cdb_db_pager from the loaded library (ComboliteLib sets
+# them); None for libraries too old to export them
+_db_catalog_fn = None
+_db_pager_fn = None
+
+
 def get_catalog_ptr(db_ptr: POINTER(cdb_db)) -> c_void_p:
-    """Offsets into cdb_db to locate the embedded cdb_catalog struct (offset 16344)."""
-    base_addr = ctypes.cast(db_ptr, c_void_p).value
-    return c_void_p(base_addr + 16344)
+    """The cdb_catalog inside cdb_db: asked of the library, or for an older
+    library the offset it had (16344)."""
+    if _db_catalog_fn is not None:
+        return c_void_p(_db_catalog_fn(db_ptr))
+    return c_void_p(ctypes.cast(db_ptr, c_void_p).value + 16344)
 
 
 def get_pager_ptr(db_ptr: POINTER(cdb_db)) -> c_void_p:
-    """Offsets into cdb_db to locate the embedded cdb_pager struct (offset 12640)."""
-    base_addr = ctypes.cast(db_ptr, c_void_p).value
-    return c_void_p(base_addr + 12640)
+    """The cdb_pager inside cdb_db: asked of the library, or for an older
+    library the offset it had (12640)."""
+    if _db_pager_fn is not None:
+        return c_void_p(_db_pager_fn(db_ptr))
+    return c_void_p(ctypes.cast(db_ptr, c_void_p).value + 12640)
 
 
 def decode_value(val: cdb_value, lib: ComboliteLib, order: int = CDB_ORDER_LITTLE) -> object:

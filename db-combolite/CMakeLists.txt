@@ -21,6 +21,19 @@ else()
 endif()
 option(CDB_SANITIZE "Build with AddressSanitizer and UBSan" ${CDB_SANITIZE_DEFAULT})
 
+# Build profile (spec 17): host sizes a process's limits for a host and
+# grows working memory through the environment's allocator; mcu keeps
+# everything in caller memory. Both read and write the same files.
+set(CDB_PROFILE host CACHE STRING "Build profile: host or mcu (spec 17)")
+set_property(CACHE CDB_PROFILE PROPERTY STRINGS host mcu)
+if(NOT CDB_PROFILE STREQUAL "host" AND NOT CDB_PROFILE STREQUAL "mcu")
+  message(FATAL_ERROR "CDB_PROFILE must be host or mcu, not '${CDB_PROFILE}'")
+endif()
+# Host optimisation (17.6): -O3 and link-time optimisation in optimised
+# builds; -march=native only on request, for builds that never leave this
+# machine.
+option(CDB_NATIVE "Optimise for this machine's CPU (-march=native); never for distributed builds" OFF)
+
 # LZMA2 compression through the vendored liblzma (spec 15.7,
 # third-party/xz/VENDORED.md). Without it, compression defaults are off and
 # files that use compression are refused.
@@ -125,6 +138,23 @@ if(CDB_SANITIZE)
   target_compile_options(combolite PUBLIC ${CDB_SANITIZER_FLAGS})
   target_link_options(combolite PUBLIC ${CDB_SANITIZER_FLAGS})
 endif()
+if(CDB_PROFILE STREQUAL "mcu")
+  target_compile_definitions(combolite PUBLIC CDB_PROFILE_MCU=1)
+  target_compile_options(combolite PRIVATE $<$<NOT:$<CONFIG:Debug>>:-Os>)
+else()
+  target_compile_options(combolite PRIVATE $<$<NOT:$<CONFIG:Debug>>:-O3>)
+  if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT CDB_IPO_OK OUTPUT CDB_IPO_MSG LANGUAGES C)
+    if(CDB_IPO_OK)
+      set_property(TARGET combolite PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+    endif()
+  endif()
+  if(CDB_NATIVE)
+    target_compile_options(combolite PRIVATE -march=native)
+  endif()
+endif()
+message(STATUS "CDB_PROFILE=${CDB_PROFILE}")
 
 if(CDB_BUILD_TESTS)
   enable_testing()

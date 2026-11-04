@@ -155,6 +155,11 @@ typedef struct cdb_db_config {
     cdb_rotation_policy rotation_policy;
     cdb_signing_policy signing_policy;
     const cdb_identity *identity;
+    /* Host profile: most memory one query may grow to through the
+     * environment's allocator; 0 means CDB_QUERY_MEM_DEFAULT (spec 17.4).
+     * The mcu profile never grows. Last, so bindings that mirror the
+     * fields before it keep their offsets. */
+    size_t query_mem;
 } cdb_db_config;
 
 /* An open document pool (cdb_doc.h). */
@@ -258,6 +263,10 @@ struct cdb_table_store {
 
 /* Caller memory for n open stores of each kind, without an allocator. */
 size_t cdb_db_slot_mem_size(unsigned n);
+/* The sizes of cdb_db and cdb_db_config, for bindings that mirror them to
+ * check their copies against this build */
+size_t cdb_db_struct_size(void);
+size_t cdb_db_config_size(void);
 
 /* An open database. All fields are internal to the engine. */
 typedef struct cdb_db {
@@ -391,6 +400,11 @@ typedef struct cdb_db {
     /* Event triggers (spec 11.6). */
     cdb_trigger_registry triggers;
 } cdb_db;
+
+/* The catalog and pager inside a database, for bindings that call the
+ * catalog and index functions directly (no fixed offsets to keep in step) */
+cdb_catalog *cdb_db_catalog(cdb_db *db);
+cdb_pager *cdb_db_pager(cdb_db *db);
 
 /* Re-entrant synchronization locks across threads (spec 5.9.6, M20). */
 void cdb_db_lock(cdb_db *db);

@@ -4,10 +4,11 @@
     {
       "name": "noxz",
       "displayName": "No xz: micro-controller test build",
-      "description": "Debug with sanitizers and CDB_WITH_XZ=OFF: the engine without LZMA2 (xz) compression, the way a micro-controller build will run it. A host build for testing that configuration; not a micro-controller target.",
+      "description": "Debug with sanitizers, the mcu profile (spec 17) and CDB_WITH_XZ=OFF: the engine the way a micro-controller build will run it, with caller memory only and without LZMA2 (xz). A host build for testing that configuration; not a micro-controller target.",
       "binaryDir": "${sourceDir}/build-noxz",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
+        "CDB_PROFILE": "mcu",
         "CDB_WITH_XZ": "OFF",
         "CDB_BUILD_TESTS": "ON"
       }
