@@ -213,16 +213,18 @@ static cdb_status scan_open(cdb_exec_op *op, cdb_exec_cursor *cur)
     memset(&s->tcur, 0, sizeof s->tcur);
     s->mock_idx = 0;
 
+    /* A store the catalog does not have is an error, not an empty result: a
+     * misspelt name must not read as "no rows match" */
     if (cur->cat != NULL) {
         int found = 0;
-        st = cdb_catalog_find_store(cur->cat, s->store_name, s->store_name_len, &s->store_id, &found);
-        if (st == CDB_OK && found) {
-            st = cdb_catalog_get_store(cur->cat, s->store_id, &info);
-            if (st == CDB_OK) {
-                s->model = info.model;
-                s->max_entry_id = info.next_entry_id;
-            }
-        }
+        if ((st = cdb_catalog_find_store(cur->cat, s->store_name, s->store_name_len, &s->store_id, &found)) != CDB_OK)
+            return st;
+        if (!found)
+            return CDB_E_NOT_FOUND;
+        if ((st = cdb_catalog_get_store(cur->cat, s->store_id, &info)) != CDB_OK)
+            return st;
+        s->model = info.model;
+        s->max_entry_id = info.next_entry_id;
     }
 
     return CDB_OK;
