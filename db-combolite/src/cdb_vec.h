@@ -168,6 +168,59 @@ cdb_status cdb_vec_refresh_async(cdb_db *db, cdb_vec_refresh_task *task, uint64_
 cdb_status cdb_vec_neighbours(cdb_db *db, uint64_t store, uint64_t entry, cdb_vec_hit *hits, size_t max,
                               size_t *n, int *fresh);
 
+/* ---- Change log and named change cursors (spec 14.12.5, 18.12) ----
+ *
+ * Every collection created now keeps a change log: which entries each
+ * archive commit inserted, replaced or deleted, keyed by that commit's
+ * sequence. Reconciliation trims it below the readers' floor and the lowest
+ * named cursor, so an application that wants the changes since it last
+ * looked, across sessions, holds them with a named cursor. */
+
+#define CDB_VEC_CURSOR_NAME_MAX 64u
+
+/* One changed entry: the sequence of the archive commit that changed it,
+ * and whether it is live now (0: deleted since). An entry changed under
+ * several sequences is listed once for each. */
+typedef struct cdb_vec_change {
+    uint64_t seq;
+    uint64_t entry;
+    int live;
+} cdb_vec_change;
+
+/* Adds a change log to a collection created before logs existed; it holds
+ * every change from now on. Commits immediately. CDB_E_EXISTS if it has
+ * one. */
+cdb_status cdb_vec_track_changes(cdb_db *db, uint64_t store);
+
+/* The collection's change stamp, the sequence of its newest change (or its
+ * trimmed-through sequence when no change is kept), and *oldest, the
+ * sequence the log holds every change after. CDB_E_STATE without a log. */
+cdb_status cdb_vec_change_stamp(cdb_db *db, uint64_t store, uint64_t *stamp, uint64_t *oldest);
+
+/* Lists the changes after (*seq, *entry), in that order, at most max of
+ * them; *n says how many. Start with *seq the sequence to read after and
+ * *entry UINT64_MAX; both are advanced past what is returned, so call
+ * again until *n is 0. CDB_E_STATE without a log, or when the log no
+ * longer reaches back to *seq (it was trimmed: read the collection whole
+ * instead). Not inside a transaction. */
+cdb_status cdb_vec_changes(cdb_db *db, uint64_t store, uint64_t *seq, uint64_t *entry, cdb_vec_change *out,
+                           size_t max, size_t *n);
+
+/* Opens the named cursor, creating it at the change stamp if it does not
+ * exist; *seq is the sequence it has read up to. Commits immediately when
+ * it creates. Names are 1 to CDB_VEC_CURSOR_NAME_MAX bytes. CDB_E_STATE
+ * without a log. */
+cdb_status cdb_vec_cursor_open(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t *seq);
+
+/* Advances the named cursor to seq, in the open transaction: one ordinary
+ * commit, no reconciliation (spec 14.12.5). A lower seq changes nothing.
+ * CDB_E_NOT_FOUND if there is no such cursor. */
+cdb_status cdb_vec_cursor_advance(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t seq);
+
+/* Drops the named cursor, so it no longer holds the log. Commits
+ * immediately. CDB_E_NOT_FOUND if there is no such cursor. */
+cdb_status cdb_vec_cursor_drop(cdb_db *db, uint64_t store, const char *name, size_t len);
+
 /* Bytes of vec_work a collection with this shape and k needs. */
 size_t cdb_vec_work_size(cdb_vector_elem elem, uint32_t dims, uint32_t k);
 

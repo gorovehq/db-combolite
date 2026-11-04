@@ -56,7 +56,8 @@
 
 /* Settings fields (spec 14.12.3), kept in store record field 16. */
 enum { S_ELEM = 1, S_DIMS, S_MEASURE, S_MODEL, S_VERSION, S_ENTRIES, S_BLOCKS, S_SOURCES, S_NORMS,
-       S_K, S_GRAPH, S_REVERSE, S_PENDING /* optional: the neighbour graph */ };
+       S_K, S_GRAPH, S_REVERSE, S_PENDING /* optional: the neighbour graph */,
+       S_CHANGES /* optional for older collections: the change log */ };
 
 typedef struct cdb_vec_coll coll;
 
@@ -127,7 +128,7 @@ static int measure_fits(unsigned elem, unsigned measure)
 /* -------------------------------------------------------- settings */
 
 /* Encodes the settings object (spec 14.12.3). Fields 10-13 are written
- * only once the collection has a graph. */
+ * only once the collection has a graph, field 14 once it has a change log. */
 static cdb_status encode_settings(const cdb_db *db, const cdb_vec_config *cfg, const coll *c,
                                   uint8_t *out, size_t cap, size_t *len)
 {
@@ -162,6 +163,10 @@ static cdb_status encode_settings(const cdb_db *db, const cdb_vec_config *cfg, c
         cdb_value_field(&w, S_PENDING);
         cdb_value_write_int(&w, (int64_t)c->pending.root);
     }
+    if (c->changes_on) {
+        cdb_value_field(&w, S_CHANGES);
+        cdb_value_write_int(&w, (int64_t)c->changes.root);
+    }
     cdb_value_end_object(&w);
     *len = cdb_value_writer_len(&w);
     return w.error;
@@ -195,9 +200,10 @@ static cdb_status get_text(const cdb_value *obj, cdb_byte_order o, uint64_t f, c
 }
 
 /* Decodes settings into c (index roots in roots: entries, blocks, sources,
- * then graph, reverse, pending when c->graph_on) and, optionally, cfg with
- * its model strings copied to model and version. */
-static cdb_status decode_settings(const cdb_db *db, const uint8_t *in, size_t len, coll *c, uint64_t roots[6],
+ * then graph, reverse, pending when c->graph_on, then changes when
+ * c->changes_on) and, optionally, cfg with its model strings copied to
+ * model and version. */
+static cdb_status decode_settings(const cdb_db *db, const uint8_t *in, size_t len, coll *c, uint64_t roots[7],
                                   cdb_vec_config *cfg, char *model, char *version)
 {
     cdb_byte_order o = db->pager.order;
@@ -242,6 +248,16 @@ static cdb_status decode_settings(const cdb_db *db, const uint8_t *in, size_t le
         }
         c->graph_on = 1;
         c->k = (uint32_t)kk;
+    }
+    c->changes_on = 0;
+    if (cdb_value_object_get(&obj, o, S_CHANGES, &v, &found) != CDB_OK)
+        return CDB_E_CORRUPT;
+    if (found) {
+        int64_t ch;
+        if (get_int(&obj, o, S_CHANGES, 1, INT64_MAX, &ch) != CDB_OK)
+            return CDB_E_CORRUPT;
+        roots[6] = (uint64_t)ch;
+        c->changes_on = 1;
     }
     if (cfg) {
         memset(cfg, 0, sizeof *cfg);
@@ -292,7 +308,7 @@ static cdb_status coll_get(cdb_db *db, uint64_t store, coll **out)
 {
     coll *free_slot = (coll *)cdb_slots_find(&db->vec_slots, store);
     cdb_store_info info;
-    uint64_t roots[6];
+    uint64_t roots[7];
     cdb_status s;
     void *v;
 
@@ -337,6 +353,9 @@ static cdb_status coll_get(cdb_db *db, uint64_t store, coll **out)
             || (s = cdb_index_open(&free_slot->pending, &db->pager, roots[5], &db->cfg.catalog_work)) != CDB_OK)
             return s;
     }
+    if (free_slot->changes_on
+        && (s = cdb_index_open(&free_slot->changes, &db->pager, roots[6], &db->cfg.catalog_work)) != CDB_OK)
+        return s;
     free_slot->slot.in_use = 1;
     cdb_slots_touch(db, &db->vec_slots, free_slot);
     *out = free_slot;
@@ -344,15 +363,19 @@ static cdb_status coll_get(cdb_db *db, uint64_t store, coll **out)
 }
 
 static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *processed);
+static cdb_status trim_log(cdb_db *db, coll *c);
 
-/* At reconciliation: refresh up to the budget of each graph (spec 6.8),
- * then record next entry IDs. */
+/* At reconciliation: trim each change log (spec 14.12.5), refresh up to
+ * the budget of each graph (spec 6.8), then record next entry IDs. Only
+ * open collections are trimmed; the others are when they are next open. */
 cdb_status cdb_vec_flush(cdb_db *db)
 {
     cdb_slot_iter it;
     coll *c;
     for (c = (coll *)cdb_slots_first(&db->vec_slots, &it); c != NULL; c = (coll *)cdb_slots_next(&it)) {
         cdb_status s;
+        if (c->changes_on && (s = trim_log(db, c)) != CDB_OK)
+            return s;
         if (c->graph_on) {
             size_t done;
             s = refresh_coll(db, c, db->cfg.vec_refresh_budget ? db->cfg.vec_refresh_budget : DEFAULT_BUDGET, &done);
@@ -366,8 +389,9 @@ cdb_status cdb_vec_flush(cdb_db *db)
 }
 
 /* Validates the settings, checks one vector fits a page, then (as a
- * catalog change) creates the three indexes and the store record in one
- * commit. Norms are cached only for cosine. */
+ * catalog change) creates the indexes, the change log among them (spec
+ * 14.12.5), and the store record in one commit. Norms are cached only for
+ * cosine. */
 cdb_status cdb_vec_create(cdb_db *db, const char *name, size_t len, const cdb_vec_config *cfg, uint64_t *id)
 {
     uint8_t settings[CDB_CATALOG_SETTINGS_MAX];
@@ -411,6 +435,9 @@ cdb_status cdb_vec_create(cdb_db *db, const char *name, size_t len, const cdb_ve
         s = cdb_index_create(&c.sources, &db->pager, *id, CDB_INDEX_FLAG_UNIQUE | CDB_INDEX_FLAG_PREFIX,
                              &db->cfg.catalog_work);
     if (s == CDB_OK)
+        s = cdb_index_create(&c.changes, &db->pager, *id, CDB_INDEX_FLAG_UNIQUE, &db->cfg.catalog_work);
+    c.changes_on = 1; /* no trimmed-through row yet: the log holds every change */
+    if (s == CDB_OK)
         s = encode_settings(db, cfg, &c, settings, sizeof settings, &slen);
     if (s == CDB_OK)
         s = cdb_catalog_create_store_ex(&db->catalog, name, len, CDB_MODEL_VECTOR, settings, slen, &got);
@@ -422,7 +449,7 @@ cdb_status cdb_vec_create(cdb_db *db, const char *name, size_t len, const cdb_ve
 cdb_status cdb_vec_describe(cdb_db *db, uint64_t store, cdb_vec_config *cfg, char *model, char *model_version)
 {
     cdb_store_info info;
-    uint64_t roots[6];
+    uint64_t roots[7];
     coll *c, tmp;
     cdb_status s;
     if ((s = coll_get(db, store, &c)) != CDB_OK)
@@ -1876,6 +1903,170 @@ static cdb_status source_rev(cdb_db *db, uint64_t store, uint64_t entry, uint64_
 
 /* The vector apply. Like the document apply it never fails for logical
  * reasons: it runs again during recovery. */
+/* -------------------------------------------------------- change log */
+
+/* Rows of the changes index (spec 14.12.5): (sequence, entry) -> kind;
+ * under sequence 0, entry 0 holds the trimmed-through sequence and entry n
+ * named cursor n (its sequence, then its name). */
+#define CH_PUT 1u           /* inserted or replaced */
+#define CH_DEL 2u           /* deleted */
+#define CURSOR_VAL (8u + CDB_VEC_CURSOR_NAME_MAX)
+#define TRIM_BATCH 64u      /* rows deleted per pass of the trim */
+
+/* Records that this apply changes entry, under the sequence of the archive
+ * commit that will make it durable: the one after the archive the change
+ * is applied to. A rebase applies it again over the new archive, so the
+ * key follows. */
+static cdb_status log_change(cdb_db *db, coll *c, uint64_t entry, uint8_t kind)
+{
+    uint8_t k[16];
+    if (!c->changes_on)
+        return CDB_OK;
+    return cdb_index_put(&c->changes, k, k_pair(k, db->pager.hs.record.committed_seq + 1u, entry), &kind, 1);
+}
+
+/* The trimmed-through sequence: the log holds every change after it. A log
+ * never trimmed has no row, and holds every change: 0. */
+static cdb_status trimmed_through(coll *c, uint64_t *seq)
+{
+    uint8_t k[16], v[8];
+    size_t vlen;
+    int found;
+    cdb_status s;
+    *seq = 0;
+    if ((s = cdb_index_get(&c->changes, k, k_pair(k, 0, 0), v, sizeof v, &vlen, &found)) != CDB_OK || !found)
+        return s;
+    if (vlen != 8)
+        return CDB_E_CORRUPT;
+    *seq = cdb_load_u64(v, CDB_ORDER_BIG);
+    return CDB_OK;
+}
+
+/* Calls fn for each named cursor, in number order, until it returns
+ * nonzero. */
+static cdb_status each_cursor(cdb_db *db, coll *c, int (*fn)(void *arg, uint64_t num, uint64_t seq,
+                                                             const uint8_t *name, size_t len), void *arg)
+{
+    cdb_index_cursor cur;
+    uint8_t k[16], key[16], val[CURSOR_VAL];
+    size_t klen, vlen;
+    int done;
+    cdb_status s;
+    if ((s = cdb_index_seek(&cur, &c->changes, vbuf(db, V_CURSOR), k, k_pair(k, 0, 1))) != CDB_OK)
+        return s;
+    for (;;) {
+        if ((s = cdb_index_next(&cur, key, sizeof key, &klen, val, sizeof val, &vlen, &done)) != CDB_OK || done)
+            return s;
+        if (klen != 16 || cdb_load_u64(key, CDB_ORDER_BIG) != 0)
+            return CDB_OK; /* past the rows under sequence 0 */
+        if (vlen <= 8)
+            return CDB_E_CORRUPT;
+        if (fn(arg, cdb_load_u64(key + 8, CDB_ORDER_BIG), cdb_load_u64(val, CDB_ORDER_BIG), val + 8, vlen - 8))
+            return CDB_OK;
+    }
+}
+
+typedef struct cursor_scan {
+    const uint8_t *name;   /* the one sought, or NULL */
+    size_t len;
+    uint64_t num, seq;     /* the one found */
+    uint64_t lowest, highest;
+    int found, any;
+} cursor_scan;
+
+static int scan_cursor(void *arg, uint64_t num, uint64_t seq, const uint8_t *name, size_t len)
+{
+    cursor_scan *sc = (cursor_scan *)arg;
+    if (!sc->any || seq < sc->lowest)
+        sc->lowest = seq;
+    sc->any = 1;
+    sc->highest = num;
+    if (sc->name != NULL && len == sc->len && memcmp(name, sc->name, len) == 0) {
+        sc->found = 1;
+        sc->num = num;
+        sc->seq = seq;
+    }
+    return 0;
+}
+
+static cdb_status find_cursors(cdb_db *db, coll *c, const char *name, size_t len, cursor_scan *sc)
+{
+    memset(sc, 0, sizeof *sc);
+    sc->name = (const uint8_t *)name;
+    sc->len = len;
+    return each_cursor(db, c, scan_cursor, sc);
+}
+
+/* At reconciliation, by the baton holder: drops the change rows at or
+ * below the trim point, the lower of the readers' floor (spec 5.9.7) and
+ * the lowest named cursor, and records it as trimmed through. Replayed
+ * changes, cursor advances among them, are applied before this runs. */
+static cdb_status trim_log(cdb_db *db, coll *c)
+{
+    uint64_t point = db->pager.hs.record.committed_seq, through;
+    uint8_t k[16], keys[TRIM_BATCH][16], v[8];
+    cursor_scan sc;
+    cdb_status s;
+
+    if (db->coord.min_pin != 0 && db->coord.min_pin < point)
+        point = db->coord.min_pin;
+    if ((s = find_cursors(db, c, NULL, 0, &sc)) != CDB_OK)
+        return s;
+    if (sc.any && sc.lowest < point)
+        point = sc.lowest;
+    if ((s = trimmed_through(c, &through)) != CDB_OK || point <= through)
+        return s;
+    /* Batches of keys, gathered first: an index is not changed under a
+     * cursor walking it. */
+    for (;;) {
+        cdb_index_cursor cur;
+        size_t klen, vlen, n = 0, i;
+        uint8_t kind;
+        int done, found;
+        if ((s = cdb_index_seek(&cur, &c->changes, vbuf(db, V_CURSOR), k, k_pair(k, through + 1u, 0))) != CDB_OK)
+            return s;
+        while (n < TRIM_BATCH) {
+            if ((s = cdb_index_next(&cur, keys[n], 16, &klen, &kind, 1, &vlen, &done)) != CDB_OK)
+                return s;
+            if (done || klen != 16 || cdb_load_u64(keys[n], CDB_ORDER_BIG) > point)
+                break;
+            n++;
+        }
+        for (i = 0; i < n; i++)
+            if ((s = cdb_index_delete(&c->changes, keys[i], 16, &found)) != CDB_OK)
+                return s;
+        if (n < TRIM_BATCH)
+            break;
+    }
+    cdb_store_u64(v, point, CDB_ORDER_BIG);
+    return cdb_index_put(&c->changes, k, k_pair(k, 0, 0), v, sizeof v);
+}
+
+/* A cursor advance (spec 14.12.5): the patch operation keyed by the cursor
+ * number, with the new sequence. Like every apply it never fails for
+ * logical reasons, since it runs again at recovery: a malformed payload, a
+ * dropped cursor or a lower sequence changes nothing. */
+static cdb_status cursor_apply(coll *c, const cdb_delta *d)
+{
+    uint8_t k[16], val[CURSOR_VAL];
+    size_t vlen;
+    uint64_t seq;
+    int found;
+    cdb_status s;
+    if (!c->changes_on || d->len != 8)
+        return CDB_OK;
+    seq = cdb_load_u64(d->data, CDB_ORDER_BIG);
+    if ((s = cdb_index_get(&c->changes, k, k_pair(k, 0, d->entry_id), val, sizeof val, &vlen, &found)) != CDB_OK
+        || !found)
+        return s;
+    if (vlen <= 8)
+        return CDB_E_CORRUPT;
+    if (seq <= cdb_load_u64(val, CDB_ORDER_BIG))
+        return CDB_OK;
+    cdb_store_u64(val, seq, CDB_ORDER_BIG);
+    return cdb_index_put(&c->changes, k, 16, val, vlen);
+}
+
 cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
 {
     uint8_t k[24];
@@ -1895,6 +2086,8 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
         return s;
     if (d->entry_id == 0)
         return CDB_OK;
+    if (d->op == CDB_OP_PATCH)
+        return cursor_apply(c, d); /* keyed by a cursor number, not an entry */
     if (d->entry_id >= c->next_entry) {
         c->next_entry = d->entry_id + 1u; /* replay never hands an ID out again */
         c->dirty = 1;
@@ -1929,7 +2122,7 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
                 return s;
             if (c->graph_on && ((s = pending_put(c, d->entry_id)) != CDB_OK || (s = meta_live(c, +1)) != CDB_OK))
                 return s;
-            return CDB_OK;
+            return log_change(db, c, d->entry_id, CH_PUT);
         } else {
             /* Replace (an insert of an existing entry also lands here):
              * overwrite the vector in its slot. Any source in the payload
@@ -1940,7 +2133,8 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
                 return s;
             if (r.slot >= b.count || slot_entry(db, &b, r.slot) != d->entry_id)
                 return CDB_E_CORRUPT;
-            if ((s = block_write(db, c, r.block, &b, b.count, r.slot, d->entry_id, data)) != CDB_OK)
+            if ((s = block_write(db, c, r.block, &b, b.count, r.slot, d->entry_id, data)) != CDB_OK
+                || (s = log_change(db, c, d->entry_id, CH_PUT)) != CDB_OK)
                 return s;
             /* A new vector: its place in the graph is worked out again. */
             if (c->graph_on && ((s = graph_detach(db, c, d->entry_id)) != CDB_OK
@@ -1969,7 +2163,8 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
             && (s = cdb_index_delete(&c->sources, k, k_source(k, r.source_store, r.source_entry, d->entry_id),
                                      &found)) != CDB_OK)
             return s;
-        if ((s = cdb_index_delete(&c->entries, k, k_u64(k, d->entry_id), &found)) != CDB_OK)
+        if ((s = cdb_index_delete(&c->entries, k, k_u64(k, d->entry_id), &found)) != CDB_OK
+            || (s = log_change(db, c, d->entry_id, CH_DEL)) != CDB_OK)
             return s;
         return cdb_link_on_delete(db, d->store_id, d->entry_id); /* its links (spec 6.7) */
     default:
@@ -2378,7 +2573,7 @@ cdb_status cdb_vec_create_graph(cdb_db *db, uint64_t store, uint32_t k)
     uint8_t settings[CDB_CATALOG_SETTINGS_MAX];
     cdb_store_info info;
     cdb_vec_config cfg;
-    uint64_t roots[6], live = 0;
+    uint64_t roots[7], live = 0;
     size_t slen;
     coll *c, tmp;
     cdb_status s;
@@ -2544,4 +2739,261 @@ cdb_status cdb_vec_neighbours(cdb_db *db, uint64_t store, uint64_t entry, cdb_ve
         (*n)++;
     }
     return source_states(db, c, hits, *n);
+}
+
+/* -------------------------------------------------------- change API */
+
+/* A catalog change: creates the changes index, records that it holds
+ * every change after the archive's committed sequence now, and rewrites
+ * the settings with field 14 (spec 14.12.5). */
+cdb_status cdb_vec_track_changes(cdb_db *db, uint64_t store)
+{
+    char model[CDB_VEC_MODEL_MAX], version[CDB_VEC_MODEL_MAX];
+    uint8_t settings[CDB_CATALOG_SETTINGS_MAX], k[16], v[8];
+    cdb_store_info info;
+    cdb_vec_config cfg;
+    uint64_t roots[7];
+    size_t slen;
+    coll *c, tmp;
+    cdb_status s;
+
+    if (db->in_tx || db->failed)
+        return CDB_E_STATE;
+    if ((s = coll_get(db, store, &c)) != CDB_OK)
+        return s;
+    if (c->changes_on)
+        return CDB_E_EXISTS;
+    if ((s = cdb_db_catalog_begin(db)) != CDB_OK)
+        return s;
+    s = cdb_index_create(&c->changes, &db->pager, store, CDB_INDEX_FLAG_UNIQUE, &db->cfg.catalog_work);
+    cdb_store_u64(v, db->pager.hs.record.committed_seq, CDB_ORDER_BIG);
+    if (s == CDB_OK)
+        s = cdb_index_put(&c->changes, k, k_pair(k, 0, 0), v, sizeof v);
+    c->changes_on = 1;
+    if (s == CDB_OK)
+        s = cdb_catalog_get_store(&db->catalog, store, &info);
+    if (s == CDB_OK)
+        s = decode_settings(db, info.vector, info.vector_len, &tmp, roots, &cfg, model, version);
+    if (s == CDB_OK)
+        s = encode_settings(db, &cfg, c, settings, sizeof settings, &slen);
+    if (s == CDB_OK)
+        s = cdb_catalog_set_vector(&db->catalog, store, settings, slen);
+    if (s != CDB_OK)
+        c->changes_on = 0; /* the pages written so far are unreferenced: space, not damage */
+    return cdb_db_catalog_end(db, s);
+}
+
+/* Whether the log has a change row at sequence seq or later (seq >= 1). */
+static cdb_status row_from(cdb_db *db, coll *c, uint64_t seq, int *any)
+{
+    cdb_index_cursor cur;
+    uint8_t k[16], key[16], kind;
+    size_t klen, vlen;
+    int done;
+    cdb_status s;
+    *any = 0;
+    if ((s = cdb_index_seek(&cur, &c->changes, vbuf(db, V_CURSOR), k, k_pair(k, seq, 0))) != CDB_OK
+        || (s = cdb_index_next(&cur, key, sizeof key, &klen, &kind, 1, &vlen, &done)) != CDB_OK)
+        return s;
+    *any = !done;
+    return CDB_OK;
+}
+
+/* The newest change's sequence, found by bisecting the sequences the log
+ * can hold: none is above the archive's committed sequence plus one (this
+ * process's own applied changes). */
+static cdb_status change_stamp(cdb_db *db, coll *c, uint64_t *stamp, uint64_t *oldest)
+{
+    uint64_t lo, hi;
+    int any;
+    cdb_status s;
+    if ((s = trimmed_through(c, oldest)) != CDB_OK)
+        return s;
+    lo = *oldest; /* no row after hi; a row at or after lo + 1 is sought */
+    hi = db->pager.hs.record.committed_seq + 1u;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo + 1u) / 2u;
+        if ((s = row_from(db, c, mid, &any)) != CDB_OK)
+            return s;
+        if (any)
+            lo = mid;
+        else
+            hi = mid - 1u;
+    }
+    *stamp = lo;
+    return CDB_OK;
+}
+
+cdb_status cdb_vec_change_stamp(cdb_db *db, uint64_t store, uint64_t *stamp, uint64_t *oldest)
+{
+    coll *c;
+    cdb_status s;
+    if ((s = coll_get(db, store, &c)) != CDB_OK)
+        return s;
+    if (!c->changes_on)
+        return CDB_E_STATE;
+    return change_stamp(db, c, stamp, oldest);
+}
+
+cdb_status cdb_vec_changes(cdb_db *db, uint64_t store, uint64_t *seq, uint64_t *entry, cdb_vec_change *out,
+                           size_t max, size_t *n)
+{
+    cdb_index_cursor cur;
+    uint8_t k[16], key[16], kind;
+    uint64_t through, from_seq, from_entry;
+    size_t klen, vlen;
+    coll *c;
+    cdb_status s;
+
+    *n = 0;
+    if (db->in_tx || db->failed)
+        return CDB_E_STATE;
+    if (out == NULL && max)
+        return CDB_E_INVALID_ARG;
+    if ((s = coll_get(db, store, &c)) != CDB_OK)
+        return s;
+    if (!c->changes_on)
+        return CDB_E_STATE;
+    if ((s = trimmed_through(c, &through)) != CDB_OK)
+        return s;
+    if (*seq < through)
+        return CDB_E_STATE; /* trimmed: the log no longer reaches back that far */
+    /* The first key after (*seq, *entry). Rows under sequence 0 are not
+     * changes. */
+    from_seq = *seq;
+    from_entry = *entry;
+    if (from_entry == UINT64_MAX) {
+        if (from_seq == UINT64_MAX)
+            return CDB_OK;
+        from_seq++;
+        from_entry = 0;
+    } else {
+        from_entry++;
+    }
+    if (from_seq == 0) {
+        from_seq = 1;
+        from_entry = 0;
+    }
+    if ((s = cdb_index_seek(&cur, &c->changes, vbuf(db, V_CURSOR), k, k_pair(k, from_seq, from_entry))) != CDB_OK)
+        return s;
+    while (*n < max) {
+        entry_rec r;
+        int done, found;
+        if ((s = cdb_index_next(&cur, key, sizeof key, &klen, &kind, 1, &vlen, &done)) != CDB_OK)
+            return s;
+        if (done)
+            break;
+        if (klen != 16 || vlen != 1)
+            return CDB_E_CORRUPT;
+        out[*n].seq = cdb_load_u64(key, CDB_ORDER_BIG);
+        out[*n].entry = cdb_load_u64(key + 8, CDB_ORDER_BIG);
+        if ((s = entry_get(c, out[*n].entry, &r, &found)) != CDB_OK)
+            return s;
+        out[*n].live = found;
+        *seq = out[*n].seq;
+        *entry = out[*n].entry;
+        (*n)++;
+    }
+    return CDB_OK;
+}
+
+static int cursor_name_ok(const char *name, size_t len)
+{
+    return name != NULL && len > 0 && len <= CDB_VEC_CURSOR_NAME_MAX;
+}
+
+/* Opening and dropping are catalog changes (spec 14.12.5): the index pages
+ * they write commit at once, as a refresh's do. */
+cdb_status cdb_vec_cursor_open(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t *seq)
+{
+    uint8_t k[16], val[CURSOR_VAL];
+    uint64_t oldest;
+    cursor_scan sc;
+    coll *c;
+    cdb_status s;
+
+    if (!cursor_name_ok(name, len))
+        return CDB_E_INVALID_ARG;
+    if (db->in_tx || db->failed)
+        return CDB_E_STATE;
+    if ((s = coll_get(db, store, &c)) != CDB_OK)
+        return s;
+    if (!c->changes_on)
+        return CDB_E_STATE;
+    if ((s = find_cursors(db, c, name, len, &sc)) != CDB_OK)
+        return s;
+    if (sc.found) {
+        *seq = sc.seq;
+        return CDB_OK;
+    }
+    if ((s = cdb_db_catalog_begin(db)) != CDB_OK)
+        return s;
+    /* Looked up again: reconciling may have applied another process's open. */
+    s = find_cursors(db, c, name, len, &sc);
+    if (s == CDB_OK && sc.found) {
+        *seq = sc.seq;
+        return cdb_db_catalog_end(db, CDB_OK);
+    }
+    if (s == CDB_OK)
+        s = change_stamp(db, c, seq, &oldest);
+    if (s == CDB_OK) {
+        cdb_store_u64(val, *seq, CDB_ORDER_BIG);
+        memcpy(val + 8, name, len);
+        s = cdb_index_put(&c->changes, k, k_pair(k, 0, sc.highest + 1u), val, 8u + len);
+    }
+    if (s == CDB_OK && db->pager.dirty)
+        s = cdb_pager_commit(&db->pager);
+    return cdb_db_catalog_end(db, s);
+}
+
+cdb_status cdb_vec_cursor_advance(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t seq)
+{
+    uint8_t p[8];
+    cursor_scan sc;
+    coll *c;
+    cdb_status s;
+
+    if (!cursor_name_ok(name, len))
+        return CDB_E_INVALID_ARG;
+    if ((s = tx_coll(db, store, &c)) != CDB_OK)
+        return s;
+    if (!c->changes_on)
+        return CDB_E_STATE;
+    if ((s = find_cursors(db, c, name, len, &sc)) != CDB_OK)
+        return s;
+    if (!sc.found)
+        return CDB_E_NOT_FOUND;
+    cdb_store_u64(p, seq, CDB_ORDER_BIG);
+    if ((s = cdb_tx_put(db, store, sc.num, CDB_OP_PATCH, p, sizeof p)) != CDB_OK)
+        return s;
+    c->touched_tx = db->tx_id;
+    return CDB_OK;
+}
+
+cdb_status cdb_vec_cursor_drop(cdb_db *db, uint64_t store, const char *name, size_t len)
+{
+    uint8_t k[16];
+    cursor_scan sc;
+    coll *c;
+    int found;
+    cdb_status s;
+
+    if (!cursor_name_ok(name, len))
+        return CDB_E_INVALID_ARG;
+    if (db->in_tx || db->failed)
+        return CDB_E_STATE;
+    if ((s = coll_get(db, store, &c)) != CDB_OK)
+        return s;
+    if (!c->changes_on)
+        return CDB_E_STATE;
+    if ((s = cdb_db_catalog_begin(db)) != CDB_OK)
+        return s;
+    s = find_cursors(db, c, name, len, &sc);
+    if (s == CDB_OK && !sc.found)
+        s = CDB_E_NOT_FOUND;
+    if (s == CDB_OK)
+        s = cdb_index_delete(&c->changes, k, k_pair(k, 0, sc.num), &found);
+    if (s == CDB_OK && db->pager.dirty)
+        s = cdb_pager_commit(&db->pager);
+    return cdb_db_catalog_end(db, s);
 }
