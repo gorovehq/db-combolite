@@ -201,11 +201,12 @@ class TestNativeBackend(unittest.TestCase):
         self.backend.table_insert("users", {"id": 1, "name": "Alice", "age": 30})
         self.backend.table_insert("users", {"id": 2, "name": "Bob", "age": 25})
 
+        initial_count = len(self.backend.proc_list())
         p = Procedure("get_users", ["$a"], "FROM users LIMIT 5", "Retrieve users")
         self.backend.proc_save(p)
         procs = self.backend.proc_list()
-        self.assertEqual(len(procs), 1)
-        self.assertEqual(procs[0].name, "get_users")
+        self.assertEqual(len(procs), initial_count + 1)
+        self.assertIn("get_users", [pr.name for pr in procs])
 
         # Call procedure
         call_res = self.backend.execute("CALL get_users")
@@ -220,7 +221,7 @@ class TestNativeBackend(unittest.TestCase):
         self.assertEqual(q_res2.total, 2)
 
         self.backend.proc_delete("get_users")
-        self.assertEqual(len(self.backend.proc_list()), 0)
+        self.assertEqual(len(self.backend.proc_list()), initial_count)
 
     def test_08_explain_plan(self):
         self.backend.create(self.db_path)
@@ -286,6 +287,49 @@ class TestNativeBackend(unittest.TestCase):
         pts = self.backend.ts_points("metrics", 86400)
         self.assertTrue(len(pts) > 0)
 
+        # Verify call ingestion_records and call downloaded_books
+        ing_res = self.backend.execute("call ingestion_records")
+        self.assertEqual(len(ing_res.rows), 121)
+        self.assertIn("book_vector", ing_res.columns)
+        self.assertIn("similar_links", ing_res.columns)
+
+        dl_res = self.backend.execute("call downloaded_books")
+        self.assertEqual(ing_res.rows, dl_res.rows)
+
+        # Verify from books does not hit the shortcut
+        from_res = self.backend.execute("from books where passages > 0 limit 5")
+        self.assertNotIn("book_vector", from_res.columns)
+        self.assertIn("title", from_res.columns)
+
+    def test_10_ingestion_data_missing_error(self):
+        self.backend.create(self.db_path)
+        with self.assertRaises(BackendError) as ctx:
+            self.backend.execute("call ingestion_records")
+        self.assertIn("this database has no ingestion data", str(ctx.exception))
+
+    def test_11_console_queries_read_real_rows(self):
+        self.backend.create(self.db_path)
+        self.backend.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, years INT);")
+        for pk, name, age in [(1, "Alice", 30), (2, "Bob", 25), (3, "Cara", 41)]:
+            self.backend.table_insert("users", {"id": pk, "name": name, "years": age})
+
+        # A filter returns the matching rows, by column name, in schema order
+        res = self.backend.execute("from users where years > 28")
+        self.assertEqual(res.columns, ["$id", "id", "name", "years"])
+        self.assertEqual([r[2] for r in res.rows], ["Alice", "Cara"])
+
+        # No match is no rows, not some other rows
+        self.assertEqual(self.backend.execute("from users where years > 99").rows, [])
+
+        # Projection and sort
+        res = self.backend.execute("select name from users order by years desc")
+        self.assertEqual(res.columns, ["name"])
+        self.assertEqual([r[0] for r in res.rows], ["Cara", "Alice", "Bob"])
+
+        # A query that does not compile is an error, not a procedure's result
+        with self.assertRaises(BackendError) as ctx:
+            self.backend.execute("select count(*) from users")
+        self.assertIn("CMBQL error", str(ctx.exception))
 
 
 if __name__ == "__main__":

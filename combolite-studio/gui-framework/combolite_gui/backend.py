@@ -70,6 +70,7 @@ class Procedure:
     params: list      # e.g. ["$year", "$lang"]
     body: str         # CMBQL text
     doc: str = ""
+    handler: Any = None
 
 
 @dataclass
@@ -127,7 +128,7 @@ class Backend:
     def vector_delete(self, coll: str, vec_id: str) -> None: self._todo("vector_delete")
 
     # links
-    def link_edges(self, name: str, limit: int = 500) -> Result: self._todo("link_edges")       # columns: source, target, ...
+    def link_edges(self, name: str, limit: int | None = 500) -> Result: self._todo("link_edges")       # columns: source, target, ...
     def link_add(self, name: str, source: str, target: str, weight: float = 1.0) -> None: self._todo("link_add")
     def link_delete(self, name: str, pairs: list[tuple[str, str]]) -> int: self._todo("link_delete")
 
@@ -174,7 +175,8 @@ class NativeBackend(Backend):
             cdb_ts_in, cdb_ts_row, cdb_compile_error, cdb_value_writer, cdb_value,
             cdb_value_iter, cdb_store_info, cdb_link_type_info, cdb_table_def,
             cdb_exec_cursor, cdb_exec_row, cdb_proc_vm,
-            CDB_OK, CDB_MODEL_RELATIONAL, CDB_MODEL_DOCUMENT, CDB_MODEL_VECTOR,
+            CDB_OK, CDB_E_NOT_FOUND, CDB_E_BUFFER_TOO_SMALL,
+            CDB_MODEL_RELATIONAL, CDB_MODEL_DOCUMENT, CDB_MODEL_VECTOR,
             CDB_MODEL_TIME_SERIES, CDB_MODEL_LINK, CDB_ORDER_LITTLE, CDB_ORDER_BIG,
             CDB_LAYOUT_ADDR64, CDB_DURABILITY_DEFAULT, CDB_DURABILITY_FULL,
             CDB_STORE_DROPPED, CDB_TABLE_NO_INDEX, CDB_DECIMAL_COMPACT,
@@ -228,6 +230,8 @@ class NativeBackend(Backend):
             "cdb_exec_row": cdb_exec_row,
             "cdb_proc_vm": cdb_proc_vm,
             "CDB_OK": CDB_OK,
+            "CDB_E_NOT_FOUND": CDB_E_NOT_FOUND,
+            "CDB_E_BUFFER_TOO_SMALL": CDB_E_BUFFER_TOO_SMALL,
             "CDB_MODEL_RELATIONAL": CDB_MODEL_RELATIONAL,
             "CDB_MODEL_DOCUMENT": CDB_MODEL_DOCUMENT,
             "CDB_MODEL_VECTOR": CDB_MODEL_VECTOR,
@@ -303,19 +307,23 @@ class NativeBackend(Backend):
         self._buffers = []
         self._he = None
         self._env = None
+        ingestion_proc = Procedure(
+            "ingestion_records", [],
+            "call ingestion_records",
+            "Display complete ingestion records of downloaded books with vectors, neurons, and links",
+            handler=self._execute_downloaded_books_query
+        )
         self._procs = {
-            "ingestion_records": Procedure(
-                "ingestion_records", [],
-                "from books where passages > 0",
-                "Display complete ingestion records of downloaded books with vectors, neurons, and links"
-            ),
+            "ingestion_records": ingestion_proc,
             "downloaded_books": Procedure(
                 "downloaded_books", [],
-                "from books where passages > 0",
-                "List all downloaded books with passage counts and vector ranges"
+                "call ingestion_records",
+                "List all downloaded books with passage counts and vector ranges (alias for ingestion_records)",
+                handler=self._execute_downloaded_books_query
             )
         }
         self._link_cache = {}
+        self._field_name_cache = {}
         self._ts_extra = {}
 
     def _alloc(self, size: int):
@@ -388,6 +396,7 @@ class NativeBackend(Backend):
 
     def _open_or_create(self, path: str, create: bool) -> None:
         self.close()
+        self._field_name_cache = {}
         base = self._normalize_base(path)
 
         self._he = self.b_types["cdb_hostenv"]()
@@ -1111,7 +1120,7 @@ class NativeBackend(Backend):
                 except Exception:
                     doc = {"content": decoded[1]}
             elif isinstance(decoded, dict):
-                doc = decoded
+                doc = self._named(sid, decoded)
             else:
                 doc = {"value": decoded}
         else:
@@ -1336,7 +1345,7 @@ class NativeBackend(Backend):
         ref.flags = 0
         return ref
 
-    def link_edges(self, name: str, limit: int = 500) -> Result:
+    def link_edges(self, name: str, limit: int | None = 500) -> Result:
         t0 = time.perf_counter()
         cached = self._link_cache.get(name)
         if cached is not None:
@@ -1595,14 +1604,17 @@ class NativeBackend(Backend):
         if self._procs.pop(name, None) is None:
             raise BackendError(f"No procedure {name}")
 
-    def _execute_downloaded_books_query(self, text: str, t0: float) -> Result:
+    def _execute_downloaded_books_query(self, text: str = "", t0: float = 0.0, limit: int | None = None) -> Result:
         c = self.clib.lib
         ct = self.ctypes
 
-        sid_bv = self._find_store_id("book_vec")
-        sid_books = self._find_store_id("books")
+        try:
+            sid_bv = self._find_store_id("book_vec")
+            sid_books = self._find_store_id("books")
+            schema = self.table_schema("books")
+        except Exception:
+            raise BackendError("this database has no ingestion data")
 
-        schema = self.table_schema("books")
         cols = [r[0] for r in schema.rows]
         f_map = {}
         for cname in cols:
@@ -1615,26 +1627,20 @@ class NativeBackend(Backend):
 
         # Map similar_to edge counts per book_vec
         edge_counts = {}
+        links_available = True
         try:
-            edges_res = self.link_edges("similar_to")
+            edges_res = self.link_edges("similar_to", limit=None)
             for r in edges_res.rows:
                 edge_counts[r[0]] = edge_counts.get(r[0], 0) + 1
         except Exception:
-            pass
+            links_available = False
 
-        # Parse limit
-        m_lim = re.search(r'\blimit\s+(\d+)', text, re.I)
-        limit = int(m_lim.group(1)) if m_lim else 1000
+        cat_ptr = self.b_types["get_catalog_ptr"](ct.byref(self._db))
+        info = self.b_types["cdb_store_info"]()
+        s_cat = c.cdb_catalog_get_store(cat_ptr, sid_bv, ct.byref(info))
+        max_bv_id = int(info.next_entry_id) if (s_cat == self.b_types["CDB_OK"] and info.next_entry_id > 1) else None
 
-        # Parse projection if specified
-        m_sel = re.search(r'^\s*select\s+(.+?)\s+from\b', text, re.I)
-        proj_cols = None
-        if m_sel:
-            raw_proj = m_sel.group(1).strip()
-            if raw_proj != "*":
-                proj_cols = [p.strip().split()[-1] for p in raw_proj.split(",") if p.strip()]
-
-        enc_buf = ct.create_string_buffer(2048)
+        enc_buf = ct.create_string_buffer(4096)
         enc_len = ct.c_size_t()
         src_store = ct.c_uint64()
         src_entry = ct.c_uint64()
@@ -1645,18 +1651,43 @@ class NativeBackend(Backend):
             "ebook", "title", "author", "passages", "doc_range",
             "vectors_f32", "neurons_1bit", "book_vector", "similar_links"
         ]
-        out_cols = proj_cols or default_cols
+        out_cols = default_cols
 
         rows = []
-        for bv_id in range(1, 10000):
-            s = c.cdb_vec_get(ct.byref(self._db), sid_bv, bv_id, enc_buf, 2048, ct.byref(enc_len),
-                              ct.byref(src_store), ct.byref(src_entry))
-            if s != self.b_types["CDB_OK"]:
+        unreadable_count = 0
+        consecutive_misses = 0
+        max_consecutive_misses = 100
+        bv_id = 1
+
+        while True:
+            if max_bv_id is not None and bv_id >= max_bv_id:
                 break
+            s = c.cdb_vec_get(ct.byref(self._db), sid_bv, bv_id, enc_buf, 4096, ct.byref(enc_len),
+                              ct.byref(src_store), ct.byref(src_entry))
+            if s == self.b_types["CDB_E_NOT_FOUND"]:
+                consecutive_misses += 1
+                if max_bv_id is None and consecutive_misses >= max_consecutive_misses:
+                    break
+                bv_id += 1
+                continue
+            elif s != self.b_types["CDB_OK"]:
+                raise BackendError(f"Vector get failed for book_vec-{bv_id:05d}: {self.b_types['status_str'](self.clib, s)}")
+
+            consecutive_misses = 0
             eid = src_entry.value
             s_get = c.cdb_table_get(ct.byref(self._db), sid_books, eid, read_buf, 65536, ct.byref(read_len))
+            if s_get == self.b_types["CDB_E_BUFFER_TOO_SMALL"]:
+                large_buf = ct.create_string_buffer(524288)
+                large_len = ct.c_size_t()
+                s_get = c.cdb_table_get(ct.byref(self._db), sid_books, eid, large_buf, 524288, ct.byref(large_len))
+                if s_get == self.b_types["CDB_OK"]:
+                    read_buf = large_buf
+                    read_len = large_len
             if s_get != self.b_types["CDB_OK"]:
+                unreadable_count += 1
+                bv_id += 1
                 continue
+
             val = self.b_types["cdb_value"]()
             c.cdb_value_read(ct.cast(read_buf, ct.POINTER(ct.c_uint8)), read_len.value,
                              self.b_types["CDB_ORDER_LITTLE"], ct.byref(val))
@@ -1678,17 +1709,22 @@ class NativeBackend(Backend):
                 "vectors_f32": f"passage_vec-{first_p:05d}..{last_p:05d} ({passages} x 384-dim)",
                 "neurons_1bit": f"passage_bits-{first_p:05d}..{last_p:05d} ({passages} x 384 neurons)",
                 "book_vector": f"{bv_tag} (384-dim mean)",
-                "similar_links": f"{n_links} links",
-                "similar_to": f"{n_links} links",
+                "similar_links": f"{n_links} links" if links_available else "unavailable",
+                "similar_to": f"{n_links} links" if links_available else "unavailable",
             }
             row_vals = tuple(rec.get(col, obj_dict.get(c_to_fid.get(col))) for col in out_cols)
             rows.append(row_vals)
-            if len(rows) >= limit:
+            bv_id += 1
+            if limit is not None and len(rows) >= limit:
                 break
 
         elapsed = (time.perf_counter() - t0) * 1000
-        return Result(out_cols, rows, len(rows), elapsed,
-                      message=f"Retrieved {len(rows)} downloaded book ingestion records")
+        msg = f"Retrieved {len(rows)} downloaded book ingestion records"
+        if unreadable_count:
+            msg += f" ({unreadable_count} unreadable)"
+        if not links_available:
+            msg += " (link counts unavailable)"
+        return Result(out_cols, rows, len(rows), elapsed, message=msg)
 
     def execute(self, text: str) -> Result:
         t0 = time.perf_counter()
@@ -1696,19 +1732,21 @@ class NativeBackend(Backend):
         ct = self.ctypes
 
         # Check for procedure call
-        m = re.match(r"\s*call\s+(\w+)", text, re.I)
+        m = re.match(r"\s*call\s+(\w+)(?:\s*\((.*?)\))?", text, re.I)
         if m:
-            p = self._procs.get(m.group(1))
+            p_name = m.group(1)
+            p = self._procs.get(p_name)
+            if not p and p_name.lower() == "downloaded_books":
+                p = self._procs.get("ingestion_records")
             if not p:
-                raise BackendError(f"No procedure named {m.group(1)}")
+                raise BackendError(f"No procedure named {p_name}")
+            if getattr(p, "handler", None) or p_name in ("ingestion_records", "downloaded_books"):
+                handler = getattr(p, "handler", None) or self._execute_downloaded_books_query
+                lim = None
+                if m.group(2) and m.group(2).strip().isdigit():
+                    lim = int(m.group(2).strip())
+                return handler(text, t0, limit=lim)
             return self.execute(p.body)
-
-        # Check for queries selecting downloaded books or ingestion records
-        s_text = text.strip()
-        m_books = re.search(r'\b(?:from\s+books|Scan\(["\']?books["\']?\))\b', s_text, re.I)
-        m_passages_filter = re.search(r'\bpassages\s*(?:>|!=|is\s+not\s+null)|\bdownloaded\b', s_text, re.I)
-        if m_books and m_passages_filter:
-            return self._execute_downloaded_books_query(s_text, t0)
 
         # DDL shortcuts
         s_text = text.strip()
@@ -1763,7 +1801,22 @@ class NativeBackend(Backend):
 
         # Query normalization: rewrite FROM <ident> to FROM Scan("<ident>") if not already Scan(...)
         normalized = s_text
-        if not re.search(r"\bscan\s*\(", normalized, re.I):
+        m_del = re.match(r"^\s*delete\s+from\s+(?:table\s+|pool\s+|vectors\s+)?([A-Za-z0-9_]+)(.*)$", s_text, re.I | re.S)
+        if m_del:
+            tbl_target = m_del.group(1)
+            rest_clause = m_del.group(2)
+            try:
+                sid = self._find_store_id(tbl_target)
+                info = self.b_types["cdb_store_info"]()
+                cat_ptr = self.b_types["get_catalog_ptr"](ct.byref(self._db))
+                if c.cdb_catalog_get_store(cat_ptr, sid, ct.byref(info)) == self.b_types["CDB_OK"]:
+                    if info.model == self.b_types["CDB_MODEL_RELATIONAL"]:
+                        normalized = f"DELETE FROM TABLE {tbl_target}{rest_clause}"
+                    elif info.model == self.b_types["CDB_MODEL_VECTOR"]:
+                        normalized = f"DELETE FROM VECTORS {tbl_target}{rest_clause}"
+            except Exception:
+                pass
+        elif not re.search(r"\bscan\s*\(", normalized, re.I):
             if re.match(r"^\s*from\s+([A-Za-z0-9_]+)", normalized, re.I):
                 normalized = re.sub(r"^\s*from\s+([A-Za-z0-9_]+)", r'SELECT * FROM Scan("\1")', normalized, flags=re.I)
             else:
@@ -1779,45 +1832,13 @@ class NativeBackend(Backend):
                                      ct.cast(wire, ct.POINTER(ct.c_uint8)), 8192,
                                      ct.byref(wire_len), ct.byref(err))
         if s_comp == self.b_types["CDB_OK"]:
-            # Streaming cursor execution
-            cur = self.b_types["cdb_exec_cursor"]()
-            scratch = ct.create_string_buffer(32768)
-            s_open = c.cdb_exec_open(ct.byref(cur), ct.byref(self._db),
-                                     ct.cast(wire, ct.POINTER(ct.c_uint8)), wire_len.value,
-                                     None, 0,
-                                     ct.cast(scratch, ct.POINTER(ct.c_uint8)), 32768)
-            if s_open == self.b_types["CDB_OK"]:
-                rows = []
-                cols = []
-                out_row = self.b_types["cdb_exec_row"]()
-                has_row = ct.c_int(0)
-                while len(rows) < 1000:
-                    s_nxt = c.cdb_exec_next(ct.byref(cur), ct.byref(out_row), ct.byref(has_row))
-                    if s_nxt != self.b_types["CDB_OK"] or not has_row.value:
-                        break
-                    if not cols and out_row.n_fields > 0:
-                        for f_idx in range(out_row.n_fields):
-                            fld = out_row.fields[f_idx]
-                            fname = ct.string_at(fld.name, fld.name_len).decode("utf-8")
-                            cols.append(fname)
-                    r_vals = []
-                    for f_idx in range(out_row.n_fields):
-                        r_vals.append(self.b_types["decode_value"](out_row.fields[f_idx].val, self.clib))
-                    rows.append(tuple(r_vals) if r_vals else (out_row.entry_id,))
-                c.cdb_exec_close(ct.byref(cur))
-                if not rows:
-                    m_tbl = re.search(r'Scan\(["\']?([A-Za-z0-9_]+)', text, re.I) or re.search(r'\bfrom\s+["\']?([A-Za-z0-9_]+)', text, re.I)
-                    if m_tbl:
-                        tbl_name = m_tbl.group(1)
-                        try:
-                            t_res = self.table_rows(tbl_name, 0, 50)
-                            if t_res.rows:
-                                return t_res
-                        except Exception:
-                            pass
-                cols = cols or ["entry_id"]
-                elapsed = (time.perf_counter() - t0) * 1000
-                return Result(cols, rows, len(rows), elapsed, message=f"Executed CMBQL query ({len(rows)} rows)")
+            return self._run_query(wire, wire_len.value, t0)
+
+        # A query that does not compile is a query error: compiling it as a
+        # procedure would accept some of it and return a meaningless value.
+        if re.match(r"\s*(?:select\b|from\b|scan\s*\()", normalized, re.I):
+            err_msg = ct.string_at(err.msg).decode("utf-8") if err.msg else "Unknown CMBQL syntax error"
+            raise BackendError(f"CMBQL error at line {err.line}:{err.col}: {err_msg}")
 
         # Fallback to procedure/mutation compilation
         bc = ct.create_string_buffer(8192)
@@ -1839,6 +1860,114 @@ class NativeBackend(Backend):
         # Query parsing error
         err_msg = ct.string_at(err.msg).decode("utf-8") if err.msg else "Unknown CMBQL syntax error"
         raise BackendError(f"CMBQL error at line {err.line}:{err.col}: {err_msg}")
+
+    # Query memory: operators, a scan's record buffer, and room for Sort and
+    # Aggregate to buffer up to the engine's 256 rows of about 2 KB each.
+    QUERY_SCRATCH = 4 * 1024 * 1024
+    QUERY_MAX_ROWS = 1000
+
+    def _field_name(self, store_id: int, field_id: int):
+        """A field's name from the store's field dictionary, or None; cached."""
+        names = self._field_name_cache.setdefault(store_id, {})
+        if field_id in names:
+            return names[field_id]
+        c = self.clib.lib
+        ct = self.ctypes
+        nb = ct.create_string_buffer(256)
+        nl = ct.c_size_t()
+        cat_ptr = self.b_types["get_catalog_ptr"](ct.byref(self._db))
+        if c.cdb_catalog_field_name(cat_ptr, store_id, field_id, nb, 256, ct.byref(nl)) != self.b_types["CDB_OK"]:
+            return None  # not cached: the name may be added later
+        names[field_id] = nb.raw[:nl.value].decode("utf-8", errors="replace")
+        return names[field_id]
+
+    def _named(self, store_id: int, obj):
+        """An object decoded with field IDs as keys, keyed by field name where
+        the field dictionary has one (the ID otherwise)."""
+        if not isinstance(obj, dict):
+            return obj
+        out = {}
+        for k, v in obj.items():
+            name = self._field_name(store_id, k) if isinstance(k, int) else None
+            out[name if name else k] = v
+        return out
+
+    def _run_query(self, wire, wire_len: int, t0: float) -> Result:
+        c = self.clib.lib
+        ct = self.ctypes
+        ok = self.b_types["CDB_OK"]
+        status_str = self.b_types["status_str"]
+
+        cur = self.b_types["cdb_exec_cursor"]()
+        scratch = ct.create_string_buffer(self.QUERY_SCRATCH)
+        s_open = c.cdb_exec_open(ct.byref(cur), ct.byref(self._db),
+                                 ct.cast(wire, ct.POINTER(ct.c_uint8)), wire_len,
+                                 None, 0,
+                                 ct.cast(scratch, ct.POINTER(ct.c_uint8)), self.QUERY_SCRATCH)
+        if s_open != ok:
+            raise BackendError(f"Query could not start: {status_str(self.clib, s_open)}")
+
+        cols: list = []
+        records: list = []
+        stores: set = set()
+        truncated = False
+        out_row = self.b_types["cdb_exec_row"]()
+        has_row = ct.c_int(0)
+        try:
+            while True:
+                s_nxt = c.cdb_exec_next(ct.byref(cur), ct.byref(out_row), ct.byref(has_row))
+                if s_nxt == -19:  # CDB_E_OUT_OF_BUDGET
+                    raise BackendError("Query too large: Sort and GROUP BY hold at most 256 rows in the engine "
+                                       "today. Narrow it with WHERE.")
+                if s_nxt != ok:
+                    raise BackendError(f"Query failed after {len(records)} rows: {status_str(self.clib, s_nxt)}")
+                if not has_row.value:
+                    break
+                if len(records) >= self.QUERY_MAX_ROWS:
+                    truncated = True
+                    break
+                if out_row.n_fields > 0:
+                    # Output fields: a projection, aggregate or join
+                    rec = {}
+                    for f_idx in range(out_row.n_fields):
+                        fld = out_row.fields[f_idx]
+                        fname = ct.string_at(fld.name, fld.name_len).decode("utf-8", errors="replace")
+                        rec[fname] = self.b_types["decode_value"](fld.val, self.clib)
+                elif out_row.record_data and out_row.record_len:
+                    # SELECT *: the whole record, by field name
+                    rec = {"$id": out_row.entry_id}
+                    val = self.b_types["cdb_value"]()
+                    if c.cdb_value_read(out_row.record_data, out_row.record_len,
+                                        self.b_types["CDB_ORDER_LITTLE"], ct.byref(val)) == ok:
+                        named = self._named(out_row.store_id, self.b_types["decode_value"](val, self.clib))
+                        rec.update(named if isinstance(named, dict) else {"value": named})
+                else:
+                    rec = {"$id": out_row.entry_id}
+                for k in rec:
+                    if k not in cols:
+                        cols.append(k)
+                records.append(rec)
+                stores.add(out_row.store_id)
+        finally:
+            c.cdb_exec_close(ct.byref(cur))
+
+        # Whole table rows: the table's column order. A row stores no NULL
+        # columns, so the order they were first seen in is arbitrary.
+        if len(stores) == 1 and cols and cols[0] == "$id":
+            name = self._store_names_map().get(next(iter(stores)))
+            try:
+                order = [r[0] for r in self.table_schema(name).rows] if name else []
+            except Exception:
+                order = []  # not a table
+            if order:
+                cols = ["$id"] + order + [k for k in cols if k != "$id" and k not in order]
+
+        rows = [tuple(r.get(k) for k in cols) for r in records]
+        elapsed = (time.perf_counter() - t0) * 1000
+        msg = f"Executed CMBQL query ({len(rows)} rows)"
+        if truncated:
+            msg = f"Executed CMBQL query (first {len(rows)} rows shown; there are more)"
+        return Result([str(k) for k in cols] or ["$id"], rows, len(rows), elapsed, message=msg)
 
     def explain(self, text: str) -> Result:
         t0 = time.perf_counter()
