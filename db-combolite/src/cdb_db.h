@@ -205,6 +205,8 @@ struct cdb_vec_coll {
     cdb_index graph;         /* entry -> neighbour record; 0 -> live count */
     cdb_index reverse;       /* (neighbour, entry): entry lists neighbour; (0, entry): an entry point */
     cdb_index pending;       /* entries whose list needs work */
+    int changes_on;          /* it keeps a change log (spec 14.12.5, 18.12) */
+    cdb_index changes;       /* (sequence, entry) -> kind; (0, 0) trimmed-through; (0, n) cursor n */
 };
 
 /* An open time-series store (cdb_ts.h). */

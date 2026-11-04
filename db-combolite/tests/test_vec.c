@@ -795,6 +795,211 @@ static void test_persists_and_replays(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+/* ------------------------------------------------------- change log */
+
+/* Reads every change after since, two at a time; -1 when the log no
+ * longer reaches back that far (or there is none). */
+static int read_changes(uint64_t coll, uint64_t since, cdb_vec_change *out, size_t cap)
+{
+    uint64_t seq = since, entry = UINT64_MAX;
+    size_t total = 0, n;
+    cdb_status s;
+    do {
+        s = cdb_vec_changes(&db, coll, &seq, &entry, out + total, cap - total < 2 ? cap - total : 2, &n);
+        if (s == CDB_E_STATE)
+            return -1;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, s);
+        total += n;
+    } while (n > 0 && total < cap);
+    return (int)total;
+}
+
+static int has_change(const cdb_vec_change *ch, int n, uint64_t entry, int live)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (ch[i].entry == entry && ch[i].live == live)
+            return 1;
+    return 0;
+}
+
+static uint64_t cursor_at(uint64_t coll, const char *name)
+{
+    uint64_t seq = 0;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_cursor_open(&db, coll, name, strlen(name), &seq));
+    return seq;
+}
+
+static void advance(uint64_t coll, const char *name, uint64_t seq)
+{
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_cursor_advance(&db, coll, name, strlen(name), seq));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+}
+
+/* Spec 14.12.5, 18.12: changes are logged as they are applied, trimmed at
+ * reconciliation below the readers' floor and the lowest named cursor; a
+ * cursor holds the log until it is advanced (journaled) or dropped. */
+static void test_change_log_and_cursors(void)
+{
+    static vec v[16];
+    cdb_vec_change ch[32];
+    uint64_t coll, stamp, oldest, first, at, later, sq, en;
+    size_t got;
+    int i, n;
+
+    rng = 41u;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_EQUAL_UINT64(0, db.pager.hs.record.rocompat_flags & CDB_FEATURE_RO_VEC_CHANGES);
+    coll = make_coll("c", CDB_VEC_F32, CDB_VEC_COSINE);
+    TEST_ASSERT_EQUAL_INT(CDB_E_EXISTS, cdb_vec_track_changes(&db, coll)); /* new collections keep one */
+    /* The file now says its writers must keep change logs (spec 14.1.10). */
+    TEST_ASSERT_TRUE(db.pager.hs.record.rocompat_flags & CDB_FEATURE_RO_VEC_CHANGES);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    for (i = 1; i <= 5; i++) {
+        v[i] = make_vec(CDB_VEC_F32, 0);
+        insert(coll, &v[i], 0, 0);
+    }
+    sq = 0;
+    en = UINT64_MAX;
+    TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_vec_changes(&db, coll, &sq, &en, ch, 1, &got)); /* not in a transaction */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+
+    /* Applied at commit, before any reconciliation: all five, under one
+     * sequence, which is the change stamp. */
+    n = read_changes(coll, 0, ch, 32);
+    TEST_ASSERT_EQUAL_INT(5, n);
+    for (i = 1; i <= 5; i++)
+        TEST_ASSERT_TRUE(has_change(ch, n, (uint64_t)i, 1));
+    first = ch[0].seq;
+    TEST_ASSERT_EQUAL_UINT64(first, ch[4].seq);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_change_stamp(&db, coll, &stamp, &oldest));
+    TEST_ASSERT_EQUAL_UINT64(first, stamp);
+    TEST_ASSERT_EQUAL_UINT64(0, oldest);
+
+    /* One process and no cursor: reconciliation keeps only what is after
+     * the archive it reconciled from. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db));
+    TEST_ASSERT_EQUAL_INT(-1, read_changes(coll, 0, ch, 32));
+    TEST_ASSERT_EQUAL_INT(5, read_changes(coll, first - 1u, ch, 32));
+
+    /* A cursor starts at the stamp and holds the log after it. */
+    at = cursor_at(coll, "agent");
+    TEST_ASSERT_EQUAL_UINT64(first, at);
+    TEST_ASSERT_EQUAL_UINT64(at, cursor_at(coll, "agent")); /* opening again finds it */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    v[6] = make_vec(CDB_VEC_F32, 0);
+    v[7] = make_vec(CDB_VEC_F32, 0);
+    insert(coll, &v[6], 0, 0);
+    insert(coll, &v[7], 0, 0);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_delete(&db, coll, 2));
+    v[8] = make_vec(CDB_VEC_F32, 0);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_replace(&db, coll, 3, v[8].enc, v[8].n));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db)); /* twice: the cursor still holds */
+    n = read_changes(coll, at, ch, 32);
+    TEST_ASSERT_EQUAL_INT(4, n);
+    TEST_ASSERT_TRUE(has_change(ch, n, 6, 1));
+    TEST_ASSERT_TRUE(has_change(ch, n, 7, 1));
+    TEST_ASSERT_TRUE(has_change(ch, n, 2, 0)); /* deleted */
+    TEST_ASSERT_TRUE(has_change(ch, n, 3, 1)); /* replaced */
+    later = ch[0].seq;
+    TEST_ASSERT_TRUE(later > at);
+
+    /* Advancing is journaled; reconciliation then trims up to it. */
+    advance(coll, "agent", later);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db));
+    TEST_ASSERT_EQUAL_UINT64(later, cursor_at(coll, "agent"));
+    TEST_ASSERT_EQUAL_INT(-1, read_changes(coll, at, ch, 32));
+    TEST_ASSERT_EQUAL_INT(0, read_changes(coll, later, ch, 32));
+    advance(coll, "agent", at); /* never backwards */
+    TEST_ASSERT_EQUAL_UINT64(later, cursor_at(coll, "agent"));
+
+    /* Cursors persist; a dropped one no longer exists. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_TRUE(db.pager.hs.record.rocompat_flags & CDB_FEATURE_RO_VEC_CHANGES); /* durable */
+    TEST_ASSERT_EQUAL_UINT64(later, cursor_at(coll, "agent"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_cursor_drop(&db, coll, "agent", 5));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_vec_cursor_drop(&db, coll, "agent", 5));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_vec_cursor_advance(&db, coll, "agent", 5, later));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_abort(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_vec_cursor_open(&db, coll, "x", 0, &at));
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG,
+                          cdb_vec_cursor_open(&db, coll, "0123456789012345678901234567890123456789012345678901234567890123x",
+                                              CDB_VEC_CURSOR_NAME_MAX + 1u, &at));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+/* A collection from before change logs (settings without field 14) gets
+ * one with cdb_vec_track_changes, holding every change from then on. */
+static void test_track_changes_on_old_collection(void)
+{
+    static uint8_t buf[CDB_CATALOG_SETTINGS_MAX];
+    static vec v[4];
+    cdb_vec_change ch[8];
+    cdb_store_info info;
+    cdb_value_writer w;
+    cdb_value obj, fv;
+    uint64_t coll, stamp, oldest, seq;
+    int found, f, n;
+    cdb_status s;
+
+    rng = 43u;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    coll = make_coll("old", CDB_VEC_F32, CDB_VEC_EUCLIDEAN);
+    /* Rewrite its settings as an older build wrote them: fields 1-13. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_catalog_get_store(&db.catalog, coll, &info));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_read(info.vector, info.vector_len, CDB_ORDER_LITTLE, &obj));
+    cdb_value_writer_init(&w, buf, sizeof buf, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_object(&w);
+    for (f = 1; f <= 13; f++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_object_get(&obj, CDB_ORDER_LITTLE, (uint64_t)f, &fv, &found));
+        if (found) {
+            cdb_value_field(&w, (uint64_t)f);
+            cdb_value_write_encoded(&w, fv.start, fv.encoded_len);
+        }
+    }
+    cdb_value_end_object(&w);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, w.error);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_catalog_begin(&db));
+    s = cdb_catalog_set_vector(&db.catalog, coll, buf, cdb_value_writer_len(&w));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_catalog_end(&db, s));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_vec_change_stamp(&db, coll, &stamp, &oldest));
+    TEST_ASSERT_EQUAL_INT(-1, read_changes(coll, 0, ch, 8));
+    TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_vec_cursor_open(&db, coll, "a", 1, &seq));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    v[1] = make_vec(CDB_VEC_F32, 0);
+    insert(coll, &v[1], 0, 0); /* before the log: not in it */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_track_changes(&db, coll));
+    TEST_ASSERT_EQUAL_INT(CDB_E_EXISTS, cdb_vec_track_changes(&db, coll));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_change_stamp(&db, coll, &stamp, &oldest));
+    TEST_ASSERT_EQUAL_UINT64(oldest, stamp); /* nothing logged yet */
+    TEST_ASSERT_EQUAL_INT(0, read_changes(coll, oldest, ch, 8));
+    TEST_ASSERT_EQUAL_INT(-1, read_changes(coll, oldest - 1u, ch, 8));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    v[2] = make_vec(CDB_VEC_F32, 0);
+    insert(coll, &v[2], 0, 0);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    n = read_changes(coll, oldest, ch, 8);
+    TEST_ASSERT_EQUAL_INT(1, n);
+    TEST_ASSERT_EQUAL_UINT64(2, ch[0].entry);
+
+    /* It persists: the settings name it now. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_EQUAL_INT(CDB_E_EXISTS, cdb_vec_track_changes(&db, coll));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_change_stamp(&db, coll, &stamp, &oldest));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 /* ------------------------------------------------------- crash sweep */
 
 /* S0: nothing. S1: collection, 20 vectors. S2: 5 replaced. S3: 6 deleted,
@@ -876,6 +1081,21 @@ static int observed(uint64_t *coll_out)
     if (k >= 2)
         want[5] = sweep_v[25];
     verify_coll(coll, want, live, 24);
+    {
+        /* The change log reads back whole after any crash, and agrees with
+         * the entries (spec 14.12.5). */
+        static cdb_vec_change ch[64];
+        uint64_t stamp, oldest;
+        int n, j;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_change_stamp(&db, coll, &stamp, &oldest));
+        n = read_changes(coll, oldest, ch, 64);
+        TEST_ASSERT_TRUE(n >= 0);
+        for (j = 0; j < n; j++) {
+            TEST_ASSERT_TRUE(ch[j].entry >= 1 && ch[j].entry <= 24);
+            TEST_ASSERT_TRUE(ch[j].seq > oldest && ch[j].seq <= stamp);
+            TEST_ASSERT_EQUAL_INT(live[ch[j].entry], ch[j].live);
+        }
+    }
     if (k >= 1) {
         uint64_t es[2];
         size_t n;
@@ -940,6 +1160,8 @@ int main(void)
     RUN_TEST(test_source_states);
     RUN_TEST(test_transaction_rules);
     RUN_TEST(test_persists_and_replays);
+    RUN_TEST(test_change_log_and_cursors);
+    RUN_TEST(test_track_changes_on_old_collection);
     RUN_TEST(test_crash_sweep);
     return UNITY_END();
 }
