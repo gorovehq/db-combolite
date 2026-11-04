@@ -254,8 +254,12 @@ cdb_status cdb_eval_resolve_field(cdb_eval_ctx *ctx, const char *path, size_t pa
     *found = 0;
     cdb_eval_make_null(out_val);
 
-    if (ctx->custom_resolver != NULL)
-        return ctx->custom_resolver(ctx->custom_data, path, path_len, out_val, found);
+    /* The custom resolver overlays the record: a name it does not know is
+     * looked up as a pseudo-field or in the record as usual. */
+    if (ctx->custom_resolver != NULL) {
+        if ((s = ctx->custom_resolver(ctx->custom_data, path, path_len, out_val, found)) != CDB_OK || *found)
+            return s;
+    }
 
     /* Check pseudo-fields */
     if (path_len > 0 && path[0] == '$') {
