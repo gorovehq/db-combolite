@@ -523,12 +523,58 @@ static void test_large_record(void)
     cdb_exec_close(&cur);
 }
 
+/* The same for a table row: cdb_table_get must say how large the row is */
+static void test_large_table_row(void)
+{
+    static char text[10000];
+    static uint8_t body[10100];
+    cdb_table_column col;
+    cdb_table_def def;
+    cdb_value_writer w;
+    cdb_exec_row row;
+    uint64_t table, f_body, entry;
+    cdb_status s;
+    int has = 0;
+
+    memset(text, 'b', sizeof text);
+    memset(&col, 0, sizeof col);
+    col.name = "body";
+    col.name_len = 4;
+    col.type = CDB_TYPE_STRING;
+    memset(&def, 0, sizeof def);
+    def.columns = &col;
+    def.ncolumns = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_create(&db, "whole", 5, &def, &table));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_column_id(&db, table, "body", 4, &f_body));
+    cdb_value_writer_init(&w, body, sizeof body, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, f_body);
+    cdb_value_write_string(&w, text, sizeof text);
+    cdb_value_end_object(&w);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, w.error);
+    begin();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_insert(&db, table, body, cdb_value_writer_len(&w), &entry));
+    commit();
+
+    open_text("SELECT body FROM Scan(\"whole\")");
+    s = cdb_exec_next(&cur, &row, &has);
+#ifdef CDB_PROFILE_HOST
+    TEST_ASSERT_EQUAL_INT(CDB_OK, s);
+    TEST_ASSERT_TRUE(has);
+    TEST_ASSERT_EQUAL_size_t(sizeof text, field(&row, "body").payload_len);
+#else
+    TEST_ASSERT_EQUAL_INT(CDB_E_OUT_OF_BUDGET, s);
+#endif
+    cdb_exec_close(&cur);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_sort_past_256_rows);
     RUN_TEST(test_top_n);
     RUN_TEST(test_large_record);
+    RUN_TEST(test_large_table_row);
     RUN_TEST(test_unknown_store_is_an_error);
     RUN_TEST(test_scan_reads_table_rows);
     RUN_TEST(test_filter_on_table_field);

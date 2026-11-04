@@ -318,6 +318,16 @@ static void test_rows_defaults_and_refusals(void)
     TEST_ASSERT_EQUAL_INT64(7, int_of(a, F_SCORE));
     TEST_ASSERT_EQUAL_INT64(40, int_of(b, F_SCORE));
     TEST_ASSERT_TRUE(is_null(a, F_NOTE));
+    /* A buffer too small for the row: *len is a size that will do. */
+    {
+        uint8_t out[PAGE];
+        size_t need = 0, len = 0, len2 = 0;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_get(&db, T, b, out, sizeof out, &len));
+        TEST_ASSERT_EQUAL_INT(CDB_E_BUFFER_TOO_SMALL, cdb_table_get(&db, T, b, out, 4, &need));
+        TEST_ASSERT_TRUE(need >= len);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_table_get(&db, T, b, out, need, &len2));
+        TEST_ASSERT_EQUAL_size_t(len, len2);
+    }
     /* update changes only the columns named; a null clears one. */
     begin();
     obj_begin(&e);

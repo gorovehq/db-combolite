@@ -896,6 +896,26 @@ cdb_status cdb_table_delete(cdb_db *db, uint64_t store, uint64_t entry)
 /* -------------------------------------------------------- reads */
 
 /* The committed row of entry, projected into out. */
+/* Bytes the value writer stages per field while an object is open
+ * (cdb_value.h) */
+#define WRITER_FIELD_SCRATCH 16u
+
+/* project for a caller's buffer: when the row does not fit, it is projected
+ * once more into T_CUR (free outside an update) to learn its length, and
+ * CDB_E_BUFFER_TOO_SMALL comes back with *len set to a buffer size that
+ * will do (the row plus the writer's staging), so the call can be retried. */
+static cdb_status project_out(cdb_db *db, const table *t, const uint8_t *raw, size_t rlen, uint32_t version,
+                              uint8_t *out, size_t cap, size_t *len)
+{
+    cdb_status s = project(db, t, raw, rlen, version, out, cap, len);
+    if (s == CDB_E_BUFFER_TOO_SMALL && (s = project(db, t, raw, rlen, version, tbuf(db, T_CUR), tbuf_size(db), len))
+                                           == CDB_OK) {
+        *len += (size_t)t->ncols * WRITER_FIELD_SCRATCH;
+        s = CDB_E_BUFFER_TOO_SMALL;
+    }
+    return s;
+}
+
 static cdb_status read_row(cdb_db *db, table *t, uint64_t entry, void *out, size_t cap, size_t *len)
 {
     cdb_doc_info info;
@@ -904,7 +924,7 @@ static cdb_status read_row(cdb_db *db, table *t, uint64_t entry, void *out, size
                                NULL, &info);
     if (s != CDB_OK)
         return s;
-    return project(db, t, tbuf(db, T_OTHER), raw, info.schema_version, (uint8_t *)out, cap, len);
+    return project_out(db, t, tbuf(db, T_OTHER), raw, info.schema_version, (uint8_t *)out, cap, len);
 }
 
 cdb_status cdb_table_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *live)
@@ -1130,7 +1150,7 @@ cdb_status cdb_table_get(cdb_db *db, uint64_t store, uint64_t entry, void *out, 
                 if (!live)
                     s = CDB_E_NOT_FOUND;
                 else
-                    s = project(db, t, tbuf(db, T_OTHER), raw, ver, (uint8_t *)out, cap, len);
+                    s = project_out(db, t, tbuf(db, T_OTHER), raw, ver, (uint8_t *)out, cap, len);
             }
         } else {
             s = read_row(db, t, entry, out, cap, len);
