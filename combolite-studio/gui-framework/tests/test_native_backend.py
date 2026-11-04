@@ -279,6 +279,18 @@ class TestNativeBackend(unittest.TestCase):
         self.assertEqual(self.backend.vector_source_label("passage_vec", "vec-00001"),
                          self.backend.doc_list("passages", limit=1)[0].title)
 
+        # A whole book is one table row (host profile: rows as large as doc_max)
+        self.assertEqual(store_map["book_text"].count, 121)
+        res = self.backend.execute("select title, body from book_text where ebook = 5776")
+        self.assertEqual(res.columns, ["title", "body"])
+        self.assertEqual(len(res.rows), 1)
+        self.assertGreater(len(res.rows[0][1]), 500000)
+
+        # ... and so is every passage of one, in order, past the old 256-row sort limit
+        res = self.backend.execute("select passage from passages where ebook = 68881 order by seq")
+        self.assertGreater(len(res.rows), 256)
+        self.assertEqual([r[0] for r in res.rows], sorted(r[0] for r in res.rows))
+
     def test_10_ingestion_records_need_a_library(self):
         self.backend.create(self.db_path)
         with self.assertRaises(BackendError):

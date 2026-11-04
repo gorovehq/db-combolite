@@ -1756,8 +1756,9 @@ class NativeBackend(Backend):
         err_msg = ct.string_at(err.msg).decode("utf-8") if err.msg else "Unknown CMBQL syntax error"
         raise BackendError(f"CMBQL error at line {err.line}:{err.col}: {err_msg}")
 
-    # Query memory: operators, a scan's record buffer, and room for Sort and
-    # Aggregate to buffer up to the engine's 256 rows of about 2 KB each.
+    # A query's first memory: operators, a scan's record buffer, and Sort and
+    # Aggregate's first rows. On the host profile the engine grows past it,
+    # up to cdb_db_config.query_mem, for more rows or larger records.
     QUERY_SCRATCH = 4 * 1024 * 1024
     QUERY_MAX_ROWS = 1000
 
@@ -1890,8 +1891,9 @@ class NativeBackend(Backend):
             while True:
                 s_nxt = c.cdb_exec_next(ct.byref(cur), ct.byref(out_row), ct.byref(has_row))
                 if s_nxt == -19:  # CDB_E_OUT_OF_BUDGET
-                    raise BackendError("Query too large: Sort and GROUP BY hold at most 256 rows in the engine "
-                                       "today. Narrow it with WHERE.")
+                    raise BackendError("Query too large for the engine's query memory (cdb_db_config.query_mem; "
+                                       "on a micro-controller build, Sort and GROUP BY hold at most 256 rows). "
+                                       "Narrow it with WHERE or LIMIT.")
                 if s_nxt != ok:
                     raise BackendError(f"Query failed after {len(records)} rows: {status_str(self.clib, s_nxt)}")
                 if not has_row.value:
