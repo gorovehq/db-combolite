@@ -18,6 +18,10 @@
 #define PAGE_LOG2 10u
 #define PAGE (1u << PAGE_LOG2)
 #define NODES 16u
+/* Bodies up to 12 KB, past the 4-page (4 KB) record buffer a scan starts
+ * with, so a large one shows the profiles apart (spec 17.3) */
+#define DOC_MAX 12288u
+#define DBUF (DOC_MAX + PAGE)
 
 static uint8_t env_arena[CDB_FAULTENV_MAX_FILES * 3u * FCAP];
 static cdb_fault_record env_records[CDB_FAULTENV_MAX_FILES * 8192u];
@@ -27,14 +31,14 @@ static cdb_env env;
 static uint8_t arena[NODES * 2u * PAGE + 2u * PAGE];
 static cdb_pager_node nodes[NODES];
 static cdb_free_extent free_list[4096];
-static uint8_t record_buf[2u * PAGE];
+static uint8_t record_buf[DOC_MAX + 2u * PAGE];
 static uint8_t cat_work[24u * 1024u];
 static cdb_index_entry cat_entries[512];
 static uint8_t cat_page[PAGE];
-static uint8_t doc_buffers[8u * PAGE];
+static uint8_t doc_buffers[3u * DBUF + 5u * PAGE];
 static uint8_t doc_stage[4096];
 static uint8_t idx_stage[16u * 1024u];
-static uint8_t table_buffers[4u * PAGE];
+static uint8_t table_buffers[64u * 1024u];
 static cdb_db_config cfg;
 static cdb_db db;
 
@@ -80,7 +84,10 @@ void setUp(void)
     cfg.idx_stage = idx_stage;
     cfg.idx_stage_size = sizeof idx_stage;
     cfg.table_buffers = table_buffers;
+    cfg.doc_max = DOC_MAX;
     cfg.durability = CDB_DURABILITY_FULL;
+    TEST_ASSERT_EQUAL_size_t(cdb_doc_buffers_size(PAGE, DOC_MAX), sizeof doc_buffers);
+    TEST_ASSERT_TRUE(cdb_table_buffers_size(PAGE, DOC_MAX) <= sizeof table_buffers);
 
     memset(&h, 0, sizeof h);
     h.order = CDB_ORDER_LITTLE;
@@ -391,9 +398,137 @@ static void test_unknown_store_is_an_error(void)
     TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_exec_open(&cur, &db, wire, len, NULL, 0, scratch, sizeof scratch));
 }
 
+/* ------------------------------------------------------------ profiles (spec 17) */
+
+/* 600 documents {n}: n is 0..599 in a shuffled order */
+#define MANY 600u
+static uint64_t F_N;
+
+static void make_many(void)
+{
+    uint64_t store, entry;
+    unsigned i;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_store(&db, "nums", 4, CDB_MODEL_DOCUMENT, &store));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_catalog_field_id(&db.catalog, store, "n", 1, &F_N));
+    /* 20 to a commit: the fixture's pager holds few dirty nodes */
+    for (i = 0; i < MANY; i++) {
+        enc e;
+        if (i % 20 == 0)
+            begin();
+        obj_begin(&e);
+        cdb_value_field(&e.w, F_N);
+        cdb_value_write_int(&e.w, (int64_t)((i * 7919u) % MANY));
+        obj_end(&e);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_insert(&db, store, NULL, 0, e.b, e.n, &entry));
+        if (i % 20 == 19) {
+            commit();
+            /* Fold the journal in: the fault environment's files are 1 MB */
+            if (i % 200 == 199)
+                TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db));
+        }
+    }
+}
+
+/* Runs a query to its end: the rows seen and the status that ended it */
+static cdb_status drain(const char *q, int64_t *firsts, size_t nfirst, size_t *rows)
+{
+    cdb_exec_row row;
+    cdb_status s;
+    int has = 0;
+
+    *rows = 0;
+    open_text(q);
+    while ((s = cdb_exec_next(&cur, &row, &has)) == CDB_OK && has) {
+        if (*rows < nfirst)
+            firsts[*rows] = field(&row, "n").as.i64;
+        (*rows)++;
+    }
+    cdb_exec_close(&cur);
+    return s;
+}
+
+/* Sort holds more than 256 rows on the host profile; mcu stops at its limit */
+static void test_sort_past_256_rows(void)
+{
+    int64_t first[3];
+    size_t rows;
+    cdb_status s;
+
+    make_many();
+    s = drain("SELECT n FROM Scan(\"nums\") ORDER BY n", first, 3, &rows);
+#ifdef CDB_PROFILE_HOST
+    TEST_ASSERT_EQUAL_INT(CDB_OK, s);
+    TEST_ASSERT_EQUAL_size_t(MANY, rows);
+    TEST_ASSERT_EQUAL_INT64(0, first[0]);
+    TEST_ASSERT_EQUAL_INT64(2, first[2]);
+#else
+    TEST_ASSERT_EQUAL_INT(CDB_E_OUT_OF_BUDGET, s);
+#endif
+}
+
+/* ORDER BY ... LIMIT keeps only the top N on the host profile */
+static void test_top_n(void)
+{
+    int64_t first[3];
+    size_t rows;
+    cdb_status s;
+
+    make_many();
+    s = drain("SELECT n FROM Scan(\"nums\") ORDER BY n DESC LIMIT 3", first, 3, &rows);
+#ifdef CDB_PROFILE_HOST
+    TEST_ASSERT_EQUAL_INT(CDB_OK, s);
+    TEST_ASSERT_EQUAL_size_t(3, rows);
+    TEST_ASSERT_EQUAL_INT64(599, first[0]);
+    TEST_ASSERT_EQUAL_INT64(598, first[1]);
+    TEST_ASSERT_EQUAL_INT64(597, first[2]);
+#else
+    TEST_ASSERT_EQUAL_INT(CDB_E_OUT_OF_BUDGET, s);
+#endif
+}
+
+/* A record past the scan's first buffer: read whole on the host profile */
+static void test_large_record(void)
+{
+    static char text[10000];
+    static uint8_t body[10100];
+    cdb_value_writer w;
+    cdb_exec_row row;
+    uint64_t store, f_text, entry;
+    cdb_status s;
+    int has = 0;
+
+    memset(text, 'a', sizeof text);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_store(&db, "big", 3, CDB_MODEL_DOCUMENT, &store));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_catalog_field_id(&db.catalog, store, "text", 4, &f_text));
+    cdb_value_writer_init(&w, body, sizeof body, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, f_text);
+    cdb_value_write_string(&w, text, sizeof text);
+    cdb_value_end_object(&w);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, w.error);
+    begin();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_doc_insert(&db, store, NULL, 0, body, cdb_value_writer_len(&w), &entry));
+    commit();
+
+    open_text("SELECT text FROM Scan(\"big\")");
+    s = cdb_exec_next(&cur, &row, &has);
+#ifdef CDB_PROFILE_HOST
+    TEST_ASSERT_EQUAL_INT(CDB_OK, s);
+    TEST_ASSERT_TRUE(has);
+    TEST_ASSERT_EQUAL_size_t(sizeof text, field(&row, "text").payload_len);
+#else
+    TEST_ASSERT_EQUAL_INT(CDB_E_OUT_OF_BUDGET, s);
+#endif
+    cdb_exec_close(&cur);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_sort_past_256_rows);
+    RUN_TEST(test_top_n);
+    RUN_TEST(test_large_record);
     RUN_TEST(test_unknown_store_is_an_error);
     RUN_TEST(test_scan_reads_table_rows);
     RUN_TEST(test_filter_on_table_field);

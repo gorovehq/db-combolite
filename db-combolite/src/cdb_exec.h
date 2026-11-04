@@ -11,11 +11,14 @@
 #ifndef CDB_EXEC_H
 #define CDB_EXEC_H
 
+#include <stddef.h>
+
 #include "combolite/cdb_common.h"
 #include "combolite/cdb_value.h"
 #include "cdb_catalog.h"
 #include "cdb_db.h"
 #include "cdb_eval.h"
+#include "cdb_profile.h"
 #include "cdb_query.h"
 
 #define CDB_EXEC_MAX_FIELDS 16u
@@ -51,10 +54,6 @@ typedef struct cdb_exec_row {
     const uint8_t *record_data;
     size_t record_len;
 
-    /* Explicit/computed fields (Project, Aggregate, Unnest, Join) */
-    cdb_exec_field fields[CDB_EXEC_MAX_FIELDS];
-    size_t n_fields;
-
     /* Secondary context for Joins */
     int has_right;
     uint64_t right_store_id;
@@ -62,7 +61,16 @@ typedef struct cdb_exec_row {
     uint32_t right_model;
     const uint8_t *right_record_data;
     size_t right_record_len;
+
+    /* Explicit/computed fields (Project, Aggregate, Unnest, Join). Last, so
+     * a buffered row is stored with only the fields it has
+     * (CDB_EXEC_ROW_SIZE). */
+    size_t n_fields;
+    cdb_exec_field fields[CDB_EXEC_MAX_FIELDS];
 } cdb_exec_row;
+
+/* Bytes a row with n fields needs when stored compactly */
+#define CDB_EXEC_ROW_SIZE(n) (offsetof(cdb_exec_row, fields) + (n) * sizeof(cdb_exec_field))
 
 /* Virtual function table for an operator node iterator */
 typedef struct cdb_exec_vtab {
@@ -111,7 +119,18 @@ struct cdb_exec_cursor {
     uint64_t step_budget;
     size_t max_buffered_rows;
     int is_open;
+
+    /* Host profile (spec 17.4): memory grown through the environment's
+     * allocator, at most mem_budget bytes (0: none can grow), each block on
+     * a list freed by its owner or at close */
+    size_t mem_budget;
+    size_t mem_used;
+    struct cdb_exec_block *blocks; /* the cursor's own: scan buffers */
 };
+
+/* The sizes of the structs a binding mirrors, to check its copy against */
+size_t cdb_exec_cursor_size(void);
+size_t cdb_exec_row_size(void);
 
 /* Opens a query cursor from wire format bytes */
 cdb_status cdb_exec_open(cdb_exec_cursor *cur, cdb_db *db, const uint8_t *wire, size_t len,

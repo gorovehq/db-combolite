@@ -832,6 +832,26 @@ static cdb_status start_session(cdb_db *db)
 /* Caller memory for n slots of each kind, laid out the way the slot code
  * carves it: full chunks of CDB_SLOTS_CHUNK, then one smaller chunk for the
  * remainder. */
+size_t cdb_db_struct_size(void)
+{
+    return sizeof(cdb_db);
+}
+
+size_t cdb_db_config_size(void)
+{
+    return sizeof(cdb_db_config);
+}
+
+cdb_catalog *cdb_db_catalog(cdb_db *db)
+{
+    return &db->catalog;
+}
+
+cdb_pager *cdb_db_pager(cdb_db *db)
+{
+    return &db->pager;
+}
+
 size_t cdb_db_slot_mem_size(unsigned n)
 {
     unsigned chunks = (n + CDB_SLOTS_CHUNK - 1u) / CDB_SLOTS_CHUNK, last = n - (chunks - 1u) * CDB_SLOTS_CHUNK;
@@ -2121,18 +2141,20 @@ cdb_status cdb_tx_commit(cdb_db *db)
      * recorded its store's next entry ID (prune_held_blocks), and the slot
      * holds at most CDB_COORD_MAX_BLOCKS (spec 5.9.3). Reconcile when half
      * are held, so a long run of commits never runs out; not inside an
-     * operation scope, whose slot pointers reconciliation may free. Another
-     * process holding the baton (BUSY) only defers it to a later commit;
-     * the commit itself has succeeded either way. */
-    if (s == CDB_OK && !db->in_tx && db->op_depth == 0 && db->coord.me.nblocks > CDB_COORD_MAX_BLOCKS / 2) {
-        cdb_status r = cdb_db_reconcile(db);
-        if (r == CDB_OK) {
-            db_lock(db);
-            r = release_held_blocks(db);
-            db_unlock(db);
-        }
-        if (r != CDB_OK && r != CDB_E_BUSY)
-            s = r;
+     * operation scope, whose slot pointers reconciliation may free.
+     *
+     * The transaction is durable by now, so its status is the commit's:
+     * reporting a failed reconcile here would read as a failed commit, and a
+     * caller retrying it would write the same changes twice. A reconcile
+     * that fails (or finds another process holding the baton) leaves the
+     * blocks held; a later commit tries again, a claim past the limit is
+     * CDB_E_OUT_OF_BUDGET, and a failure that breaks the database marks it
+     * failed, which the next call reports. */
+    if (s == CDB_OK && !db->in_tx && db->op_depth == 0 && db->coord.me.nblocks > CDB_COORD_MAX_BLOCKS / 2
+        && cdb_db_reconcile(db) == CDB_OK) {
+        db_lock(db);
+        (void)release_held_blocks(db);
+        db_unlock(db);
     }
     return s;
 }

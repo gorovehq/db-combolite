@@ -49,7 +49,7 @@ ctest --test-dir build --output-on-failure   # run every test
 ctest --test-dir build -R test_value         # run one test executable
 ./build/tests/test_value                     # run one executable directly (Unity output)
 cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release   # optimised build, sanitizers off
-cmake --preset noxz                          # micro-controller test build: Debug, xz off, in build-noxz/
+cmake --preset noxz                          # mcu-profile test build (spec 17): Debug, xz off, in build-noxz/
 ```
 
 The demo is built separately; see `demo/gutenfree/README.md`.
@@ -81,6 +81,8 @@ These were agreed with the user:
 - **C99 only.** `CMAKE_C_EXTENSIONS` is off.
 - **Warnings are errors.** The flags include `-Wconversion`, `-Wsign-conversion` and `-Wvla`, so write explicit casts and never use VLAs.
 - **No heap allocation in the core.** Memory comes from the caller: buffers, and the environment's optional `alloc`/`free` hooks (`cdb_env.h`), which only the host environment backs with malloc. Anything that grows must also work from caller memory alone, so microcontroller builds can use static pools. Readers return views into caller-owned buffers.
+- **Build profiles (spec 17).** `CDB_PROFILE=host` (the default) or `mcu`, in `src/cdb_profile.h`. Both read and write the same files; only a process's limits differ. On host, query working memory grows through the environment's `alloc` hooks up to `cdb_db_config.query_mem`, so size host limits for speed. On mcu, everything stays in caller memory. A profile limit that is reached is `CDB_E_OUT_OF_BUDGET` in both. Run the suite in `build` (host) and `build-noxz` (mcu).
+- **Bindings mirror structs.** The studio's `binding.py` mirrors `cdb_db_config`, `cdb_exec_row` and others, and checks their sizes at load (`cdb_db_config_size`, `cdb_exec_row_size`, ...). Add new config fields at the end, and update `binding.py` with any struct change.
 - **Fallible functions return `cdb_status`**, defined in `include/combolite/cdb_common.h`. The value writer's errors are sticky.
 - **Explicit byte order.** Every multi-byte on-disk field goes through `src/cdb_endian.h`, using the file's declared byte order. Never cast raw bytes to integers.
 - **Canonical encoding.** Writers produce the one canonical form, and validators reject anything else (spec 14.6.5).

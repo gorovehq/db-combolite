@@ -43,17 +43,106 @@ void cdb_exec_row_copy(cdb_exec_row *dst, const cdb_exec_row *src)
     *dst = *src;
 }
 
+size_t cdb_exec_cursor_size(void)
+{
+    return sizeof(cdb_exec_cursor);
+}
+
+size_t cdb_exec_row_size(void)
+{
+    return sizeof(cdb_exec_row);
+}
+
+/* --------------------------------------------------------------------------
+ * Grown memory (host profile, spec 17.4): blocks from the environment's
+ * allocator, counted against the query's budget, each on its owner's list
+ * -------------------------------------------------------------------------- */
+typedef struct cdb_exec_block {
+    struct cdb_exec_block *next;
+    size_t size; /* bytes after the header */
+} cdb_exec_block;
+
+#define BLOCK_HEAD 16u /* the header, rounded so what follows is aligned */
+
+/* A new block of size bytes on *list, or NULL: the mcu profile, no
+ * allocator, or over the budget */
+static void *exec_grow(cdb_exec_cursor *cur, cdb_exec_block **list, size_t size)
+{
+    const cdb_env_ops *ops = cur->db != NULL ? cur->db->env.ops : NULL;
+    cdb_exec_block *b;
+
+    if (cur->mem_budget == 0 || ops == NULL || ops->alloc == NULL || ops->free == NULL
+        || size > cur->mem_budget - cur->mem_used)
+        return NULL;
+    if ((b = (cdb_exec_block *)ops->alloc(cur->db->env.ctx, BLOCK_HEAD + size)) == NULL)
+        return NULL;
+    b->next = *list;
+    b->size = size;
+    *list = b;
+    cur->mem_used += size;
+    return (uint8_t *)b + BLOCK_HEAD;
+}
+
+/* Frees one block of *list (p as exec_grow returned it) */
+static void exec_free_one(cdb_exec_cursor *cur, cdb_exec_block **list, void *p)
+{
+    cdb_exec_block **at;
+    for (at = list; *at != NULL; at = &(*at)->next) {
+        if ((uint8_t *)*at + BLOCK_HEAD == (uint8_t *)p) {
+            cdb_exec_block *b = *at;
+            *at = b->next;
+            cur->mem_used -= b->size;
+            cur->db->env.ops->free(cur->db->env.ctx, b);
+            return;
+        }
+    }
+}
+
+static void exec_free_all(cdb_exec_cursor *cur, cdb_exec_block **list)
+{
+    while (*list != NULL) {
+        cdb_exec_block *b = *list;
+        *list = b->next;
+        cur->mem_used -= b->size;
+        cur->db->env.ops->free(cur->db->env.ctx, b);
+    }
+}
+
+/* What buffered rows and values point to: the chunk being filled (first a
+ * share of the arena), and on the host profile further chunks grown as
+ * needed */
+typedef struct cdb_exec_pool {
+    cdb_exec_arena a;
+    cdb_exec_block *blocks;
+} cdb_exec_pool;
+
+#define POOL_CHUNK (1u << 20)
+
+static void *pool_alloc(cdb_exec_cursor *cur, cdb_exec_pool *p, size_t size, size_t align)
+{
+    void *x = cdb_exec_arena_alloc(&p->a, size, align);
+    if (x == NULL) {
+        size_t chunk = size + align > POOL_CHUNK ? size + align : POOL_CHUNK;
+        uint8_t *buf = (uint8_t *)exec_grow(cur, &p->blocks, chunk);
+        if (buf == NULL)
+            return NULL;
+        p->a.buf = buf;
+        p->a.cap = chunk;
+        p->a.used = 0;
+        x = cdb_exec_arena_alloc(&p->a, size, align);
+    }
+    return x;
+}
+
 /* Gives a pipeline breaker (Sort, Aggregate) its share of the arena: a slot
- * array of n items of item_size, at most max_items, and a byte pool for the
- * data its buffered values point to. The slots take at most half of what is
- * left and the pool a quarter, so a breaker opened after this one (the one
- * above it) still gets memory. */
+ * array of n items of item_size, at most max_items and at most half of what
+ * is left, and a pool of half of what remains, so a breaker opened after
+ * this one (the one above it) still gets memory. */
 static cdb_status carve_buffer(cdb_exec_arena *arena, size_t item_size, size_t max_items,
-                               void **items, size_t *n, cdb_exec_arena *pool)
+                               void **items, size_t *n, cdb_exec_pool *pool)
 {
     size_t avail = (arena->cap > arena->used) ? (arena->cap - arena->used) : 0;
-    size_t share = avail / 4;
-    size_t count = (avail / 2) / item_size;
+    size_t count = (avail / 2) / item_size, share;
 
     if (count > max_items)
         count = max_items;
@@ -64,30 +153,30 @@ static cdb_status carve_buffer(cdb_exec_arena *arena, size_t item_size, size_t m
         return CDB_E_OUT_OF_BUDGET;
     *n = count;
 
-    pool->buf = (uint8_t *)cdb_exec_arena_alloc(arena, share, sizeof(void *));
-    if (pool->buf == NULL)
-        return CDB_E_OUT_OF_BUDGET;
-    pool->cap = share;
-    pool->used = 0;
+    share = ((arena->cap > arena->used) ? (arena->cap - arena->used) : 0) / 2;
+    pool->blocks = NULL;
+    pool->a.buf = (uint8_t *)cdb_exec_arena_alloc(arena, share, sizeof(void *));
+    pool->a.cap = pool->a.buf != NULL ? share : 0;
+    pool->a.used = 0;
     return CDB_OK;
 }
 
 /* Values point into the buffer they were read from: a scan's record buffer,
  * which the next row overwrites, or the evaluator's scratch, which each
- * cdb_exec_next resets. A buffered value is copied into pool first. */
-static cdb_status pin_value(cdb_exec_arena *pool, cdb_byte_order order, cdb_value *v)
+ * cdb_exec_next resets. A buffered value is copied into the pool first. */
+static cdb_status pin_value(cdb_exec_cursor *cur, cdb_exec_pool *pool, cdb_value *v)
 {
     uint8_t *copy;
 
     if (v->start != NULL && v->encoded_len > 0) {
-        if ((copy = (uint8_t *)cdb_exec_arena_alloc(pool, v->encoded_len, 1)) == NULL)
+        if ((copy = (uint8_t *)pool_alloc(cur, pool, v->encoded_len, 1)) == NULL)
             return CDB_E_OUT_OF_BUDGET;
         memcpy(copy, v->start, v->encoded_len);
-        return cdb_value_read(copy, v->encoded_len, order, v);
+        return cdb_value_read(copy, v->encoded_len, cur->order, v);
     }
     /* Computed strings and binaries carry only a payload */
     if (v->payload != NULL && v->payload_len > 0) {
-        if ((copy = (uint8_t *)cdb_exec_arena_alloc(pool, v->payload_len, 1)) == NULL)
+        if ((copy = (uint8_t *)pool_alloc(cur, pool, v->payload_len, 1)) == NULL)
             return CDB_E_OUT_OF_BUDGET;
         memcpy(copy, v->payload, v->payload_len);
         v->payload = copy;
@@ -95,31 +184,46 @@ static cdb_status pin_value(cdb_exec_arena *pool, cdb_byte_order order, cdb_valu
     return CDB_OK;
 }
 
-static cdb_status pin_bytes(cdb_exec_arena *pool, const uint8_t **data, size_t len)
+static cdb_status pin_bytes(cdb_exec_cursor *cur, cdb_exec_pool *pool, const uint8_t **data, size_t len)
 {
     uint8_t *copy;
 
     if (*data == NULL || len == 0)
         return CDB_OK;
-    if ((copy = (uint8_t *)cdb_exec_arena_alloc(pool, len, 1)) == NULL)
+    if ((copy = (uint8_t *)pool_alloc(cur, pool, len, 1)) == NULL)
         return CDB_E_OUT_OF_BUDGET;
     memcpy(copy, *data, len);
     *data = copy;
     return CDB_OK;
 }
 
-static cdb_status pin_row(cdb_exec_arena *pool, cdb_byte_order order, cdb_exec_row *row)
+/* A compact copy of src in the pool, with only its fields and with
+ * everything it points to copied too */
+static cdb_status store_row(cdb_exec_cursor *cur, cdb_exec_pool *pool, const cdb_exec_row *src,
+                            cdb_exec_row **out)
 {
+    cdb_exec_row *r = (cdb_exec_row *)pool_alloc(cur, pool, CDB_EXEC_ROW_SIZE(src->n_fields), sizeof(void *));
     cdb_status s;
     size_t i;
 
-    for (i = 0; i < row->n_fields; i++) {
-        if ((s = pin_value(pool, order, &row->fields[i].val)) != CDB_OK)
+    if (r == NULL)
+        return CDB_E_OUT_OF_BUDGET;
+    memcpy(r, src, CDB_EXEC_ROW_SIZE(src->n_fields));
+    for (i = 0; i < r->n_fields; i++)
+        if ((s = pin_value(cur, pool, &r->fields[i].val)) != CDB_OK)
             return s;
-    }
-    if ((s = pin_bytes(pool, &row->record_data, row->record_len)) != CDB_OK)
+    if ((s = pin_bytes(cur, pool, &r->record_data, r->record_len)) != CDB_OK)
         return s;
-    return pin_bytes(pool, &row->right_record_data, row->right_record_len);
+    if ((s = pin_bytes(cur, pool, &r->right_record_data, r->right_record_len)) != CDB_OK)
+        return s;
+    *out = r;
+    return CDB_OK;
+}
+
+/* The full row from a compact copy */
+static void load_row(cdb_exec_row *dst, const cdb_exec_row *src)
+{
+    memcpy(dst, src, CDB_EXEC_ROW_SIZE(src->n_fields));
 }
 
 /* Custom field resolver hook to look up fields on an executed row */
@@ -250,7 +354,7 @@ static void scan_close(cdb_exec_op *op, cdb_exec_cursor *cur)
  * current columns, or a document's current revision. A vector entry is only
  * checked for existence. Time series and the link store keep entry-ID rows.
  * CDB_E_NOT_FOUND: no such entry (deleted). */
-static cdb_status scan_load(cdb_exec_scan *s, cdb_exec_cursor *cur, uint64_t eid, size_t *len)
+static cdb_status scan_read(cdb_exec_scan *s, cdb_exec_cursor *cur, uint64_t eid, size_t *len)
 {
     uint64_t src_store, src_entry;
 
@@ -262,12 +366,34 @@ static cdb_status scan_load(cdb_exec_scan *s, cdb_exec_cursor *cur, uint64_t eid
         return cdb_doc_get(cur->db, s->store_id, eid, 0, s->rec_buf, s->rec_cap, len, NULL, 0, NULL, NULL);
     case CDB_MODEL_VECTOR: {
         cdb_status st = cdb_vec_get(cur->db, s->store_id, eid, s->rec_buf, s->rec_cap, len, &src_store, &src_entry);
-        *len = 0;
+        if (st != CDB_E_BUFFER_TOO_SMALL)
+            *len = 0;
         return st;
     }
     default:
         return CDB_OK;
     }
+}
+
+/* scan_read, growing the record buffer for a larger record on the host
+ * profile (spec 17.3: up to the largest document body); a record past the
+ * profile's buffer is CDB_E_OUT_OF_BUDGET */
+static cdb_status scan_load(cdb_exec_scan *s, cdb_exec_cursor *cur, uint64_t eid, size_t *len)
+{
+    cdb_status st = scan_read(s, cur, eid, len);
+    uint8_t *grown, *old = s->rec_buf;
+
+    if (st != CDB_E_BUFFER_TOO_SMALL)
+        return st;
+    if (*len <= s->rec_cap || (grown = (uint8_t *)exec_grow(cur, &cur->blocks, *len)) == NULL)
+        return CDB_E_OUT_OF_BUDGET;
+    s->rec_buf = grown;
+    s->rec_cap = *len;
+    if (cur->blocks->next != NULL && (uint8_t *)cur->blocks->next + BLOCK_HEAD == old)
+        exec_free_one(cur, &cur->blocks, old);
+    if ((st = scan_read(s, cur, eid, len)) == CDB_OK && s->model == CDB_MODEL_VECTOR)
+        *len = 0;
+    return st;
 }
 
 static cdb_status scan_next(cdb_exec_op *op, cdb_exec_cursor *cur, cdb_exec_row *out_row, int *has_row)
@@ -802,20 +928,18 @@ typedef struct cdb_exec_sort {
     size_t count;
     cdb_exec_sort_key keys[CDB_EXEC_MAX_SORT_KEYS];
 
-    cdb_exec_row *buf;
+    cdb_exec_row **rows;         /* the buffered rows: compact copies in pool */
     size_t n_rows;
     size_t max_rows;
     size_t cur_idx;
     int is_buffered;
-    cdb_exec_arena pool; /* what the buffered rows point to */
+    cdb_exec_block *row_blocks;  /* host profile: the grown rows array */
+    cdb_exec_pool pool;
+    uint64_t keep;               /* a Limit above needs only the first keep rows; 0: all */
 } cdb_exec_sort;
 
-static int compare_rows(const void *a_ptr, const void *b_ptr, void *ctx_ptr)
+static int compare_rows(cdb_exec_cursor *cur, const cdb_exec_sort *s, const cdb_exec_row *a, const cdb_exec_row *b)
 {
-    const cdb_exec_row *a = (const cdb_exec_row *)a_ptr;
-    const cdb_exec_row *b = (const cdb_exec_row *)b_ptr;
-    cdb_exec_cursor *cur = (cdb_exec_cursor *)ctx_ptr;
-    cdb_exec_sort *s = (cdb_exec_sort *)cur->root_op; /* Default or active op */
     size_t k;
 
     for (k = 0; k < s->count; k++) {
@@ -866,24 +990,66 @@ static int compare_rows(const void *a_ptr, const void *b_ptr, void *ctx_ptr)
     return 0;
 }
 
-/* Zero-heap in-place insertion sort for bounded row array */
-static void sort_rows_insertion(cdb_exec_row *rows, size_t n, cdb_exec_cursor *cur, cdb_exec_sort *s)
+/* Stable insertion sort: few rows, or no memory for a merge buffer */
+static void sort_insertion(cdb_exec_cursor *cur, const cdb_exec_sort *s, cdb_exec_row **rows, size_t n)
 {
     size_t i, j;
-    cdb_exec_op *prev_root = cur->root_op;
-    cur->root_op = &s->base;
-
     for (i = 1; i < n; i++) {
-        cdb_exec_row key = rows[i];
-        j = i;
-        while (j > 0 && compare_rows(&rows[j - 1], &key, (void *)cur) > 0) {
+        cdb_exec_row *key = rows[i];
+        for (j = i; j > 0 && compare_rows(cur, s, rows[j - 1], key) > 0; j--)
             rows[j] = rows[j - 1];
-            j--;
-        }
         rows[j] = key;
     }
+}
 
-    cur->root_op = prev_root;
+/* Stable bottom-up merge sort of the row pointers, O(n log n): the host
+ * profile's path for large inputs (spec 17.5). Falls back to insertion when
+ * no merge buffer can be grown. */
+static void sort_rows(cdb_exec_cursor *cur, cdb_exec_sort *s, cdb_exec_row **rows, size_t n)
+{
+    cdb_exec_block *tmp_block = NULL;
+    cdb_exec_row **tmp, **from = rows, **to;
+    size_t width, i;
+
+    if (n < 32 || (tmp = (cdb_exec_row **)exec_grow(cur, &tmp_block, n * sizeof *tmp)) == NULL) {
+        sort_insertion(cur, s, rows, n);
+        return;
+    }
+    to = tmp;
+    for (width = 1; width < n; width *= 2) {
+        for (i = 0; i < n; i += 2 * width) {
+            size_t lo = i, mid = i + width < n ? i + width : n, hi = i + 2 * width < n ? i + 2 * width : n;
+            size_t a = lo, b = mid, k = lo;
+            while (a < mid && b < hi)
+                to[k++] = compare_rows(cur, s, from[b], from[a]) < 0 ? from[b++] : from[a++];
+            while (a < mid)
+                to[k++] = from[a++];
+            while (b < hi)
+                to[k++] = from[b++];
+        }
+        { cdb_exec_row **t = from; from = to; to = t; }
+    }
+    if (from != rows)
+        memcpy(rows, from, n * sizeof *rows);
+    exec_free_all(cur, &tmp_block);
+}
+
+/* Top-N (host profile): keep the first s->keep rows, and move them to a
+ * fresh pool so the dropped rows' memory goes back */
+static cdb_status sort_trim(cdb_exec_cursor *cur, cdb_exec_sort *s)
+{
+    cdb_exec_pool old = s->pool;
+    size_t i;
+    cdb_status st;
+
+    sort_rows(cur, s, s->rows, s->n_rows);
+    s->n_rows = (size_t)s->keep;
+    memset(&s->pool, 0, sizeof s->pool);
+    for (i = 0; i < s->n_rows; i++)
+        if ((st = store_row(cur, &s->pool, s->rows[i], &s->rows[i])) != CDB_OK)
+            return st;
+    exec_free_all(cur, &old.blocks);
+    return CDB_OK;
 }
 
 static cdb_status sort_open(cdb_exec_op *op, cdb_exec_cursor *cur)
@@ -895,13 +1061,14 @@ static cdb_status sort_open(cdb_exec_op *op, cdb_exec_cursor *cur)
     s->n_rows = 0;
     s->cur_idx = 0;
     s->is_buffered = 0;
+    s->row_blocks = NULL;
     /* The input first, so a breaker below gets its memory before this one */
     if ((st = s->input->vtab->open(s->input, cur)) != CDB_OK)
         return st;
-    if ((st = carve_buffer(&cur->arena, sizeof(cdb_exec_row), cur->max_buffered_rows, &items, &s->max_rows,
+    if ((st = carve_buffer(&cur->arena, sizeof(cdb_exec_row *), cur->max_buffered_rows, &items, &s->max_rows,
                            &s->pool)) != CDB_OK)
         return st;
-    s->buf = (cdb_exec_row *)items;
+    s->rows = (cdb_exec_row **)items;
     return CDB_OK;
 }
 
@@ -916,6 +1083,10 @@ static cdb_status sort_reset(cdb_exec_op *op, cdb_exec_cursor *cur)
 static void sort_close(cdb_exec_op *op, cdb_exec_cursor *cur)
 {
     cdb_exec_sort *s = (cdb_exec_sort *)op;
+    if (cur->db != NULL) {
+        exec_free_all(cur, &s->pool.blocks);
+        exec_free_all(cur, &s->row_blocks);
+    }
     s->input->vtab->close(s->input, cur);
 }
 
@@ -929,6 +1100,9 @@ static cdb_status sort_next(cdb_exec_op *op, cdb_exec_cursor *cur, cdb_exec_row 
     if (!s->is_buffered) {
         cdb_exec_row item;
         int in_has_row = 0;
+        /* With a Limit above, trim to the first keep rows each time twice
+         * that many are held */
+        int trim = s->keep > 0 && cur->mem_budget > 0 && s->keep <= SIZE_MAX / 4;
 
         while (1) {
             st = s->input->vtab->next(s->input, cur, &item, &in_has_row);
@@ -937,23 +1111,36 @@ static cdb_status sort_next(cdb_exec_op *op, cdb_exec_cursor *cur, cdb_exec_row 
             if (!in_has_row)
                 break;
 
-            if (s->n_rows >= s->max_rows)
-                return CDB_E_OUT_OF_BUDGET;
-            if ((st = pin_row(&s->pool, cur->order, &item)) != CDB_OK)
+            if (s->n_rows >= s->max_rows) {
+                /* Host profile: a larger rows array; mcu: the limit (17.3) */
+                cdb_exec_row **grown;
+                if (s->max_rows > SIZE_MAX / 2 / sizeof *grown
+                    || (grown = (cdb_exec_row **)exec_grow(cur, &s->row_blocks, 2 * s->max_rows * sizeof *grown))
+                           == NULL)
+                    return CDB_E_OUT_OF_BUDGET;
+                memcpy(grown, s->rows, s->n_rows * sizeof *grown);
+                if (s->row_blocks->next != NULL && (uint8_t *)s->row_blocks->next + BLOCK_HEAD == (uint8_t *)s->rows)
+                    exec_free_one(cur, &s->row_blocks, s->rows);
+                s->rows = grown;
+                s->max_rows *= 2;
+            }
+            if ((st = store_row(cur, &s->pool, &item, &s->rows[s->n_rows])) != CDB_OK)
                 return st;
-
-            s->buf[s->n_rows++] = item;
+            s->n_rows++;
+            if (trim && s->n_rows >= 2 * s->keep && s->n_rows >= 64 && (st = sort_trim(cur, s)) != CDB_OK)
+                return st;
         }
 
-        if (s->n_rows > 1) {
-            sort_rows_insertion(s->buf, s->n_rows, cur, s);
-        }
+        if (s->n_rows > 1)
+            sort_rows(cur, s, s->rows, s->n_rows);
+        if (trim && s->n_rows > s->keep)
+            s->n_rows = (size_t)s->keep;
         s->is_buffered = 1;
         s->cur_idx = 0;
     }
 
     if (s->cur_idx < s->n_rows) {
-        *out_row = s->buf[s->cur_idx++];
+        load_row(out_row, s->rows[s->cur_idx++]);
         *has_row = 1;
         return CDB_OK;
     }
@@ -1002,7 +1189,8 @@ typedef struct cdb_exec_aggregate {
     size_t max_groups;
     size_t cur_idx;
     int is_buffered;
-    cdb_exec_arena pool; /* what group keys and MIN/MAX values point to */
+    cdb_exec_pool pool;           /* what group keys and MIN/MAX values point to */
+    cdb_exec_block *group_blocks; /* host profile: the grown groups array */
 } cdb_exec_aggregate;
 
 static cdb_status aggregate_open(cdb_exec_op *op, cdb_exec_cursor *cur)
@@ -1014,6 +1202,7 @@ static cdb_status aggregate_open(cdb_exec_op *op, cdb_exec_cursor *cur)
     a->n_groups = 0;
     a->cur_idx = 0;
     a->is_buffered = 0;
+    a->group_blocks = NULL;
     /* The input first, so a breaker below gets its memory before this one */
     if ((st = a->input->vtab->open(a->input, cur)) != CDB_OK)
         return st;
@@ -1035,6 +1224,10 @@ static cdb_status aggregate_reset(cdb_exec_op *op, cdb_exec_cursor *cur)
 static void aggregate_close(cdb_exec_op *op, cdb_exec_cursor *cur)
 {
     cdb_exec_aggregate *a = (cdb_exec_aggregate *)op;
+    if (cur->db != NULL) {
+        exec_free_all(cur, &a->pool.blocks);
+        exec_free_all(cur, &a->group_blocks);
+    }
     a->input->vtab->close(a->input, cur);
 }
 
@@ -1096,13 +1289,25 @@ static cdb_status aggregate_next(cdb_exec_op *op, cdb_exec_cursor *cur, cdb_exec
 
             /* Create new group if not found */
             if (group_idx < 0) {
-                if (a->n_groups >= a->max_groups)
-                    return CDB_E_OUT_OF_BUDGET;
+                if (a->n_groups >= a->max_groups) {
+                    /* Host profile: a larger groups array; mcu: the limit */
+                    cdb_exec_agg_group *grown;
+                    if (a->max_groups > SIZE_MAX / 2 / sizeof *grown
+                        || (grown = (cdb_exec_agg_group *)exec_grow(cur, &a->group_blocks,
+                                                                     2 * a->max_groups * sizeof *grown)) == NULL)
+                        return CDB_E_OUT_OF_BUDGET;
+                    memcpy(grown, a->groups, a->n_groups * sizeof *grown);
+                    if (a->group_blocks->next != NULL
+                        && (uint8_t *)a->group_blocks->next + BLOCK_HEAD == (uint8_t *)a->groups)
+                        exec_free_one(cur, &a->group_blocks, a->groups);
+                    a->groups = grown;
+                    a->max_groups *= 2;
+                }
 
                 group_idx = (int)a->n_groups++;
                 memset(&a->groups[group_idx], 0, sizeof(cdb_exec_agg_group));
                 for (i = 0; i < a->groups_count; i++) {
-                    if ((st = pin_value(&a->pool, cur->order, &gvals[i])) != CDB_OK)
+                    if ((st = pin_value(cur, &a->pool, &gvals[i])) != CDB_OK)
                         return st;
                     a->groups[group_idx].group_vals[i] = gvals[i];
                 }
@@ -1141,7 +1346,7 @@ static cdb_status aggregate_next(cdb_exec_op *op, cdb_exec_cursor *cur, cdb_exec
                 /* MIN and MAX keep a value across rows, so it is pinned;
                  * only when it changes, which keeps the pool small */
                 if (!grp->has_val[i]) {
-                    if ((st = pin_value(&a->pool, cur->order, &aval)) != CDB_OK)
+                    if ((st = pin_value(cur, &a->pool, &aval)) != CDB_OK)
                         return st;
                     grp->min_val[i] = aval;
                     grp->max_val[i] = aval;
@@ -1154,7 +1359,7 @@ static cdb_status aggregate_next(cdb_exec_op *op, cdb_exec_cursor *cur, cdb_exec
                     int higher = cdb_eval_compare(&aval, &grp->max_val[i], &c_res, &is_null) == CDB_OK && !is_null
                                  && c_res > 0;
                     if (lower || higher) {
-                        if ((st = pin_value(&a->pool, cur->order, &aval)) != CDB_OK)
+                        if ((st = pin_value(cur, &a->pool, &aval)) != CDB_OK)
                             return st;
                         if (lower)
                             grp->min_val[i] = aval;
@@ -2036,6 +2241,15 @@ static cdb_status build_exec_tree(cdb_exec_cursor *cur, const uint8_t **p, const
         op->offset = node.as.limit.offset;
         st = build_exec_tree(cur, &node.as.limit.input_wire, end, &op->input);
         if (st != CDB_OK) return st;
+        /* A Sort below (through Projects, which keep every row) need only
+         * hold the rows this Limit can reach: top-N */
+        if (op->count > 0 && op->offset <= UINT64_MAX - op->count) {
+            cdb_exec_op *below = op->input;
+            while (below->tag == CDB_QUERY_NODE_PROJECT)
+                below = ((cdb_exec_project *)below)->input;
+            if (below->tag == CDB_QUERY_NODE_SORT)
+                ((cdb_exec_sort *)below)->keep = op->offset + op->count;
+        }
         *out_op = &op->base;
         return CDB_OK;
     }
@@ -2306,6 +2520,13 @@ cdb_status cdb_exec_open(cdb_exec_cursor *cur, cdb_db *db, const uint8_t *wire, 
     cur->arena.cap = scratch_cap;
     cur->arena.used = 0;
     cur->max_buffered_rows = CDB_EXEC_DEFAULT_BUFFERED_ROWS;
+#ifdef CDB_PROFILE_HOST
+    /* Pipeline breakers and scan buffers may grow past the arena, up to the
+     * query memory budget (spec 17.4); max_buffered_rows then only sizes
+     * their first array */
+    if (db != NULL)
+        cur->mem_budget = db->cfg.query_mem != 0 ? db->cfg.query_mem : CDB_QUERY_MEM_DEFAULT;
+#endif
 
     /* Initialize evaluation context */
     cdb_eval_ctx_init(&cur->eval_ctx, cur->order, cur->cat, 0);
@@ -2358,6 +2579,8 @@ cdb_status cdb_exec_close(cdb_exec_cursor *cur)
     if (cur->root_op != NULL) {
         cur->root_op->vtab->close(cur->root_op, cur);
     }
+    if (cur->db != NULL)
+        exec_free_all(cur, &cur->blocks);
     cur->is_open = 0;
     return CDB_OK;
 }
