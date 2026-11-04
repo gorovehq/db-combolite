@@ -390,6 +390,7 @@ class cdb_db_config(Structure):
         ("signing_policy", c_uint32),
         ("identity", c_void_p),
         ("query_mem", c_size_t),   # host profile: a query's memory budget (spec 17.4); 0 = default
+        ("vec_mem", c_size_t),     # host profile: a graph refresh's memory budget (spec 17.4); 0 = default
     ]
 
 

@@ -24,6 +24,7 @@
 #include "cdb_endian.h"
 #include "cdb_key.h"
 #include "cdb_link.h"
+#include "cdb_profile.h"
 #include "cdb_varint.h"
 #include "cdb_vec.h"
 
@@ -1587,6 +1588,7 @@ static cdb_status check_coverage(cdb_db *db, coll *c, checks *k, uint8_t *mem, s
         return CDB_OK;
     }
     /* Too many to list: every entry with a list, and every entry point. */
+    db->vec_full_checks++;
     for (from = 1;; from = e + 1u) {
         cdb_index_cursor cur;
         uint8_t key[8], got[8], rec[REC_HDR + NB_SIZE * CDB_VEC_MAX_K];
@@ -1623,14 +1625,14 @@ static int in_batch(const uint8_t *items, size_t stride, size_t n, uint64_t e)
 }
 
 /* Refreshes pending entries, at most budget of them (0: all), in batches
- * that fit vec_work. Each batch reads every vector once: it builds the
- * batch's lists and offers the batch's vectors to the fresh lists of the
- * others. Changes only pager pages; the caller commits. */
-static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *processed)
+ * that fit the working memory at items (avail bytes). Each batch reads
+ * every vector once: it builds the batch's lists and offers the batch's
+ * vectors to the fresh lists of the others. Changes only pager pages; the
+ * caller commits. */
+static cdb_status refresh_in(cdb_db *db, coll *c, size_t budget, size_t *processed, uint8_t *items, size_t avail)
 {
     cdb_byte_order o = db->pager.order;
-    size_t avail, stride = item_stride(c->vec_bytes), cap, n, i;
-    uint8_t *items = work_base(db, &avail);
+    size_t stride = item_stride(c->vec_bytes), cap, n, i;
     checks chk;
     cdb_status s;
 
@@ -1768,6 +1770,69 @@ static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *proce
         *processed += n;
     }
     return *processed ? check_coverage(db, c, &chk, items, avail) : CDB_OK;
+}
+
+#ifdef CDB_PROFILE_HOST
+static cdb_status count_pending(cdb_db *db, coll *c, size_t *n);
+
+/* Bytes a refresh of batch entries of a collection with live vectors would
+ * like (spec 17.4): the whole batch in one pass, about sqrt(live) entry
+ * points, and a list of entries to check that does not overflow. The list
+ * takes the last eighth; it holds each refreshed entry, its old and new
+ * neighbours, the entries displaced from other lists, and the reach entry
+ * points. That is an estimate: past it a refresh checks every entry, as it
+ * does at the minimum vec_work. */
+static size_t refresh_want(const coll *c, uint64_t live, size_t batch)
+{
+    size_t eps = (size_t)ceil(sqrt((double)live)) + 1u, items, ids, want;
+    if (eps > MAX_EP + 1u)
+        eps = MAX_EP + 1u;
+    items = batch * item_stride(c->vec_bytes);
+    if (eps * ep_stride(c->vec_bytes) > items)
+        items = eps * ep_stride(c->vec_bytes);
+    ids = (batch * (3u * (size_t)c->k + 2u) + 2u * MAX_EP) * sizeof(uint64_t);
+    want = items + items / 7u;
+    if (ids * 8u > want)
+        want = ids * 8u;
+    return want + 64u;
+}
+#endif
+
+/* refresh_in in vec_work. On the host profile the working memory grows
+ * first, through the environment's allocator, to what this refresh would
+ * like, up to vec_mem, and is freed after it (spec 17.4). Less memory
+ * only makes a refresh slower (spec 17.3). */
+static cdb_status refresh_coll(cdb_db *db, coll *c, size_t budget, size_t *processed)
+{
+    size_t avail;
+    uint8_t *base = work_base(db, &avail);
+#ifdef CDB_PROFILE_HOST
+    const cdb_env_ops *ops = db->env.ops;
+    size_t limit = db->cfg.vec_mem != 0 ? db->cfg.vec_mem : CDB_VEC_MEM_DEFAULT, batch = 0, want;
+    uint64_t live = 0;
+    uint8_t *grown = NULL;
+    cdb_status s;
+
+    if (ops != NULL && ops->alloc != NULL && ops->free != NULL && limit > avail) {
+        if ((s = count_pending(db, c, &batch)) != CDB_OK || (s = meta_get(c, &live)) != CDB_OK)
+            return s;
+        if (budget != 0 && budget < batch)
+            batch = budget;
+        want = batch > 0 ? refresh_want(c, live, batch) : 0;
+        if (want > limit)
+            want = limit;
+        if (want > avail && (grown = (uint8_t *)ops->alloc(db->env.ctx, want)) != NULL) {
+            base = grown; /* the allocator's alignment serves every structure */
+            avail = want;
+        }
+    }
+    s = refresh_in(db, c, budget, processed, base, avail);
+    if (grown != NULL)
+        ops->free(db->env.ctx, grown);
+    return s;
+#else
+    return refresh_in(db, c, budget, processed, base, avail);
+#endif
 }
 
 /* -------------------------------------------------------- apply */
