@@ -66,6 +66,8 @@ cdb_status gf_db_open(gf_db *g, const char *base)
     cfg.pager.nodes = take(g, GF_NODES * sizeof(cdb_pager_node));
     cfg.pager.free_cap = 16384u;
     cfg.pager.free_list = take(g, cfg.pager.free_cap * sizeof(cdb_free_extent));
+    cfg.pager.page_cache_size = GF_PAGE_CACHE;
+    cfg.pager.page_cache = take(g, cfg.pager.page_cache_size);
 
     /* A change's journal record holds the whole body (cdb_doc.h). */
     cfg.record_buf_size = GF_DOC_MAX + 2u * GF_PAGE + 64u;
@@ -88,6 +90,8 @@ cdb_status gf_db_open(gf_db *g, const char *base)
 
     cfg.vec_buffers = take(g, 3u * GF_PAGE);
     cfg.vec_work_size = cdb_vec_work_size(CDB_VEC_F32, GF_VEC_DIMS, GF_VEC_K);
+    if (cfg.vec_work_size < GF_VEC_WORK)
+        cfg.vec_work_size = GF_VEC_WORK;
     cfg.vec_work = take(g, cfg.vec_work_size);
 
     cfg.ts_buffers = take(g, 3u * GF_PAGE);

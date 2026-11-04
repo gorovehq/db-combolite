@@ -275,6 +275,21 @@ static void graph_progress(size_t done, size_t pending, double ms, void *ctx)
     fflush(stdout);
 }
 
+static cdb_status refresh_graph(gf_db *g, const gf_vec *v)
+{
+    size_t remaining = 0;
+    double t0 = gf_now_ms();
+    cdb_status s;
+
+    printf("neighbour graph: refreshing (each entry's %u nearest, exact) ...\n", GF_VEC_K);
+    s = gf_vec_refresh_graph(g, v, graph_progress, NULL, &remaining);
+    printf("neighbour graph: %s, refreshed in %.0f ms, %zu pending\n", cdb_status_str(s), gf_now_ms() - t0,
+           remaining);
+    gf_metric("vec.graph_refresh_ms", gf_now_ms() - t0);
+    gf_metrics_flush(g);
+    return s;
+}
+
 static int embed_cli(gf_db *g, const char *model)
 {
     static uint64_t rows[4096];
@@ -283,7 +298,7 @@ static int embed_cli(gf_db *g, const char *model)
     gf_vec v;
     gf_embed *e;
     cdb_table_cursor cur;
-    size_t n = 0, i, remaining = 0;
+    size_t n = 0, i;
     uint64_t links = 0, total = 0;
     double t0;
     cdb_status s;
@@ -326,17 +341,23 @@ static int embed_cli(gf_db *g, const char *model)
     s = gf_vec_link_similar(g, &v, &links);
     printf("similar_to: %s, %llu links added in %.1f ms\n", cdb_status_str(s), (unsigned long long)links,
            gf_now_ms() - t0);
-    t0 = gf_now_ms();
-    if (s == CDB_OK) {
-        printf("neighbour graph: refreshing (each entry's %u nearest, exact) ...\n", GF_VEC_K);
-        s = gf_vec_refresh_graph(g, &v, graph_progress, NULL, &remaining);
-    }
-    printf("neighbour graph: %s, refreshed in %.0f ms, %zu pending\n", cdb_status_str(s), gf_now_ms() - t0,
-           remaining);
-    gf_metric("vec.graph_refresh_ms", gf_now_ms() - t0);
-    gf_metrics_flush(g);
+    if (s == CDB_OK)
+        s = refresh_graph(g, &v);
     printf("embedded %llu passages this run\n", (unsigned long long)total);
     return s == CDB_OK ? 0 : 1;
+}
+
+/* Refreshes the passages' neighbour graph only: what embed ends with. */
+static int graph_cli(gf_db *g)
+{
+    gf_vec v;
+    cdb_status s = gf_vec_open(g, &v);
+
+    if (s != CDB_OK) {
+        fprintf(stderr, "gutenfree: open stores: %s\n", cdb_status_str(s));
+        return 1;
+    }
+    return refresh_graph(g, &v) == CDB_OK ? 0 : 1;
 }
 
 /* Runs the diagnostics screen's probe load for a number of seconds. */
@@ -447,11 +468,14 @@ int main(int argc, char **argv)
     int cli_books = argc > 1 && strcmp(argv[1], "ingest-books") == 0;
     int cli_text = argc > 1 && strcmp(argv[1], "ingest-text") == 0;
     int cli_embed = argc > 1 && strcmp(argv[1], "embed") == 0;
+    int cli_graph = argc > 1 && strcmp(argv[1], "graph") == 0;
     int cli_metrics = argc > 1 && strcmp(argv[1], "metrics") == 0;
     int cli_probe = argc > 1 && strcmp(argv[1], "probe") == 0;
     int cli_merge = argc > 1 && strcmp(argv[1], "merge-csv") == 0;
     int cli_filter = argc > 1 && strcmp(argv[1], "filter") == 0;
-    int a = cli_filter ? argc : cli || cli_books || cli_text || cli_embed || cli_metrics || cli_probe || cli_merge ? 2 : 1;
+    int a = cli_filter ? argc : cli || cli_books || cli_text || cli_embed || cli_graph || cli_metrics || cli_probe || cli_merge
+                                ? 2
+                                : 1;
     const char *pgcsv = GF_DEFAULT_PGCSV;
     double seconds = 10;
     unsigned batch = GF_INGEST_BATCH;
@@ -461,9 +485,6 @@ int main(int argc, char **argv)
     double t0, open_ms;
     cdb_status s;
     int quit = 0, rc = 0;
-
-    /* Each progress line as it is printed, also when piped (tee, a log) */
-    setvbuf(stdout, NULL, _IOLBF, 0);
 
     if (cli && a + 1 < argc && strcmp(argv[a], "--batch") == 0) {
         batch = (unsigned)strtoul(argv[a + 1], NULL, 10);
@@ -482,7 +503,7 @@ int main(int argc, char **argv)
     if (argc > 1 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
         printf("gutenfree [base] | ingest-index [--batch N] [gutindex] [base] | merge-csv [csv] [base]\n"
                "          | ingest-books [dir] [base] | ingest-text [dir] [base] | embed [model.gguf] [base]\n"
-               "          | filter key=value ...\n"
+               "          | graph [base] | filter key=value ...\n"
                "          | probe [seconds] [base] | metrics [base]\n"
                "base: database path without extension (default %s, or $GUTENFREE_DB).\n"
                "Run from demo/gutenfree/; see README.md there.\n", GF_DEFAULT_BASE);
@@ -519,11 +540,12 @@ int main(int argc, char **argv)
         rc = merge_cli(&g, pgcsv);
     } else if (cli_filter) {
         rc = filter_cli(&g, argc, argv, 2);
-    } else if (cli || cli_books || cli_text || cli_embed) {
+    } else if (cli || cli_books || cli_text || cli_embed || cli_graph) {
         printf("build: %s\nopen: %.1f ms\n", GF_BUILD_LABEL, open_ms);
         rc = cli ? ingest_cli(&g, gutindex, batch)
              : cli_books ? ingest_books_cli(&g, books)
              : cli_text ? ingest_text_cli(&g, books)
+             : cli_graph ? graph_cli(&g)
              : embed_cli(&g, model);
     } else {
         app.g = &g;
