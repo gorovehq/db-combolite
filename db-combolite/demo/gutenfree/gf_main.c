@@ -112,6 +112,7 @@ static cdb_status merge_csv(gf_db *g, const gf_catalog *c, const char *path)
     printf("  %llu records: %llu rows updated, %llu new rows, %llu refused; %.0f ms, %u commits, worst %.1f ms\n",
            (unsigned long long)st.entries, (unsigned long long)st.updated, (unsigned long long)st.inserted,
            (unsigned long long)st.refused, st.ms, st.batches, st.worst_batch_ms);
+    printf("  %llu GUTINDEX titles with '?' for letters replaced by the CSV's\n", (unsigned long long)st.retitled);
     if (st.ms > 0)
         gf_metric("catalog.merge_rows_per_s", (double)st.entries / (st.ms / 1000.0));
     gf_metrics_flush(g);
@@ -149,6 +150,9 @@ static int ingest_cli(gf_db *g, const char *gutindex, unsigned batch)
     printf("  entries %llu, inserted %llu, already present %llu, refused %llu\n",
            (unsigned long long)st.entries, (unsigned long long)st.inserted,
            (unsigned long long)st.duplicates, (unsigned long long)st.refused);
+    if (st.refused > 0)
+        printf("  first refused: ebook %lld, %s\n", (long long)st.first_refused_ebook,
+               cdb_status_str(st.first_refused));
     printf("  %.0f ms in all: %.0f ms parsing, %.0f ms in the engine; %u commits, worst %.1f ms\n", st.ms,
            st.parse_ms, st.ms - st.parse_ms, st.batches, st.worst_batch_ms);
     if (s == CDB_OK && access(GF_DEFAULT_PGCSV, R_OK) == 0)
@@ -212,6 +216,16 @@ static int ingest_books_cli(gf_db *g, const char *dir)
 }
 
 /* Embeds every book with passages but no vectors, then links and refreshes. */
+/* One line per slice of the graph refresh: how far, how fast, how long to go. */
+static void graph_progress(size_t done, size_t pending, double ms, void *ctx)
+{
+    double rate = ms > 0 ? (double)done / (ms / 1000.0) : 0;
+    (void)ctx;
+    printf("  graph: %6zu refreshed, %6zu pending | %6.1f entries/s | %5.0f s so far, about %.0f s to go\n", done,
+           pending, rate, ms / 1000.0, rate > 0 ? (double)pending / rate : 0.0);
+    fflush(stdout);
+}
+
 static int embed_cli(gf_db *g, const char *model)
 {
     static uint64_t rows[4096];
@@ -264,8 +278,10 @@ static int embed_cli(gf_db *g, const char *model)
     printf("similar_to: %s, %llu links added in %.1f ms\n", cdb_status_str(s), (unsigned long long)links,
            gf_now_ms() - t0);
     t0 = gf_now_ms();
-    if (s == CDB_OK)
-        s = cdb_vec_refresh(&g->db, v.passages, 0, &remaining);
+    if (s == CDB_OK) {
+        printf("neighbour graph: refreshing (each entry's %u nearest, exact) ...\n", GF_VEC_K);
+        s = gf_vec_refresh_graph(g, &v, graph_progress, NULL, &remaining);
+    }
     printf("neighbour graph: %s, refreshed in %.0f ms, %zu pending\n", cdb_status_str(s), gf_now_ms() - t0,
            remaining);
     gf_metric("vec.graph_refresh_ms", gf_now_ms() - t0);
@@ -395,6 +411,9 @@ int main(int argc, char **argv)
     double t0, open_ms;
     cdb_status s;
     int quit = 0, rc = 0;
+
+    /* Each progress line as it is printed, also when piped (tee, a log) */
+    setvbuf(stdout, NULL, _IOLBF, 0);
 
     if (cli && a + 1 < argc && strcmp(argv[a], "--batch") == 0) {
         batch = (unsigned)strtoul(argv[a + 1], NULL, 10);

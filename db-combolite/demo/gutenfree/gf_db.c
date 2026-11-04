@@ -124,6 +124,16 @@ double gf_now_ms(void)
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec * 1e-6;
 }
 
+cdb_status gf_db_commit(gf_db *g)
+{
+    cdb_status s = cdb_tx_commit(&g->db);
+    /* Leave room for the next transaction's claims: a book's passages or
+     * vectors can take several blocks */
+    if (s == CDB_OK && g->db.coord.me.nblocks + 8u >= CDB_COORD_MAX_BLOCKS)
+        s = cdb_db_reconcile(&g->db);
+    return s;
+}
+
 cdb_status gf_db_close(gf_db *g)
 {
     cdb_status s = CDB_OK;

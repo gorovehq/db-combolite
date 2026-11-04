@@ -241,71 +241,48 @@ class TestNativeBackend(unittest.TestCase):
         self.assertIn("LIMIT", ops)
 
     def test_09_open_large_demo_database(self):
-        demo_path = Path(__file__).resolve().parents[3] / "db-combolite" / "demo" / "gutenfree" / "data" / "gutenfree.cdbarch"
+        # GutenFree Diet as reorganized: catalog and library, named passages,
+        # links between the entities themselves
+        demo_path = Path(__file__).resolve().parents[3] / "db-combolite" / "demo" / "gutenfree" / "data" / "gutenfree-v2.cdbarch"
         if not demo_path.exists():
-            self.skipTest("gutenfree.cdbarch demo database not found")
+            self.skipTest("gutenfree-v2.cdbarch demo database not found")
 
         self.backend.open(str(demo_path))
-        stores = self.backend.list_stores()
-        self.assertTrue(len(stores) > 0)
-        store_map = {s.name: s for s in stores}
-        self.assertIn("books", store_map)
-        self.assertIn("passages", store_map)
-        self.assertIn("passage_vec", store_map)
-        self.assertIn("similar_to", store_map)
-        self.assertIn("metrics", store_map)
-
-        # Verify accurate counts
-        self.assertEqual(store_map["books"].count, 79875)
+        store_map = {s.name: s for s in self.backend.list_stores()}
+        for name in ("catalog", "library", "passages", "passage_vec", "passage_bits", "book_vec", "metrics"):
+            self.assertIn(name, store_map)
+        self.assertEqual(store_map["catalog"].count, 79875)
+        self.assertEqual(store_map["library"].count, 121)
         self.assertEqual(store_map["passages"].count, 16033)
         self.assertEqual(store_map["passage_vec"].count, 16033)
-        self.assertEqual(store_map["passage_bits"].count, 16033)
         self.assertEqual(store_map["book_vec"].count, 121)
-        self.assertEqual(store_map["similar_to"].count, 715)
-        self.assertEqual(store_map["metrics"].count, 28097)
 
-        # Verify reading rows from the 79k+ books table
-        rows = self.backend.table_rows("books", 0, 10)
-        self.assertTrue(len(rows.rows) > 0)
-        self.assertIn("title", rows.columns)
-        self.assertIn("author", rows.columns)
+        # The library says what is stored, in words and keys
+        lib = self.backend.execute("call ingestion_records")
+        self.assertEqual(len(lib.rows), 121)
+        for col in ("ebook", "title", "passages", "first_passage", "last_passage", "ingested", "embedded"):
+            self.assertIn(col, lib.columns)
+        row = dict(zip(lib.columns, lib.rows[0]))
+        self.assertRegex(row["first_passage"], r"^\d+/0000$")
 
-        # Verify reading document
-        docs = self.backend.doc_list("passages", limit=10)
-        self.assertTrue(len(docs) > 0)
+        # A passage is named and says what it contains
+        docs = self.backend.doc_list("passages", limit=1)
         doc = self.backend.doc_get("passages", docs[0].id)
-        self.assertIn("_id", doc)
+        for field in ("passage", "ebook", "title", "seq", "hint", "words", "text"):
+            self.assertIn(field, doc)
+        self.assertIn(" - ", docs[0].title)  # the summary: "<title> - <hint>"
 
-        # Verify reading link edges
-        edges = self.backend.link_edges("similar_to")
-        self.assertEqual(edges.total, 715)
-        self.assertTrue(len(edges.rows) > 0)
+        # Links and vectors point at entities a person recognizes
+        edges = self.backend.link_edges("has_passage", 5)
+        self.assertEqual(edges.columns[-2:], ["source_label", "target_label"])
+        self.assertTrue(edges.rows[0][4].startswith("library "))
+        self.assertEqual(self.backend.vector_source_label("passage_vec", "vec-00001"),
+                         self.backend.doc_list("passages", limit=1)[0].title)
 
-        # Verify reading timeseries series and points
-        series = self.backend.ts_series_list("metrics")
-        self.assertTrue(len(series) > 0)
-        pts = self.backend.ts_points("metrics", 86400)
-        self.assertTrue(len(pts) > 0)
-
-        # Verify call ingestion_records and call downloaded_books
-        ing_res = self.backend.execute("call ingestion_records")
-        self.assertEqual(len(ing_res.rows), 121)
-        self.assertIn("book_vector", ing_res.columns)
-        self.assertIn("similar_links", ing_res.columns)
-
-        dl_res = self.backend.execute("call downloaded_books")
-        self.assertEqual(ing_res.rows, dl_res.rows)
-
-        # Verify from books does not hit the shortcut
-        from_res = self.backend.execute("from books where passages > 0 limit 5")
-        self.assertNotIn("book_vector", from_res.columns)
-        self.assertIn("title", from_res.columns)
-
-    def test_10_ingestion_data_missing_error(self):
+    def test_10_ingestion_records_need_a_library(self):
         self.backend.create(self.db_path)
-        with self.assertRaises(BackendError) as ctx:
+        with self.assertRaises(BackendError):
             self.backend.execute("call ingestion_records")
-        self.assertIn("this database has no ingestion data", str(ctx.exception))
 
     def test_11_console_queries_read_real_rows(self):
         self.backend.create(self.db_path)

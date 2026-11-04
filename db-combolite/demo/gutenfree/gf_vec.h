@@ -5,8 +5,8 @@
  *                 neighbour graph (k = 16) for approximate search
  *   passage_bits  the same vectors as 384 sign bits (48 bytes), Hamming
  *   book_vec      the mean of a book's passage vectors, source = its
- *                 catalog row
- *   similar_to    links between book_vec entries (N:M, recorded), to each
+ *                 library row
+ *   similar_to    links between library rows (N:M, recorded), to each
  *                 book's nearest books, weight = cosine similarity */
 #ifndef GF_VEC_H
 #define GF_VEC_H
@@ -62,6 +62,15 @@ cdb_status gf_vec_embed_book(gf_db *g, const gf_catalog *c, const gf_books *b, c
 /* Links every book vector to its GF_SIMILAR nearest; adds only links that
  * are missing. *added counts them. */
 cdb_status gf_vec_link_similar(gf_db *g, const gf_vec *v, uint64_t *added);
+
+/* Refreshes the passage neighbour graph until nothing is pending, in slices
+ * of GF_GRAPH_SLICE entries, calling progress after each with how many are
+ * done and still pending and the milliseconds so far. Each slice commits,
+ * so an interrupted refresh keeps what it did. */
+#define GF_GRAPH_SLICE 256u
+typedef void (*gf_graph_progress_fn)(size_t done, size_t pending, double ms, void *ctx);
+cdb_status gf_vec_refresh_graph(gf_db *g, const gf_vec *v, gf_graph_progress_fn progress, void *ctx,
+                                size_t *remaining);
 
 /* Encodes a vector value: f32, or with bits set, its sign bits. */
 size_t gf_vec_encode(const float *f, int bits, uint8_t *out, size_t cap);

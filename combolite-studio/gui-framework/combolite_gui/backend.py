@@ -78,6 +78,7 @@ class VectorGraph:
     ids: list            # entry ids
     vectors: list        # list[list[float]], same order as ids
     edges: list          # list[(i, j)] index pairs from the neighbour graph
+    labels: list = field(default_factory=list)  # what each vector points to, same order
 
 
 class BackendError(Exception):
@@ -126,6 +127,7 @@ class Backend:
     def vector_get(self, coll: str, vec_id: str) -> list[float]: self._todo("vector_get")
     def vector_put(self, coll: str, vec_id: str, vec: list[float]) -> None: self._todo("vector_put")
     def vector_delete(self, coll: str, vec_id: str) -> None: self._todo("vector_delete")
+    def vector_source_label(self, coll: str, vec_id: str) -> str: return ""   # what the vector points to
 
     # links
     def link_edges(self, name: str, limit: int | None = 500) -> Result: self._todo("link_edges")       # columns: source, target, ...
@@ -307,23 +309,21 @@ class NativeBackend(Backend):
         self._buffers = []
         self._he = None
         self._env = None
-        ingestion_proc = Procedure(
-            "ingestion_records", [],
-            "call ingestion_records",
-            "Display complete ingestion records of downloaded books with vectors, neurons, and links",
-            handler=self._execute_downloaded_books_query
-        )
+        # The library table records each ingested book, so these are plain
+        # queries (GutenFree Diet's layout)
         self._procs = {
-            "ingestion_records": ingestion_proc,
+            "ingestion_records": Procedure(
+                "ingestion_records", [], "from library",
+                "Every book whose text is stored: passages, words, passage keys, when ingested and embedded"),
             "downloaded_books": Procedure(
-                "downloaded_books", [],
-                "call ingestion_records",
-                "List all downloaded books with passage counts and vector ranges (alias for ingestion_records)",
-                handler=self._execute_downloaded_books_query
-            )
+                "downloaded_books", [], "select ebook, title, author, passages, first_passage, last_passage from library",
+                "The downloaded books with their passage counts and key ranges"),
         }
         self._link_cache = {}
         self._field_name_cache = {}
+        self._label_cache = {}
+        self._vec_count_cache = {}
+        self._label_body = None
         self._ts_extra = {}
 
     def _alloc(self, size: int):
@@ -397,6 +397,8 @@ class NativeBackend(Backend):
     def _open_or_create(self, path: str, create: bool) -> None:
         self.close()
         self._field_name_cache = {}
+        self._label_cache = {}
+        self._vec_count_cache = {}
         base = self._normalize_base(path)
 
         self._he = self.b_types["cdb_hostenv"]()
@@ -674,8 +676,13 @@ class NativeBackend(Backend):
                 m_buf = ct.create_string_buffer(64)
                 mv_buf = ct.create_string_buffer(64)
                 c.cdb_vec_describe(ct.byref(self._db), sid, ct.byref(cfg_v), m_buf, mv_buf)
-                meta = {"dims": cfg_v.dims, "metric": "cosine", "index": "neighbour graph"}
-                tot = max(0, int(info.next_entry_id) - 1) if info.next_entry_id else 0
+                tot, has_graph = self._vec_census(sid, int(info.next_entry_id or 0))
+                meta = {"dims": cfg_v.dims,
+                        "metric": {1: "cosine", 2: "dot", 3: "euclidean", 4: "hamming"}.get(cfg_v.measure, "?"),
+                        "index": "neighbour graph" if has_graph else "exact scan",
+                        "model": " ".join(x for x in (m_buf.raw[:cfg_v.model_len].decode("utf-8", "replace"),
+                                                      mv_buf.raw[:cfg_v.model_version_len].decode("utf-8", "replace"))
+                                          if x)}
                 stores.append(Store(name, Model.VECTOR, tot, meta=meta))
             elif model_val == self.b_types["CDB_MODEL_TIME_SERIES"]:
                 ts_summary = self._get_ts_store_summary(sid, info)
@@ -1114,7 +1121,10 @@ class NativeBackend(Backend):
                                   self.b_types["CDB_ORDER_LITTLE"], ct.byref(val))
         if s_read == self.b_types["CDB_OK"]:
             decoded = self.b_types["decode_value"](val, self.clib)
-            if isinstance(decoded, dict) and 1 in decoded and isinstance(decoded[1], str):
+            # Documents the studio writes keep JSON text in an unnamed field 1;
+            # a field with a name in the dictionary is real data
+            if (isinstance(decoded, dict) and 1 in decoded and isinstance(decoded[1], str)
+                    and self._field_name(sid, 1) is None):
                 try:
                     doc = json.loads(decoded[1])
                 except Exception:
@@ -1286,7 +1296,8 @@ class NativeBackend(Backend):
                 near = sorted(range(len(vecs)), key=lambda j: _cos_dist(a, vecs[j]) if j != i else 9)[:3]
                 edges.update((min(i, j), max(i, j)) for j in near)
 
-        return VectorGraph(ids, vecs, sorted(edges))
+        labels = [self.entry_label(sid, self._parse_vec_id(v)) for v in ids]
+        return VectorGraph(ids, vecs, sorted(edges), labels)
 
     def vector_put(self, coll: str, vec_id: str, vec: list[float]) -> None:
         sid = self._find_store_id(coll)
@@ -1312,6 +1323,7 @@ class NativeBackend(Backend):
                 c.cdb_tx_abort(ct.byref(self._db))
                 raise BackendError(f"Vector put failed: {self.b_types['status_str'](self.clib, s_ins)}")
         c.cdb_tx_commit(ct.byref(self._db))
+        self._vec_count_cache.pop(sid, None)
 
     def vector_delete(self, coll: str, vec_id: str) -> None:
         sid = self._find_store_id(coll)
@@ -1325,6 +1337,7 @@ class NativeBackend(Backend):
             c.cdb_tx_abort(ct.byref(self._db))
             raise BackendError(f"Vector delete failed: {self.b_types['status_str'](self.clib, s)}")
         c.cdb_tx_commit(ct.byref(self._db))
+        self._vec_count_cache.pop(sid, None)
 
     # ---- links
     def _parse_ref(self, target: str) -> cdb_ref:
@@ -1382,6 +1395,7 @@ class NativeBackend(Backend):
         vlen = ct.c_size_t()
         done = ct.c_int(0)
         rows = []
+        refs = []  # (source store, entry, target store, entry) per row
         import struct
 
         while c.cdb_index_next(ct.byref(cur), k_buf, 512, ct.byref(klen), v_buf, 128, ct.byref(vlen), ct.byref(done)) == self.b_types["CDB_OK"] and not done.value:
@@ -1390,7 +1404,7 @@ class NativeBackend(Backend):
             if klen.value == 40:
                 s_store, s_entry, l_type, t_store, t_entry = struct.unpack(">QQQQQ", raw_k[:40])
             elif klen.value == 58:
-                s_store, s_entry, s_fl, s_ts, l_type, t_store, t_entry, t_fl, t_ts = struct.unpack(">QQBQ Q QBQ", raw_k[:58])
+                s_store, s_entry, s_fl, s_ts, l_type, t_store, t_entry, t_fl, t_ts = struct.unpack(">QQBQ Q QQBQ", raw_k[:58])
             else:
                 continue
 
@@ -1403,8 +1417,13 @@ class NativeBackend(Backend):
             s_pfx = store_names.get(s_store, f"store{s_store}")
             t_pfx = store_names.get(t_store, f"store{t_store}")
             rows.append((f"{s_pfx}-{s_entry:05d}", f"{t_pfx}-{t_entry:05d}", date_str, round(w, 3)))
+            refs.append((s_store, s_entry, t_store, t_entry))
 
-        return Result(["source", "target", "created", "weight"], rows[:limit], len(rows), (time.perf_counter() - t0) * 1000)
+        # What each end is, for the rows shown (labels read the entries)
+        shown = [r + (self.entry_label(ref[0], ref[1]), self.entry_label(ref[2], ref[3]))
+                 for r, ref in zip(rows[:limit], refs[:limit])]
+        return Result(["source", "target", "created", "weight", "source_label", "target_label"], shown, len(rows),
+                      (time.perf_counter() - t0) * 1000)
 
     def link_add(self, name: str, source: str, target: str, weight: float = 1.0) -> None:
         c = self.clib.lib
@@ -1604,128 +1623,6 @@ class NativeBackend(Backend):
         if self._procs.pop(name, None) is None:
             raise BackendError(f"No procedure {name}")
 
-    def _execute_downloaded_books_query(self, text: str = "", t0: float = 0.0, limit: int | None = None) -> Result:
-        c = self.clib.lib
-        ct = self.ctypes
-
-        try:
-            sid_bv = self._find_store_id("book_vec")
-            sid_books = self._find_store_id("books")
-            schema = self.table_schema("books")
-        except Exception:
-            raise BackendError("this database has no ingestion data")
-
-        cols = [r[0] for r in schema.rows]
-        f_map = {}
-        for cname in cols:
-            fid = ct.c_uint64()
-            cn_b = cname.encode("utf-8")
-            s = c.cdb_table_column_id(ct.byref(self._db), sid_books, cn_b, len(cn_b), ct.byref(fid))
-            if s == self.b_types["CDB_OK"]:
-                f_map[fid.value] = cname
-        c_to_fid = {v: k for k, v in f_map.items()}
-
-        # Map similar_to edge counts per book_vec
-        edge_counts = {}
-        links_available = True
-        try:
-            edges_res = self.link_edges("similar_to", limit=None)
-            for r in edges_res.rows:
-                edge_counts[r[0]] = edge_counts.get(r[0], 0) + 1
-        except Exception:
-            links_available = False
-
-        cat_ptr = self.b_types["get_catalog_ptr"](ct.byref(self._db))
-        info = self.b_types["cdb_store_info"]()
-        s_cat = c.cdb_catalog_get_store(cat_ptr, sid_bv, ct.byref(info))
-        max_bv_id = int(info.next_entry_id) if (s_cat == self.b_types["CDB_OK"] and info.next_entry_id > 1) else None
-
-        enc_buf = ct.create_string_buffer(4096)
-        enc_len = ct.c_size_t()
-        src_store = ct.c_uint64()
-        src_entry = ct.c_uint64()
-        read_buf = ct.create_string_buffer(65536)
-        read_len = ct.c_size_t()
-
-        default_cols = [
-            "ebook", "title", "author", "passages", "doc_range",
-            "vectors_f32", "neurons_1bit", "book_vector", "similar_links"
-        ]
-        out_cols = default_cols
-
-        rows = []
-        unreadable_count = 0
-        consecutive_misses = 0
-        max_consecutive_misses = 100
-        bv_id = 1
-
-        while True:
-            if max_bv_id is not None and bv_id >= max_bv_id:
-                break
-            s = c.cdb_vec_get(ct.byref(self._db), sid_bv, bv_id, enc_buf, 4096, ct.byref(enc_len),
-                              ct.byref(src_store), ct.byref(src_entry))
-            if s == self.b_types["CDB_E_NOT_FOUND"]:
-                consecutive_misses += 1
-                if max_bv_id is None and consecutive_misses >= max_consecutive_misses:
-                    break
-                bv_id += 1
-                continue
-            elif s != self.b_types["CDB_OK"]:
-                raise BackendError(f"Vector get failed for book_vec-{bv_id:05d}: {self.b_types['status_str'](self.clib, s)}")
-
-            consecutive_misses = 0
-            eid = src_entry.value
-            s_get = c.cdb_table_get(ct.byref(self._db), sid_books, eid, read_buf, 65536, ct.byref(read_len))
-            if s_get == self.b_types["CDB_E_BUFFER_TOO_SMALL"]:
-                large_buf = ct.create_string_buffer(524288)
-                large_len = ct.c_size_t()
-                s_get = c.cdb_table_get(ct.byref(self._db), sid_books, eid, large_buf, 524288, ct.byref(large_len))
-                if s_get == self.b_types["CDB_OK"]:
-                    read_buf = large_buf
-                    read_len = large_len
-            if s_get != self.b_types["CDB_OK"]:
-                unreadable_count += 1
-                bv_id += 1
-                continue
-
-            val = self.b_types["cdb_value"]()
-            c.cdb_value_read(ct.cast(read_buf, ct.POINTER(ct.c_uint8)), read_len.value,
-                             self.b_types["CDB_ORDER_LITTLE"], ct.byref(val))
-            obj_dict = self.b_types["decode_value"](val, self.clib) or {}
-            passages = obj_dict.get(c_to_fid.get("passages")) or 0
-            first_p = obj_dict.get(c_to_fid.get("first_passage")) or 0
-            last_p = first_p + passages - 1 if passages > 0 else 0
-            bv_tag = f"book_vec-{bv_id:05d}"
-            n_links = edge_counts.get(bv_tag, 0)
-
-            rec = {
-                "ebook": obj_dict.get(c_to_fid.get("ebook")),
-                "title": obj_dict.get(c_to_fid.get("title")),
-                "author": obj_dict.get(c_to_fid.get("author")),
-                "passages": passages,
-                "first_passage": first_p,
-                "last_passage": last_p,
-                "doc_range": f"doc-{first_p:05d}..doc-{last_p:05d}",
-                "vectors_f32": f"passage_vec-{first_p:05d}..{last_p:05d} ({passages} x 384-dim)",
-                "neurons_1bit": f"passage_bits-{first_p:05d}..{last_p:05d} ({passages} x 384 neurons)",
-                "book_vector": f"{bv_tag} (384-dim mean)",
-                "similar_links": f"{n_links} links" if links_available else "unavailable",
-                "similar_to": f"{n_links} links" if links_available else "unavailable",
-            }
-            row_vals = tuple(rec.get(col, obj_dict.get(c_to_fid.get(col))) for col in out_cols)
-            rows.append(row_vals)
-            bv_id += 1
-            if limit is not None and len(rows) >= limit:
-                break
-
-        elapsed = (time.perf_counter() - t0) * 1000
-        msg = f"Retrieved {len(rows)} downloaded book ingestion records"
-        if unreadable_count:
-            msg += f" ({unreadable_count} unreadable)"
-        if not links_available:
-            msg += " (link counts unavailable)"
-        return Result(out_cols, rows, len(rows), elapsed, message=msg)
-
     def execute(self, text: str) -> Result:
         t0 = time.perf_counter()
         c = self.clib.lib
@@ -1736,12 +1633,10 @@ class NativeBackend(Backend):
         if m:
             p_name = m.group(1)
             p = self._procs.get(p_name)
-            if not p and p_name.lower() == "downloaded_books":
-                p = self._procs.get("ingestion_records")
             if not p:
                 raise BackendError(f"No procedure named {p_name}")
-            if getattr(p, "handler", None) or p_name in ("ingestion_records", "downloaded_books"):
-                handler = getattr(p, "handler", None) or self._execute_downloaded_books_query
+            if getattr(p, "handler", None):
+                handler = p.handler
                 lim = None
                 if m.group(2) and m.group(2).strip().isdigit():
                     lim = int(m.group(2).strip())
@@ -1891,6 +1786,84 @@ class NativeBackend(Backend):
             name = self._field_name(store_id, k) if isinstance(k, int) else None
             out[name if name else k] = v
         return out
+
+    def entry_label(self, store_id: int, entry: int) -> str:
+        """What an entry is, in words a person (or an agent) recognizes: a
+        document's summary, a table row's key and title, or for a vector the
+        label of the entry it was computed from. Cached until reopen."""
+        key = (store_id, entry)
+        if key in self._label_cache:
+            return self._label_cache[key]
+        c = self.clib.lib
+        ct = self.ctypes
+        ok = self.b_types["CDB_OK"]
+        name = self._store_names_map().get(store_id, f"store{store_id}")
+        label = f"{name} {entry}"
+        info = self.b_types["cdb_store_info"]()
+        cat_ptr = self.b_types["get_catalog_ptr"](ct.byref(self._db))
+        model = info.model if c.cdb_catalog_get_store(cat_ptr, store_id, ct.byref(info)) == ok else None
+        if self._label_body is None:
+            self._label_body = ct.create_string_buffer(self.DOC_MAX)
+        body, blen = self._label_body, ct.c_size_t()
+        if model == self.b_types["CDB_MODEL_DOCUMENT"]:
+            sbuf, slen = ct.create_string_buffer(512), ct.c_size_t()
+            if c.cdb_doc_get(ct.byref(self._db), store_id, entry, 0, body, self.DOC_MAX, ct.byref(blen),
+                             sbuf, 512, ct.byref(slen), None) == ok and slen.value:
+                label = sbuf.raw[:slen.value].decode("utf-8", errors="replace")
+        elif model == self.b_types["CDB_MODEL_RELATIONAL"]:
+            if c.cdb_table_get(ct.byref(self._db), store_id, entry, body, self.DOC_MAX, ct.byref(blen)) == ok:
+                val = self.b_types["cdb_value"]()
+                if c.cdb_value_read(ct.cast(body, ct.POINTER(ct.c_uint8)), blen.value,
+                                    self.b_types["CDB_ORDER_LITTLE"], ct.byref(val)) == ok:
+                    row = self._named(store_id, self.b_types["decode_value"](val, self.clib))
+                    if isinstance(row, dict):
+                        try:
+                            pk = self.table_schema(name).rows[0][0]
+                        except Exception:
+                            pk = None
+                        parts = [str(row[pk])] if pk in row else []
+                        for col in ("title", "name"):
+                            if row.get(col):
+                                parts.append(str(row[col]))
+                                break
+                        if parts:
+                            label = f"{name} " + " · ".join(parts)
+        elif model == self.b_types["CDB_MODEL_VECTOR"]:
+            src_store, src_entry = ct.c_uint64(), ct.c_uint64()
+            if c.cdb_vec_get(ct.byref(self._db), store_id, entry, body, self.DOC_MAX, ct.byref(blen),
+                             ct.byref(src_store), ct.byref(src_entry)) == ok and src_store.value:
+                label = self.entry_label(src_store.value, src_entry.value)
+        self._label_cache[key] = label
+        return label
+
+    def _vec_census(self, sid: int, next_id: int) -> tuple:
+        """(live vectors, has a neighbour graph) for a collection. Entry IDs
+        are claimed in blocks of 1024, so next_entry_id overstates the count:
+        the live ones are counted, once per next_entry_id (vector_put and
+        vector_delete drop the cached answer)."""
+        cached = self._vec_count_cache.get(sid)
+        if cached and cached[0] == next_id:
+            return cached[1], cached[2]
+        c = self.clib.lib
+        ct = self.ctypes
+        ok = self.b_types["CDB_OK"]
+        buf, blen = ct.create_string_buffer(8192), ct.c_size_t()
+        ss, se = ct.c_uint64(), ct.c_uint64()
+        live, first = 0, 0
+        for eid in range(1, next_id):
+            if c.cdb_vec_get(ct.byref(self._db), sid, eid, buf, 8192, ct.byref(blen), ct.byref(ss), ct.byref(se)) == ok:
+                live += 1
+                first = first or eid
+        has_graph = False
+        if first:
+            hits, n, fresh = (self.b_types["cdb_vec_hit"] * 1)(), ct.c_size_t(), ct.c_int()
+            has_graph = c.cdb_vec_neighbours(ct.byref(self._db), sid, first, hits, 1, ct.byref(n), ct.byref(fresh)) == ok
+        self._vec_count_cache[sid] = (next_id, live, has_graph)
+        return live, has_graph
+
+    def vector_source_label(self, coll: str, vec_id: str) -> str:
+        """The entry a vector was computed from, as entry_label gives it."""
+        return self.entry_label(self._find_store_id(coll), self._parse_vec_id(vec_id))
 
     def _run_query(self, wire, wire_len: int, t0: float) -> Result:
         c = self.clib.lib

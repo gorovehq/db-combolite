@@ -8,13 +8,21 @@
 
 #include <stdint.h>
 #include <strings.h>
+#include <time.h>
+
+#include "cdb_link.h"
 
 static const char *const col_names[GF_NCOLS] = {
     "ebook", "title", "author", "subtitle", "language", "credits", "sort_title",
 };
 
 static const char *const bib_names[GF_NBIB] = {
-    "type", "issued", "authors", "subjects", "locc", "bookshelves", "genre", "author_sort",
+    "media_type", "issued", "authors", "subjects", "locc", "bookshelves", "genre", "author_sort",
+};
+
+static const char *const lib_names[GF_NLIB] = {
+    "ebook", "title", "author", "language", "passages", "words",
+    "first_passage", "last_passage", "ingested", "embedded", "embed_model",
 };
 
 /* The second schema change: the pg_catalog.csv columns and the sort indexes
@@ -56,6 +64,8 @@ static cdb_status open_bib(gf_db *g, gf_catalog *c)
     return s;
 }
 
+static cdb_status open_library(gf_db *g, gf_catalog *c);
+
 cdb_status gf_catalog_open(gf_db *g, gf_catalog *c)
 {
     cdb_status s;
@@ -63,7 +73,7 @@ cdb_status gf_catalog_open(gf_db *g, gf_catalog *c)
     unsigned i;
 
     memset(c, 0, sizeof *c);
-    if ((s = cdb_db_find_store(&g->db, "books", 5, &c->store, &found)) != CDB_OK)
+    if ((s = cdb_db_find_store(&g->db, "catalog", 7, &c->store, &found)) != CDB_OK)
         return s;
     if (!found) {
         cdb_table_column cols[GF_NCOLS];
@@ -86,7 +96,7 @@ cdb_status gf_catalog_open(gf_db *g, gf_catalog *c)
         def.primary_key = pk;
         def.npk = 1;
         def.keep = 1; /* the catalog needs no history */
-        if ((s = cdb_table_create(&g->db, "books", 5, &def, &c->store)) != CDB_OK)
+        if ((s = cdb_table_create(&g->db, "catalog", 7, &def, &c->store)) != CDB_OK)
             return s;
         for (i = 0; i < GF_NCOLS; i++)
             if ((s = cdb_table_column_id(&g->db, c->store, col_names[i], strlen(col_names[i]), &c->field[i]))
@@ -102,66 +112,173 @@ cdb_status gf_catalog_open(gf_db *g, gf_catalog *c)
             != CDB_OK)
             return s;
 
-    /* The schema change: passage columns and the shelf index, once. */
-    s = cdb_table_column_id(&g->db, c->store, "passages", 8, &c->passages_field);
-    if (s == CDB_E_NOT_FOUND) {
-        cdb_table_column col;
-        uint32_t ix;
-        memset(&col, 0, sizeof col);
-        col.type = CDB_TYPE_INT;
-        col.name = "first_passage", col.name_len = 13;
-        if ((s = cdb_table_add_column(&g->db, c->store, &col, &c->first_field)) != CDB_OK)
-            return s;
-        col.name = "passages", col.name_len = 8;
-        if ((s = cdb_table_add_column(&g->db, c->store, &col, &c->passages_field)) != CDB_OK)
-            return s;
-        if ((s = cdb_table_create_index(&g->db, c->store, &c->passages_field, 1, 0, &ix)) != CDB_OK)
-            return s;
-        if (ix != GF_CATALOG_SHELF_INDEX)
-            return CDB_E_STATE;
-    } else if (s != CDB_OK
-               || (s = cdb_table_column_id(&g->db, c->store, "first_passage", 13, &c->first_field)) != CDB_OK) {
+    if ((s = open_bib(g, c)) != CDB_OK)
         return s;
-    }
-    return open_bib(g, c);
+    return open_library(g, c);
 }
 
-cdb_status gf_catalog_set_passages(gf_db *g, const gf_catalog *c, uint64_t entry, uint64_t first, uint64_t count)
+/* A link type, defined the first time. */
+static cdb_status link_type(gf_db *g, const char *name, unsigned card, unsigned on_delete, uint64_t *type)
 {
-    uint8_t buf[64];
+    int found;
+    cdb_status s = cdb_link_find_type(&g->db, name, strlen(name), type, &found);
+    if (s != CDB_OK || found)
+        return s;
+    return cdb_link_define_type(&g->db, name, strlen(name), card, 1, on_delete, type);
+}
+
+/* The library table and the links from it. */
+static cdb_status open_library(gf_db *g, gf_catalog *c)
+{
+    cdb_status s;
+    int found;
+    unsigned i;
+
+    if ((s = cdb_db_find_store(&g->db, "library", 7, &c->lib_store, &found)) != CDB_OK)
+        return s;
+    if (!found) {
+        cdb_table_column cols[GF_NLIB];
+        static const unsigned pk[1] = { GF_LIB_EBOOK };
+        cdb_table_def def;
+        memset(cols, 0, sizeof cols);
+        for (i = 0; i < GF_NLIB; i++) {
+            cols[i].name = lib_names[i];
+            cols[i].name_len = strlen(lib_names[i]);
+            cols[i].type = CDB_TYPE_STRING;
+        }
+        cols[GF_LIB_EBOOK].type = CDB_TYPE_INT;
+        cols[GF_LIB_PASSAGES].type = CDB_TYPE_INT;
+        cols[GF_LIB_WORDS].type = CDB_TYPE_INT;
+        cols[GF_LIB_TITLE].not_null = 1;
+        memset(&def, 0, sizeof def);
+        def.columns = cols;
+        def.ncolumns = GF_NLIB;
+        def.primary_key = pk;
+        def.npk = 1;
+        def.keep = 1;
+        if ((s = cdb_table_create(&g->db, "library", 7, &def, &c->lib_store)) != CDB_OK)
+            return s;
+    }
+    for (i = 0; i < GF_NLIB; i++)
+        if ((s = cdb_table_column_id(&g->db, c->lib_store, lib_names[i], strlen(lib_names[i]), &c->lib[i]))
+            != CDB_OK)
+            return s;
+    /* A library row is its catalog row's text; removing it removes its
+     * passages' membership, not the passages (the reader keeps working) */
+    if ((s = link_type(g, "in_catalog", CDB_CARD_1_1, CDB_LINK_ON_DELETE_TOMBSTONE, &c->in_catalog)) != CDB_OK)
+        return s;
+    return link_type(g, "has_passage", CDB_CARD_1_N, CDB_LINK_ON_DELETE_TOMBSTONE, &c->has_passage);
+}
+
+void gf_iso_now(char *out, size_t cap)
+{
+    time_t t = time(NULL);
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    strftime(out, cap, "%Y-%m-%dT%H:%M:%SZ", &tm);
+}
+
+typedef struct colval {
+    uint64_t id;
+    const char *s;  /* NULL: the int */
+    int64_t i;
+} colval;
+
+static int by_id(const void *a, const void *b)
+{
+    uint64_t x = ((const colval *)a)->id, y = ((const colval *)b)->id;
+    return x < y ? -1 : x > y;
+}
+
+/* Encodes the columns as an object, in field-ID order (spec 14.6.5). */
+static cdb_status encode_cols(colval *v, size_t n, uint8_t *out, size_t cap, size_t *len)
+{
     cdb_value_writer w;
-    int swap = c->first_field > c->passages_field;
-    cdb_value_writer_init(&w, buf, sizeof buf, GF_ORDER, CDB_DECIMAL_COMPACT);
+    size_t i;
+    qsort(v, n, sizeof v[0], by_id);
+    cdb_value_writer_init(&w, out, cap, GF_ORDER, CDB_DECIMAL_COMPACT);
     cdb_value_begin_object(&w);
-    cdb_value_field(&w, swap ? c->passages_field : c->first_field);
-    cdb_value_write_int(&w, (int64_t)(swap ? count : first));
-    cdb_value_field(&w, swap ? c->first_field : c->passages_field);
-    cdb_value_write_int(&w, (int64_t)(swap ? first : count));
+    for (i = 0; i < n; i++) {
+        cdb_value_field(&w, v[i].id);
+        if (v[i].s == NULL)
+            cdb_value_write_int(&w, v[i].i);
+        else
+            cdb_value_write_string(&w, v[i].s, strlen(v[i].s));
+    }
     cdb_value_end_object(&w);
-    if (w.error != CDB_OK)
-        return w.error;
-    return cdb_table_update(&g->db, c->store, entry, buf, cdb_value_writer_len(&w));
+    *len = cdb_value_writer_len(&w);
+    return w.error;
+}
+
+cdb_status gf_library_add(gf_db *g, const gf_catalog *c, uint64_t row, const gf_book *b, uint64_t passages,
+                          uint64_t words, const char *first_key, const char *last_key, uint64_t *lib_row)
+{
+    static uint8_t buf[4096];
+    char now[32];
+    colval v[GF_NLIB];
+    size_t n = 0, len;
+    cdb_status s;
+
+    gf_iso_now(now, sizeof now);
+    v[n].id = c->lib[GF_LIB_EBOOK], v[n].s = NULL, v[n].i = b->ebook, n++;
+    v[n].id = c->lib[GF_LIB_TITLE], v[n].s = b->title, n++;
+    if (b->author[0])
+        v[n].id = c->lib[GF_LIB_AUTHOR], v[n].s = b->author, n++;
+    if (b->language[0])
+        v[n].id = c->lib[GF_LIB_LANGUAGE], v[n].s = b->language, n++;
+    v[n].id = c->lib[GF_LIB_PASSAGES], v[n].s = NULL, v[n].i = (int64_t)passages, n++;
+    v[n].id = c->lib[GF_LIB_WORDS], v[n].s = NULL, v[n].i = (int64_t)words, n++;
+    v[n].id = c->lib[GF_LIB_FIRST], v[n].s = first_key, n++;
+    v[n].id = c->lib[GF_LIB_LAST], v[n].s = last_key, n++;
+    v[n].id = c->lib[GF_LIB_INGESTED], v[n].s = now, n++;
+    if ((s = encode_cols(v, n, buf, sizeof buf, &len)) != CDB_OK)
+        return s;
+    if ((s = cdb_table_insert(&g->db, c->lib_store, buf, len, lib_row)) != CDB_OK)
+        return s;
+    return cdb_link_add(&g->db, c->in_catalog, cdb_ref_entry(c->lib_store, *lib_row), cdb_ref_entry(c->store, row),
+                        1.0f, 0);
+}
+
+cdb_status gf_library_set_embedded(gf_db *g, const gf_catalog *c, uint64_t lib_row, const char *model)
+{
+    uint8_t buf[256];
+    char now[32];
+    colval v[2];
+    size_t len;
+    cdb_status s;
+
+    gf_iso_now(now, sizeof now);
+    v[0].id = c->lib[GF_LIB_EMBEDDED], v[0].s = now;
+    v[1].id = c->lib[GF_LIB_MODEL], v[1].s = model;
+    if ((s = encode_cols(v, 2, buf, sizeof buf, &len)) != CDB_OK)
+        return s;
+    return cdb_table_update(&g->db, c->lib_store, lib_row, buf, len);
 }
 
 cdb_status gf_catalog_shelf(gf_db *g, const gf_catalog *c, cdb_table_cursor *cur, uint64_t *entries, size_t max,
                             size_t *n)
 {
-    /* passages from 1 to the largest int: rows without text are left out
-     * wherever nulls sort. */
-    uint8_t lo[16], hi[16];
-    cdb_value_writer w;
-    size_t lo_len, hi_len;
-    cdb_value_writer_init(&w, lo, sizeof lo, GF_ORDER, CDB_DECIMAL_COMPACT);
-    cdb_value_begin_array(&w);
-    cdb_value_write_int(&w, 1);
-    cdb_value_end_array(&w);
-    lo_len = cdb_value_writer_len(&w);
-    cdb_value_writer_init(&w, hi, sizeof hi, GF_ORDER, CDB_DECIMAL_COMPACT);
-    cdb_value_begin_array(&w);
-    cdb_value_write_int(&w, INT64_MAX);
-    cdb_value_end_array(&w);
-    hi_len = cdb_value_writer_len(&w);
-    return cdb_table_scan(&g->db, c->store, GF_CATALOG_SHELF_INDEX, lo, lo_len, hi, hi_len, cur, entries, max, n);
+    uint64_t lib[64];
+    size_t got = 0, i;
+    cdb_status s;
+
+    *n = 0;
+    while (*n < max) {
+        size_t want = max - *n < 64 ? max - *n : 64;
+        if ((s = cdb_table_scan(&g->db, c->lib_store, CDB_TABLE_NO_INDEX, NULL, 0, NULL, 0, cur, lib, want, &got))
+                != CDB_OK || got == 0)
+            return s;
+        for (i = 0; i < got; i++) {
+            cdb_link out;
+            size_t k = 0;
+            if ((s = cdb_link_list(&g->db, cdb_ref_entry(c->lib_store, lib[i]), CDB_LINK_OUT, c->in_catalog, NULL,
+                                   &out, 1, &k)) != CDB_OK)
+                return s;
+            if (k == 1)
+                entries[(*n)++] = out.target.entry;
+        }
+    }
+    return CDB_OK;
 }
 
 /* ------------------------------------------------------------ text */
@@ -205,6 +322,19 @@ void gf_utf8_clean(char *s)
         }
         p += n + 1;
     }
+}
+
+/* A column value that clears the column: written as null */
+static const char null_value[] = "";
+
+/* A title with a '?' right before a letter or digit: GUTINDEX's stand-in
+ * for a character it could not represent, never a question mark. */
+static int garbled(const char *t)
+{
+    for (const char *q = strchr(t, '?'); q != NULL; q = strchr(q + 1, '?'))
+        if (isalnum((unsigned char)q[1]))
+            return 1;
+    return 0;
 }
 
 /* Appends src to dst (cap bytes), stopping at a character boundary. */
@@ -339,18 +469,6 @@ static void close_tag(gentry *en)
 
 /* ------------------------------------------------------------ rows */
 
-typedef struct colval {
-    uint64_t id;
-    const char *s;  /* NULL: the int */
-    int64_t i;
-} colval;
-
-static int by_id(const void *a, const void *b)
-{
-    uint64_t x = ((const colval *)a)->id, y = ((const colval *)b)->id;
-    return x < y ? -1 : x > y;
-}
-
 static cdb_status encode_row(const gf_catalog *c, const gentry *en, uint8_t *buf, size_t cap, size_t *len)
 {
     char title[1024], author[512], sort[GF_SORT_MAX + 1];
@@ -416,7 +534,7 @@ typedef struct ingest {
 
 static cdb_status commit_batch(ingest *in, int reopen)
 {
-    cdb_status s = cdb_tx_commit(&in->g->db);
+    cdb_status s = gf_db_commit(in->g);
     double t;
     if (s != CDB_OK)
         return s;
@@ -457,9 +575,12 @@ static cdb_status flush_entry(ingest *in, gentry *en)
     s = cdb_table_insert(&in->g->db, in->c->store, in->row, len, &row_entry);
     if (s == CDB_E_EXISTS)
         in->st->duplicates++;
-    else if (s == CDB_E_SCHEMA || s == CDB_E_OVERFLOW)
-        in->st->refused++;
-    else if (s != CDB_OK)
+    else if (s == CDB_E_SCHEMA || s == CDB_E_OVERFLOW) {
+        if (in->st->refused++ == 0) {
+            in->st->first_refused = s;
+            in->st->first_refused_ebook = en->ebook;
+        }
+    } else if (s != CDB_OK)
         return s;
     else
         in->st->inserted++;
@@ -564,6 +685,8 @@ static void get_str(const cdb_value *obj, uint64_t id, char *out, size_t cap)
         append(out, cap, (const char *)v.payload, v.payload_len);
 }
 
+static cdb_status read_library(gf_db *g, const gf_catalog *c, gf_book *b);
+
 cdb_status gf_catalog_read(gf_db *g, const gf_catalog *c, uint64_t entry, gf_book *b)
 {
     static uint8_t buf[32768];
@@ -584,12 +707,6 @@ cdb_status gf_catalog_read(gf_db *g, const gf_catalog *c, uint64_t entry, gf_boo
     get_str(&obj, c->field[GF_COL_SUBTITLE], b->subtitle, sizeof b->subtitle);
     get_str(&obj, c->field[GF_COL_LANGUAGE], b->language, sizeof b->language);
     get_str(&obj, c->field[GF_COL_CREDITS], b->credits, sizeof b->credits);
-    if (cdb_value_object_get(&obj, GF_ORDER, c->first_field, &v, &found) == CDB_OK && found
-        && v.type == CDB_TYPE_INT)
-        b->first_passage = (uint64_t)v.as.i64;
-    if (cdb_value_object_get(&obj, GF_ORDER, c->passages_field, &v, &found) == CDB_OK && found
-        && v.type == CDB_TYPE_INT)
-        b->passages = (uint64_t)v.as.i64;
     get_str(&obj, c->bib[GF_BIB_TYPE], b->type, sizeof b->type);
     get_str(&obj, c->bib[GF_BIB_ISSUED], b->issued, sizeof b->issued);
     get_str(&obj, c->bib[GF_BIB_AUTHORS], b->authors, sizeof b->authors);
@@ -597,6 +714,50 @@ cdb_status gf_catalog_read(gf_db *g, const gf_catalog *c, uint64_t entry, gf_boo
     get_str(&obj, c->bib[GF_BIB_LOCC], b->locc, sizeof b->locc);
     get_str(&obj, c->bib[GF_BIB_SHELVES], b->shelves, sizeof b->shelves);
     get_str(&obj, c->bib[GF_BIB_GENRE], b->genre, sizeof b->genre);
+    return read_library(g, c, b);
+}
+
+/* The library's part of a book, when its text is stored: the row with the
+ * same ebook number, and its first passage by has_passage (links list in
+ * key order, so the lowest entry, which is the first stored). */
+static cdb_status read_library(gf_db *g, const gf_catalog *c, gf_book *b)
+{
+    static uint8_t buf[4096];
+    uint8_t key[16];
+    cdb_value_writer w;
+    cdb_value obj, v;
+    cdb_link first;
+    size_t len, k = 0;
+    int found;
+    cdb_status s;
+
+    cdb_value_writer_init(&w, key, sizeof key, GF_ORDER, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_array(&w);
+    cdb_value_write_int(&w, b->ebook);
+    cdb_value_end_array(&w);
+    if ((s = cdb_table_find(&g->db, c->lib_store, key, cdb_value_writer_len(&w), &b->lib_row, &found)) != CDB_OK
+        || !found) {
+        b->lib_row = 0;
+        return s;
+    }
+    if ((s = cdb_table_get(&g->db, c->lib_store, b->lib_row, buf, sizeof buf, &len)) != CDB_OK
+        || (s = cdb_value_read(buf, len, GF_ORDER, &obj)) != CDB_OK)
+        return s;
+    if (cdb_value_object_get(&obj, GF_ORDER, c->lib[GF_LIB_PASSAGES], &v, &found) == CDB_OK && found
+        && v.type == CDB_TYPE_INT)
+        b->passages = (uint64_t)v.as.i64;
+    if (cdb_value_object_get(&obj, GF_ORDER, c->lib[GF_LIB_WORDS], &v, &found) == CDB_OK && found
+        && v.type == CDB_TYPE_INT)
+        b->words = (uint64_t)v.as.i64;
+    get_str(&obj, c->lib[GF_LIB_FIRST], b->first_key, sizeof b->first_key);
+    get_str(&obj, c->lib[GF_LIB_LAST], b->last_key, sizeof b->last_key);
+    get_str(&obj, c->lib[GF_LIB_INGESTED], b->ingested, sizeof b->ingested);
+    get_str(&obj, c->lib[GF_LIB_EMBEDDED], b->embedded, sizeof b->embedded);
+    if ((s = cdb_link_list(&g->db, cdb_ref_entry(c->lib_store, b->lib_row), CDB_LINK_OUT, c->has_passage, NULL,
+                           &first, 1, &k)) != CDB_OK)
+        return s;
+    if (k == 1)
+        b->first_passage = first.target.entry;
     return CDB_OK;
 }
 
@@ -711,7 +872,7 @@ static const char *language_name(const char *code)
 static cdb_status merge_commit(gf_db *g, gf_ingest_stats *st, unsigned *in_batch, double *t0, gf_progress_fn progress,
                                void *ctx, int reopen)
 {
-    cdb_status s = cdb_tx_commit(&g->db);
+    cdb_status s = gf_db_commit(g);
     if (s != CDB_OK)
         return s;
     st->batches++;
@@ -800,17 +961,37 @@ cdb_status gf_catalog_merge_csv(gf_db *g, const gf_catalog *c, const char *path,
 
         if ((s = gf_catalog_find(g, c, ebook, &entry, &found)) != CDB_OK)
             break;
-        if (!found) { /* not in GUTINDEX: a whole row from the CSV */
-            title[0] = sub[0] = '\0';
-            append(title, sizeof title, fields[3], strlen(fields[3]));
-            if ((nl = strchr(title, '\n')) != NULL) {
-                *nl = '\0';
-                append(sub, sizeof sub, nl + 1, strlen(nl + 1));
-                for (char *q = sub; *q; q++)
-                    if (*q == '\n')
-                        *q = ' ';
+        /* The CSV's title: its first line, the rest a subtitle */
+        title[0] = sub[0] = '\0';
+        append(title, sizeof title, fields[3], strlen(fields[3]));
+        if ((nl = strchr(title, '\n')) != NULL) {
+            *nl = '\0';
+            append(sub, sizeof sub, nl + 1, strlen(nl + 1));
+            for (char *q = sub; *q; q++)
+                if (*q == '\n')
+                    *q = ' ';
+        }
+        sort_title(title, sort);
+        if (found) {
+            static gf_book old;
+            /* GUTINDEX names a language only when it is not English, so a
+             * French book it does not mark reads as English: the CSV's
+             * language is the one to keep */
+            if (fields[4][0])
+                v[n].id = c->field[GF_COL_LANGUAGE], v[n].s = language_name(fields[4]), n++;
+            /* GUTINDEX replaced letters it could not represent with '?'
+             * ("Sensibilit?tome"); the CSV has the real title, and its
+             * subtitle or none */
+            if (title[0] && strchr(title, '?') == NULL && gf_catalog_read(g, c, entry, &old) == CDB_OK) {
+                if (garbled(old.title)) {
+                    v[n].id = c->field[GF_COL_TITLE], v[n].s = title, n++;
+                    v[n].id = c->field[GF_COL_SORT], v[n].s = sort, n++;
+                    st->retitled++;
+                }
+                if (garbled(old.subtitle))
+                    v[n].id = c->field[GF_COL_SUBTITLE], v[n].s = sub[0] ? sub : null_value, n++;
             }
-            sort_title(title, sort);
+        } else { /* not in GUTINDEX: a whole row from the CSV */
             v[n].id = c->field[GF_COL_EBOOK], v[n].s = NULL, v[n].i = ebook, n++;
             v[n].id = c->field[GF_COL_TITLE], v[n].s = title[0] ? title : "(untitled)", n++;
             v[n].id = c->field[GF_COL_LANGUAGE], v[n].s = language_name(fields[4]), n++;
@@ -827,6 +1008,8 @@ cdb_status gf_catalog_merge_csv(gf_db *g, const gf_catalog *c, const char *path,
             cdb_value_field(&w, v[i].id);
             if (v[i].s == NULL)
                 cdb_value_write_int(&w, v[i].i);
+            else if (v[i].s == null_value)
+                cdb_value_write_null(&w);
             else
                 cdb_value_write_string(&w, v[i].s, strlen(v[i].s));
         }

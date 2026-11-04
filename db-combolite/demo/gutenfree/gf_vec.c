@@ -66,8 +66,15 @@ size_t gf_vec_encode(const float *f, int bits, uint8_t *out, size_t cap)
 cdb_status gf_vec_book_entry(gf_db *g, const gf_catalog *c, const gf_vec *v, uint64_t row, uint64_t *entry,
                              int *found)
 {
+    static gf_book b;
     size_t n = 0;
-    cdb_status s = cdb_vec_by_source(&g->db, v->books, c->store, row, entry, 1, &n);
+    cdb_status s = gf_catalog_read(g, c, row, &b);
+
+    *found = 0;
+    if (s != CDB_OK || b.lib_row == 0)
+        return s;
+    /* A book vector's source is the book's library row */
+    s = cdb_vec_by_source(&g->db, v->books, c->lib_store, b.lib_row, entry, 1, &n);
     *found = s == CDB_OK && n > 0;
     return s;
 }
@@ -90,7 +97,7 @@ cdb_status gf_vec_job_start(gf_db *g, const gf_catalog *c, const gf_vec *v, uint
     j->row = row;
     if ((s = gf_catalog_read(g, c, row, &j->bk)) != CDB_OK)
         return s;
-    if (j->bk.passages == 0)
+    if (j->bk.lib_row == 0 || j->bk.passages == 0)
         return CDB_E_NOT_FOUND;
     if ((s = gf_vec_book_entry(g, c, v, row, &entry, &found)) != CDB_OK)
         return s;
@@ -151,13 +158,15 @@ cdb_status gf_vec_job_commit(gf_db *g, const gf_catalog *c, const gf_books *b, c
     }
     if (s == CDB_OK) {
         len = gf_vec_encode(book, 0, enc, sizeof enc);
-        s = cdb_vec_insert(&g->db, v->books, enc, len, c->store, j->row, &entry);
+        s = cdb_vec_insert(&g->db, v->books, enc, len, c->lib_store, j->bk.lib_row, &entry);
     }
+    if (s == CDB_OK)
+        s = gf_library_set_embedded(g, c, j->bk.lib_row, MODEL " " VERSION);
     if (s != CDB_OK) {
         cdb_tx_abort(&g->db);
         return s;
     }
-    s = cdb_tx_commit(&g->db);
+    s = gf_db_commit(g);
     j->st.commit_ms = gf_now_ms() - t;
     j->st.passages = j->n;
     return s;
@@ -182,6 +191,27 @@ cdb_status gf_vec_embed_book(gf_db *g, const gf_catalog *c, const gf_books *b, c
     return s;
 }
 
+cdb_status gf_vec_refresh_graph(gf_db *g, const gf_vec *v, gf_graph_progress_fn progress, void *ctx,
+                                size_t *remaining)
+{
+    double t0 = gf_now_ms();
+    size_t done = 0, pending = 0, before;
+    cdb_status s = cdb_vec_refresh(&g->db, v->passages, 1, &pending); /* learns the size of the work */
+
+    if (s == CDB_OK)
+        done = 1;
+    while (s == CDB_OK && pending > 0) {
+        before = pending;
+        s = cdb_vec_refresh(&g->db, v->passages, GF_GRAPH_SLICE, &pending);
+        done += before > pending ? before - pending : 0;
+        if (progress != NULL)
+            progress(done, pending, gf_now_ms() - t0, ctx);
+    }
+    if (remaining != NULL)
+        *remaining = pending;
+    return s;
+}
+
 cdb_status gf_vec_link_similar(gf_db *g, const gf_vec *v, uint64_t *added)
 {
     static uint8_t enc[VEC_BYTES];
@@ -193,7 +223,9 @@ cdb_status gf_vec_link_similar(gf_db *g, const gf_vec *v, uint64_t *added)
     *added = 0;
     if ((s = cdb_tx_begin(&g->db, CDB_DURABILITY_DEFAULT)) != CDB_OK)
         return s;
-    /* Book vectors have entry IDs 1, 2, ...: walk until one is missing. */
+    /* Book vectors have entry IDs 1, 2, ...: walk until one is missing. The
+     * links join the books themselves, the library rows the vectors come
+     * from, so they read as "this book is similar to that one". */
     for (entry = 1; s == CDB_OK; entry++) {
         cdb_ref from, to;
         s = cdb_vec_get(&g->db, v->books, entry, enc, sizeof enc, &len, &src_store, &src_entry);
@@ -204,12 +236,12 @@ cdb_status gf_vec_link_similar(gf_db *g, const gf_vec *v, uint64_t *added)
         if (s != CDB_OK || (s = cdb_vec_search(&g->db, v->books, enc, len, CDB_VEC_BASE, hits, GF_SIMILAR + 1, &n))
                                != CDB_OK)
             break;
-        from = cdb_ref_entry(v->books, entry);
+        from = cdb_ref_entry(src_store, src_entry);
         for (i = 0; i < n; i++) {
             cdb_status ls;
             if (hits[i].entry == entry)
                 continue;
-            to = cdb_ref_entry(v->books, hits[i].entry);
+            to = cdb_ref_entry(hits[i].source_store, hits[i].source_entry);
             ls = cdb_link_add(&g->db, v->similar, from, to, (float)(1.0 - hits[i].distance), 0);
             if (ls == CDB_OK)
                 (*added)++;
@@ -221,5 +253,5 @@ cdb_status gf_vec_link_similar(gf_db *g, const gf_vec *v, uint64_t *added)
         cdb_tx_abort(&g->db);
         return s;
     }
-    return cdb_tx_commit(&g->db);
+    return gf_db_commit(g);
 }

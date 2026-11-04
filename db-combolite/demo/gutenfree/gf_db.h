@@ -37,6 +37,14 @@ typedef struct gf_db {
 /* Opens <base>.cdbarch, creating it if it does not exist. */
 cdb_status gf_db_open(gf_db *g, const char *base);
 
+/* Commits the open transaction, then reconciles when this process holds
+ * most of its entry-ID blocks: the coordinator holds at most
+ * CDB_COORD_MAX_BLOCKS of them (21 x 1024 IDs, across all stores) and
+ * releases one only once reconciliation has recorded its store's next entry
+ * ID, so a long ingest that never reconciles stops at 21,504 new entries
+ * with CDB_E_OVERFLOW (docs/BACKLOG.md). */
+cdb_status gf_db_commit(gf_db *g);
+
 /* Closes the database (one file at rest) and frees the buffers. */
 cdb_status gf_db_close(gf_db *g);
 

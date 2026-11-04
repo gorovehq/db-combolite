@@ -128,7 +128,7 @@ static int field(int y, const char *label, const char *value, int maxy)
 void gf_screen_book(gf_app *a, uint64_t entry)
 {
     gf_book b;
-    char num[32], text[96];
+    char num[32], text[256];
     double t0 = gf_now_ms(), ms;
     cdb_status s = gf_catalog_read(a->g, &a->cat, entry, &b);
     int y = 1;
@@ -152,11 +152,18 @@ void gf_screen_book(gf_app *a, uint64_t entry)
         y = field(y, "Issued", b.issued, LINES - 2);
         y = field(y, "LoCC", b.locc, LINES - 2);
         y = field(y, "Type", b.type, LINES - 2);
-        if (b.passages > 0)
-            snprintf(text, sizeof text, "%llu passages: press r to read", (unsigned long long)b.passages);
-        else
-            snprintf(text, sizeof text, "not on the shelf yet: press a to fetch and add it");
-        field(y, "Text", text, LINES - 2);
+        if (b.passages > 0) {
+            char when[160];
+            snprintf(text, sizeof text, "%llu passages (%s to %s), %llu words: press r to read",
+                     (unsigned long long)b.passages, b.first_key, b.last_key, (unsigned long long)b.words);
+            y = field(y, "Library", text, LINES - 2);
+            snprintf(when, sizeof when, "ingested %s; %s%s", b.ingested, b.embedded[0] ? "embedded " : "not embedded yet",
+                     b.embedded);
+            field(y, "Stored", when, LINES - 2);
+        } else {
+            snprintf(text, sizeof text, "not in the library yet: press a to fetch and add it");
+            field(y, "Library", text, LINES - 2);
+        }
     }
     gf_status(" row %llu read in %.3f ms | r: read | a: add | m: more like this | any other key: back ",
               (unsigned long long)entry, ms);
@@ -1082,26 +1089,29 @@ void gf_screen_similar(gf_app *a, uint64_t row)
     char status[160];
     double t0 = gf_now_ms();
 
-    memset(&from, 0, sizeof from);
+    uint64_t book_vec;
 
-    if (gf_vec_book_entry(a->g, &a->cat, &a->vec, row, &from.entry, &found) == CDB_OK && found) {
-        from.store = a->vec.books;
+    memset(&from, 0, sizeof from);
+    /* similar_to joins library rows; in_catalog leads each to its catalog row */
+    if (gf_vec_book_entry(a->g, &a->cat, &a->vec, row, &book_vec, &found) == CDB_OK && found) {
+        static gf_book self;
+        gf_catalog_read(a->g, &a->cat, row, &self);
+        from = cdb_ref_entry(a->cat.lib_store, self.lib_row);
         cdb_link_list(&a->g->db, from, CDB_LINK_OUT, a->vec.similar, NULL, out, GF_SIMILAR * 4, &n);
     }
     for (i = 0; i < n; i++) {
-        uint8_t enc[2048];
-        size_t len;
-        uint64_t ss, se;
+        cdb_link cat;
+        size_t k1 = 0;
         gf_book b;
         if ((out[i].flags & CDB_LINK_TOMBSTONE) != 0
-            || cdb_vec_get(&a->g->db, a->vec.books, out[i].target.entry, enc, sizeof enc, &len, &ss, &se) != CDB_OK
-            || gf_catalog_read(a->g, &a->cat, se, &b) != CDB_OK)
+            || cdb_link_list(&a->g->db, out[i].target, CDB_LINK_OUT, a->cat.in_catalog, NULL, &cat, 1, &k1) != CDB_OK
+            || k1 != 1 || gf_catalog_read(a->g, &a->cat, cat.target.entry, &b) != CDB_OK)
             continue;
         snprintf(lines[m], PICK_LINE, "%.3f  %7lld  %.250s%s%.200s", out[i].weight, (long long)b.ebook, b.title,
                  b.author[0] ? " -- " : "", b.author);
-        rows[m++] = se;
+        rows[m++] = cat.target.entry;
     }
-    snprintf(status, sizeof status, " %zu similar_to links (links + vectors + rows: %.2f ms) | Enter: open | q: back ",
+    snprintf(status, sizeof status, " %zu similar_to links (links + rows: %.2f ms) | Enter: open | q: back ",
              m, gf_now_ms() - t0);
     if (!found)
         snprintf(status, sizeof status, " this book has no vectors yet: press e on the main menu | q: back ");
@@ -1119,6 +1129,18 @@ static void bar(int y, int x, int width, double frac)
     for (i = 0; i < width; i++)
         addch(i < fill ? ACS_CKBOARD : ' ');
     addch(']');
+}
+
+/* The graph refresh on the embed screen: a bar, the counts, time to go. */
+static void screen_graph_progress(size_t done, size_t pending, double ms, void *ctx)
+{
+    double rate = ms > 0 ? (double)done / (ms / 1000.0) : 0;
+    (void)ctx;
+    bar(6, 4, 40, done + pending > 0 ? (double)done / (double)(done + pending) : 1.0);
+    printw(" %zu of %zu, %.0f/s, about %.0f s to go", done, done + pending, rate,
+           rate > 0 ? (double)pending / rate : 0.0);
+    clrtoeol();
+    refresh();
 }
 
 void gf_screen_embed(gf_app *a)
@@ -1193,7 +1215,9 @@ void gf_screen_embed(gf_app *a)
         refresh();
         t = gf_now_ms();
         if (s == CDB_OK)
-            s = cdb_vec_refresh(&a->g->db, a->vec.passages, 0, &remaining);
+            s = gf_vec_refresh_graph(a->g, &a->vec, screen_graph_progress, NULL, &remaining);
+        move(6, 0);
+        clrtoeol();
         mvprintw(5, 4, "neighbour graph: %s, refreshed in %.0f ms, %zu pending", cdb_status_str(s), gf_now_ms() - t,
                  remaining);
         gf_metric("vec.graph_refresh_ms", gf_now_ms() - t);

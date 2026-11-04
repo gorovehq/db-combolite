@@ -214,7 +214,7 @@ cdb_status gf_metrics_flush(gf_db *g)
         return s;
     }
     M.error[0] = '\0';
-    if ((s = cdb_tx_commit(&g->db)) != CDB_OK)
+    if ((s = gf_db_commit(g)) != CDB_OK)
         return s;
     gf_metric("ts.flush_ms", gf_now_ms() - t0); /* written with the next flush */
     return CDB_OK;
