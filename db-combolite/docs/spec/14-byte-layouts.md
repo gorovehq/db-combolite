@@ -1104,11 +1104,13 @@ One record per entry:
   |---|---|---|
   | changes | sequence · entry ID | kind (1): 1 inserted or replaced, 2 deleted |
   | changes | 0 · 0 | trimmed-through sequence (8, big-endian): the log holds every change after it |
+  | changes | 0 · cursor number | a named cursor: read-up-to sequence (8, big-endian) · name (1–64 bytes, UTF-8) |
 
-  Entry ID 0 and sequence 0 are never used, so the row under 0 · 0 can't be mistaken for a change.
+  Entry ID 0 and sequence 0 are never used, so the rows under sequence 0 can't be mistaken for changes.
+- **Named cursors** (Section 18.12). Cursor numbers start at 1; a new cursor takes one above the highest in use, and names are unique within a collection. Opening a cursor sets its sequence to the collection's change stamp. Opening, advancing and dropping one are catalog changes (4.7), so each commits at once. A cursor's sequence never moves backwards.
 - **The sequence.** A change is keyed by the committed sequence of the archive commit that makes it durable: the committed sequence of the archive the change is applied to, plus one. A process whose archive moves before then rebases and applies the change again (5.9.1), so its key follows. Two changes to one entry under one sequence share a row, and the later one's kind stands.
 - **The change stamp** of a collection (18.6) is the sequence of its newest row, or the trimmed-through sequence when the log has no change rows.
-- **Trimming.** At reconciliation, the baton holder deletes the rows whose sequence is at or below the readers' floor (5.9.7) and raises the trimmed-through sequence to it.
+- **Trimming.** At reconciliation, the baton holder deletes the change rows whose sequence is at or below the trim point, and raises the trimmed-through sequence to it. The trim point is the lower of the readers' floor (5.9.7) and the lowest named cursor's sequence.
 - **Reading.** Changes after a sequence *s* are the rows whose key is above *s* · the largest entry ID. They are complete only when *s* is at or above the trimmed-through sequence.
 - **Readers without the accelerator** need not read the log. Every writer keeps it up to date.
 
