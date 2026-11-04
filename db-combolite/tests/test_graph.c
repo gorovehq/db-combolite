@@ -7,6 +7,7 @@
 #include "cdb_doc.h"
 #include "cdb_endian.h"
 #include "cdb_faultenv.h"
+#include "cdb_profile.h"
 #include "cdb_vec.h"
 
 #define FCAP (1536u * 1024u)
@@ -505,6 +506,63 @@ static void test_approximate_recall(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+/* At the minimum vec_work, 600 clustered vectors refreshed in slices; the
+ * graph must come out exact. Returns how many refreshes fell back to
+ * checking every entry: on the host profile the working memory grows
+ * (spec 17.4), so none should; on mcu they do. */
+static uint64_t refresh_in_slices(void)
+{
+    static vec centers[60];
+    uint64_t coll, full;
+    size_t left = 1, allocs;
+    unsigned slices = 0;
+    int i;
+
+    reset_data(91u);
+    cfg.vec_work_size = cdb_vec_work_size(elem_of, DIMS, K);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    coll = make_coll("c");
+    for (i = 0; i < 60; i++)
+        centers[i] = make_vec(NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    for (i = 0; i < 600; i++) {
+        vec v = make_vec(&centers[i % 60]);
+        add(coll, &v);
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_create_graph(&db, coll, K));
+    allocs = cdb_faultenv_live_allocs(&fe);
+    /* Slices of 150: each lists at least its 150 refreshed entries to check,
+     * more than the minimum vec_work's list holds (about 110 here). */
+    while (left > 0) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_refresh(&db, coll, 150, &left));
+        slices++;
+    }
+    TEST_ASSERT_EQUAL_UINT(4, slices);
+    TEST_ASSERT_EQUAL_size_t(allocs, cdb_faultenv_live_allocs(&fe)); /* grown memory is given back */
+    full = db.vec_full_checks;
+    verify_graph(coll, 1);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    return full;
+}
+
+static void test_minimum_vec_work_slices(void)
+{
+#ifdef CDB_PROFILE_HOST
+    TEST_ASSERT_EQUAL_UINT64(0, refresh_in_slices());
+#else
+    TEST_ASSERT_TRUE(refresh_in_slices() > 0);
+#endif
+}
+
+/* The maintenance budget reached: slower (every entry checked), never an
+ * error, and the graph still exact (spec 17.3). */
+static void test_vec_mem_limit_falls_back(void)
+{
+    cfg.vec_mem = 1;
+    TEST_ASSERT_TRUE(refresh_in_slices() > 0);
+}
+
 static void test_rejects_bad_use(void)
 {
     uint64_t coll;
@@ -675,6 +733,8 @@ int main(void)
     RUN_TEST(test_build_is_exact);
     RUN_TEST(test_graph_follows_changes);
     RUN_TEST(test_approximate_recall);
+    RUN_TEST(test_minimum_vec_work_slices);
+    RUN_TEST(test_vec_mem_limit_falls_back);
     RUN_TEST(test_rejects_bad_use);
     RUN_TEST(test_crash_sweep);
     graph_k = K;

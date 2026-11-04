@@ -160,6 +160,10 @@ typedef struct cdb_db_config {
      * The mcu profile never grows. Last, so bindings that mirror the
      * fields before it keep their offsets. */
     size_t query_mem;
+    /* Host profile: most memory a neighbour-graph refresh may grow to past
+     * vec_work; 0 means CDB_VEC_MEM_DEFAULT (spec 17.4). At the limit a
+     * refresh is slower, never an error (spec 17.3). */
+    size_t vec_mem;
 } cdb_db_config;
 
 /* An open document pool (cdb_doc.h). */
@@ -354,6 +358,9 @@ typedef struct cdb_db {
     int hb_running;           /* 1 if hb_thread is running and must be joined */
     /* Background worker threads (spec 5.9.6, M20). */
     cdb_worker_pool workers;
+    /* Graph refreshes whose list of entries to check overflowed, so every
+     * entry was checked (spec 14.12.4): a diagnostic for tests. */
+    uint64_t vec_full_checks;
     /* Security, encryption & RBAC (spec 12). */
     uint8_t master_key[32];
     uint8_t integrity_key[32];
