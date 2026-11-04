@@ -56,11 +56,12 @@ So stored neighbour lists and their distances, and search results, are always th
 A search runs outside any transaction, so it sees the archive at a committed sequence plus the process's own applied commits (5.9.1). A mirror must reflect the same state.
 
 - **Changes this process applies.** Every change reaches the process's pages through the apply hook: its own commits, their re-application at a rebase, and, when the process holds the baton, every slot's transactions replayed at reconciliation (5.9.1). The engine tells the mirror of each one as it is applied, so these never leave a mirror stale.
-- **Changes another process reconciles.** These appear only when the archive moves under the process and it rebases (5.9.1). To tell which collections they touched, each vector collection records a **change stamp**: the committed sequence of the reconciliation that last changed it. This is an addition to the format (14.12).
+- **Changes another process reconciles.** These appear only when the archive moves under the process and it rebases (5.9.1). To tell which collections they touched, each vector collection records a **change stamp**: the committed sequence of the reconciliation that last changed it. The stamp is the newest sequence in the collection's change log (14.12.5).
   - A mirror records the stamp of the state it reflects.
-  - At a rebase, the engine compares each mirrored collection's stamp with the archive's. A mirror whose collection changed is stale, and the others stay.
+  - At a rebase, the engine compares each mirrored collection's stamp with the archive's. A mirror whose collection changed catches up (18.12), and the others stay as they are.
   - A process that reconciled the changes itself applied them through the hook, so it records the new stamps without dropping anything.
-- **A stale or empty mirror.** A request that finds its collection's mirror stale, or not filled yet, takes the CPU path, so its results and latency are those of a build without an accelerator. The mirror is filled again from the vector blocks on the worker pool (5.9.6), for later requests. Results are the same either way (18.3).
+  - A collection without a change log has no stamp: at every rebase its mirror is stale.
+- **A stale or empty mirror.** A mirror that cannot catch up (18.12) is stale. A request that finds its collection's mirror stale, or not filled yet, takes the CPU path, so its results and latency are those of a build without an accelerator. The mirror is filled again from the vector blocks on the worker pool (5.9.6), for later requests. Results are the same either way (18.3).
 
 ### 18.7 The accelerator's calls
 
@@ -108,11 +109,22 @@ The accelerator path is tested in two ways that cover different things.
   - The neighbour-graph crash sweep also runs with the fake installed: after a crash and reboot, mirrors start empty, are refilled, and results still match.
 - **Real devices, where present.** `test_accel_cuda` and `test_accel_vulkan` are built only when their backend is enabled, and are registered with ctest. They compare the device's results with the CPU path's on the same data, and check that the device's distances stay within the bound it reports, which only a real device can show. On a machine without a usable device they report skipped, not passed.
 
+### 18.12 Incremental catch-up
+
+A mirror that falls behind fetches only what changed, not the whole collection, so the cost of catching up grows with the changes and not with the collection.
+
+- **The change log.** Every vector collection created from now on keeps a change log (14.12.5): which entries each archive commit inserted, replaced or deleted. A call, `cdb_vec_track_changes`, adds one to a collection created before. The log is part of the format, not of the accelerator, so it is kept whether or not any accelerator exists.
+- **Catching up.** At a rebase, before the process publishes the committed sequence its readers use (5.9.7), the engine reads each mirrored collection's log after the mirror's stamp. It sends the live entries' vectors in one `mirror_put` batch and the deleted entries in one `mirror_del` batch (18.7), and records the new stamp.
+- **When it cannot.** A mirror whose stamp is older than the oldest sequence the log still covers, or whose collection has no log, is stale and is refilled whole (18.6). So is one whose catch-up the accelerator declines.
+- **Trimming.** At reconciliation, the baton holder drops log rows at or below the **readers' floor**: the lowest committed sequence any live coordinator publishes (5.9.7), the same floor that guards page reuse. Every live process catches its mirrors up before it publishes, so no row a live mirror still needs is dropped.
+- **The changes call.** `cdb_vec_changes` lists the entries of a collection that changed after a given committed sequence, each with whether it is live now, in pages of the caller's size. It is public: an application or agent can ask what changed since it last looked, and the accelerator's catch-up uses the same call. It reports when the log no longer reaches back that far.
+
 ## Open questions
+
+- **Writers that predate the change log (14.12.5).** A build from before the log, writing to a collection that has one, would not keep it, and catch-up would then miss changes. The format is not released yet, so no such writer exists, but how a file says that its writers must keep the log (a feature flag, or the epoch) is to be decided.
 
 - **First shortlist sizes by element type (18.10).** The factor for each type, measured by how often a first shortlist fails its check.
 - **Mirrors and growth.** A collection keeps growing after its mirror is made. Whether a `mirror_put` that would pass the budget evicts other mirrors first, or marks this mirror stale so the next fill decides again (18.8).
-- **Where the change stamp lives (18.6).** Its place in a vector collection's on-disk state (14.12), and how a reader without the accelerator treats it (it can ignore it).
 - **Refilling without a worker pool.** On a host whose environment has no thread hooks, the worker pool runs tasks at once (5.9.6), so an asynchronous refill would block the request after all. Whether such a host refills at the next reconciliation or `cdb_db_tick` instead.
 - **Vulkan shaders.** How the compute shaders are built and checked in, for example SPIR-V generated by a tool in `tools/`, as the CRC tables are.
 - **Profiling first.** Measured, a refresh slice of GutenFree took 22 s, while the arithmetic is estimated at under a second. Most of the time is probably in coverage walks and index work, which stay on the CPU. Profile a refresh before implementation, to show what acceleration gains and what else needs fixing.

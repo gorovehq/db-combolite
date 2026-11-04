@@ -1042,8 +1042,9 @@ An ordered index maps each entry ID to *(block logical ID, slot)*.
   | 9 | bool: blocks cache norms |
   | 10 | K, neighbours kept per entry (1–64), present once a neighbour graph exists (14.12.4) |
   | 11, 12, 13 | root page IDs of the graph, reverse and pending indexes (14.12.4) |
+  | 14 | root page ID of the changes index (14.12.5), present once the collection has a change log |
 
-  Fields 10–13 are added when the graph is created; the rest never change.
+  Fields 10–13 are added when the graph is created, and field 14 when a change log is added to an older collection; the rest never change.
 
 - **Indexes.**
 
@@ -1093,6 +1094,23 @@ One record per entry:
   - **Reach** (kind 2) cover the pieces the spread points miss: an exact neighbour graph can fall apart into more pieces than there are spread points. A refresh checks the entries it touched: each refreshed entry, each entry it dropped from a list or from a list it rewrote, and every reach entry point. A check walks from the other entry points with the entry's own vector and stops once a list leads to it. An entry the walk doesn't reach becomes a reach entry point; a reach entry point the walk does reach stops being one. Pending entries are not checked, since searches measure them directly. When the entries to check don't fit the working memory, every entry with a list and every entry point is checked.
 - **Approximate search** (Section 7.4). A best-first walk under the base measure starts from the nearest entry points and keeps the *ef* best vectors found (default 64, at least the number asked for). Pending vectors are not in the graph, so each one is measured directly. What was found is ranked with the requested measure.
 - **Neighbour lookup.** Returns an entry's stored list, and whether it is current (the entry is not pending).
+
+### 14.12.5 Change log (Section 18.12)
+
+- **Creation.** A collection created with this layout has a change log from the start. An explicit call adds one to a collection created before it. Settings field 14 (14.12.3) is the root page ID of the changes index, present once the collection has a log.
+- **Index.**
+
+  | Index | Key (big-endian) | Value |
+  |---|---|---|
+  | changes | sequence · entry ID | kind (1): 1 inserted or replaced, 2 deleted |
+  | changes | 0 · 0 | trimmed-through sequence (8, big-endian): the log holds every change after it |
+
+  Entry ID 0 and sequence 0 are never used, so the row under 0 · 0 can't be mistaken for a change.
+- **The sequence.** A change is keyed by the committed sequence of the archive commit that makes it durable: the committed sequence of the archive the change is applied to, plus one. A process whose archive moves before then rebases and applies the change again (5.9.1), so its key follows. Two changes to one entry under one sequence share a row, and the later one's kind stands.
+- **The change stamp** of a collection (18.6) is the sequence of its newest row, or the trimmed-through sequence when the log has no change rows.
+- **Trimming.** At reconciliation, the baton holder deletes the rows whose sequence is at or below the readers' floor (5.9.7) and raises the trimmed-through sequence to it.
+- **Reading.** Changes after a sequence *s* are the rows whose key is above *s* · the largest entry ID. They are complete only when *s* is at or above the trimmed-through sequence.
+- **Readers without the accelerator** need not read the log. Every writer keeps it up to date.
 
 ---
 
