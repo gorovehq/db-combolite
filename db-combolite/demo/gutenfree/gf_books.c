@@ -14,6 +14,48 @@ static const char *const field_names[GF_NP] = {
     "passage", "ebook", "title", "seq", "heading", "hint", "words", "text",
 };
 
+static const char *const text_cols[GF_NT] = { "ebook", "title", "body" };
+
+/* The book_text table and the full_text link from the library to it */
+static cdb_status open_text_table(gf_db *g, gf_books *b)
+{
+    cdb_status s;
+    int found;
+    unsigned i;
+
+    if ((s = cdb_db_find_store(&g->db, "book_text", 9, &b->text_table, &found)) != CDB_OK)
+        return s;
+    if (!found) {
+        cdb_table_column cols[GF_NT];
+        static const unsigned pk[1] = { GF_T_EBOOK };
+        cdb_table_def def;
+        memset(cols, 0, sizeof cols);
+        for (i = 0; i < GF_NT; i++) {
+            cols[i].name = text_cols[i];
+            cols[i].name_len = strlen(text_cols[i]);
+            cols[i].type = CDB_TYPE_STRING;
+            cols[i].not_null = 1;
+        }
+        cols[GF_T_EBOOK].type = CDB_TYPE_INT;
+        memset(&def, 0, sizeof def);
+        def.columns = cols;
+        def.ncolumns = GF_NT;
+        def.primary_key = pk;
+        def.npk = 1;
+        def.keep = 1;
+        if ((s = cdb_table_create(&g->db, "book_text", 9, &def, &b->text_table)) != CDB_OK)
+            return s;
+    }
+    for (i = 0; i < GF_NT; i++)
+        if ((s = cdb_table_column_id(&g->db, b->text_table, text_cols[i], strlen(text_cols[i]), &b->tcol[i]))
+            != CDB_OK)
+            return s;
+    if ((s = cdb_link_find_type(&g->db, "full_text", 9, &b->full_text, &found)) != CDB_OK || found)
+        return s;
+    return cdb_link_define_type(&g->db, "full_text", 9, CDB_CARD_1_1, 1, CDB_LINK_ON_DELETE_TOMBSTONE,
+                                &b->full_text);
+}
+
 cdb_status gf_books_open(gf_db *g, gf_books *b)
 {
     cdb_fts_config fc;
@@ -42,10 +84,12 @@ cdb_status gf_books_open(gf_db *g, gf_books *b)
         if ((s = cdb_doc_create_full_text(&g->db, b->pool, &fc)) != CDB_OK)
             return s;
     }
-    if ((s = cdb_link_find_type(&g->db, "next_passage", 12, &b->next_passage, &found)) != CDB_OK || found)
+    if ((s = cdb_link_find_type(&g->db, "next_passage", 12, &b->next_passage, &found)) != CDB_OK)
         return s;
-    return cdb_link_define_type(&g->db, "next_passage", 12, CDB_CARD_1_1, 1, CDB_LINK_ON_DELETE_TOMBSTONE,
-                                &b->next_passage);
+    if (!found && (s = cdb_link_define_type(&g->db, "next_passage", 12, CDB_CARD_1_1, 1,
+                                            CDB_LINK_ON_DELETE_TOMBSTONE, &b->next_passage)) != CDB_OK)
+        return s;
+    return open_text_table(g, b);
 }
 
 /* One field of a passage: a string of n bytes, or with s NULL an int. */
@@ -220,6 +264,42 @@ static size_t next_passage(const char *text, size_t len, size_t *pos, size_t *st
     return cut - p;
 }
 
+/* Plain line ends and valid UTF-8, in place; *len is updated */
+static void clean_text(char *text, size_t *len)
+{
+    size_t w = 0;
+    for (size_t r = 0; r < *len; r++)
+        if (text[r] != '\r')
+            text[w++] = text[r];
+    text[w] = '\0';
+    *len = w;
+    gf_utf8_clean(text);
+}
+
+/* Inside a transaction: the book's whole text as its book_text row, linked
+ * from its library row by full_text */
+static cdb_status store_text(gf_db *g, const gf_catalog *c, const gf_books *b, uint64_t lib_row,
+                             const gf_book *book, const char *text, size_t len)
+{
+    size_t title_len = strlen(book->title), cap = len + title_len + 128u, n;
+    uint8_t *row = malloc(cap);
+    uint64_t entry;
+    pfield v[GF_NT];
+    cdb_status s;
+
+    if (row == NULL)
+        return CDB_E_BUFFER_TOO_SMALL;
+    v[0].id = b->tcol[GF_T_EBOOK], v[0].s = NULL, v[0].i = book->ebook;
+    v[1].id = b->tcol[GF_T_TITLE], v[1].s = book->title, v[1].n = title_len;
+    v[2].id = b->tcol[GF_T_BODY], v[2].s = text, v[2].n = len;
+    if ((s = encode_fields(v, GF_NT, row, cap, &n)) == CDB_OK
+        && (s = cdb_table_insert(&g->db, b->text_table, row, n, &entry)) == CDB_OK)
+        s = cdb_link_add(&g->db, b->full_text, cdb_ref_entry(c->lib_store, lib_row),
+                         cdb_ref_entry(b->text_table, entry), 1.0f, 0);
+    free(row);
+    return s;
+}
+
 cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int64_t ebook, char *text,
                            size_t len, gf_book_stats *st)
 {
@@ -247,13 +327,7 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
     if (book.lib_row != 0)
         return CDB_E_EXISTS;
 
-    /* Plain line ends and valid UTF-8, in place. */
-    for (size_t r = 0; r < len; r++)
-        if (text[r] != '\r')
-            text[w++] = text[r];
-    text[w] = '\0';
-    len = w;
-    gf_utf8_clean(text);
+    clean_text(text, &len);
 
     /* The library row comes first, so the passages can be linked to it:
      * count them before writing any */
@@ -268,6 +342,10 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
         return s;
     st->step = "library row";
     s = gf_library_add(g, c, row, &book, count, count_words(text, len), first_key, last_key, &lib_row);
+    if (s == CDB_OK) {
+        st->step = "book text";
+        s = store_text(g, c, b, lib_row, &book, text, len);
+    }
     heading[0] = '\0';
     pos = 0;
     while (s == CDB_OK && (n = next_passage(text, len, &pos, &start)) > 0) {
@@ -342,18 +420,14 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
     return s;
 }
 
-cdb_status gf_books_ingest_file(gf_db *g, const gf_catalog *c, const gf_books *b, int64_t ebook, const char *dir,
-                                gf_book_stats *st)
+/* dir/<ebook>.txt, read whole into a malloc'd, terminated buffer */
+static cdb_status read_book_file(const char *dir, int64_t ebook, char **text, size_t *len)
 {
     char path[1024];
-    char *text;
     FILE *f;
     long size;
-    cdb_status s;
 
-    memset(st, 0, sizeof *st);
-    st->ebook = ebook;
-    st->step = "read file";
+    *text = NULL;
     snprintf(path, sizeof path, "%s/%lld.txt", dir, (long long)ebook);
     if ((f = fopen(path, "rb")) == NULL)
         return CDB_E_IO;
@@ -362,16 +436,78 @@ cdb_status gf_books_ingest_file(gf_db *g, const gf_catalog *c, const gf_books *b
         return CDB_E_IO;
     }
     rewind(f);
-    text = malloc((size_t)size + 1);
-    if (text == NULL || fread(text, 1, (size_t)size, f) != (size_t)size) {
+    *text = malloc((size_t)size + 1);
+    if (*text == NULL || fread(*text, 1, (size_t)size, f) != (size_t)size) {
         fclose(f);
-        free(text);
+        free(*text);
+        *text = NULL;
         return CDB_E_IO;
     }
     fclose(f);
-    text[size] = '\0';
-    s = gf_books_ingest(g, c, b, ebook, text, (size_t)size, st);
+    (*text)[size] = '\0';
+    *len = (size_t)size;
+    return CDB_OK;
+}
+
+cdb_status gf_books_ingest_file(gf_db *g, const gf_catalog *c, const gf_books *b, int64_t ebook, const char *dir,
+                                gf_book_stats *st)
+{
+    char *text;
+    size_t len;
+    cdb_status s;
+
+    memset(st, 0, sizeof *st);
+    st->ebook = ebook;
+    st->step = "read file";
+    if ((s = read_book_file(dir, ebook, &text, &len)) != CDB_OK)
+        return s;
+    s = gf_books_ingest(g, c, b, ebook, text, len, st);
     free(text);
+    return s;
+}
+
+cdb_status gf_books_add_text_file(gf_db *g, const gf_catalog *c, const gf_books *b, int64_t ebook, const char *dir,
+                                  gf_book_stats *st)
+{
+    static gf_book book;
+    uint8_t key[16];
+    cdb_value_writer w;
+    uint64_t row, entry;
+    char *text;
+    size_t len;
+    int found;
+    cdb_status s;
+    double t0 = gf_now_ms();
+
+    memset(st, 0, sizeof *st);
+    st->ebook = ebook;
+    st->step = "library find";
+    if ((s = gf_catalog_find(g, c, ebook, &row, &found)) != CDB_OK)
+        return s;
+    if (!found || (s = gf_catalog_read(g, c, row, &book)) != CDB_OK || book.lib_row == 0)
+        return s != CDB_OK ? s : CDB_E_NOT_FOUND;
+    cdb_value_writer_init(&w, key, sizeof key, GF_ORDER, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_array(&w);
+    cdb_value_write_int(&w, ebook);
+    cdb_value_end_array(&w);
+    if ((s = cdb_table_find(&g->db, b->text_table, key, cdb_value_writer_len(&w), &entry, &found)) != CDB_OK)
+        return s;
+    if (found)
+        return CDB_E_EXISTS;
+    st->step = "read file";
+    if ((s = read_book_file(dir, ebook, &text, &len)) != CDB_OK)
+        return s;
+    clean_text(text, &len);
+    st->bytes = len;
+    st->step = "book text";
+    if ((s = cdb_tx_begin(&g->db, CDB_DURABILITY_DEFAULT)) == CDB_OK) {
+        if ((s = store_text(g, c, b, book.lib_row, &book, text, len)) == CDB_OK)
+            s = cdb_tx_commit(&g->db);
+        else
+            cdb_tx_abort(&g->db);
+    }
+    free(text);
+    st->ms = gf_now_ms() - t0;
     return s;
 }
 

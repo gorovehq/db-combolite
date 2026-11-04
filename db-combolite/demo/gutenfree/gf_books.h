@@ -31,10 +31,17 @@
 /* Passage fields, in the order their names are registered. */
 enum { GF_P_PASSAGE, GF_P_EBOOK, GF_P_TITLE, GF_P_SEQ, GF_P_HEADING, GF_P_HINT, GF_P_WORDS, GF_P_TEXT, GF_NP };
 
+/* book_text columns: a book's whole text in one table row (tables overlay
+ * the document engine, spec 9.7, so a row may be as large as doc_max) */
+enum { GF_T_EBOOK, GF_T_TITLE, GF_T_BODY, GF_NT };
+
 typedef struct gf_books {
     uint64_t pool;
     uint64_t field[GF_NP];  /* field IDs from the pool's field dictionary */
     uint64_t next_passage;  /* link type: passage -> the next one, 1:1 */
+    uint64_t text_table;    /* book_text: ebook (primary key), title, body */
+    uint64_t tcol[GF_NT];
+    uint64_t full_text;     /* link type: library row -> book_text row, 1:1 */
 } gf_books;
 
 typedef struct gf_book_stats {
@@ -46,14 +53,15 @@ typedef struct gf_book_stats {
     const char *step;    /* on failure: the call that failed */
 } gf_book_stats;
 
-/* Opens the "passages" pool, creating it, its field names, its full-text
- * index and the next_passage link type the first time. */
+/* Opens the "passages" pool and the "book_text" table, creating them, the
+ * pool's field names and full-text index, and the next_passage and
+ * full_text link types the first time. */
 cdb_status gf_books_open(gf_db *g, gf_books *b);
 
 /* Stores the text of one ebook, in one transaction: its library row, its
- * passages and their links. CDB_E_EXISTS: the book is in the library
- * already; CDB_E_NOT_FOUND: no catalog row for it. text is changed in
- * place. */
+ * passages and their links, and its whole text in book_text.
+ * CDB_E_EXISTS: the book is in the library already; CDB_E_NOT_FOUND: no
+ * catalog row for it. text is changed in place. */
 cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int64_t ebook, char *text,
                            size_t len, gf_book_stats *st);
 
@@ -61,6 +69,13 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
  * CDB_E_IO with st->step "read file" when the file cannot be read. */
 cdb_status gf_books_ingest_file(gf_db *g, const gf_catalog *c, const gf_books *b, int64_t ebook, const char *dir,
                                 gf_book_stats *st);
+
+/* For a book in the library without a book_text row (stored before there
+ * was one): adds the row from dir/<ebook>.txt, and its full_text link, in
+ * one transaction. CDB_E_EXISTS: it has one; CDB_E_NOT_FOUND: not in the
+ * library; CDB_E_IO: the file cannot be read. */
+cdb_status gf_books_add_text_file(gf_db *g, const gf_catalog *c, const gf_books *b, int64_t ebook, const char *dir,
+                                  gf_book_stats *st);
 
 /* Reads passage `entry`: its text (terminated, truncated to cap), ebook and
  * position in the book. */

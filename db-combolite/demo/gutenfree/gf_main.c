@@ -7,6 +7,10 @@
  *   gutenfree ingest-books [books-dir] [base]
  *                                           store the books gf_fetch.py fetched
  *                                           (listed in books-dir/manifest.tsv)
+ *   gutenfree ingest-text [books-dir] [base]
+ *                                           give library books stored before
+ *                                           book_text existed their whole
+ *                                           text there
  *   gutenfree merge-csv [pg_catalog.csv] [base]
  *                                           add genres, subjects and dates
  *                                           (ingest-index does it too when
@@ -161,6 +165,51 @@ static int ingest_cli(gf_db *g, const char *gutindex, unsigned batch)
     if (gf_catalog_count(g, &c, &rows) == CDB_OK)
         printf("  table now holds %llu rows (counted in %.1f ms)\n", (unsigned long long)rows, gf_now_ms() - t0);
     return s == CDB_OK ? 0 : 1;
+}
+
+/* Gives each book in the library its book_text row, from dir/<ebook>.txt:
+ * for books stored before the table existed. */
+static int ingest_text_cli(gf_db *g, const char *dir)
+{
+    static uint64_t rows[4096];
+    gf_catalog c;
+    gf_books b;
+    cdb_table_cursor cur;
+    size_t n = 0, i;
+    unsigned done = 0, had = 0, failed = 0;
+    uint64_t bytes = 0;
+    double t0 = gf_now_ms();
+    cdb_status s;
+
+    if ((s = gf_catalog_open(g, &c)) != CDB_OK || (s = gf_books_open(g, &b)) != CDB_OK) {
+        fprintf(stderr, "gutenfree: open stores: %s\n", cdb_status_str(s));
+        return 1;
+    }
+    memset(&cur, 0, sizeof cur);
+    gf_catalog_shelf(g, &c, &cur, rows, sizeof rows / sizeof rows[0], &n);
+    for (i = 0; i < n; i++) {
+        static gf_book bk;
+        gf_book_stats st;
+        if (gf_catalog_read(g, &c, rows[i], &bk) != CDB_OK)
+            continue;
+        s = gf_books_add_text_file(g, &c, &b, bk.ebook, dir, &st);
+        if (s == CDB_E_EXISTS) {
+            had++;
+            continue;
+        }
+        if (s != CDB_OK) {
+            printf("  #%lld: %s: %s\n", (long long)bk.ebook, st.step, cdb_status_str(s));
+            failed++;
+            continue;
+        }
+        done++;
+        bytes += st.bytes;
+        printf("  #%lld: %llu bytes of text in book_text, %.1f ms\n", (long long)bk.ebook,
+               (unsigned long long)st.bytes, st.ms);
+    }
+    printf("book_text: %u added, %u had it, %u failed; %llu bytes, %.0f ms\n", done, had, failed,
+           (unsigned long long)bytes, gf_now_ms() - t0);
+    return failed == 0 ? 0 : 1;
 }
 
 /* Stores every book listed in dir/manifest.tsv that has no passages yet. */
@@ -396,12 +445,13 @@ int main(int argc, char **argv)
     static gf_app app;
     int cli = argc > 1 && strcmp(argv[1], "ingest-index") == 0;
     int cli_books = argc > 1 && strcmp(argv[1], "ingest-books") == 0;
+    int cli_text = argc > 1 && strcmp(argv[1], "ingest-text") == 0;
     int cli_embed = argc > 1 && strcmp(argv[1], "embed") == 0;
     int cli_metrics = argc > 1 && strcmp(argv[1], "metrics") == 0;
     int cli_probe = argc > 1 && strcmp(argv[1], "probe") == 0;
     int cli_merge = argc > 1 && strcmp(argv[1], "merge-csv") == 0;
     int cli_filter = argc > 1 && strcmp(argv[1], "filter") == 0;
-    int a = cli_filter ? argc : cli || cli_books || cli_embed || cli_metrics || cli_probe || cli_merge ? 2 : 1;
+    int a = cli_filter ? argc : cli || cli_books || cli_text || cli_embed || cli_metrics || cli_probe || cli_merge ? 2 : 1;
     const char *pgcsv = GF_DEFAULT_PGCSV;
     double seconds = 10;
     unsigned batch = GF_INGEST_BATCH;
@@ -421,7 +471,7 @@ int main(int argc, char **argv)
     }
     if (cli && a < argc)
         gutindex = argv[a++];
-    if (cli_books && a < argc)
+    if ((cli_books || cli_text) && a < argc)
         books = argv[a++];
     if (cli_embed && a < argc)
         model = argv[a++];
@@ -431,7 +481,8 @@ int main(int argc, char **argv)
         pgcsv = argv[a++];
     if (argc > 1 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
         printf("gutenfree [base] | ingest-index [--batch N] [gutindex] [base] | merge-csv [csv] [base]\n"
-               "          | ingest-books [dir] [base] | embed [model.gguf] [base] | filter key=value ...\n"
+               "          | ingest-books [dir] [base] | ingest-text [dir] [base] | embed [model.gguf] [base]\n"
+               "          | filter key=value ...\n"
                "          | probe [seconds] [base] | metrics [base]\n"
                "base: database path without extension (default %s, or $GUTENFREE_DB).\n"
                "Run from demo/gutenfree/; see README.md there.\n", GF_DEFAULT_BASE);
@@ -468,9 +519,12 @@ int main(int argc, char **argv)
         rc = merge_cli(&g, pgcsv);
     } else if (cli_filter) {
         rc = filter_cli(&g, argc, argv, 2);
-    } else if (cli || cli_books || cli_embed) {
+    } else if (cli || cli_books || cli_text || cli_embed) {
         printf("build: %s\nopen: %.1f ms\n", GF_BUILD_LABEL, open_ms);
-        rc = cli ? ingest_cli(&g, gutindex, batch) : cli_books ? ingest_books_cli(&g, books) : embed_cli(&g, model);
+        rc = cli ? ingest_cli(&g, gutindex, batch)
+             : cli_books ? ingest_books_cli(&g, books)
+             : cli_text ? ingest_text_cli(&g, books)
+             : embed_cli(&g, model);
     } else {
         app.g = &g;
         gf_jobs_set_app(&app);
