@@ -290,7 +290,9 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
             hlen = (size_t)snprintf(hint, sizeof hint, "%s: ", heading);
         copy_line(hint + hlen, sizeof hint - hlen, t + at, n - at);
         snprintf(key, sizeof key, "%lld/%04llu", (long long)ebook, (unsigned long long)seq);
-        snprintf(summary, sizeof summary, "%s - %s", book.title, hint);
+        /* Key first: it is what tells passages of one book apart wherever a
+         * label is cut short (graph nodes, link lists) */
+        snprintf(summary, sizeof summary, "%s \xc2\xb7 %s (%s)", key, hint, book.title);
 
         v[k].id = b->field[GF_P_PASSAGE], v[k].s = key, v[k].n = strlen(key), k++;
         v[k].id = b->field[GF_P_EBOOK], v[k].s = NULL, v[k].i = ebook, k++;
@@ -333,7 +335,7 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
     }
     st->step = "commit";
     tc = gf_now_ms();
-    s = gf_db_commit(g);
+    s = cdb_tx_commit(&g->db);
     st->commit_ms = gf_now_ms() - tc;
     st->passages = seq;
     st->ms = gf_now_ms() - t0;

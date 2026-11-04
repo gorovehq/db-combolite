@@ -166,7 +166,7 @@ cdb_status gf_vec_job_commit(gf_db *g, const gf_catalog *c, const gf_books *b, c
         cdb_tx_abort(&g->db);
         return s;
     }
-    s = gf_db_commit(g);
+    s = cdb_tx_commit(&g->db);
     j->st.commit_ms = gf_now_ms() - t;
     j->st.passages = j->n;
     return s;
@@ -253,5 +253,5 @@ cdb_status gf_vec_link_similar(gf_db *g, const gf_vec *v, uint64_t *added)
         cdb_tx_abort(&g->db);
         return s;
     }
-    return gf_db_commit(g);
+    return cdb_tx_commit(&g->db);
 }

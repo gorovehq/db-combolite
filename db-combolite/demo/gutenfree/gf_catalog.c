@@ -534,7 +534,7 @@ typedef struct ingest {
 
 static cdb_status commit_batch(ingest *in, int reopen)
 {
-    cdb_status s = gf_db_commit(in->g);
+    cdb_status s = cdb_tx_commit(&in->g->db);
     double t;
     if (s != CDB_OK)
         return s;
@@ -872,7 +872,7 @@ static const char *language_name(const char *code)
 static cdb_status merge_commit(gf_db *g, gf_ingest_stats *st, unsigned *in_batch, double *t0, gf_progress_fn progress,
                                void *ctx, int reopen)
 {
-    cdb_status s = gf_db_commit(g);
+    cdb_status s = cdb_tx_commit(&g->db);
     if (s != CDB_OK)
         return s;
     st->batches++;

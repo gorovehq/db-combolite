@@ -12,7 +12,7 @@
  *   hint     the heading and the passage's opening words
  *   words    how many words it has
  *   text     the passage itself
- * and its document summary is "<title> - <hint>". Links place it: the
+ * and its document summary is "<passage> · <hint> (<title>)". Links place it: the
  * library row has_passage it, and next_passage leads to the one after it
  * (1:1). A book's passages have consecutive entry IDs. */
 #ifndef GF_BOOKS_H

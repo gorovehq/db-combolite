@@ -270,7 +270,7 @@ class TestNativeBackend(unittest.TestCase):
         doc = self.backend.doc_get("passages", docs[0].id)
         for field in ("passage", "ebook", "title", "seq", "hint", "words", "text"):
             self.assertIn(field, doc)
-        self.assertIn(" - ", docs[0].title)  # the summary: "<title> - <hint>"
+        self.assertRegex(docs[0].title, r"^\d+/\d{4} · .+ \(.+\)$")  # "<passage> · <hint> (<title>)"
 
         # Links and vectors point at entities a person recognizes
         edges = self.backend.link_edges("has_passage", 5)
