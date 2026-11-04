@@ -70,6 +70,7 @@ class Procedure:
     params: list      # e.g. ["$year", "$lang"]
     body: str         # CMBQL text
     doc: str = ""
+    handler: Any = None
 
 
 @dataclass
@@ -127,7 +128,7 @@ class Backend:
     def vector_delete(self, coll: str, vec_id: str) -> None: self._todo("vector_delete")
 
     # links
-    def link_edges(self, name: str, limit: int = 500) -> Result: self._todo("link_edges")       # columns: source, target, ...
+    def link_edges(self, name: str, limit: int | None = 500) -> Result: self._todo("link_edges")       # columns: source, target, ...
     def link_add(self, name: str, source: str, target: str, weight: float = 1.0) -> None: self._todo("link_add")
     def link_delete(self, name: str, pairs: list[tuple[str, str]]) -> int: self._todo("link_delete")
 
@@ -174,7 +175,8 @@ class NativeBackend(Backend):
             cdb_ts_in, cdb_ts_row, cdb_compile_error, cdb_value_writer, cdb_value,
             cdb_value_iter, cdb_store_info, cdb_link_type_info, cdb_table_def,
             cdb_exec_cursor, cdb_exec_row, cdb_proc_vm,
-            CDB_OK, CDB_MODEL_RELATIONAL, CDB_MODEL_DOCUMENT, CDB_MODEL_VECTOR,
+            CDB_OK, CDB_E_NOT_FOUND, CDB_E_BUFFER_TOO_SMALL,
+            CDB_MODEL_RELATIONAL, CDB_MODEL_DOCUMENT, CDB_MODEL_VECTOR,
             CDB_MODEL_TIME_SERIES, CDB_MODEL_LINK, CDB_ORDER_LITTLE, CDB_ORDER_BIG,
             CDB_LAYOUT_ADDR64, CDB_DURABILITY_DEFAULT, CDB_DURABILITY_FULL,
             CDB_STORE_DROPPED, CDB_TABLE_NO_INDEX, CDB_DECIMAL_COMPACT,
@@ -228,6 +230,8 @@ class NativeBackend(Backend):
             "cdb_exec_row": cdb_exec_row,
             "cdb_proc_vm": cdb_proc_vm,
             "CDB_OK": CDB_OK,
+            "CDB_E_NOT_FOUND": CDB_E_NOT_FOUND,
+            "CDB_E_BUFFER_TOO_SMALL": CDB_E_BUFFER_TOO_SMALL,
             "CDB_MODEL_RELATIONAL": CDB_MODEL_RELATIONAL,
             "CDB_MODEL_DOCUMENT": CDB_MODEL_DOCUMENT,
             "CDB_MODEL_VECTOR": CDB_MODEL_VECTOR,
@@ -303,16 +307,19 @@ class NativeBackend(Backend):
         self._buffers = []
         self._he = None
         self._env = None
+        ingestion_proc = Procedure(
+            "ingestion_records", [],
+            "call ingestion_records",
+            "Display complete ingestion records of downloaded books with vectors, neurons, and links",
+            handler=self._execute_downloaded_books_query
+        )
         self._procs = {
-            "ingestion_records": Procedure(
-                "ingestion_records", [],
-                "from books where passages > 0",
-                "Display complete ingestion records of downloaded books with vectors, neurons, and links"
-            ),
+            "ingestion_records": ingestion_proc,
             "downloaded_books": Procedure(
                 "downloaded_books", [],
-                "from books where passages > 0",
-                "List all downloaded books with passage counts and vector ranges"
+                "call ingestion_records",
+                "List all downloaded books with passage counts and vector ranges (alias for ingestion_records)",
+                handler=self._execute_downloaded_books_query
             )
         }
         self._link_cache = {}
@@ -1336,7 +1343,7 @@ class NativeBackend(Backend):
         ref.flags = 0
         return ref
 
-    def link_edges(self, name: str, limit: int = 500) -> Result:
+    def link_edges(self, name: str, limit: int | None = 500) -> Result:
         t0 = time.perf_counter()
         cached = self._link_cache.get(name)
         if cached is not None:
@@ -1595,14 +1602,17 @@ class NativeBackend(Backend):
         if self._procs.pop(name, None) is None:
             raise BackendError(f"No procedure {name}")
 
-    def _execute_downloaded_books_query(self, text: str, t0: float) -> Result:
+    def _execute_downloaded_books_query(self, text: str = "", t0: float = 0.0, limit: int | None = None) -> Result:
         c = self.clib.lib
         ct = self.ctypes
 
-        sid_bv = self._find_store_id("book_vec")
-        sid_books = self._find_store_id("books")
+        try:
+            sid_bv = self._find_store_id("book_vec")
+            sid_books = self._find_store_id("books")
+            schema = self.table_schema("books")
+        except Exception:
+            raise BackendError("this database has no ingestion data")
 
-        schema = self.table_schema("books")
         cols = [r[0] for r in schema.rows]
         f_map = {}
         for cname in cols:
@@ -1615,26 +1625,20 @@ class NativeBackend(Backend):
 
         # Map similar_to edge counts per book_vec
         edge_counts = {}
+        links_available = True
         try:
-            edges_res = self.link_edges("similar_to")
+            edges_res = self.link_edges("similar_to", limit=None)
             for r in edges_res.rows:
                 edge_counts[r[0]] = edge_counts.get(r[0], 0) + 1
         except Exception:
-            pass
+            links_available = False
 
-        # Parse limit
-        m_lim = re.search(r'\blimit\s+(\d+)', text, re.I)
-        limit = int(m_lim.group(1)) if m_lim else 1000
+        cat_ptr = self.b_types["get_catalog_ptr"](ct.byref(self._db))
+        info = self.b_types["cdb_store_info"]()
+        s_cat = c.cdb_catalog_get_store(cat_ptr, sid_bv, ct.byref(info))
+        max_bv_id = int(info.next_entry_id) if (s_cat == self.b_types["CDB_OK"] and info.next_entry_id > 1) else None
 
-        # Parse projection if specified
-        m_sel = re.search(r'^\s*select\s+(.+?)\s+from\b', text, re.I)
-        proj_cols = None
-        if m_sel:
-            raw_proj = m_sel.group(1).strip()
-            if raw_proj != "*":
-                proj_cols = [p.strip().split()[-1] for p in raw_proj.split(",") if p.strip()]
-
-        enc_buf = ct.create_string_buffer(2048)
+        enc_buf = ct.create_string_buffer(4096)
         enc_len = ct.c_size_t()
         src_store = ct.c_uint64()
         src_entry = ct.c_uint64()
@@ -1645,18 +1649,43 @@ class NativeBackend(Backend):
             "ebook", "title", "author", "passages", "doc_range",
             "vectors_f32", "neurons_1bit", "book_vector", "similar_links"
         ]
-        out_cols = proj_cols or default_cols
+        out_cols = default_cols
 
         rows = []
-        for bv_id in range(1, 10000):
-            s = c.cdb_vec_get(ct.byref(self._db), sid_bv, bv_id, enc_buf, 2048, ct.byref(enc_len),
-                              ct.byref(src_store), ct.byref(src_entry))
-            if s != self.b_types["CDB_OK"]:
+        unreadable_count = 0
+        consecutive_misses = 0
+        max_consecutive_misses = 100
+        bv_id = 1
+
+        while True:
+            if max_bv_id is not None and bv_id >= max_bv_id:
                 break
+            s = c.cdb_vec_get(ct.byref(self._db), sid_bv, bv_id, enc_buf, 4096, ct.byref(enc_len),
+                              ct.byref(src_store), ct.byref(src_entry))
+            if s == self.b_types["CDB_E_NOT_FOUND"]:
+                consecutive_misses += 1
+                if max_bv_id is None and consecutive_misses >= max_consecutive_misses:
+                    break
+                bv_id += 1
+                continue
+            elif s != self.b_types["CDB_OK"]:
+                raise BackendError(f"Vector get failed for book_vec-{bv_id:05d}: {self.b_types['status_str'](self.clib, s)}")
+
+            consecutive_misses = 0
             eid = src_entry.value
             s_get = c.cdb_table_get(ct.byref(self._db), sid_books, eid, read_buf, 65536, ct.byref(read_len))
+            if s_get == self.b_types["CDB_E_BUFFER_TOO_SMALL"]:
+                large_buf = ct.create_string_buffer(524288)
+                large_len = ct.c_size_t()
+                s_get = c.cdb_table_get(ct.byref(self._db), sid_books, eid, large_buf, 524288, ct.byref(large_len))
+                if s_get == self.b_types["CDB_OK"]:
+                    read_buf = large_buf
+                    read_len = large_len
             if s_get != self.b_types["CDB_OK"]:
+                unreadable_count += 1
+                bv_id += 1
                 continue
+
             val = self.b_types["cdb_value"]()
             c.cdb_value_read(ct.cast(read_buf, ct.POINTER(ct.c_uint8)), read_len.value,
                              self.b_types["CDB_ORDER_LITTLE"], ct.byref(val))
@@ -1678,17 +1707,22 @@ class NativeBackend(Backend):
                 "vectors_f32": f"passage_vec-{first_p:05d}..{last_p:05d} ({passages} x 384-dim)",
                 "neurons_1bit": f"passage_bits-{first_p:05d}..{last_p:05d} ({passages} x 384 neurons)",
                 "book_vector": f"{bv_tag} (384-dim mean)",
-                "similar_links": f"{n_links} links",
-                "similar_to": f"{n_links} links",
+                "similar_links": f"{n_links} links" if links_available else "unavailable",
+                "similar_to": f"{n_links} links" if links_available else "unavailable",
             }
             row_vals = tuple(rec.get(col, obj_dict.get(c_to_fid.get(col))) for col in out_cols)
             rows.append(row_vals)
-            if len(rows) >= limit:
+            bv_id += 1
+            if limit is not None and len(rows) >= limit:
                 break
 
         elapsed = (time.perf_counter() - t0) * 1000
-        return Result(out_cols, rows, len(rows), elapsed,
-                      message=f"Retrieved {len(rows)} downloaded book ingestion records")
+        msg = f"Retrieved {len(rows)} downloaded book ingestion records"
+        if unreadable_count:
+            msg += f" ({unreadable_count} unreadable)"
+        if not links_available:
+            msg += " (link counts unavailable)"
+        return Result(out_cols, rows, len(rows), elapsed, message=msg)
 
     def execute(self, text: str) -> Result:
         t0 = time.perf_counter()
@@ -1696,19 +1730,21 @@ class NativeBackend(Backend):
         ct = self.ctypes
 
         # Check for procedure call
-        m = re.match(r"\s*call\s+(\w+)", text, re.I)
+        m = re.match(r"\s*call\s+(\w+)(?:\s*\((.*?)\))?", text, re.I)
         if m:
-            p = self._procs.get(m.group(1))
+            p_name = m.group(1)
+            p = self._procs.get(p_name)
+            if not p and p_name.lower() == "downloaded_books":
+                p = self._procs.get("ingestion_records")
             if not p:
-                raise BackendError(f"No procedure named {m.group(1)}")
+                raise BackendError(f"No procedure named {p_name}")
+            if getattr(p, "handler", None) or p_name in ("ingestion_records", "downloaded_books"):
+                handler = getattr(p, "handler", None) or self._execute_downloaded_books_query
+                lim = None
+                if m.group(2) and m.group(2).strip().isdigit():
+                    lim = int(m.group(2).strip())
+                return handler(text, t0, limit=lim)
             return self.execute(p.body)
-
-        # Check for queries selecting downloaded books or ingestion records
-        s_text = text.strip()
-        m_books = re.search(r'\b(?:from\s+books|Scan\(["\']?books["\']?\))\b', s_text, re.I)
-        m_passages_filter = re.search(r'\bpassages\s*(?:>|!=|is\s+not\s+null)|\bdownloaded\b', s_text, re.I)
-        if m_books and m_passages_filter:
-            return self._execute_downloaded_books_query(s_text, t0)
 
         # DDL shortcuts
         s_text = text.strip()
@@ -1763,7 +1799,22 @@ class NativeBackend(Backend):
 
         # Query normalization: rewrite FROM <ident> to FROM Scan("<ident>") if not already Scan(...)
         normalized = s_text
-        if not re.search(r"\bscan\s*\(", normalized, re.I):
+        m_del = re.match(r"^\s*delete\s+from\s+(?:table\s+|pool\s+|vectors\s+)?([A-Za-z0-9_]+)(.*)$", s_text, re.I | re.S)
+        if m_del:
+            tbl_target = m_del.group(1)
+            rest_clause = m_del.group(2)
+            try:
+                sid = self._find_store_id(tbl_target)
+                info = self.b_types["cdb_store_info"]()
+                cat_ptr = self.b_types["get_catalog_ptr"](ct.byref(self._db))
+                if c.cdb_catalog_get_store(cat_ptr, sid, ct.byref(info)) == self.b_types["CDB_OK"]:
+                    if info.model == self.b_types["CDB_MODEL_RELATIONAL"]:
+                        normalized = f"DELETE FROM TABLE {tbl_target}{rest_clause}"
+                    elif info.model == self.b_types["CDB_MODEL_VECTOR"]:
+                        normalized = f"DELETE FROM VECTORS {tbl_target}{rest_clause}"
+            except Exception:
+                pass
+        elif not re.search(r"\bscan\s*\(", normalized, re.I):
             if re.match(r"^\s*from\s+([A-Za-z0-9_]+)", normalized, re.I):
                 normalized = re.sub(r"^\s*from\s+([A-Za-z0-9_]+)", r'SELECT * FROM Scan("\1")', normalized, flags=re.I)
             else:
