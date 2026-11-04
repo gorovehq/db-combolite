@@ -179,7 +179,9 @@ static void test_exec_limit_and_offset(void)
 /* 3. Test Sort ASC / DESC */
 static void test_exec_sort(void)
 {
-    uint8_t wire[256], scratch[16384];
+    /* Four rows of about 2 KB each, in the half of the arena the slots get */
+    static uint8_t scratch[32768];
+    uint8_t wire[256];
     cdb_query_writer qw;
     cdb_exec_cursor cur;
     cdb_exec_row scores[4];
@@ -243,7 +245,9 @@ static void test_exec_sort(void)
 /* 4. Test Aggregate: Group By region, SUM(amount), COUNT(*) */
 static void test_exec_aggregate(void)
 {
-    uint8_t wire[512], scratch[16384];
+    /* Two groups of about 5 KB each, in the half of the arena the slots get */
+    static uint8_t scratch[32768];
+    uint8_t wire[512];
     cdb_query_writer qw;
     cdb_exec_cursor cur;
     cdb_exec_row sales[4];

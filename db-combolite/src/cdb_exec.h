@@ -23,6 +23,8 @@
 #define CDB_EXEC_MAX_SORT_KEYS 8u
 #define CDB_EXEC_MAX_AGGS 16u
 #define CDB_EXEC_DEFAULT_BUFFERED_ROWS 256u
+/* A live Scan's record buffer, in pages, taken from the cursor's scratch */
+#define CDB_EXEC_SCAN_RECORD_PAGES 4u
 
 /* Forward declarations */
 typedef struct cdb_exec_op cdb_exec_op;
