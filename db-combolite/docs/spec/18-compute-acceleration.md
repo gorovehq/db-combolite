@@ -74,10 +74,18 @@ A search runs outside any transaction, so it sees the archive at a committed seq
 - **Declining.** An accelerator may decline any call. A declined `mirror_open` leaves that collection on the CPU path. A failed `nearest` sends that request to the CPU path. A failed `mirror_put` or `mirror_del` marks the mirror stale. No accelerator failure ever reaches the caller of the engine.
 - **Refilling and threads.** A stale mirror is refilled as a new mirror on the worker pool while the old one, if any, keeps serving requests; then the engine swaps them and closes the old one. So calls on different mirrors may overlap, and the accelerator must allow that. The engine never calls one mirror from two threads at once.
 
+### 18.8 Device memory
+
+The device may be shared with the application's own work, such as computing embeddings, so the engine's mirrors have a budget.
+
+- **The budget.** The database configuration gets a field, `accel_mem`: the most device memory the engine's mirrors may use together. 0 leaves it to the accelerator's judgment. The engine counts a mirror as the bytes of its vectors. Within the budget, the accelerator may still decline `mirror_open` or `mirror_put` when the device is short (18.7).
+- **A collection that does not fit.** All or nothing: a collection whose vectors exceed the budget, or whose mirror the accelerator declines, has no mirror and uses the CPU path. There are no partial mirrors.
+- **Several collections.** A collection that needs a mirror evicts the least recently used mirrors until it fits, as the open-store slots close the least recently used store. A mirror that a request is using is never evicted.
+
 ## Open questions
 
 - **The shortlist margin.** How many candidates beyond K, fixed or as a factor of K, to be set by measuring how often a true neighbour falls outside it on real data, such as GutenFree's passages.
-- **Device memory.** A budget for mirrors, like `vec_mem` (17.4). What happens when one collection doesn't fit: the CPU path, or a partial mirror?
+- **Mirrors and growth.** A collection keeps growing after its mirror is made. Whether a `mirror_put` that would pass the budget evicts other mirrors first, or marks this mirror stale so the next fill decides again (18.8).
 - **Where the change stamp lives (18.6).** Its place in a vector collection's on-disk state (14.12), and how a reader without the accelerator treats it (it can ignore it).
 - **Refilling without a worker pool.** On a host whose environment has no thread hooks, the worker pool runs tasks at once (5.9.6), so an asynchronous refill would block the request after all. Whether such a host refills at the next reconciliation or `cdb_db_tick` instead.
 - **Element types and measures.** Whether the first version covers only f32 vectors with the Euclidean, cosine and dot-product measures, leaving binary (Hamming) and other element types to the CPU.
