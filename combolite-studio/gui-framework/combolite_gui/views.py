@@ -129,7 +129,7 @@ class ResultGrid(Gtk.ScrolledWindow):
         def bind(_f, li):
             w, item = li.get_child(), li.get_item()
             w._item = item
-            v = item.values[i]
+            v = item.values[i] if item and hasattr(item, "values") and i < len(item.values) else None
             w.set_text(fmt(v))
             (w.add_css_class if v is None else w.remove_css_class)("null-cell")
 
@@ -145,7 +145,8 @@ class ResultGrid(Gtk.ScrolledWindow):
         if w.get_editing() or w._item is None or not self.on_edit:
             return
         item = w._item
-        old, text = item.values[i], w.get_text()
+        old = item.values[i] if i < len(item.values) else None
+        text = w.get_text()
         if text == fmt(old):
             return
         new = self.on_edit(item.values, i, text)
@@ -153,12 +154,14 @@ class ResultGrid(Gtk.ScrolledWindow):
             w.set_text(fmt(old))
             return
         vals = list(item.values)
-        vals[i] = new
-        item.values = tuple(vals)
+        if i < len(vals):
+            vals[i] = new
+            item.values = tuple(vals)
         w.set_text(fmt(new))
         (w.add_css_class if new is None else w.remove_css_class)("null-cell")
 
     def set_result(self, res: Result, editable_cols=()):
+        self.model.remove_all()
         cols = self.view.get_columns()
         while cols.get_n_items():
             self.view.remove_column(cols.get_item(0))
@@ -166,7 +169,6 @@ class ResultGrid(Gtk.ScrolledWindow):
             c = Gtk.ColumnViewColumn(title=name, resizable=True, expand=(i == len(res.columns) - 1),
                                      factory=self._factory(i, _is_numeric(res.rows, i), i in editable_cols))
             self.view.append_column(c)
-        self.model.remove_all()
         self.model.splice(0, 0, [RowItem(r) for r in res.rows])
 
     def selected_rows(self):
