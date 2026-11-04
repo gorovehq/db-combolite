@@ -378,9 +378,23 @@ static void test_filter_on_document_field(void)
     cdb_exec_close(&cur);
 }
 
+/* A store that does not exist fails the query instead of matching nothing */
+static void test_unknown_store_is_an_error(void)
+{
+    size_t len = 0;
+    cdb_compile_error err;
+
+    make_books();
+    memset(&err, 0, sizeof err);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_compile_query("SELECT * FROM Scan(\"bokos\")", 27, &db.catalog, wire,
+                                                    sizeof wire, &len, &err));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_exec_open(&cur, &db, wire, len, NULL, 0, scratch, sizeof scratch));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_unknown_store_is_an_error);
     RUN_TEST(test_scan_reads_table_rows);
     RUN_TEST(test_filter_on_table_field);
     RUN_TEST(test_project_table_columns);
