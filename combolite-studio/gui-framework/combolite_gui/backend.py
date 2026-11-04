@@ -323,6 +323,7 @@ class NativeBackend(Backend):
             )
         }
         self._link_cache = {}
+        self._field_name_cache = {}
         self._ts_extra = {}
 
     def _alloc(self, size: int):
@@ -395,6 +396,7 @@ class NativeBackend(Backend):
 
     def _open_or_create(self, path: str, create: bool) -> None:
         self.close()
+        self._field_name_cache = {}
         base = self._normalize_base(path)
 
         self._he = self.b_types["cdb_hostenv"]()
@@ -1118,7 +1120,7 @@ class NativeBackend(Backend):
                 except Exception:
                     doc = {"content": decoded[1]}
             elif isinstance(decoded, dict):
-                doc = decoded
+                doc = self._named(sid, decoded)
             else:
                 doc = {"value": decoded}
         else:
@@ -1830,45 +1832,13 @@ class NativeBackend(Backend):
                                      ct.cast(wire, ct.POINTER(ct.c_uint8)), 8192,
                                      ct.byref(wire_len), ct.byref(err))
         if s_comp == self.b_types["CDB_OK"]:
-            # Streaming cursor execution
-            cur = self.b_types["cdb_exec_cursor"]()
-            scratch = ct.create_string_buffer(32768)
-            s_open = c.cdb_exec_open(ct.byref(cur), ct.byref(self._db),
-                                     ct.cast(wire, ct.POINTER(ct.c_uint8)), wire_len.value,
-                                     None, 0,
-                                     ct.cast(scratch, ct.POINTER(ct.c_uint8)), 32768)
-            if s_open == self.b_types["CDB_OK"]:
-                rows = []
-                cols = []
-                out_row = self.b_types["cdb_exec_row"]()
-                has_row = ct.c_int(0)
-                while len(rows) < 1000:
-                    s_nxt = c.cdb_exec_next(ct.byref(cur), ct.byref(out_row), ct.byref(has_row))
-                    if s_nxt != self.b_types["CDB_OK"] or not has_row.value:
-                        break
-                    if not cols and out_row.n_fields > 0:
-                        for f_idx in range(out_row.n_fields):
-                            fld = out_row.fields[f_idx]
-                            fname = ct.string_at(fld.name, fld.name_len).decode("utf-8")
-                            cols.append(fname)
-                    r_vals = []
-                    for f_idx in range(out_row.n_fields):
-                        r_vals.append(self.b_types["decode_value"](out_row.fields[f_idx].val, self.clib))
-                    rows.append(tuple(r_vals) if r_vals else (out_row.entry_id,))
-                c.cdb_exec_close(ct.byref(cur))
-                if not rows:
-                    m_tbl = re.search(r'Scan\(["\']?([A-Za-z0-9_]+)', text, re.I) or re.search(r'\bfrom\s+["\']?([A-Za-z0-9_]+)', text, re.I)
-                    if m_tbl:
-                        tbl_name = m_tbl.group(1)
-                        try:
-                            t_res = self.table_rows(tbl_name, 0, 50)
-                            if t_res.rows:
-                                return t_res
-                        except Exception:
-                            pass
-                cols = cols or ["entry_id"]
-                elapsed = (time.perf_counter() - t0) * 1000
-                return Result(cols, rows, len(rows), elapsed, message=f"Executed CMBQL query ({len(rows)} rows)")
+            return self._run_query(wire, wire_len.value, t0)
+
+        # A query that does not compile is a query error: compiling it as a
+        # procedure would accept some of it and return a meaningless value.
+        if re.match(r"\s*(?:select\b|from\b|scan\s*\()", normalized, re.I):
+            err_msg = ct.string_at(err.msg).decode("utf-8") if err.msg else "Unknown CMBQL syntax error"
+            raise BackendError(f"CMBQL error at line {err.line}:{err.col}: {err_msg}")
 
         # Fallback to procedure/mutation compilation
         bc = ct.create_string_buffer(8192)
@@ -1890,6 +1860,114 @@ class NativeBackend(Backend):
         # Query parsing error
         err_msg = ct.string_at(err.msg).decode("utf-8") if err.msg else "Unknown CMBQL syntax error"
         raise BackendError(f"CMBQL error at line {err.line}:{err.col}: {err_msg}")
+
+    # Query memory: operators, a scan's record buffer, and room for Sort and
+    # Aggregate to buffer up to the engine's 256 rows of about 2 KB each.
+    QUERY_SCRATCH = 4 * 1024 * 1024
+    QUERY_MAX_ROWS = 1000
+
+    def _field_name(self, store_id: int, field_id: int):
+        """A field's name from the store's field dictionary, or None; cached."""
+        names = self._field_name_cache.setdefault(store_id, {})
+        if field_id in names:
+            return names[field_id]
+        c = self.clib.lib
+        ct = self.ctypes
+        nb = ct.create_string_buffer(256)
+        nl = ct.c_size_t()
+        cat_ptr = self.b_types["get_catalog_ptr"](ct.byref(self._db))
+        if c.cdb_catalog_field_name(cat_ptr, store_id, field_id, nb, 256, ct.byref(nl)) != self.b_types["CDB_OK"]:
+            return None  # not cached: the name may be added later
+        names[field_id] = nb.raw[:nl.value].decode("utf-8", errors="replace")
+        return names[field_id]
+
+    def _named(self, store_id: int, obj):
+        """An object decoded with field IDs as keys, keyed by field name where
+        the field dictionary has one (the ID otherwise)."""
+        if not isinstance(obj, dict):
+            return obj
+        out = {}
+        for k, v in obj.items():
+            name = self._field_name(store_id, k) if isinstance(k, int) else None
+            out[name if name else k] = v
+        return out
+
+    def _run_query(self, wire, wire_len: int, t0: float) -> Result:
+        c = self.clib.lib
+        ct = self.ctypes
+        ok = self.b_types["CDB_OK"]
+        status_str = self.b_types["status_str"]
+
+        cur = self.b_types["cdb_exec_cursor"]()
+        scratch = ct.create_string_buffer(self.QUERY_SCRATCH)
+        s_open = c.cdb_exec_open(ct.byref(cur), ct.byref(self._db),
+                                 ct.cast(wire, ct.POINTER(ct.c_uint8)), wire_len,
+                                 None, 0,
+                                 ct.cast(scratch, ct.POINTER(ct.c_uint8)), self.QUERY_SCRATCH)
+        if s_open != ok:
+            raise BackendError(f"Query could not start: {status_str(self.clib, s_open)}")
+
+        cols: list = []
+        records: list = []
+        stores: set = set()
+        truncated = False
+        out_row = self.b_types["cdb_exec_row"]()
+        has_row = ct.c_int(0)
+        try:
+            while True:
+                s_nxt = c.cdb_exec_next(ct.byref(cur), ct.byref(out_row), ct.byref(has_row))
+                if s_nxt == -19:  # CDB_E_OUT_OF_BUDGET
+                    raise BackendError("Query too large: Sort and GROUP BY hold at most 256 rows in the engine "
+                                       "today. Narrow it with WHERE.")
+                if s_nxt != ok:
+                    raise BackendError(f"Query failed after {len(records)} rows: {status_str(self.clib, s_nxt)}")
+                if not has_row.value:
+                    break
+                if len(records) >= self.QUERY_MAX_ROWS:
+                    truncated = True
+                    break
+                if out_row.n_fields > 0:
+                    # Output fields: a projection, aggregate or join
+                    rec = {}
+                    for f_idx in range(out_row.n_fields):
+                        fld = out_row.fields[f_idx]
+                        fname = ct.string_at(fld.name, fld.name_len).decode("utf-8", errors="replace")
+                        rec[fname] = self.b_types["decode_value"](fld.val, self.clib)
+                elif out_row.record_data and out_row.record_len:
+                    # SELECT *: the whole record, by field name
+                    rec = {"$id": out_row.entry_id}
+                    val = self.b_types["cdb_value"]()
+                    if c.cdb_value_read(out_row.record_data, out_row.record_len,
+                                        self.b_types["CDB_ORDER_LITTLE"], ct.byref(val)) == ok:
+                        named = self._named(out_row.store_id, self.b_types["decode_value"](val, self.clib))
+                        rec.update(named if isinstance(named, dict) else {"value": named})
+                else:
+                    rec = {"$id": out_row.entry_id}
+                for k in rec:
+                    if k not in cols:
+                        cols.append(k)
+                records.append(rec)
+                stores.add(out_row.store_id)
+        finally:
+            c.cdb_exec_close(ct.byref(cur))
+
+        # Whole table rows: the table's column order. A row stores no NULL
+        # columns, so the order they were first seen in is arbitrary.
+        if len(stores) == 1 and cols and cols[0] == "$id":
+            name = self._store_names_map().get(next(iter(stores)))
+            try:
+                order = [r[0] for r in self.table_schema(name).rows] if name else []
+            except Exception:
+                order = []  # not a table
+            if order:
+                cols = ["$id"] + order + [k for k in cols if k != "$id" and k not in order]
+
+        rows = [tuple(r.get(k) for k in cols) for r in records]
+        elapsed = (time.perf_counter() - t0) * 1000
+        msg = f"Executed CMBQL query ({len(rows)} rows)"
+        if truncated:
+            msg = f"Executed CMBQL query (first {len(rows)} rows shown; there are more)"
+        return Result([str(k) for k in cols] or ["$id"], rows, len(rows), elapsed, message=msg)
 
     def explain(self, text: str) -> Result:
         t0 = time.perf_counter()

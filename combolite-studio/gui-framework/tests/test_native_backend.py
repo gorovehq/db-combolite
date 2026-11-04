@@ -307,6 +307,30 @@ class TestNativeBackend(unittest.TestCase):
             self.backend.execute("call ingestion_records")
         self.assertIn("this database has no ingestion data", str(ctx.exception))
 
+    def test_11_console_queries_read_real_rows(self):
+        self.backend.create(self.db_path)
+        self.backend.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, years INT);")
+        for pk, name, age in [(1, "Alice", 30), (2, "Bob", 25), (3, "Cara", 41)]:
+            self.backend.table_insert("users", {"id": pk, "name": name, "years": age})
+
+        # A filter returns the matching rows, by column name, in schema order
+        res = self.backend.execute("from users where years > 28")
+        self.assertEqual(res.columns, ["$id", "id", "name", "years"])
+        self.assertEqual([r[2] for r in res.rows], ["Alice", "Cara"])
+
+        # No match is no rows, not some other rows
+        self.assertEqual(self.backend.execute("from users where years > 99").rows, [])
+
+        # Projection and sort
+        res = self.backend.execute("select name from users order by years desc")
+        self.assertEqual(res.columns, ["name"])
+        self.assertEqual([r[0] for r in res.rows], ["Cara", "Alice", "Bob"])
+
+        # A query that does not compile is an error, not a procedure's result
+        with self.assertRaises(BackendError) as ctx:
+            self.backend.execute("select count(*) from users")
+        self.assertIn("CMBQL error", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
