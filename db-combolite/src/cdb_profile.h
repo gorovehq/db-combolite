@@ -15,9 +15,14 @@
 /* A query may grow through env alloc up to this, unless the database
  * configuration says otherwise (cdb_db_config.query_mem; spec 17.4) */
 #define CDB_QUERY_MEM_DEFAULT (256u * 1024u * 1024u)
+/* A neighbour-graph refresh may grow past vec_work up to this, unless the
+ * database configuration says otherwise (cdb_db_config.vec_mem; spec 17.4).
+ * Provisional: spec 17 leaves the default to measurement. */
+#define CDB_VEC_MEM_DEFAULT (64u * 1024u * 1024u)
 #else
 #define CDB_PROFILE_NAME "mcu"
 #define CDB_QUERY_MEM_DEFAULT 0u /* no growth: caller memory only */
+#define CDB_VEC_MEM_DEFAULT 0u
 #endif
 
 #endif /* CDB_PROFILE_H */
