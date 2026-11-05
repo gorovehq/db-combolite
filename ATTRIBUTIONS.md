@@ -17,6 +17,7 @@ Every design decision in the specification was confirmed by the owner.
 | [XZ Utils](https://tukaani.org/xz/) v5.8.4, liblzma only | LZMA2 compression (spec 15), built when `CDB_WITH_XZ` is on | 0BSD | `db-combolite/third-party/xz/` |
 | [Mbed TLS](https://github.com/Mbed-TLS/mbedtls) v3.6.2 (libmbedcrypto) | Cryptography and authenticated encryption (spec 12) | Apache-2.0 / GPL-2.0-or-later | `db-combolite/third-party/mbedtls/` |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) b11701 (commit 01fc3aa) | CPU sentence embeddings, used only in the GutenFree Diet demo | MIT | `db-combolite/demo/third-party/llama.cpp/` (see `VENDORED.md`) |
+| [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) 13.5: the CUDA runtime and cuBLAS (system install) | GPU kernels and matrix products for the optional accelerator library `combolite_accel` (spec 18.5), built only when `CDB_ACCEL_CUDA` is on; never in the core | NVIDIA CUDA Toolkit EULA | system install (`/usr/local/cuda`); linked, not vendored |
 | [ncurses](https://invisible-island.net/ncurses/) (system library) | Terminal screens, used only in the GutenFree Diet demo; linked, not vendored | X11-style (MIT) | system package `libncurses-dev` |
 | [bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5), GGUF by [CompendiumLabs](https://huggingface.co/CompendiumLabs/bge-small-en-v1.5-gguf) | Embedding model, downloaded by the demo's `tools/gf_model.py` at setup; never committed | MIT | `db-combolite/datastore/gutenberg/models/` (git-ignored) |
 
