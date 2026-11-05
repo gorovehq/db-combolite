@@ -424,7 +424,18 @@ static cdb_status adjust_df(struct cdb_doc_pool *pool, const cdb_fts_token *t, i
 
 /* -------------------------------------------------------- maintenance */
 
+static cdb_status fts_create_in(cdb_db *db, struct cdb_doc_pool *pool);
+
 cdb_status cdb_fts_create(cdb_db *db, struct cdb_doc_pool *pool)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = fts_create_in(db, pool);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status fts_create_in(cdb_db *db, struct cdb_doc_pool *pool)
 {
     cdb_status s;
     if ((s = cdb_index_create(&pool->fts_terms, &db->pager, pool->slot.store_id,
@@ -440,8 +451,21 @@ cdb_status cdb_fts_create(cdb_db *db, struct cdb_doc_pool *pool)
 /* Brings the index from a document's old state to its new one (either may
  * be "not live"). fts_tokens is split in two halves, one per version; each
  * half is big enough by construction (cdb_fts_tokens_needed). */
+static cdb_status fts_update_in(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry,
+                                const cdb_fts_doc *before, const cdb_fts_doc *after);
+
 cdb_status cdb_fts_update(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry,
                           const cdb_fts_doc *before, const cdb_fts_doc *after)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = fts_update_in(db, pool, entry, before, after);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status fts_update_in(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entry,
+                                const cdb_fts_doc *before, const cdb_fts_doc *after)
 {
     cdb_byte_order o = db->pager.order;
     size_t half = db->cfg.fts_tokens_cap / 2u, na, nb, ta, tb, i = 0, j = 0;
@@ -586,8 +610,21 @@ static cdb_status score(struct cdb_doc_pool *pool, const term_state *ts, unsigne
  * lowest current entry; ALL leapfrogs every list up to the highest current
  * entry until they agree. Each scored entry goes into the top-max list.
  * The query's words are kept in fts_tokens. */
+static cdb_status fts_search_in(cdb_db *db, struct cdb_doc_pool *pool, const char *query, size_t len, int mode,
+                                cdb_fts_hit *hits, size_t max, size_t *n);
+
 cdb_status cdb_fts_search(cdb_db *db, struct cdb_doc_pool *pool, const char *query, size_t len, int mode,
                           cdb_fts_hit *hits, size_t max, size_t *n)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = fts_search_in(db, pool, query, len, mode, hits, max, n);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status fts_search_in(cdb_db *db, struct cdb_doc_pool *pool, const char *query, size_t len, int mode,
+                                cdb_fts_hit *hits, size_t max, size_t *n)
 {
     term_state ts[CDB_FTS_MAX_QUERY_TERMS];
     cdb_fts_token *words = db->cfg.fts_tokens;

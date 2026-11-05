@@ -1568,8 +1568,21 @@ cdb_status cdb_stage_idx_get(const cdb_db *db, uint64_t store, uint8_t idx_no, c
  * at its final place inside record_buf, after the record header, so the
  * append does not copy it again. data may itself already lie inside
  * record_buf, hence memmove. The change is not applied until commit. */
+static cdb_status tx_put_in(cdb_db *db, uint64_t store_id, uint64_t entry_id, uint8_t op,
+                            const void *data, size_t len);
+
 cdb_status cdb_tx_put(cdb_db *db, uint64_t store_id, uint64_t entry_id, uint8_t op,
                       const void *data, size_t len)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = tx_put_in(db, store_id, entry_id, op, data, len);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status tx_put_in(cdb_db *db, uint64_t store_id, uint64_t entry_id, uint8_t op,
+                            const void *data, size_t len)
 {
     uint8_t *payload = db->cfg.record_buf + CDB_RECORD_HEADER_SIZE;
     cdb_record r;
@@ -1632,7 +1645,18 @@ cdb_status cdb_tx_put(cdb_db *db, uint64_t store_id, uint64_t entry_id, uint8_t 
 /* Journals a write-set key record (kind 4, spec 5.9.4, 14.4.7 rule 3):
  * target store = table, target entry = 0, payload = 4-byte index number +
  * 4-byte CRC32C of the encoded key. Counts only for collision detection. */
+static cdb_status tx_put_key_in(cdb_db *db, uint64_t store_id, uint32_t index_num, const void *key, size_t key_len);
+
 cdb_status cdb_tx_put_key(cdb_db *db, uint64_t store_id, uint32_t index_num, const void *key, size_t key_len)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = tx_put_key_in(db, store_id, index_num, key, key_len);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status tx_put_key_in(cdb_db *db, uint64_t store_id, uint32_t index_num, const void *key, size_t key_len)
 {
     uint8_t payload[CDB_WRITE_KEY_PAYLOAD_SIZE];
     cdb_record r;
@@ -1653,7 +1677,18 @@ cdb_status cdb_tx_put_key(cdb_db *db, uint64_t store_id, uint32_t index_num, con
 
 /* Ensures a 1024-ID block is claimed for store and returns its next ID
  * without consuming it yet (spec 5.9.3). */
+static cdb_status db_peek_entry_in(cdb_db *db, uint64_t store, const uint64_t *next_entry, uint64_t *id);
+
 cdb_status cdb_db_peek_entry(cdb_db *db, uint64_t store, const uint64_t *next_entry, uint64_t *id)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_peek_entry_in(db, store, next_entry, id);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_peek_entry_in(cdb_db *db, uint64_t store, const uint64_t *next_entry, uint64_t *id)
 {
     uint64_t floor, first;
     unsigned i;
@@ -1710,7 +1745,18 @@ cdb_status cdb_db_peek_entry(cdb_db *db, uint64_t store, const uint64_t *next_en
     return CDB_OK;
 }
 
+static uint64_t db_take_entry_in(cdb_db *db, uint64_t store, uint64_t *next_entry, int *dirty);
+
 uint64_t cdb_db_take_entry(cdb_db *db, uint64_t store, uint64_t *next_entry, int *dirty)
+{
+    uint64_t r;
+    cdb_db_lock(db);
+    r = db_take_entry_in(db, store, next_entry, dirty);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static uint64_t db_take_entry_in(cdb_db *db, uint64_t store, uint64_t *next_entry, int *dirty)
 {
     uint64_t id = *next_entry ? *next_entry : 1u;
     unsigned i;
@@ -2338,7 +2384,18 @@ static cdb_status finish_archive_op(cdb_db *db, cdb_status op_status)
     return finish_baton(db);
 }
 
+static cdb_status db_create_store_in(cdb_db *db, const char *name, size_t len, uint32_t model, uint64_t *id);
+
 cdb_status cdb_db_create_store(cdb_db *db, const char *name, size_t len, uint32_t model, uint64_t *id)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_create_store_in(db, name, len, model, id);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_create_store_in(cdb_db *db, const char *name, size_t len, uint32_t model, uint64_t *id)
 {
     cdb_status s = catalog_ready(db);
     if (s != CDB_OK)
@@ -2348,7 +2405,18 @@ cdb_status cdb_db_create_store(cdb_db *db, const char *name, size_t len, uint32_
 
 /* A read: no reconcile and no rotation needed, but rebases if the archive
  * has moved. */
+static cdb_status db_find_store_in(cdb_db *db, const char *name, size_t len, uint64_t *id, int *found);
+
 cdb_status cdb_db_find_store(cdb_db *db, const char *name, size_t len, uint64_t *id, int *found)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_find_store_in(db, name, len, id, found);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_find_store_in(cdb_db *db, const char *name, size_t len, uint64_t *id, int *found)
 {
     cdb_status s;
     if (usable(db) != CDB_OK)
@@ -2360,7 +2428,18 @@ cdb_status cdb_db_find_store(cdb_db *db, const char *name, size_t len, uint64_t 
     return cdb_catalog_find_store(&db->catalog, name, len, id, found);
 }
 
+static cdb_status db_drop_store_in(cdb_db *db, uint64_t id);
+
 cdb_status cdb_db_drop_store(cdb_db *db, uint64_t id)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_drop_store_in(db, id);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_drop_store_in(cdb_db *db, uint64_t id)
 {
     cdb_status s = catalog_ready(db);
     cdb_slot *slot;
@@ -2402,7 +2481,18 @@ cdb_status cdb_db_catalog_end(cdb_db *db, cdb_status s)
     return finish_archive_op(db, s);
 }
 
+static cdb_status db_add_schema_in(cdb_db *db, uint64_t store_id, const void *schema, size_t len, uint32_t *version);
+
 cdb_status cdb_db_add_schema(cdb_db *db, uint64_t store_id, const void *schema, size_t len, uint32_t *version)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_add_schema_in(db, store_id, schema, len, version);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_add_schema_in(cdb_db *db, uint64_t store_id, const void *schema, size_t len, uint32_t *version)
 {
     cdb_status s = catalog_ready(db);
     if (s != CDB_OK)
@@ -2462,7 +2552,18 @@ static cdb_status reclaim_dropped_under_baton(cdb_db *db, uint64_t *pages_freed,
     return CDB_OK;
 }
 
+static cdb_status db_reclaim_in(cdb_db *db, uint64_t *pages_freed, uint64_t *nibblets_freed);
+
 cdb_status cdb_db_reclaim(cdb_db *db, uint64_t *pages_freed, uint64_t *nibblets_freed)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_reclaim_in(db, pages_freed, nibblets_freed);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_reclaim_in(cdb_db *db, uint64_t *pages_freed, uint64_t *nibblets_freed)
 {
     uint64_t p_freed = 0, n_freed = 0;
     cdb_status s;
@@ -2492,7 +2593,18 @@ cdb_status cdb_db_reclaim(cdb_db *db, uint64_t *pages_freed, uint64_t *nibblets_
 /* Compaction requires a clean pager, hence the reconcile first. It makes
  * its own archive commits under the same baton, so the journal is rotated
  * afterwards to match the new committed sequence. */
+static cdb_status db_compact_in(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed);
+
 cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_compact_in(db, max_moves, moved, reclaimed);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_compact_in(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed)
 {
     cdb_status s;
     uint64_t dp = 0, dn = 0;
@@ -2621,7 +2733,18 @@ cdb_status cdb_db_close(cdb_db *db)
 
 /* -------------------------------------------------------- security & RBAC */
 
+static cdb_status db_create_enclave_in(cdb_db *db, uint64_t enclave_id, const char *key_ref);
+
 cdb_status cdb_db_create_enclave(cdb_db *db, uint64_t enclave_id, const char *key_ref)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_create_enclave_in(db, enclave_id, key_ref);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_create_enclave_in(cdb_db *db, uint64_t enclave_id, const char *key_ref)
 {
     unsigned i;
     int free_idx = -1;
@@ -2670,7 +2793,18 @@ cdb_status cdb_db_create_enclave(cdb_db *db, uint64_t enclave_id, const char *ke
     return CDB_OK;
 }
 
+static cdb_status db_open_enclave_in(cdb_db *db, uint64_t enclave_id, const char *key_ref);
+
 cdb_status cdb_db_open_enclave(cdb_db *db, uint64_t enclave_id, const char *key_ref)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_open_enclave_in(db, enclave_id, key_ref);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_open_enclave_in(cdb_db *db, uint64_t enclave_id, const char *key_ref)
 {
     unsigned i;
     int idx = -1;
@@ -2716,7 +2850,18 @@ cdb_status cdb_db_open_enclave(cdb_db *db, uint64_t enclave_id, const char *key_
     return CDB_OK;
 }
 
+static cdb_status db_rotate_master_key_in(cdb_db *db, const char *new_master_key_uri);
+
 cdb_status cdb_db_rotate_master_key(cdb_db *db, const char *new_master_key_uri)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_rotate_master_key_in(db, new_master_key_uri);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_rotate_master_key_in(cdb_db *db, const char *new_master_key_uri)
 {
     uint8_t new_mk[32];
     uint8_t wrapped[CDB_WRAPPED_KEY_SIZE];
@@ -2762,7 +2907,18 @@ cdb_status cdb_db_rotate_master_key(cdb_db *db, const char *new_master_key_uri)
     return CDB_OK;
 }
 
+static cdb_status db_rotate_enclave_key_in(cdb_db *db, uint64_t enclave_id, const char *new_enclave_key_uri);
+
 cdb_status cdb_db_rotate_enclave_key(cdb_db *db, uint64_t enclave_id, const char *new_enclave_key_uri)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_rotate_enclave_key_in(db, enclave_id, new_enclave_key_uri);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_rotate_enclave_key_in(cdb_db *db, uint64_t enclave_id, const char *new_enclave_key_uri)
 {
     unsigned i;
     int idx = -1;
@@ -2806,7 +2962,18 @@ cdb_status cdb_db_rotate_enclave_key(cdb_db *db, uint64_t enclave_id, const char
     return s;
 }
 
+static cdb_status db_check_key_rotation_in(cdb_db *db);
+
 cdb_status cdb_db_check_key_rotation(cdb_db *db)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_check_key_rotation_in(db);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_check_key_rotation_in(cdb_db *db)
 {
     if (db == NULL)
         return CDB_E_INVALID_ARG;
@@ -2821,8 +2988,21 @@ cdb_status cdb_db_check_key_rotation(cdb_db *db)
     return CDB_OK;
 }
 
+static cdb_status db_register_principal_in(cdb_db *db, uint64_t principal_id, uint32_t tenant_id,
+                                           const uint8_t pubkey[33]);
+
 cdb_status cdb_db_register_principal(cdb_db *db, uint64_t principal_id, uint32_t tenant_id,
                                      const uint8_t pubkey[33])
+{
+    cdb_status s;
+    cdb_db_lock(db);
+    s = db_register_principal_in(db, principal_id, tenant_id, pubkey);
+    cdb_db_unlock(db);
+    return s;
+}
+
+static cdb_status db_register_principal_in(cdb_db *db, uint64_t principal_id, uint32_t tenant_id,
+                                           const uint8_t pubkey[33])
 {
     unsigned i;
     int free_idx = -1;
@@ -2859,8 +3039,21 @@ cdb_status cdb_db_register_principal(cdb_db *db, uint64_t principal_id, uint32_t
     return CDB_OK;
 }
 
+static cdb_status db_grant_role_in(cdb_db *db, uint64_t principal_id, uint32_t role_id,
+                                   uint64_t scope_store_or_enclave, uint8_t perm_mask);
+
 cdb_status cdb_db_grant_role(cdb_db *db, uint64_t principal_id, uint32_t role_id,
                              uint64_t scope_store_or_enclave, uint8_t perm_mask)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_grant_role_in(db, principal_id, role_id, scope_store_or_enclave, perm_mask);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_grant_role_in(cdb_db *db, uint64_t principal_id, uint32_t role_id,
+                                   uint64_t scope_store_or_enclave, uint8_t perm_mask)
 {
     unsigned i;
     int free_idx = -1;
@@ -2892,8 +3085,21 @@ cdb_status cdb_db_grant_role(cdb_db *db, uint64_t principal_id, uint32_t role_id
     return CDB_OK;
 }
 
+static cdb_status db_check_perm_in(cdb_db *db, uint64_t principal_id, uint64_t scope_store_or_enclave,
+                                   uint8_t required_perm);
+
 cdb_status cdb_db_check_perm(cdb_db *db, uint64_t principal_id, uint64_t scope_store_or_enclave,
                              uint8_t required_perm)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_check_perm_in(db, principal_id, scope_store_or_enclave, required_perm);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_check_perm_in(cdb_db *db, uint64_t principal_id, uint64_t scope_store_or_enclave,
+                                   uint8_t required_perm)
 {
     unsigned i;
 
@@ -2922,17 +3128,45 @@ cdb_status cdb_db_check_perm(cdb_db *db, uint64_t principal_id, uint64_t scope_s
     return CDB_E_SECURITY;
 }
 
+static cdb_status db_trigger_register_in(cdb_db *db, const char *name, size_t name_len,
+                                         uint64_t store_id, uint8_t events,
+                                         const char *proc_name, size_t proc_len,
+                                         uint8_t max_depth);
+
 cdb_status cdb_db_trigger_register(cdb_db *db, const char *name, size_t name_len,
                                    uint64_t store_id, uint8_t events,
                                    const char *proc_name, size_t proc_len,
                                    uint8_t max_depth)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_trigger_register_in(db, name, name_len, store_id, events, proc_name, proc_len, max_depth);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_trigger_register_in(cdb_db *db, const char *name, size_t name_len,
+                                         uint64_t store_id, uint8_t events,
+                                         const char *proc_name, size_t proc_len,
+                                         uint8_t max_depth)
 {
     if (db == NULL)
         return CDB_E_INVALID_ARG;
     return cdb_trigger_register(&db->triggers, name, name_len, store_id, events, proc_name, proc_len, max_depth);
 }
 
+static cdb_status db_trigger_unregister_in(cdb_db *db, const char *name, size_t name_len);
+
 cdb_status cdb_db_trigger_unregister(cdb_db *db, const char *name, size_t name_len)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_trigger_unregister_in(db, name, name_len);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_trigger_unregister_in(cdb_db *db, const char *name, size_t name_len)
 {
     if (db == NULL)
         return CDB_E_INVALID_ARG;
@@ -2960,7 +3194,20 @@ static const uint8_t *get_enclave_hash_key(cdb_db *db, uint64_t store_id)
     return NULL;
 }
 
+static cdb_status db_blob_write_begin_in(cdb_db *db, uint64_t store_id, uint8_t *scratch, cdb_blob_writer *w);
+
 cdb_status cdb_db_blob_write_begin(cdb_db *db, uint64_t store_id, uint8_t *scratch, cdb_blob_writer *w)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_blob_write_begin_in(db, store_id, scratch, w);
+    if (r == CDB_OK)
+        w->db = db; /* the stream's later calls take this database's lock */
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_blob_write_begin_in(cdb_db *db, uint64_t store_id, uint8_t *scratch, cdb_blob_writer *w)
 {
     const uint8_t *hkey;
     if (db == NULL)
@@ -2969,23 +3216,54 @@ cdb_status cdb_db_blob_write_begin(cdb_db *db, uint64_t store_id, uint8_t *scrat
     return cdb_blob_write_begin(&db->pager, store_id, scratch, hkey, w);
 }
 
+/* The stream calls take the lock of the database the stream began in. */
 cdb_status cdb_db_blob_write_chunk(cdb_blob_writer *w, const void *chunk, size_t len)
 {
-    return cdb_blob_write_chunk(w, chunk, len);
+    cdb_db *db = w != NULL ? (cdb_db *)w->db : NULL;
+    cdb_status s;
+    cdb_db_lock(db);
+    s = cdb_blob_write_chunk(w, chunk, len);
+    cdb_db_unlock(db);
+    return s;
 }
 
 cdb_status cdb_db_blob_write_end(cdb_blob_writer *w, cdb_blob_ref *out_ref)
 {
-    return cdb_blob_write_end(w, out_ref);
+    cdb_db *db = w != NULL ? (cdb_db *)w->db : NULL;
+    cdb_status s;
+    cdb_db_lock(db);
+    s = cdb_blob_write_end(w, out_ref);
+    cdb_db_unlock(db);
+    return s;
 }
 
 cdb_status cdb_db_blob_write_abort(cdb_blob_writer *w)
 {
-    return cdb_blob_write_abort(w);
+    cdb_db *db = w != NULL ? (cdb_db *)w->db : NULL;
+    cdb_status s;
+    cdb_db_lock(db);
+    s = cdb_blob_write_abort(w);
+    cdb_db_unlock(db);
+    return s;
 }
+
+static cdb_status db_blob_read_begin_in(cdb_db *db, uint64_t store_id, const cdb_blob_ref *ref,
+                                        uint8_t *page_buf, int verify_hash, cdb_blob_reader *r);
 
 cdb_status cdb_db_blob_read_begin(cdb_db *db, uint64_t store_id, const cdb_blob_ref *ref,
                                   uint8_t *page_buf, int verify_hash, cdb_blob_reader *r)
+{
+    cdb_status s;
+    cdb_db_lock(db);
+    s = db_blob_read_begin_in(db, store_id, ref, page_buf, verify_hash, r);
+    if (s == CDB_OK)
+        r->db = db; /* the stream's later calls take this database's lock */
+    cdb_db_unlock(db);
+    return s;
+}
+
+static cdb_status db_blob_read_begin_in(cdb_db *db, uint64_t store_id, const cdb_blob_ref *ref,
+                                        uint8_t *page_buf, int verify_hash, cdb_blob_reader *r)
 {
     const uint8_t *hkey;
     if (db == NULL)
@@ -2996,15 +3274,36 @@ cdb_status cdb_db_blob_read_begin(cdb_db *db, uint64_t store_id, const cdb_blob_
 
 cdb_status cdb_db_blob_read_chunk(cdb_blob_reader *r, void *dest, size_t cap, size_t *out_len)
 {
-    return cdb_blob_read_chunk(r, dest, cap, out_len);
+    cdb_db *db = r != NULL ? (cdb_db *)r->db : NULL;
+    cdb_status s;
+    cdb_db_lock(db);
+    s = cdb_blob_read_chunk(r, dest, cap, out_len);
+    cdb_db_unlock(db);
+    return s;
 }
 
 cdb_status cdb_db_blob_read_end(cdb_blob_reader *r)
 {
-    return cdb_blob_read_end(r);
+    cdb_db *db = r != NULL ? (cdb_db *)r->db : NULL;
+    cdb_status s;
+    cdb_db_lock(db);
+    s = cdb_blob_read_end(r);
+    cdb_db_unlock(db);
+    return s;
 }
 
+static cdb_status db_blob_free_in(cdb_db *db, uint64_t store_id, const cdb_blob_ref *ref, uint8_t *page_buf);
+
 cdb_status cdb_db_blob_free(cdb_db *db, uint64_t store_id, const cdb_blob_ref *ref, uint8_t *page_buf)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_blob_free_in(db, store_id, ref, page_buf);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status db_blob_free_in(cdb_db *db, uint64_t store_id, const cdb_blob_ref *ref, uint8_t *page_buf)
 {
     if (db == NULL)
         return CDB_E_INVALID_ARG;
@@ -3025,7 +3324,18 @@ cdb_status cdb_db_set_peer_id(cdb_db *db, uint32_t peer_id)
     return CDB_OK;
 }
 
+static cdb_status db_get_peer_id_in(const cdb_db *db, uint32_t *peer_id);
+
 cdb_status cdb_db_get_peer_id(const cdb_db *db, uint32_t *peer_id)
+{
+    cdb_status r;
+    cdb_db_lock((cdb_db *)db);
+    r = db_get_peer_id_in(db, peer_id);
+    cdb_db_unlock((cdb_db *)db);
+    return r;
+}
+
+static cdb_status db_get_peer_id_in(const cdb_db *db, uint32_t *peer_id)
 {
     if (db == NULL || peer_id == NULL)
         return CDB_E_INVALID_ARG;
@@ -3033,7 +3343,18 @@ cdb_status cdb_db_get_peer_id(const cdb_db *db, uint32_t *peer_id)
     return CDB_OK;
 }
 
+static cdb_status db_get_hlc_in(const cdb_db *db, cdb_hlc *hlc);
+
 cdb_status cdb_db_get_hlc(const cdb_db *db, cdb_hlc *hlc)
+{
+    cdb_status r;
+    cdb_db_lock((cdb_db *)db);
+    r = db_get_hlc_in(db, hlc);
+    cdb_db_unlock((cdb_db *)db);
+    return r;
+}
+
+static cdb_status db_get_hlc_in(const cdb_db *db, cdb_hlc *hlc)
 {
     if (db == NULL || hlc == NULL)
         return CDB_E_INVALID_ARG;
@@ -3041,7 +3362,18 @@ cdb_status cdb_db_get_hlc(const cdb_db *db, cdb_hlc *hlc)
     return CDB_OK;
 }
 
+static cdb_status db_get_crdt_vector_in(const cdb_db *db, cdb_crdt_vector *vector);
+
 cdb_status cdb_db_get_crdt_vector(const cdb_db *db, cdb_crdt_vector *vector)
+{
+    cdb_status r;
+    cdb_db_lock((cdb_db *)db);
+    r = db_get_crdt_vector_in(db, vector);
+    cdb_db_unlock((cdb_db *)db);
+    return r;
+}
+
+static cdb_status db_get_crdt_vector_in(const cdb_db *db, cdb_crdt_vector *vector)
 {
     if (db == NULL || vector == NULL)
         return CDB_E_INVALID_ARG;

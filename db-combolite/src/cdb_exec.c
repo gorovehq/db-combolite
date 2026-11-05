@@ -2493,9 +2493,24 @@ static cdb_status build_exec_tree(cdb_exec_cursor *cur, const uint8_t **p, const
     }
 }
 
+static cdb_status exec_open_in(cdb_exec_cursor *cur, cdb_db *db, const uint8_t *wire, size_t len,
+                               const cdb_eval_param *params, size_t n_params, uint8_t *scratch,
+                               size_t scratch_cap);
+
 cdb_status cdb_exec_open(cdb_exec_cursor *cur, cdb_db *db, const uint8_t *wire, size_t len,
                          const cdb_eval_param *params, size_t n_params,
                          uint8_t *scratch, size_t scratch_cap)
+{
+    cdb_status s;
+    cdb_db_lock(db);
+    s = exec_open_in(cur, db, wire, len, params, n_params, scratch, scratch_cap);
+    cdb_db_unlock(db);
+    return s;
+}
+
+static cdb_status exec_open_in(cdb_exec_cursor *cur, cdb_db *db, const uint8_t *wire, size_t len,
+                               const cdb_eval_param *params, size_t n_params, uint8_t *scratch,
+                               size_t scratch_cap)
 {
     size_t root_offset = 0;
     const uint8_t *p;
@@ -2553,35 +2568,49 @@ cdb_status cdb_exec_open(cdb_exec_cursor *cur, cdb_db *db, const uint8_t *wire, 
     return CDB_OK;
 }
 
+/* next, reset and close take the lock of the cursor's database for their
+ * whole run, so no worker task runs inside one step (spec 5.9.6). */
 cdb_status cdb_exec_next(cdb_exec_cursor *cur, cdb_exec_row *row, int *has_row)
 {
+    cdb_status s;
     if (cur == NULL || !cur->is_open || cur->root_op == NULL || row == NULL || has_row == NULL)
         return CDB_E_INVALID_ARG;
 
+    cdb_db_lock(cur->db);
     cdb_eval_ctx_reset_scratch(&cur->eval_ctx);
-    return cur->root_op->vtab->next(cur->root_op, cur, row, has_row);
+    s = cur->root_op->vtab->next(cur->root_op, cur, row, has_row);
+    cdb_db_unlock(cur->db);
+    return s;
 }
 
 cdb_status cdb_exec_reset(cdb_exec_cursor *cur)
 {
+    cdb_status s;
     if (cur == NULL || !cur->is_open || cur->root_op == NULL)
         return CDB_E_INVALID_ARG;
 
+    cdb_db_lock(cur->db);
     cdb_eval_ctx_reset_scratch(&cur->eval_ctx);
-    return cur->root_op->vtab->reset(cur->root_op, cur);
+    s = cur->root_op->vtab->reset(cur->root_op, cur);
+    cdb_db_unlock(cur->db);
+    return s;
 }
 
 cdb_status cdb_exec_close(cdb_exec_cursor *cur)
 {
+    cdb_db *db;
     if (cur == NULL || !cur->is_open)
         return CDB_OK;
 
+    db = cur->db; /* captured: closing may clear it */
+    cdb_db_lock(db);
     if (cur->root_op != NULL) {
         cur->root_op->vtab->close(cur->root_op, cur);
     }
     if (cur->db != NULL)
         exec_free_all(cur, &cur->blocks);
     cur->is_open = 0;
+    cdb_db_unlock(db);
     return CDB_OK;
 }
 

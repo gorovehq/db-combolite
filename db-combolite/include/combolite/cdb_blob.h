@@ -40,6 +40,7 @@ typedef struct cdb_blob_writer {
     uint8_t *scratch;   /* Exactly p->page_size bytes */
     int is_enclave;
     int is_open;
+    void *db;           /* the cdb_db whose lock cdb_db_blob_* calls take; NULL outside one */
 } cdb_blob_writer;
 
 /* Begins streaming write of a blob owned by store_id. scratch must hold
@@ -72,6 +73,7 @@ typedef struct cdb_blob_reader {
     uint8_t *page_buf;  /* Exactly p->page_size bytes */
     int verify_hash;
     int is_open;
+    void *db;           /* the cdb_db whose lock cdb_db_blob_* calls take; NULL outside one */
 } cdb_blob_reader;
 
 /* Begins streaming read of a blob. page_buf must hold p->page_size bytes.

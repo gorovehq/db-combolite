@@ -560,8 +560,21 @@ static cdb_status ref_live(cdb_db *db, cdb_ref r, int *live)
 
 /* A catalog change (reconcile, change, rotate the journal). The first type
  * also creates the link store and its indexes. */
+static cdb_status link_define_type_in(cdb_db *db, const char *name, size_t len, unsigned cardinality, int enforced,
+                                      unsigned on_delete, uint64_t *type);
+
 cdb_status cdb_link_define_type(cdb_db *db, const char *name, size_t len, unsigned cardinality, int enforced,
                                 unsigned on_delete, uint64_t *type)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = link_define_type_in(db, name, len, cardinality, enforced, on_delete, type);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status link_define_type_in(cdb_db *db, const char *name, size_t len, unsigned cardinality, int enforced,
+                                      unsigned on_delete, uint64_t *type)
 {
     cdb_link_type_info info;
     cdb_status s;
@@ -582,7 +595,18 @@ cdb_status cdb_link_define_type(cdb_db *db, const char *name, size_t len, unsign
     return cdb_db_catalog_end(db, s);
 }
 
+static cdb_status link_find_type_in(cdb_db *db, const char *name, size_t len, uint64_t *type, int *found);
+
 cdb_status cdb_link_find_type(cdb_db *db, const char *name, size_t len, uint64_t *type, int *found)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = link_find_type_in(db, name, len, type, found);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status link_find_type_in(cdb_db *db, const char *name, size_t len, uint64_t *type, int *found)
 {
     if (!db->has_catalog)
         return CDB_E_UNSUPPORTED;
@@ -627,7 +651,18 @@ static cdb_status put_link(cdb_db *db, uint8_t mode, uint64_t type, cdb_ref sour
     return cdb_tx_put(db, db->links.store_id, 0, CDB_OP_LINK, p, sizeof p);
 }
 
+static cdb_status link_add_in(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, float weight, int64_t time);
+
 cdb_status cdb_link_add(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, float weight, int64_t time)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = link_add_in(db, type, source, target, weight, time);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status link_add_in(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, float weight, int64_t time)
 {
     cdb_link_type_info ti;
     int live, state, any;
@@ -671,8 +706,21 @@ cdb_status cdb_link_add(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref targe
     }
 }
 
+static cdb_status link_reinforce_in(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, float weight,
+                                    int64_t time);
+
 cdb_status cdb_link_reinforce(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, float weight,
                               int64_t time)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = link_reinforce_in(db, type, source, target, weight, time);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status link_reinforce_in(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, float weight,
+                                    int64_t time)
 {
     cdb_link_type_info ti;
     int state;
@@ -694,7 +742,18 @@ cdb_status cdb_link_reinforce(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref
     }
 }
 
+static cdb_status link_remove_in(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target);
+
 cdb_status cdb_link_remove(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = link_remove_in(db, type, source, target);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status link_remove_in(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target)
 {
     cdb_link_type_info ti;
     uint8_t p[UNLINK_PAYLOAD];
@@ -855,7 +914,18 @@ cdb_status cdb_link_on_drop(cdb_db *db, uint64_t store)
 
 /* -------------------------------------------------------- reading */
 
+static cdb_status link_get_in(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, cdb_link *out, int *found);
+
 cdb_status cdb_link_get(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, cdb_link *out, int *found)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = link_get_in(db, type, source, target, out, found);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status link_get_in(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref target, cdb_link *out, int *found)
 {
     cdb_status s = open_store(db, 0);
     *found = 0;
@@ -866,8 +936,21 @@ cdb_status cdb_link_get(cdb_db *db, uint64_t type, cdb_ref source, cdb_ref targe
     return row_get(&db->links, type, source, target, out, found);
 }
 
+static cdb_status link_list_in(cdb_db *db, cdb_ref entry, int direction, uint64_t type, const cdb_link *after,
+                               cdb_link *out, size_t max, size_t *n);
+
 cdb_status cdb_link_list(cdb_db *db, cdb_ref entry, int direction, uint64_t type, const cdb_link *after,
                          cdb_link *out, size_t max, size_t *n)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = link_list_in(db, entry, direction, type, after, out, max, n);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status link_list_in(cdb_db *db, cdb_ref entry, int direction, uint64_t type, const cdb_link *after,
+                               cdb_link *out, size_t max, size_t *n)
 {
     struct cdb_link_store *ls = &db->links;
     int reverse = direction == CDB_LINK_IN;
