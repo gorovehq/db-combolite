@@ -226,10 +226,12 @@ Every page's payload starts with a **store ID slot**, in every domain and for ev
 ### 14.2.8 Session salts (12.1)
 
 - **Drawing.** Opening a database for writing draws a 16-byte salt from the environment's random hook (`cdb_env.random`), once, before the first encrypted write. Without the hook, an encrypted database opens read-only; a database with no encryption is unaffected.
-- **Salt table.** An ordered index (14.8) whose root is at catalog root slot offset 104 (14.3.2): key, the salt index (2 bytes, big-endian, 1–65,535); value, the salt (16 bytes). A session takes the lowest free index when it draws its salt, and the table entry is committed with the session's first encrypted write.
-- **Use.** An encrypted page or delta record names its salt in the salt index field of its header (14.2.1–14.2.3, 14.4.2). The index is part of the header, so it is authenticated as associated data. Index 0 means no salt and is used only by pages and records that are not encrypted.
+- **Journal and overlay files** carry the salt in their companion header (14.4.1). Their records and overlay pages use it; a delta record names no salt, and an overlay page's salt index is `0xFFFF`, meaning "the salt in this file's header".
+- **Held records** keep the salt they were written under in their held entry (14.4.10).
+- **Archive pages** name their salt in the salt index field of their header (14.2.1–14.2.3), 1–65,534; the field is part of the header, so it is authenticated as associated data. Index 0 means no salt and is used only by pages that are not encrypted.
+- **Salt table.** An ordered index (14.8) whose root is at catalog root slot offset 104 (14.3.2): key, the salt index (2 bytes, big-endian); value, the salt (16 bytes). Only reconciliation writes archive pages, so only the baton holder adds entries: it takes the lowest free index for the salt of each session whose pages it writes, in the same archive commit as those pages. There is no crash window and no race between processes.
 - **Derivation.** The page subkey (12.2) is derived with HKDF-SHA-256 from the domain key, with the session salt as the HKDF salt and `cdb page` as the info. The other subkeys of 12.2 never produce a nonce from a counter and are derived without a session salt, so every copy and session computes the same values.
-- **Pruning.** A salt leaves the table when a complete scrub pass (3.5) finds no page, no held record (14.4.10) and no live journal record that uses it. When all 65,535 indexes are taken, a session that needs a salt refuses encrypted writes with `CDB_E_OUT_OF_BUDGET` until a scrub pass frees one.
+- **Pruning.** A salt leaves the table when a complete scrub pass (3.5) finds no archive page that uses it. When every index is taken, reconciliation re-encrypts pages under an older salt with the current session's (as for a key version, 12.4) until a scrub pass frees an index.
 
 ## 14.3 Catalog root slot (location 0)
 
@@ -426,7 +428,7 @@ A stored procedure is a catalog object of kind 5, named in key `02` like a store
 
 ## 14.4 Companion files, delta records and commit records
 
-### 14.4.1 Companion file header (64 bytes)
+### 14.4.1 Companion file header (80 bytes)
 
 | Offset | Size | Field |
 |---|---|---|
@@ -440,8 +442,9 @@ A stored procedure is a catalog object of kind 5, named in key `02` like a store
 | 32 | 8 | Committed sequence of the archive this companion was unsealed from |
 | 40 | 8 | First delta sequence number in this file |
 | 48 | 8 | Encryption domain ID (0 = public) |
-| 56 | 4 | Reserved, zero |
-| 60 | 4 | CRC32C over bytes 0–59 |
+| 56 | 16 | Session salt (12.1, 14.2.8) of the session that writes this file; zero when the file holds nothing encrypted |
+| 72 | 4 | Reserved, zero |
+| 76 | 4 | CRC32C over bytes 0–75 |
 
 ### 14.4.2 Delta record
 
@@ -458,8 +461,7 @@ A delta record is a 48-byte header, followed by the payload, followed by the tra
 | 24 | 8 | Target store ID |
 | 32 | 8 | Target entry ID, or 0 if there is none |
 | 40 | 4 | Key version |
-| 44 | 2 | Session salt index (14.2.8); 0 on a record that is not encrypted |
-| 46 | 2 | Reserved, zero |
+| 44 | 4 | Reserved, zero |
 | 48 | n | Payload |
 | 48+n | 16 | Trailer: the AEAD tag, or a checksum padded with zeros |
 
@@ -591,16 +593,17 @@ A domain's held log keeps the committed changes of that domain that a process co
    | 8 | Commit stamp (14.4.4), the merge order key |
    | 8 | Global commit number the transaction was given at reconciliation (14.1.8) |
    | 4 | Track ID of the records: slot (2 bytes) and companion type (2 bytes), as in the nonce (14.2.5) |
+   | 16 | Session salt the records were written under, from their journal's header (14.2.8); zero for records that are not encrypted |
    | 4 | Record count |
    | n | The records, each a complete delta record (14.4.2) copied byte for byte |
 
    Only the domain's records that the transaction keeps are copied: its data changes and neuron-weight updates, in journal order. Write-set keys, rollback records and the data records a rollback dropped (14.4.9) are left out.
-3. **Nonces.** A held record keeps its header, sequence number and ciphertext, so it is decrypted with the nonce built from the entry's track ID and the record's own sequence number. Copying it changes nothing that the nonce or the associated data covers, and delta sequence numbers are reserved durably (12.1), so no other record ever takes that nonce.
+3. **Nonces.** A held record keeps its header, sequence number and ciphertext, so it is decrypted with the nonce built from the entry's track ID and the record's own sequence number, under the page subkey derived with the entry's session salt. Copying it changes nothing that the nonce or the associated data covers, and delta sequence numbers are reserved durably (12.1), so no other record ever takes that nonce.
 4. **Holding** happens in the archive commit that applies the transaction's other domains and advances its slot's mark (5.9.2). The entry is appended to the log, and new pages are linked, in that same commit, so a crash leaves either both or neither.
 5. **Draining** happens in a reconciliation by a process that holds the domain's key. It applies the entries in log order, frees every page but the head, and empties the head, all in one archive commit; then it applies the domain's new changes.
 6. **Reading.** A process with the domain open reads the log's entries in order, after the archive and before the journals, when it builds its view of the domain.
 7. **Key versions.** A held record names the key version that encrypted it. That version stays in the directory record's field 17 until the record is drained (14.3.4).
-8. **Replication form.** An entry that holds sealed replication changes (14.21.5) has transaction ID 0, track ID 0 and commit number 0, and its commit stamp is the newest change's clock physical time; its records are the changes, each exactly as received. Draining merges them (19.5) instead of applying them, in log order.
+8. **Replication form.** An entry that holds sealed replication changes (14.21.5) has transaction ID 0, track ID 0, commit number 0 and a zero session salt, and its commit stamp is the newest change's clock physical time; its records are the changes, each exactly as received. Draining merges them (19.5) instead of applying them, in log order.
 
 ## 14.5 Coordinator slot
 
@@ -1376,11 +1379,12 @@ A joined store keeps the links between domains in a link store of its own (model
 
   | Index | Key | Value |
   |---|---|---|
-  | forward | source end (40) · type (8) · target end (40) | weight (4) · time (8) · flags (1) · removed count (4), as in 14.13.1; then the sealed source if the source is an enclave end, then the sealed target if the target is |
+  | forward | source end (40) · type (8) · target end (40) | weight (4) · time (8) · flags (1) · removed count (4), as in 14.13.1; then, for the source if it is an enclave end, the key version its tag and sealed reference were made under (4) and the sealed reference (32); then the same for the target |
   | reverse | target end (40) · type (8) · source end (40) | empty |
 
 - **Sealed reference**, 32 bytes: the 16-byte reference (store ID · entry ID, big-endian) encrypted with the file's AEAD algorithm (12.1) under the enclave's seal subkey (12.2), followed by the 16-byte tag. The nonce is the first 12 bytes of HMAC-SHA-256, under the enclave's seal nonce subkey, of (joined store ID ‖ reference). The associated data is the joined store's ID (8 bytes, big-endian). Because the nonce covers both the associated data and the plaintext, two sealings share a nonce only when they are identical.
 - **Change payloads** are those of 14.13.1, with 40-byte ends, each enclave end followed by its sealed reference (32). The records are the joined store's, so they are encrypted and hide their IDs (14.4.2).
+- **Rotation (12.4).** A lookup from an enclave end computes its tag under every key version of that enclave still in use. Compaction re-makes ends and sealed references made under an older version: it deletes the forward and reverse rows and writes them again under the current version, in one commit.
 - **Checks and applying** follow 14.13.1. An enclave end's existence is checked in its enclave before the change is journaled; at apply, the tag and sealed reference are taken from the change as they are.
 
 ---
@@ -1454,7 +1458,8 @@ The structures above are built from three ordered indexes (14.8). Prefix-compres
 There is one dedup index per encryption domain (Section 1.6). It is an ordered index keyed by content hash. Each entry holds:
 
 - the location of the canonical copy;
-- a **reference count**.
+- a **reference count**;
+- in an enclave or joined store, the **key version** whose hash subkey made the keyed hash (12.4). After a rotation, a lookup hashes under every version still in use, and compaction re-keys entries made under older ones.
 
 Reference counts are updated at reconciliation. When a count reaches zero, the space is passed to the free-space list (14.7.4).
 

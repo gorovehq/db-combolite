@@ -27,7 +27,7 @@ No random number generator is needed for nonces.
 
 - each time a database is opened for writing, the library draws a **random 128-bit session salt**, once;
 - page and record subkeys are derived from the domain key **and the session salt** (12.2), so two forks of one file encrypt under different subkeys and their nonces may repeat harmlessly;
-- each page and record names the salt it was encrypted under, by a small index into a **salt table** kept in the file. A salt is removed from the table once no page or record uses it, as an old key version is (12.4).
+- a journal or overlay file carries its session's salt in its header, so its records and overlay pages need nothing more. An archive page names its salt by a small index into a **salt table** kept in the archive, whose entries are added in the same archive commit as the pages that use them. A salt is removed from the table once no page uses it, as an old key version is (12.4).
 
 The random source is needed once per session, never per nonce. Without one, an encrypted database opens read-only; a platform that encrypts must supply entropy through the environment's random hook. A replica (Section 19) needs nothing more: it writes under its own session salts like any copy. Layout: 14.2.8.
 
@@ -81,7 +81,9 @@ The library ships with a set of providers. Applications can register further pro
   - **Enclave keys and joined-store keys** follow the same norm: each has a rotation timer with a configurable interval and a configurable overdue response.
 - **Enclave keys.** Every page records the version of the key that encrypted it. After an enclave key is rotated:
   - new writes use the new key;
-  - older pages are re-encrypted during maintenance compaction, within the scrub budget (Section 3.5).
+  - older pages are re-encrypted during maintenance compaction, within the scrub budget (Section 3.5);
+  - values made with the old version's unsalted subkeys (12.2) record that version: keyed content hashes, the tags and sealed references of the domain's entries in joined stores (12.9). Until compaction has re-made them under the new version, a lookup computes the tag or hash under every version still in use. Re-tagging an entry's joined-store links needs the joined store and the enclave open, as a move does (12.8);
+  - the old version is retired once no page, record, held change, tag, sealed reference or keyed hash uses it (14.3.4).
 
   The database never has to be rewritten all at once.
 
@@ -130,6 +132,8 @@ An **encryption domain** is either the public domain (ID 0), an enclave, or a jo
   - an explicit call, made with both domains open, moves the store's record from the old domain's catalog to the new one's and records the domain it is moving out of (14.3.3). The store keeps its ID. The old domain's held log is drained first (14.4.10);
   - new writes go to the new domain at once, and the store's nibblet records are re-placed in the new domain's nibblet pages;
   - maintenance compaction walks the store's structures and re-encrypts the pages still in the old domain, within the scrub budget (Section 3.5); the walk resumes where it stopped. Every page has the same room in every domain, because its payload always starts with a store ID slot (14.2.7), so each page is re-encrypted as it is;
+  - the move needs the **baton** (5.9): it first reconciles every process's committed changes, and is refused with `CDB_E_BUSY` while another process has an open transaction that wrote the store, found by scanning their journals as a collision scan does (decrypting with the keys the mover holds);
+  - the store's entries in joined stores move with it: every link end of the store in a joined store that links into the old domain is re-made for the new domain (a new tag, or a plain end when the new domain is public), and each member list (key `07`) is updated. A move that would leave a cross-domain link in a joined store whose member domains don't include the new domain is refused with `CDB_E_STATE`, before anything changes;
   - until the move completes, reading or writing the store needs both domains open, because each page's header names the domain it was written in;
   - a **finish** call completes the re-encryption at once, for an operator who needs single-key access sooner or wants to retire the old key;
   - starting and finishing a move are audit events in the public audit series (store and domain IDs only) and in the audit series of each enclave or joined store involved (12.7), so a move out to the public domain is always on record.
