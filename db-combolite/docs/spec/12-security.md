@@ -36,7 +36,8 @@ After a crash, numbering resumes at the persisted high-water mark. A sequence nu
 - **Separate subkeys for each purpose.** From each enclave key, the library derives a separate subkey for each job:
   - encrypting pages;
   - computing keyed content hashes (Section 6.3);
-  - protecting the enclave's indexes.
+  - protecting the enclave's indexes;
+  - sealing references to its entries in joined stores (12.9): one subkey derives the synthetic nonce, another encrypts.
 
   A weakness in one use of a key therefore can't affect another use.
 - **Joined stores** (Section 4.9) have keys of their own, handled exactly like enclave keys.
@@ -133,11 +134,18 @@ An **encryption domain** is either the public domain (ID 0), an enclave, or a jo
 
 - **What a joined store is.** A joined store is an encryption domain of its own, created explicitly by an operator, like an enclave: it has an object ID and a key reference, and its key is wrapped in the keystore and rotated like an enclave key (12.2, 12.4).
 - **Links between domains.** A link whose two ends are in different domains is stored in a joined store. A link type whose ends may be in different domains names the joined store its links go into.
-- **Opaque pointers.** Inside a joined store, an end that lies in an enclave is an **opaque pointer** with two parts:
-  - **a keyed hash** of the entry reference under that enclave's index subkey (12.2), used as the index key, so that equal references match and a pair can be looked up;
-  - **the sealed reference**: the entry reference encrypted under the enclave's page subkey, so that only holders of the enclave key can follow it.
+- **Opaque pointers.** Inside a joined store, an end that lies in an enclave is an **opaque pointer** with two parts (14.13.2):
+  - **a tag**: the keyed hash (HMAC-SHA-256, all 32 bytes) of the joined store's ID and the entry reference under that enclave's index subkey (12.2), used in the index key, so that equal references match and a pair can be looked up, and the same entry can't be matched across two joined stores;
+  - **the sealed reference**: the entry reference encrypted under the enclave's sealing subkey, so that only holders of the enclave key can follow it. Its nonce is **synthetic**: a keyed hash of the joined store's ID and the reference, under a second sealing subkey. It is never stored, needs no random source (12.1), and is the same only when everything it protects is the same.
 
   A joined store therefore reveals neither the names nor the structure of the enclaves it points into. An end in the public domain is stored as is.
+- **Link types that cross domains** live in the joined store's catalog. A link type names the joined store its links go into and the **member domains** whose entries its links may join; a link with an end in any other domain is refused.
+- **Membership.** Each member domain's own catalog lists the joined stores that link into it (the public catalog does so for the public domain). Without a member's key, nobody learns which joined stores it belongs to.
+- **Keys needed.**
+  - Defining a cross-domain link type needs the joined store and every member domain open.
+  - Adding, reinforcing or removing a link needs the joined store and the domain of each enclave end open: the writer checks the end exists and computes its tag and sealed reference.
+  - Traversing from a public end needs the joined store open, and yields opaque pointers; following one needs its enclave open. Traversing from an enclave end needs that enclave open too, to compute the tag.
+- **Deletes.** Deleting an entry, or dropping or moving a store, in a domain is refused with `CDB_E_SECURITY` while any joined store that links into that domain is closed. Every delete rule (tombstone, cascade, refuse; 14.13.1) then holds across domains exactly as within one.
 - **Compound procedures.** A stored procedure that touches more than one domain is stored in a joined store (Section 4.9).
 
 ### 12.10 Stored procedures in the catalog
@@ -154,5 +162,4 @@ The decisions in 12.8–12.10 are confirmed; these byte-level details are still 
 
 - **RBAC records**: principals and role grants as catalog objects, public ones in the public catalog and an enclave's roles in its own (14.3.5): their kinds and fields.
 - **Replication slices**: the byte form of a sealed domain change in a slice, how a receiving copy holds changes it can't apply, and **nonce uniqueness across copies**: two copies sharing a domain key number their records from their own slots and sequences, so their nonces can coincide under the same key. The design must add a per-copy part to the nonce or derive per-copy subkeys.
-- **Joined stores**: the index layout of their links and the byte form of an opaque pointer.
 - **Procedure records**: their object kind in the catalog (14.3.3) and their fields.

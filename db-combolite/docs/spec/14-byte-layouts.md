@@ -269,6 +269,7 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
   | `04` | store ID + field name | field ID |
   | `05` | store ID + field ID | field name |
   | `06` | none | next object ID: a copy of the root slot's counter |
+  | `07` | joined store ID (8 bytes, big-endian) | empty: a joined store that links into this catalog's domain (12.9) |
 
 - **Record pages.** Records live in pages of type `0x0004`. Each record is written twice, and a **record reference** is the two logical page IDs, 16 bytes.
 - **Store records** use the shared value encoding (14.6), with these field IDs:
@@ -1289,6 +1290,29 @@ Every link is stored in **two** ordered indexes: one keyed by *(source, link typ
 - **Checks when a change is made**, as the open transaction sees things (its own records included): both ends exist (documents and vectors so far); the pair is not linked under the type, and its link was not tombstoned with an end gone (a removed one may be revived); an enforced 1:N type allows each target one live source, and 1:1 also each source one live target. Reinforce and remove need a live link. A delete is refused while a live refuse-type link points at the entry.
 - **Applying.** Create adds both rows when the pair has none; a link removed on purpose (tombstone flag, neither end-gone flag) is revived instead: flags cleared, weight and time set, removed count up by one. Reinforce sets the weight and time of a live link; remove (UNLINK) tombstones it. Applying never fails for logical reasons.
 - **Deletes and drops.** After an entry's delete is applied, each of its links, in either direction, is tombstoned and flagged with the end that is gone; a cascade type erases the link instead, and a refuse-type link found then is tombstoned. Dropping a store tombstones every link with an end in it, whatever the type, in the drop's own commit.
+
+### 14.13.2 Joined stores (12.9)
+
+A joined store keeps the links between domains in a link store of its own (model 5, `$links`), recorded in its own catalog (14.3.5) and written in its domain like any of its pages and records.
+
+- **Cross-domain link types** are kind-2 records in the joined store's catalog with two more fields: 7 the joined store's ID, 8 the member domains (an array of domain IDs; 0 is the public domain). Defining one adds key `07` + the joined store's ID to the catalog of each member domain that has no such key yet, in the same archive commit.
+- **Ends.** Every end is 40 bytes, big-endian:
+
+  | Size | Public end | Enclave end |
+  |---|---|---|
+  | 8 | domain ID, 0 | the enclave's domain ID |
+  | 32 | store ID (8) · entry ID (8) · 16 zero bytes | tag: HMAC-SHA-256 under the enclave's index subkey of (joined store ID ‖ store ID ‖ entry ID), each 8 bytes big-endian |
+
+- **Indexes.**
+
+  | Index | Key | Value |
+  |---|---|---|
+  | forward | source end (40) · type (8) · target end (40) | weight (4) · time (8) · flags (1) · removed count (4), as in 14.13.1; then the sealed source if the source is an enclave end, then the sealed target if the target is |
+  | reverse | target end (40) · type (8) · source end (40) | empty |
+
+- **Sealed reference**, 32 bytes: the 16-byte reference (store ID · entry ID, big-endian) encrypted with the file's AEAD algorithm (12.1) under the enclave's reference-sealing subkey (12.2), followed by the 16-byte tag. The nonce is the first 12 bytes of HMAC-SHA-256, under the enclave's nonce subkey, of (joined store ID ‖ reference). The associated data is the joined store's ID (8 bytes, big-endian). Because the nonce covers both the associated data and the plaintext, two sealings share a nonce only when they are identical.
+- **Change payloads** are those of 14.13.1, with 40-byte ends, each enclave end followed by its sealed reference (32). The records are the joined store's, so they are encrypted and hide their IDs (14.4.2).
+- **Checks and applying** follow 14.13.1. An enclave end's existence is checked in its enclave before the change is journaled; at apply, the tag and sealed reference are taken from the change as they are.
 
 ---
 
