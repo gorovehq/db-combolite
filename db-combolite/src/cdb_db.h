@@ -28,6 +28,7 @@
 #define CDB_STAGE_BUCKETS 512u
 #define CDB_STAGE_IDX_BUCKETS 512u
 #define CDB_STAGE_NIL 0xFFFFFFFFu
+#define CDB_CRDT_PEND_CAP 64u /* (import call, origin) pairs one transaction may apply */
 
 #define CDB_DB_PATH_MAX 200         /* longest path, including the terminating zero */
 
@@ -492,6 +493,13 @@ typedef struct cdb_db {
     cdb_hlc hlc;
     cdb_crdt_vector crdt_vector;
     int in_crdt_import;
+    /* Replicated changes the open transaction applied: per import call and
+     * origin, the latest one, and the data ordinal of the call's first
+     * record. The vector advances to them only at commit (spec 19.4); a
+     * rollback to a savepoint drops those at or past its mark. */
+    cdb_crdt_peer_entry crdt_pend[CDB_CRDT_PEND_CAP];
+    uint32_t crdt_pend_ord[CDB_CRDT_PEND_CAP];
+    uint32_t n_crdt_pend;
     /* Event triggers (spec 11.6). */
     cdb_trigger_registry triggers;
 } cdb_db;
@@ -577,6 +585,10 @@ cdb_status cdb_tx_rollback_to(cdb_db *db, const cdb_tx_mark *mark);
 /* Whether the open transaction's journal record at offset off was dropped by
  * a rollback. Readers of the transaction's own records skip those. */
 int cdb_tx_dropped(const cdb_db *db, uint64_t off);
+/* Reads the journal record at offset off into cfg.record_buf, decrypting it
+ * with its enclave's key when it is encrypted (spec 12). Readers of the
+ * transaction's own records use this, never cdb_journal_read. */
+cdb_status cdb_db_read_record(cdb_db *db, uint64_t off, cdb_record *r, uint64_t *next);
 
 /* Folds every applied change into the archive (spec 3.2) and starts a new
  * journal. With other processes open it takes the baton, waiting for it if

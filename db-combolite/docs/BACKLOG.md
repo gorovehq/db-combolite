@@ -106,18 +106,24 @@ Features and follow-ups that were agreed and deferred. Each one becomes a milest
   - **A row holds at most `CDB_EXEC_MAX_FIELDS` (16) output fields,** fewer than some tables have columns (GutenFree's catalog has 17).
 - **Active keys are only in the spec (found while reorganizing GutenFree, 2026-11-03).** Spec 6.2 defines keys the application assigns, such as `1342/0005`, but nothing implements them: no uniqueness, no lookup by key. The demo stores passage keys as an ordinary field, so finding one means a scan. Tables come close (a primary key is unique and found directly), but a table cannot carry a full-text index, so passages stay a document pool.
 - **A table cannot have a full-text index.** `cdb_doc_create_full_text` and `cdb_doc_search` refuse a table's pool (`doc_pool` checks `is_table`).
-- **Savepoints: what `fix_proc-savepoints` leaves open (spec 11.12.3, 14.4.9, 2026-11-05).**
-  - **Rotation's copy of a transaction with rollbacks is untested.** The rebase copy (14.4.7 rule 2) leaves out dropped records and clears the commit flag, but only a second live process reaches that path, and `tests/test_savepoint.c` runs one.
-  - **A mutation that fails after journaling** is rolled back to an internal savepoint, so it makes all its changes or none. No mutation was found that journals and then fails logically, so no test reaches that rollback.
-  - **The replication export** (`cdb_db_crdt_export_slice`) now walks committed transactions as replay does, which also stops it exporting aborted transactions. `test_export_skips_aborted_and_rolled_back` in `test_crdt` covers both.
-  - **Another process's collision scan** does not look for rollback records, so a dropped change can cause a needless collision (by design, 14.4.9 rule 7).
-- **Readers of an open transaction's journal ignore encryption (found 2026-11-05).** The document, link, time-series and vector readers of the transaction's own records (`replay_tx`, `cdb_doc_tx_entries`, `tx_next` in `cdb_link.c` and `cdb_ts.c`, `live_in_tx` in `cdb_vec.c`) call `cdb_journal_read`, not `cdb_db.c`'s `read_record`, which finds an enclave's key. A record journaled encrypted for an enclave store should then fail with `CDB_E_SECURITY` once a reader gets to it, for example after the document stage overflows. Not reproduced yet.
+- **Procedure steps and savepoints: what is still short (found 2026-11-05).**
+  - Some refusals a procedure would want to check end it instead, because they are `CDB_E_STATE`, which is not a logical failure (11.12.3): a delete refused by a refuse-type link, an enforced cardinality, a late time-series point in reject mode. A table delete refused that way also leaves its index-stage tombstones behind.
+  - A rollback to a savepoint does not undo what is not journaled: time-series retention settings (written straight to the series index), enclave, key, RBAC and trigger changes.
+- **Stores cannot join an enclave (found 2026-11-05).** Spec 1.4 and 4.4 put stores inside enclaves, but nothing implements that:
+  - `cdb_db_create_store` and the model create calls take no enclave, and nothing writes a store's `domain_id`, so it is always 0.
+  - Journal records are encrypted only when a store's ID happens to equal an enclave's ID (`tx_put_in`), which the tests use as a stand-in.
+  - No data model sets `domain_id` in its page headers, so document, table, link, time-series and vector pages are always written unencrypted, even then. Only `cdb_tx_put` with a page-writing apply that sets it (the tests' key-value apply) and blobs reach encrypted pages.
+  - An enclave's catalog entries (spec 4.4) are not kept inside the enclave.
 - **Reserved words cannot name fields in CMBQL.** The lexer reserves 132 words, among them `type`, `key`, `role`, `time`, `data`, `weight`, `source`, `summary`, `model` and `age`, so `where type = "Text"` fails on a column named `type`. The compiler should take a keyword as a field name where an expression expects one.
 
 ## Done
 
 Entries closed with nothing left open, one line each. Git history keeps their full text.
 
+- **A failed procedure step that had journaled** (2026-11-05): downsampling reaches it; `test_proc_failed_mutation_leaves_nothing`.
+- **Sync import advanced the peer vector before commit** (2026-11-05): an abort, a failure partway or a savepoint rollback lost the changes on re-import. The vector now advances at commit (`crdt_pend`), an import in the caller's transaction is atomic, and a sender is first known at the zero time; `test_import_vector_advances_at_commit`.
+- **Readers of an open transaction's journal ignored encryption** (2026-11-05): `cdb_db_read_record` decrypts for the document, link, time-series and vector readers; `tests/test_enclave_tx.c`.
+- **Savepoint rollbacks in other processes' views** (2026-11-05): the rebase copy is tested (`test_rebase_drops_rolled_back`), and the collision scan honours rollback records (`test_collision_skips_rolled_back`, spec 14.4.9 rule 7).
 - **A second process could open a database already in use** (demo, 2026-10-30): M19 joins the coordinators at open and lets several processes share the database (spec 5.9).
 - **An idle process was taken for dead** (M19 layer 1): M20's background heartbeat thread, when the environment has thread hooks; `cdb_db_tick` without them.
 - **Unique checks were quadratic per insert** (demo, 2026-10-30): staged rows are found through a hash on (store, entry) (`db->stage_buckets`) and decoded at their offset (`staged_off`).

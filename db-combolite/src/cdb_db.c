@@ -324,6 +324,11 @@ static cdb_status read_record(cdb_db *db, cdb_journal *j, uint64_t offset,
     return cdb_journal_read(j, offset, buf, buf_size, r, next);
 }
 
+cdb_status cdb_db_read_record(cdb_db *db, uint64_t off, cdb_record *r, uint64_t *next)
+{
+    return read_record(db, &db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, r, next);
+}
+
 /* Adds the dropped ordinals [from, to), at journal offsets [from_off,
  * to_off), to a transaction's n ranges (spec 14.4.9 rule 3). Every range
  * already there ends at or before `to`, so one starting at or after `from`
@@ -361,6 +366,20 @@ static int drops_has(const cdb_tx_drop *d, uint32_t n, uint32_t ord)
         if (ord >= d[i].from && ord < d[i].to)
             return 1;
     return 0;
+}
+
+/* Advances the version vector to the replicated changes the transaction
+ * that just committed applied (spec 19.4). */
+static void crdt_commit_pending(cdb_db *db)
+{
+    uint32_t i;
+    for (i = 0; i < db->n_crdt_pend; i++) {
+        cdb_crdt_peer_entry pe;
+        cdb_hlc h = db->crdt_pend[i].hlc;
+        if (cdb_crdt_vector_get(&db->crdt_vector, h.peer_id, &pe) != CDB_OK || cdb_hlc_compare(h, pe.hlc) > 0)
+            cdb_crdt_vector_set(&db->crdt_vector, h.peer_id, h.physical, h);
+    }
+    db->n_crdt_pend = 0;
 }
 
 int cdb_tx_dropped(const cdb_db *db, uint64_t off)
@@ -1593,6 +1612,7 @@ static cdb_status tx_begin_locked(cdb_db *db, cdb_durability durability)
     db->tx_deltas = 0;
     db->tx_data = 0;
     db->tx_ndrops = 0;
+    db->n_crdt_pend = 0;
     db->stage_used = 0;
     db->stage_overflow = 0;
     db->stage_removals = 0;
@@ -2040,7 +2060,11 @@ static cdb_status check_slot_collisions(cdb_db *db, unsigned slot, uint64_t my_s
 
     for (;;) {
         uint64_t off, cur_tx = 0, prep_stamp = 0;
-        int cur_overlap = 0, cur_prepared = 0;
+        int cur_overlap = 0, cur_prepared = 0, key_overlap = 0;
+        /* A rollback drops the data records from ordinal p on (spec 14.4.9
+         * rule 2), so the transaction overlaps while its first overlapping
+         * data record is below every later rollback's p. */
+        uint32_t cur_ord = 0, first_ov = UINT32_MAX;
 
         if ((s = env_exists(db, path, &exists)) != CDB_OK || !exists)
             return s;
@@ -2066,18 +2090,38 @@ static cdb_status check_slot_collisions(cdb_db *db, unsigned slot, uint64_t my_s
                 continue;
             counter = r.tx_id & TX_COUNTER_MASK;
             if (r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_WRITE_KEY) {
+                int hit = 0;
                 if (r.tx_id != cur_tx) {
                     cur_tx = r.tx_id;
                     cur_overlap = 0;
                     cur_prepared = 0;
                     prep_stamp = 0;
+                    key_overlap = 0;
+                    cur_ord = 0;
+                    first_ov = UINT32_MAX;
                 }
-                if (counter > mark && !cur_overlap && ws_from_record(&r, &it)) {
-                    if ((s = own_has_item(db, own, nown, more_at, own_end, &it, &cur_overlap)) != CDB_OK) {
+                /* Write-set keys are never dropped (rule 7), so one is
+                 * still looked at after a data record overlapped. */
+                if (counter > mark && !key_overlap && (r.kind == CDB_RECORD_WRITE_KEY || first_ov == UINT32_MAX)
+                    && ws_from_record(&r, &it)) {
+                    if ((s = own_has_item(db, own, nown, more_at, own_end, &it, &hit)) != CDB_OK) {
                         cdb_storage_close(&db->rj_st);
                         return s;
                     }
+                    if (hit && r.kind == CDB_RECORD_DATA)
+                        first_ov = cur_ord;
+                    else if (hit)
+                        key_overlap = 1;
+                    cur_overlap = key_overlap || first_ov != UINT32_MAX;
                 }
+                if (r.kind == CDB_RECORD_DATA)
+                    cur_ord++;
+            } else if (r.kind == CDB_RECORD_ROLLBACK && r.tx_id == cur_tx
+                       && r.payload_len == CDB_ROLLBACK_PAYLOAD_SIZE) {
+                uint32_t p = cdb_load_u32(r.payload, db->pager.order);
+                if (first_ov != UINT32_MAX && first_ov >= p)
+                    first_ov = UINT32_MAX;
+                cur_overlap = key_overlap || first_ov != UINT32_MAX;
             } else if (r.kind == CDB_RECORD_PREPARE && r.tx_id == cur_tx
                        && r.payload_len == CDB_PREPARE_PAYLOAD_SIZE) {
                 if (counter > mark) {
@@ -2307,6 +2351,7 @@ static cdb_status tx_commit_locked(cdb_db *db)
         /* A standing baton expired while applying: give it up and replay
          * onto the overlay instead (spec 5.9.8). */
         db->last_tx = counter;
+        crdt_commit_pending(db);
         if ((s = cdb_coord_baton_release(&db->coord)) == CDB_OK)
             s = rebase(db);
         if (s != CDB_OK)
@@ -2320,6 +2365,7 @@ static cdb_status tx_commit_locked(cdb_db *db)
     if (db->fresh)
         db->applied++;
     db->last_tx = counter;
+    crdt_commit_pending(db);
     if (db->peer_id != 0 && !db->in_crdt_import) {
         int64_t now_ns = 0;
         int have_ns = 0;
@@ -2466,6 +2512,8 @@ cdb_status cdb_tx_rollback_to(cdb_db *db, const cdb_tx_mark *mark)
     cdb_doc_stage_rewind(db, mark->stage_used, mark->stage_overflow, mark->stage_removals);
     if (db->idx_stage != NULL)
         stage_idx_rewind(db, mark->stage_idx_used, mark->stage_idx_overflow);
+    while (db->n_crdt_pend > 0 && db->crdt_pend_ord[db->n_crdt_pend - 1u] >= mark->data)
+        db->n_crdt_pend--;
     db_unlock(db);
     return CDB_OK;
 }
@@ -3739,13 +3787,136 @@ cdb_status cdb_db_crdt_export_slice(cdb_db *db, const cdb_crdt_vector *since_vec
     return s;
 }
 
+/* One import call (spec 19.4): atomic, and the version vector advances to
+ * what it applied only when the transaction commits. Inside the caller's
+ * transaction the call takes a savepoint, so a failure leaves nothing. */
+typedef struct crdt_import {
+    int own_tx;
+    cdb_tx_mark mark;
+    uint32_t ord0;                                /* data ordinal of the call's first record */
+    cdb_crdt_peer_entry adv[CDB_CRDT_MAX_PEERS];  /* per origin, the latest change applied */
+    uint32_t nadv;
+    size_t applied;
+} crdt_import;
+
+static cdb_status crdt_import_begin(cdb_db *db, crdt_import *im)
+{
+    cdb_status s;
+    memset(im, 0, sizeof *im);
+    if (!db->in_tx) {
+        if ((s = cdb_tx_begin(db, CDB_DURABILITY_NORMAL)) != CDB_OK)
+            return s;
+        im->own_tx = 1;
+    } else if ((s = cdb_tx_savepoint(db, &im->mark)) != CDB_OK) {
+        return s;
+    }
+    im->ord0 = db->tx_data;
+    db->in_crdt_import = 1;
+    return CDB_OK;
+}
+
+/* Whether a change from h's origin at h or before was applied already:
+ * committed, earlier in this transaction, or earlier in this call. */
+static int crdt_seen(const cdb_db *db, const crdt_import *im, cdb_hlc h)
+{
+    cdb_crdt_peer_entry pe;
+    uint32_t i;
+    if (cdb_crdt_vector_get(&db->crdt_vector, h.peer_id, &pe) == CDB_OK && cdb_hlc_compare(h, pe.hlc) <= 0)
+        return 1;
+    for (i = 0; i < db->n_crdt_pend; i++)
+        if (db->crdt_pend[i].peer_id == h.peer_id && cdb_hlc_compare(h, db->crdt_pend[i].hlc) <= 0)
+            return 1;
+    for (i = 0; i < im->nadv; i++)
+        if (im->adv[i].peer_id == h.peer_id && cdb_hlc_compare(h, im->adv[i].hlc) <= 0)
+            return 1;
+    return 0;
+}
+
+static cdb_status crdt_import_one(cdb_db *db, crdt_import *im, const cdb_crdt_delta_rec *r)
+{
+    int64_t now_ns = 0;
+    int have_ns = 0;
+    uint32_t i;
+    cdb_status s;
+
+    if (r->hlc.peer_id == db->peer_id && db->peer_id != 0)
+        return CDB_OK;
+    if (r->hlc.peer_id != 0 && crdt_seen(db, im, r->hlc))
+        return CDB_OK;
+    if (r->hlc.peer_id != 0) {
+        for (i = 0; i < im->nadv && im->adv[i].peer_id != r->hlc.peer_id; i++)
+            ;
+        if (i == im->nadv && im->nadv == CDB_CRDT_MAX_PEERS)
+            return CDB_E_OUT_OF_BUDGET;
+    }
+
+    cdb_db_now(db, &now_ns, &have_ns);
+    cdb_hlc_update(&db->hlc, r->hlc, have_ns ? (uint64_t)now_ns : (db->hlc.physical + 1u));
+    if ((s = cdb_tx_put(db, r->store_id, r->entry_id, r->op, r->data, r->len)) != CDB_OK)
+        return s;
+    im->applied++;
+    if (r->hlc.peer_id != 0) {
+        if (i == im->nadv)
+            im->nadv++;
+        im->adv[i].peer_id = r->hlc.peer_id;
+        im->adv[i].counter = r->hlc.physical;
+        im->adv[i].hlc = r->hlc;
+    }
+    return CDB_OK;
+}
+
+/* Undoes the call: the transaction it opened, or back to its savepoint. */
+static void crdt_import_fail(cdb_db *db, crdt_import *im)
+{
+    db->in_crdt_import = 0;
+    if (im->own_tx)
+        (void)cdb_tx_abort(db);
+    else if (cdb_tx_rollback_to(db, &im->mark) != CDB_OK)
+        db->failed = 1;
+}
+
+static cdb_status crdt_import_end(cdb_db *db, crdt_import *im, uint32_t remote_peer_id)
+{
+    cdb_status s;
+    uint32_t i;
+    if (db->n_crdt_pend + im->nadv > CDB_CRDT_PEND_CAP) {
+        crdt_import_fail(db, im);
+        return CDB_E_OUT_OF_BUDGET;
+    }
+    for (i = 0; i < im->nadv; i++) {
+        db->crdt_pend[db->n_crdt_pend] = im->adv[i];
+        db->crdt_pend_ord[db->n_crdt_pend] = im->ord0;
+        db->n_crdt_pend++;
+    }
+    if (im->own_tx) {
+        s = im->applied > 0 ? cdb_tx_commit(db) : cdb_tx_abort(db);
+        db->in_crdt_import = 0;
+        if (s != CDB_OK)
+            return s;
+    } else {
+        db->in_crdt_import = 0;
+    }
+    /* The sender becomes known, at the zero time: nothing of it is taken
+     * as seen until a change of its own commits. */
+    if (remote_peer_id != 0) {
+        cdb_crdt_peer_entry rpe;
+        if (cdb_crdt_vector_get(&db->crdt_vector, remote_peer_id, &rpe) != CDB_OK) {
+            cdb_hlc zero;
+            memset(&zero, 0, sizeof zero);
+            zero.peer_id = remote_peer_id;
+            cdb_crdt_vector_set(&db->crdt_vector, remote_peer_id, 0, zero);
+        }
+    }
+    return CDB_OK;
+}
+
 cdb_status cdb_db_crdt_import_deltas(cdb_db *db, uint32_t remote_peer_id,
                                      const cdb_crdt_delta_rec *recs, size_t count,
                                      size_t *applied_count)
 {
+    crdt_import im;
     cdb_status s;
-    size_t i, applied = 0;
-    int tx_opened_by_us = 0;
+    size_t i;
 
     if (db == NULL || applied_count == NULL || (recs == NULL && count > 0))
         return CDB_E_INVALID_ARG;
@@ -3754,86 +3925,30 @@ cdb_status cdb_db_crdt_import_deltas(cdb_db *db, uint32_t remote_peer_id,
         return CDB_OK;
 
     db_lock(db);
-    if ((s = usable(db)) != CDB_OK) {
+    if ((s = usable(db)) != CDB_OK || (s = crdt_import_begin(db, &im)) != CDB_OK) {
         db_unlock(db);
         return s;
     }
-
-    if (!db->in_tx) {
-        s = cdb_tx_begin(db, CDB_DURABILITY_NORMAL);
-        if (s != CDB_OK) {
-            db_unlock(db);
-            return s;
-        }
-        tx_opened_by_us = 1;
-    }
-
-    db->in_crdt_import = 1;
-
     for (i = 0; i < count; i++) {
-        cdb_crdt_peer_entry pe;
-        int64_t now_ns = 0;
-        int have_ns = 0;
-
-        if (recs[i].hlc.peer_id == db->peer_id && db->peer_id != 0)
-            continue;
-
-        if (recs[i].hlc.peer_id != 0 && cdb_crdt_vector_get(&db->crdt_vector, recs[i].hlc.peer_id, &pe) == CDB_OK) {
-            if (cdb_hlc_compare(recs[i].hlc, pe.hlc) <= 0)
-                continue;
-        }
-
-        cdb_db_now(db, &now_ns, &have_ns);
-        cdb_hlc_update(&db->hlc, recs[i].hlc, have_ns ? (uint64_t)now_ns : (db->hlc.physical + 1u));
-
-        s = cdb_tx_put(db, recs[i].store_id, recs[i].entry_id, recs[i].op, recs[i].data, recs[i].len);
-        if (s != CDB_OK) {
-            db->in_crdt_import = 0;
-            if (tx_opened_by_us)
-                cdb_tx_abort(db);
+        if ((s = crdt_import_one(db, &im, &recs[i])) != CDB_OK) {
+            crdt_import_fail(db, &im);
             db_unlock(db);
             return s;
         }
-
-        applied++;
-        if (recs[i].hlc.peer_id != 0)
-            cdb_crdt_vector_set(&db->crdt_vector, recs[i].hlc.peer_id, recs[i].hlc.physical, recs[i].hlc);
     }
-
-    if (tx_opened_by_us) {
-        if (applied > 0) {
-            s = cdb_tx_commit(db);
-            db->in_crdt_import = 0;
-            if (s != CDB_OK) {
-                db_unlock(db);
-                return s;
-            }
-        } else {
-            db->in_crdt_import = 0;
-            cdb_tx_abort(db);
-        }
-    } else {
-        db->in_crdt_import = 0;
-    }
-
-    if (remote_peer_id != 0) {
-        cdb_crdt_peer_entry rpe;
-        if (cdb_crdt_vector_get(&db->crdt_vector, remote_peer_id, &rpe) != CDB_OK)
-            cdb_crdt_vector_set(&db->crdt_vector, remote_peer_id, 0, db->hlc);
-    }
-
-    *applied_count = applied;
+    if ((s = crdt_import_end(db, &im, remote_peer_id)) == CDB_OK)
+        *applied_count = im.applied;
     db_unlock(db);
-    return CDB_OK;
+    return s;
 }
 
 cdb_status cdb_db_crdt_import_slice(cdb_db *db, const uint8_t *in_buf, size_t in_len,
                                     size_t *applied_count)
 {
-    uint32_t magic, remote_peer_id, nrecs;
-    size_t off, i, applied = 0;
+    uint32_t magic, remote_peer_id, nrecs, i;
+    size_t off;
+    crdt_import im;
     cdb_status s;
-    int tx_opened_by_us = 0;
 
     if (db == NULL || in_buf == NULL || applied_count == NULL)
         return CDB_E_INVALID_ARG;
@@ -3852,32 +3967,15 @@ cdb_status cdb_db_crdt_import_slice(cdb_db *db, const uint8_t *in_buf, size_t in
         return CDB_OK;
 
     db_lock(db);
-    if ((s = usable(db)) != CDB_OK) {
+    if ((s = usable(db)) != CDB_OK || (s = crdt_import_begin(db, &im)) != CDB_OK) {
         db_unlock(db);
         return s;
     }
 
-    if (!db->in_tx) {
-        s = cdb_tx_begin(db, CDB_DURABILITY_NORMAL);
-        if (s != CDB_OK) {
-            db_unlock(db);
-            return s;
-        }
-        tx_opened_by_us = 1;
-    }
-
-    db->in_crdt_import = 1;
-
     off = 12u;
     for (i = 0; i < nrecs; i++) {
-        uint64_t store_id, entry_id;
-        uint8_t op;
-        cdb_hlc hlc;
+        cdb_crdt_delta_rec r;
         uint32_t dlen;
-        const uint8_t *data;
-        cdb_crdt_peer_entry pe;
-        int64_t now_ns = 0;
-        int have_ns = 0;
 
         if (off + 37u > in_len) {
             s = CDB_E_TRUNCATED;
@@ -3888,66 +3986,26 @@ cdb_status cdb_db_crdt_import_slice(cdb_db *db, const uint8_t *in_buf, size_t in
             s = CDB_E_TRUNCATED;
             goto fail;
         }
-
-        store_id = cdb_load_u64(in_buf + off, CDB_ORDER_BIG);
-        entry_id = cdb_load_u64(in_buf + off + 8, CDB_ORDER_BIG);
-        op = in_buf[off + 16];
-        hlc.physical = cdb_load_u64(in_buf + off + 17, CDB_ORDER_BIG);
-        hlc.logical = cdb_load_u32(in_buf + off + 25, CDB_ORDER_BIG);
-        hlc.peer_id = cdb_load_u32(in_buf + off + 29, CDB_ORDER_BIG);
-        data = in_buf + off + 37u;
+        r.store_id = cdb_load_u64(in_buf + off, CDB_ORDER_BIG);
+        r.entry_id = cdb_load_u64(in_buf + off + 8, CDB_ORDER_BIG);
+        r.op = in_buf[off + 16];
+        r.hlc.physical = cdb_load_u64(in_buf + off + 17, CDB_ORDER_BIG);
+        r.hlc.logical = cdb_load_u32(in_buf + off + 25, CDB_ORDER_BIG);
+        r.hlc.peer_id = cdb_load_u32(in_buf + off + 29, CDB_ORDER_BIG);
+        r.data = in_buf + off + 37u;
+        r.len = dlen;
         off += 37u + dlen;
-
-        if (hlc.peer_id == db->peer_id && db->peer_id != 0)
-            continue;
-
-        if (hlc.peer_id != 0 && cdb_crdt_vector_get(&db->crdt_vector, hlc.peer_id, &pe) == CDB_OK) {
-            if (cdb_hlc_compare(hlc, pe.hlc) <= 0)
-                continue;
-        }
-
-        cdb_db_now(db, &now_ns, &have_ns);
-        cdb_hlc_update(&db->hlc, hlc, have_ns ? (uint64_t)now_ns : (db->hlc.physical + 1u));
-
-        s = cdb_tx_put(db, store_id, entry_id, op, data, dlen);
-        if (s != CDB_OK)
+        if ((s = crdt_import_one(db, &im, &r)) != CDB_OK)
             goto fail;
-
-        applied++;
-        if (hlc.peer_id != 0)
-            cdb_crdt_vector_set(&db->crdt_vector, hlc.peer_id, hlc.physical, hlc);
     }
 
-    if (tx_opened_by_us) {
-        if (applied > 0) {
-            s = cdb_tx_commit(db);
-            db->in_crdt_import = 0;
-            if (s != CDB_OK) {
-                db_unlock(db);
-                return s;
-            }
-        } else {
-            db->in_crdt_import = 0;
-            cdb_tx_abort(db);
-        }
-    } else {
-        db->in_crdt_import = 0;
-    }
-
-    if (remote_peer_id != 0) {
-        cdb_crdt_peer_entry rpe;
-        if (cdb_crdt_vector_get(&db->crdt_vector, remote_peer_id, &rpe) != CDB_OK)
-            cdb_crdt_vector_set(&db->crdt_vector, remote_peer_id, 0, db->hlc);
-    }
-
-    *applied_count = applied;
+    if ((s = crdt_import_end(db, &im, remote_peer_id)) == CDB_OK)
+        *applied_count = im.applied;
     db_unlock(db);
-    return CDB_OK;
+    return s;
 
 fail:
-    db->in_crdt_import = 0;
-    if (tx_opened_by_us)
-        cdb_tx_abort(db);
+    crdt_import_fail(db, &im);
     db_unlock(db);
     return s;
 }

@@ -299,7 +299,7 @@ static cdb_status tx_next(cdb_db *db, uint64_t *off, txrec *r, int *done)
     while (*off < db->journal.end) {
         cdb_record rec;
         uint64_t next, at = *off;
-        cdb_status s = cdb_journal_read(&db->journal, *off, db->cfg.record_buf, db->cfg.record_buf_size, &rec, &next);
+        cdb_status s = cdb_db_read_record(db, *off, &rec, &next);
         if (s != CDB_OK)
             return s;
         *off = next;

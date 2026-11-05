@@ -502,6 +502,85 @@ static void test_export_skips_aborted_and_rolled_back(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db2));
 }
 
+/* A slice from peer 7 with n records on pages 20, 21, ...; record i
+ * carries "Ri" at clock 100 + i. With big set, the last record is too large
+ * for one journal record, so importing it fails after the earlier ones are
+ * journaled. */
+static size_t make_slice(uint8_t *buf, size_t cap, size_t n, int big)
+{
+    static uint8_t data[8][1200];
+    cdb_crdt_delta_rec recs[8];
+    size_t i, len = 0;
+    TEST_ASSERT_TRUE(n <= 8);
+    for (i = 0; i < n; i++) {
+        memset(&recs[i], 0, sizeof recs[i]);
+        data[i][0] = 'R';
+        data[i][1] = (uint8_t)('0' + i);
+        recs[i].store_id = STORE;
+        recs[i].entry_id = 20u + i;
+        recs[i].op = CDB_OP_INSERT;
+        recs[i].hlc.physical = 100u + i;
+        recs[i].hlc.peer_id = 7u;
+        recs[i].data = data[i];
+        recs[i].len = big && i == n - 1u ? sizeof data[i] : 2u;
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_crdt_slice_encode(7u, recs, n, buf, cap, &len));
+    return len;
+}
+
+/* The version vector advances only when the transaction that applied the
+ * changes commits (spec 19.4): an abort, a failed import, or a rollback to
+ * a savepoint leaves the changes importable again. */
+static void test_import_vector_advances_at_commit(void)
+{
+    cdb_header h = settings();
+    static uint8_t slice[4096];
+    size_t len, applied = 0;
+    cdb_tx_mark m;
+    uint8_t page_buf[PAGE];
+    cdb_page_header ph;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open(&db2, &env, "peer2", &cfg2, &h));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_set_peer_id(&db2, 2u));
+    len = make_slice(slice, sizeof slice, 2, 0);
+
+    /* Imported in the caller's transaction, which aborts. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db2, CDB_DURABILITY_FULL));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_crdt_import_slice(&db2, slice, len, &applied));
+    TEST_ASSERT_EQUAL_UINT32(2u, (uint32_t)applied);
+    /* Within the transaction, the same slice is already seen. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_crdt_import_slice(&db2, slice, len, &applied));
+    TEST_ASSERT_EQUAL_UINT32(0u, (uint32_t)applied);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_abort(&db2));
+
+    /* Rolled back to a savepoint, then committed. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db2, CDB_DURABILITY_FULL));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_savepoint(&db2, &m));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_crdt_import_slice(&db2, slice, len, &applied));
+    TEST_ASSERT_EQUAL_UINT32(2u, (uint32_t)applied);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_rollback_to(&db2, &m));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&db2, STORE, 30u, CDB_OP_INSERT, "x", 1u));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db2));
+
+    /* A slice whose last record can't be journaled fails as a whole. */
+    len = make_slice(slice, sizeof slice, 3, 1);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db2, CDB_DURABILITY_FULL));
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_db_crdt_import_slice(&db2, slice, len, &applied));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db2));
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_pager_read(&db2.pager, 20u, page_buf, &ph));
+
+    /* None of that counted: the slice still applies in full, once. */
+    len = make_slice(slice, sizeof slice, 2, 0);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_crdt_import_slice(&db2, slice, len, &applied));
+    TEST_ASSERT_EQUAL_UINT32(2u, (uint32_t)applied);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db2.pager, 21u, page_buf, &ph));
+    TEST_ASSERT_EQUAL_STRING_LEN("R1", page_buf + sizeof(cdb_page_header), 2);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_crdt_import_slice(&db2, slice, len, &applied));
+    TEST_ASSERT_EQUAL_UINT32(0u, (uint32_t)applied);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db2));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -513,5 +592,6 @@ int main(void)
     RUN_TEST(test_replication_handshake_and_slice_wire_codec);
     RUN_TEST(test_db_multi_peer_replication_sync);
     RUN_TEST(test_export_skips_aborted_and_rolled_back);
+    RUN_TEST(test_import_vector_advances_at_commit);
     return UNITY_END();
 }
