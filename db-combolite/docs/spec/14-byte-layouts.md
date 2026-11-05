@@ -200,6 +200,7 @@ AES-GCM and ChaCha20-Poly1305 both take a 12-byte nonce:
   | `0x0007` | overflow (14.15) |
   | `0x0008` | time-series block (14.11.1) |
   | `0x0009` | nibblet page: small records of any store (14.18) |
+  | `0x000A` | enclave root: the roots of an enclave's or joined store's own catalog (14.3.5) |
   | `0x7F00` | reserved for tests |
 
   Further page types are assigned IDs when they are built.
@@ -304,7 +305,7 @@ The enclave directory is the public half of every enclave and joined store (12.8
   | 20 | rotation: an object `{1: last rotated, 2: interval, 3: overdue response}` |
 
 - **Key versions.** Each key reference (12.3) addresses that version's key, wrapped under the master key, in the external keystore. Rotating the key appends a version and makes it current. A version is removed from field 17 once compaction has re-encrypted the last page and the last held record (12.8) that used it. A page or record whose key version is not in field 17 is corrupt.
-- **Enclave root pages.** The two pages named in field 19 are in the domain's own encryption domain, encrypted under its current page subkey, and hold the roots of the domain's own catalog (layout: to be confirmed). The primary and the mirror are written alike, as the public catalog's body is (3.5); their logical IDs never change.
+- **Enclave root pages.** The two pages named in field 19 are in the domain's own encryption domain, encrypted under its current page subkey, and hold the roots of the domain's own catalog (14.3.5). The primary and the mirror are written alike, as the public catalog's body is (3.5); their logical IDs never change.
 - **Opening.** Opening an enclave or joined store fetches and unwraps the current key version and reads the primary root page, or the mirror when the primary is damaged. A key that does not authenticate either page is the wrong key: the open fails with `CDB_E_SECURITY` and nothing is cached.
 - **Rotation state** is public, so that it can be checked before any key is fetched:
   - *last rotated*: a timestamp in nanoseconds since the Unix epoch, from the environment's clock, as commit timestamps are (14.4.4); the creation time until the first rotation;
@@ -312,6 +313,33 @@ The enclave directory is the public half of every enclave and joined store (12.8
   - *overdue response*: 0 the configuration's default, 1 warn, 2 refuse writes to the domain, 3 refuse to open it.
 
   An outsider can learn when a domain's keys were rotated and how its rotation is configured, but nothing about its contents.
+
+### 14.3.5 Enclave root pages and an enclave's catalog
+
+An enclave or joined store keeps its own catalog (12.8, Section 4.4). It has the same shape as the public catalog, inside the domain: everything in it is written in the domain and encrypted under the domain's page subkey.
+
+- **Enclave root pages.** The two pages named in the directory record's field 19 (14.3.4) are logical pages of type `0x000A` in the domain. Their header's store ID is 0, like every encrypted page's (12.8). Both are written alike at every change to the domain's catalog. Payload, in the file's byte order:
+
+  | Offset | Size | Field | Notes |
+  |---|---|---|---|
+  | 0 | 8 | Magic | `89 43 44 42 45 4E 43 0A` (`\x89CDBENC\n`) |
+  | 8 | 4 | Format version | 1 |
+  | 12 | 4 | Reserved | zero |
+  | 16 | 8 | Domain ID | must equal the directory record's ID |
+  | 24 | 8 | Commit sequence | the archive commit that wrote this version |
+  | 32 | 8 | Catalog body root | logical page ID of the primary copy |
+  | 40 | 8 | Catalog mirror root | logical page ID of the mirrored copy (3.5) |
+  | 48 | 8 | Schema-history root | |
+  | 56 | 8 | Quick-query index root | derived, can be rebuilt (4.8) |
+  | 64 | 8 | Dedup index root | the domain's own (Section 1.6) |
+  | 72 | 8 | Audit series root | the domain's own, hash-chained (12.7) |
+  | 80 | 8 | Nibblet free-space root | the domain's own (14.18.3); 0 until its first nibblet |
+  | 88 | 40 | Reserved | zero |
+
+  A root that is 0 does not exist yet. A page whose magic, version or domain ID is wrong is corrupt; the open falls back to the other page, and fails with `CDB_E_CORRUPT` when both are.
+- **The body** is one mirrored B+tree with the public body's key prefixes (14.3.3): objects (`01`), names (`02`), schema versions (`03`, `04`, `05`). Its records use the same field IDs and kinds. Prefix `06` is not used: object IDs come from the **public** counter (14.3.2 offset 88), so an ID is unique across the whole database and survives a move between domains (12.8). An outsider can see that an object was created, and when, but not in which domain or of what kind.
+- **What it holds:** the records of the domain's stores (including its own link store, model 5), link types, schema history, field dictionaries, procedures (12.10) and roles (12.5).
+- **Changes commit as public catalog changes do** (14.3.3): they reconcile first, are refused while a transaction is open, and commit immediately. A change that touches both catalogs, such as creating a store in an enclave (which advances the public counter) or moving a store between domains, writes both in one archive commit.
 
 ## 14.4 Companion files, delta records and commit records
 

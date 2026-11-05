@@ -77,6 +77,7 @@ The library ships with a set of providers. Applications can register further pro
   - **Roles** are granted to identities.
   - **Permissions** are `read`, `write`, `execute` (procedures) and `admin`. They can be granted on the whole database, a store, an enclave or a procedure.
   - **An enclave's roles are defined inside that enclave** (Section 4.4), so its access rules don't leak.
+  - **Principals and role grants are catalog objects**, so they survive a reopen: public ones in the public catalog, an enclave's in its own catalog (14.3.5).
 - **Signing.** Revisions and audit events can be signed with the identity's key. The policy is configurable:
   - sign every revision;
   - sign audit-series events only (**the default**);
@@ -142,7 +143,7 @@ Stored procedures are catalog objects, with the source text, compiled form, depe
 
 The decisions in 12.8–12.10 are confirmed; these byte-level details are still to be proposed and confirmed:
 
-- **An enclave's catalog**: the enclave root pages' layout (the directory is in 14.3.4), its record kinds and roots (catalog body, schema history, field dictionaries, nibblet free-space index, deduplication index, audit series, quick-query index, link store).
+- **RBAC records**: principals and role grants as catalog objects, public ones in the public catalog and an enclave's roles in its own (14.3.5): their kinds and fields.
 - **Hidden IDs**: where the store ID and entry ID sit inside an encrypted page payload and an encrypted delta record (Sections 13, 14.2, 14.4.2).
 - **Held records**: how recovery records the transactions it holds, how holding interacts with journal rotation (14.4.7) and with other processes (Section 5.9), and the crash cases.
 - **Moving a store**: the store record's target-domain field, and how compaction finds and re-encrypts the pages still in the old domain.
