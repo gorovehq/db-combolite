@@ -63,11 +63,13 @@ cdb_status gf_vec_embed_book(gf_db *g, const gf_catalog *c, const gf_books *b, c
  * are missing. *added counts them. */
 cdb_status gf_vec_link_similar(gf_db *g, const gf_vec *v, uint64_t *added);
 
-/* Refreshes the passage neighbour graph until nothing is pending, in slices
- * of GF_GRAPH_SLICE entries, calling progress after each with how many are
- * done and still pending and the milliseconds so far. Each slice commits,
- * so an interrupted refresh keeps what it did. */
+/* Refreshes the passage neighbour graph until nothing is pending, in about
+ * GF_GRAPH_STEPS slices of at least GF_GRAPH_SLICE entries, calling
+ * progress after each with how many are done and still pending and the
+ * milliseconds so far. Each slice commits, so an interrupted refresh keeps
+ * what it did. */
 #define GF_GRAPH_SLICE 256u
+#define GF_GRAPH_STEPS 16u
 typedef void (*gf_graph_progress_fn)(size_t done, size_t pending, double ms, void *ctx);
 cdb_status gf_vec_refresh_graph(gf_db *g, const gf_vec *v, gf_graph_progress_fn progress, void *ctx,
                                 size_t *remaining);

@@ -25,6 +25,14 @@
  *   gutenfree embed [model.gguf] [base]     embed every stored passage (the
  *                                           model from gf_model.py), link
  *                                           similar books, refresh the graph
+ *   gutenfree graph [base]                  refresh the passages' graph only
+ *   gutenfree link-similar [base]           link similar books only (one
+ *                                           bulk search)
+ *   gutenfree bench-graph [base]            time a whole graph build (on a
+ *                                           copy of the database)
+ *
+ * With an accelerator in the build (CDB_ACCEL_CUDA, CDB_ACCEL_VULKAN),
+ * GUTENFREE_ACCEL=off goes without it and =software allows llvmpipe.
  *
  * base is the database path without extension: the last argument, else
  * $GUTENFREE_DB, else data/gutenfree (giving data/gutenfree.cdbarch);
@@ -92,8 +100,8 @@ static void draw(const char *base, const gf_db *g, double open_ms, const char *n
     }
     if (note != NULL)
         mvprintw(5 + (int)NITEMS, 4, "%s", note);
-    gf_status(" %s.cdbarch | page %u B | buffers %.1f MB | opened in %.1f ms | build: %s ", base, GF_PAGE,
-              (double)g->bytes / (1024.0 * 1024.0), open_ms, GF_BUILD_LABEL);
+    gf_status(" %s.cdbarch | page %u B | buffers %.1f MB | opened in %.1f ms | build: %s | accel: %s ", base,
+              GF_PAGE, (double)g->bytes / (1024.0 * 1024.0), open_ms, GF_BUILD_LABEL, g->accel_name);
     refresh();
 }
 
@@ -360,6 +368,31 @@ static int graph_cli(gf_db *g)
     return refresh_graph(g, &v) == CDB_OK ? 0 : 1;
 }
 
+/* Links similar books only: what embed does before its graph refresh. One
+ * bulk search over every book vector (spec 18.4), on the accelerator when
+ * there is one; prints how the searches went. */
+static int similar_cli(gf_db *g)
+{
+    gf_vec v;
+    uint64_t links = 0;
+    cdb_accel_stats before;
+    double t0;
+    cdb_status s = gf_vec_open(g, &v);
+
+    if (s != CDB_OK) {
+        fprintf(stderr, "gutenfree: open stores: %s\n", cdb_status_str(s));
+        return 1;
+    }
+    before = g->db.accel_stats;
+    t0 = gf_now_ms();
+    s = gf_vec_link_similar(g, &v, &links);
+    printf("similar_to: %s, %llu links added in %.1f ms (%llu searches on the accelerator, %llu on the CPU)\n",
+           cdb_status_str(s), (unsigned long long)links, gf_now_ms() - t0,
+           (unsigned long long)(g->db.accel_stats.certified - before.certified),
+           (unsigned long long)(g->db.accel_stats.cpu + g->db.accel_stats.small - before.cpu - before.small));
+    return s == CDB_OK ? 0 : 1;
+}
+
 /* Times a whole graph build: every passage vector copied into graph_bench,
  * then its graph refreshed as embed does. Run it on a copy of the
  * database; it refuses when graph_bench exists. */
@@ -497,11 +530,12 @@ int main(int argc, char **argv)
     int cli_embed = argc > 1 && strcmp(argv[1], "embed") == 0;
     int cli_graph = argc > 1 && strcmp(argv[1], "graph") == 0;
     int cli_bench = argc > 1 && strcmp(argv[1], "bench-graph") == 0;
+    int cli_similar = argc > 1 && strcmp(argv[1], "link-similar") == 0;
     int cli_metrics = argc > 1 && strcmp(argv[1], "metrics") == 0;
     int cli_probe = argc > 1 && strcmp(argv[1], "probe") == 0;
     int cli_merge = argc > 1 && strcmp(argv[1], "merge-csv") == 0;
     int cli_filter = argc > 1 && strcmp(argv[1], "filter") == 0;
-    int a = cli_filter ? argc : cli || cli_books || cli_text || cli_embed || cli_graph || cli_bench || cli_metrics || cli_probe
+    int a = cli_filter ? argc : cli || cli_books || cli_text || cli_embed || cli_graph || cli_bench || cli_similar || cli_metrics || cli_probe
                                         || cli_merge
                                 ? 2
                                 : 1;
@@ -569,13 +603,14 @@ int main(int argc, char **argv)
         rc = merge_cli(&g, pgcsv);
     } else if (cli_filter) {
         rc = filter_cli(&g, argc, argv, 2);
-    } else if (cli || cli_books || cli_text || cli_embed || cli_graph || cli_bench) {
-        printf("build: %s\nopen: %.1f ms\n", GF_BUILD_LABEL, open_ms);
+    } else if (cli || cli_books || cli_text || cli_embed || cli_graph || cli_bench || cli_similar) {
+        printf("build: %s\naccelerator: %s\nopen: %.1f ms\n", GF_BUILD_LABEL, g.accel_name, open_ms);
         rc = cli ? ingest_cli(&g, gutindex, batch)
              : cli_books ? ingest_books_cli(&g, books)
              : cli_text ? ingest_text_cli(&g, books)
              : cli_graph ? graph_cli(&g)
              : cli_bench ? bench_graph_cli(&g)
+             : cli_similar ? similar_cli(&g)
              : embed_cli(&g, model);
     } else {
         app.g = &g;
