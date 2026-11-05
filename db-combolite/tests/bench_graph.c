@@ -3,6 +3,7 @@
  * the recall of the approximate one. Runs on real files; not part of ctest.
  *
  *   bench_graph [max_n] [dims] [queries]
+ *   bench_graph --file <base> <collection> [n] [k]   (bench_refresh_file in bench_file.h)
  *
  * Data: clusters of about 50 vectors (f32, cosine), queries near random
  * cluster centres. The exact path is the reference for recall@10. */
@@ -16,6 +17,7 @@
 
 #include "combolite/cdb_env.h"
 #include "combolite/cdb_value.h"
+#include "bench_file.h"
 #include "cdb_doc.h"
 #include "cdb_vec.h"
 
@@ -187,6 +189,12 @@ static void run(unsigned n, unsigned dims, unsigned queries)
 int main(int argc, char **argv)
 {
     static const unsigned sizes[] = { 250, 500, 1000, 2000, 4000, 8000, 16000, 32000, 64000 };
+    if (argc >= 4 && strcmp(argv[1], "--file") == 0) {
+        cdb_hostenv_init(&he, &env);
+        bench_refresh_file(&db, &cfg, &env, argv[2], argv[3], argc > 4 ? strtoull(argv[4], NULL, 10) : 0,
+                 argc > 5 ? (uint32_t)strtoul(argv[5], NULL, 10) : 16u);
+        return 0;
+    }
     unsigned max_n = argc > 1 ? (unsigned)strtoul(argv[1], NULL, 10) : 8000u;
     unsigned dims = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 128u;
     unsigned queries = argc > 3 ? (unsigned)strtoul(argv[3], NULL, 10) : 100u;

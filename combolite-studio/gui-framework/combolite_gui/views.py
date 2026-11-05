@@ -522,7 +522,9 @@ class VectorView(StoreView):
             self.results.remove(c)
         worst = max((d for _, d in hits), default=1) or 1
         for rank, (vid, dist) in enumerate(hits, 1):
-            row = Adw.ActionRow(title=vid, subtitle=f"distance {dist:.4f}", use_markup=False)
+            # What the vector points to first: a passage, a book; then its ID
+            label = self.call(self.backend.vector_source_label, self.store.name, vid) or ""
+            row = Adw.ActionRow(title=label or vid, subtitle=f"{vid} · distance {dist:.4f}", use_markup=False)
             row.add_prefix(Gtk.Label(label=f"{rank:>2}", css_classes=["mono", "dim-label"]))
             row.add_suffix(Gtk.LevelBar(min_value=0, max_value=1, value=max(0.02, 1 - dist / (worst * 1.15)),
                                         valign=Gtk.Align.CENTER, width_request=160))
@@ -547,8 +549,10 @@ class VectorView(StoreView):
         for a, b in g.edges:
             deg[a] += 1
             deg[b] += 1
-        nodes = [{"id": i, "label": i, "x": x, "y": y, "r": 3.5 + min(math.sqrt(d), 4), "color": MODEL_RGB["vector"]}
-                 for i, (x, y), d in zip(g.ids, pts, deg)]
+        labels = g.labels if len(g.labels) == len(g.ids) else g.ids
+        nodes = [{"id": i, "label": lab[:60], "x": x, "y": y, "r": 3.5 + min(math.sqrt(d), 4),
+                  "color": MODEL_RGB["vector"]}
+                 for i, lab, (x, y), d in zip(g.ids, labels, pts, deg)]
         sims = []
         for a, b in g.edges:
             va, vb = g.vectors[a], g.vectors[b]
@@ -572,8 +576,9 @@ class VectorView(StoreView):
         c, g = self.panel.canvas, self.graph
         if kind == "node":
             n = c.nodes[idx]
-            return n["id"], [("similarity", f"{n.get('z_to', 0.5):.0%} of range"), ("graph neighbours", str(len(c.adj[idx]))),
-                             ("dimensions", str(len(g.vectors[idx])))]
+            points = g.labels[idx] if idx < len(g.labels) else ""
+            return n["id"], [("points to", points), ("similarity", f"{n.get('z_to', 0.5):.0%} of range"),
+                             ("graph neighbours", str(len(c.adj[idx]))), ("dimensions", str(len(g.vectors[idx])))]
         a, b = c.edges[idx]
         va, vb = g.vectors[a], g.vectors[b]
         dist = 1 - sum(x * y for x, y in zip(va, vb)) / ((math.sqrt(sum(x * x for x in va)) * math.sqrt(sum(y * y for y in vb))) or 1)
@@ -671,8 +676,11 @@ class LinksView(StoreView):
             return index[nid]
 
         ws = []
+        names = {}  # node id -> what it is, when the backend labels links
         for row in res.rows:
             a, b = node(row[0]), node(row[1])
+            if len(row) > 5:
+                names[row[0]], names[row[1]] = row[4], row[5]
             out_d[a] += 1
             in_d[b] += 1
             edges.append((a, b))
@@ -683,7 +691,7 @@ class LinksView(StoreView):
         for nid in ids:
             i = index[nid]
             color = both_rgb if out_d[i] and in_d[i] else (src_rgb if out_d[i] else dst_rgb)
-            nodes.append({"id": nid, "label": nid, "x": 0, "y": 0,
+            nodes.append({"id": nid, "label": names.get(nid, nid)[:60], "x": 0, "y": 0,
                           "r": 3 + min(math.sqrt(out_d[i] + in_d[i]) * 1.4, 9), "color": color})
         self._deg = (out_d, in_d)
         lo, hi = min(ws, default=0.0), max(ws, default=1.0)

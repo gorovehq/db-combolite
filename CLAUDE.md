@@ -37,7 +37,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M22 | Text query language (CMBQL): db-combolite's own human-readable language (CMBQL), formal EBNF grammar and lexer, literal dot escaping vs 0x1F nested path resolution, procedural variable scoping and materialization, compiling into the M21 structured core (spec 11.1, 11.10) | done |
 | M23 | Cross-store atomic transactions and collision handling, triggers and trigger safety, scheduled and maintenance-window procedure runs, intra-transaction cursor isolation, procedure error trapping and savepoints (spec 11.3, 11.6, 11.9) | done |
 | M24 | Security, authenticated encryption (AES-256-GCM, ChaCha20-Poly1305), envelope key wrapping, subkey derivations, key rotation, tamper-evident governance mode, identities and RBAC authorization (spec 12, 14) | done |
-| M25 | Compute acceleration (spec 18), in layers. **1:** the accelerator hook in `cdb_env`, mirrors (filled on the worker pool a chunk at a time, kept in step through batched apply notes, caught up from the vector change log at a rebase, evicted under `accel_mem`), certified exact search, the fake accelerator. **2:** CUDA backend (cuBLAS distances, our own top-K). **3:** Vulkan backend (our own shaders, checked-in SPIR-V). **4:** bulk search, graph refresh acceleration (after profiling), the demo | layer 1 done |
+| M25 | Compute acceleration (spec 18), in layers. **1:** the accelerator hook in `cdb_env`, mirrors (filled on the worker pool a chunk at a time, kept in step through batched apply notes, caught up from the vector change log at a rebase, evicted under `accel_mem`), certified exact search, the fake accelerator. **2:** CUDA backend (cuBLAS distances, our own top-K). **3:** Vulkan backend (our own shaders, checked-in SPIR-V). **4:** bulk search, graph refresh acceleration (after profiling), the demo | layers 1–4 done; approximate search's pending pass still on the CPU (BACKLOG) |
 
 ## Commands
 
@@ -51,6 +51,8 @@ ctest --test-dir build -R test_value         # run one test executable
 ./build/tests/test_value                     # run one executable directly (Unity output)
 cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release   # optimised build, sanitizers off
 cmake --preset noxz                          # mcu-profile test build (spec 17): Debug, xz off, in build-noxz/
+cmake -S . -B build-cuda -DCDB_ACCEL_CUDA=ON -DCDB_ACCEL_VULKAN=ON # combolite_accel with both backends, their device tests and bench_accel
+python3 tools/gen_spirv.py                   # after editing accel/vulkan/shaders: rewrites the checked-in SPIR-V (needs glslc)
 ```
 
 The demo is built separately; see `demo/gutenfree/README.md`.
@@ -82,7 +84,7 @@ These were agreed with the user:
 - **C99 only.** `CMAKE_C_EXTENSIONS` is off.
 - **Warnings are errors.** The flags include `-Wconversion`, `-Wsign-conversion` and `-Wvla`, so write explicit casts and never use VLAs.
 - **No heap allocation in the core.** Memory comes from the caller: buffers, and the environment's optional `alloc`/`free` hooks (`cdb_env.h`), which only the host environment backs with malloc. Anything that grows must also work from caller memory alone, so microcontroller builds can use static pools. Readers return views into caller-owned buffers.
-- **Build profiles (spec 17).** `CDB_PROFILE=host` (the default) or `mcu`, in `src/cdb_profile.h`. Both read and write the same files; only a process's limits differ. On host, query working memory grows through the environment's `alloc` hooks up to `cdb_db_config.query_mem`, so size host limits for speed. On mcu, everything stays in caller memory. A profile limit that is reached is `CDB_E_OUT_OF_BUDGET` in both. Run the suite in `build` (host) and `build-noxz` (mcu).
+- **Build profiles (spec 17).** `CDB_PROFILE=host` (the default) or `mcu`, in `src/cdb_profile.h`. Both read and write the same files; only a process's limits differ. On host, query working memory grows through the environment's `alloc` hooks up to `cdb_db_config.query_mem`, so size host limits for speed. On mcu, everything stays in caller memory. A profile limit that is reached is `CDB_E_OUT_OF_BUDGET` in both. Run the suite in `build` (host) and `build-noxz` (mcu). For a change to vector, accelerator, `cdb_env` or locking code, also run it in `build-cuda`, configured with `-DCDB_ACCEL_CUDA=ON -DCDB_ACCEL_VULKAN=ON`. Neither default build compiles `combolite_accel` or runs the real devices.
 - **Bindings mirror structs.** The studio's `binding.py` mirrors `cdb_db_config`, `cdb_exec_row` and others, and checks their sizes at load (`cdb_db_config_size`, `cdb_exec_row_size`, ...). Add new config fields at the end, and update `binding.py` with any struct change.
 - **Fallible functions return `cdb_status`**, defined in `include/combolite/cdb_common.h`. The value writer's errors are sticky.
 - **Explicit byte order.** Every multi-byte on-disk field goes through `src/cdb_endian.h`, using the file's declared byte order. Never cast raw bytes to integers.
@@ -138,6 +140,19 @@ These were agreed with the user:
       - The fault environment's allocator frees everything at reboot, as a crash would. `cdb_faultenv_live_allocs()` counts what is live.
       - ctest runs the multi-store suites a second time as `<suite>_cap1`, with `CDB_TEST_MAX_OPEN=1`. A test that needs several stores of one model in one transaction calls `need_open(n)`.
 - `src/cdb_faultenv.*`: several fault devices on one shared crash clock, plus directory entries that are lost on crash unless their directory was synced. Test-only.
+- `accel/`: `combolite_accel`, the optional accelerator library (spec 18), never part of the core. An application links it and installs its hook in `cdb_env`. Host profile only.
+  - **Opening:** `cdb_accel_open` (`cdb_accel.h`) takes whichever backend this build has: CUDA first, then Vulkan's best device, ranked discrete, integrated, virtual. A device that runs on the CPU (llvmpipe) is used only with the `CDB_ACCEL_SOFTWARE` open flag.
+  - **Shared code** (`accel/common/cax.c`): the device row shape, stored vectors as rows with the CPU path's norms, the entry ID to row map, and the error bound. The bound has a double epilogue (CUDA) and a float one (Vulkan).
+  - **CUDA** (`accel/cuda/`, `-DCDB_ACCEL_CUDA=ON`). The host code (`cdb_accel_cuda.c`) is C99 on the CUDA runtime's and cuBLAS's C interfaces. The kernels (`cak_kernels.cu`) are a separate CUDA C++ static library, so the core's flags and sanitizers never reach nvcc.
+    - **How it computes:** cuBLAS dot products in pedantic math, so no TF32. Our own top-K: unique 64-bit keys, a radix select and a bitonic sort. A worst-case error bound per query.
+  - **Vulkan** (`accel/vulkan/`, `-DCDB_ACCEL_VULKAN=ON`). It needs Vulkan 1.2 with buffer device addresses, and nothing more.
+    - **Shaders:** our own compute shaders in `accel/vulkan/shaders/`. Their SPIR-V is checked in as `cav_spirv.c` and `.h`, which `tools/gen_spirv.py` writes; never edit them by hand.
+    - **Check:** ctest's `check_spirv` fails when the sources changed since they were generated.
+  - **Tests:** `tests/accel_device.h` holds the cases every device must pass.
+    - `test_accel_cuda` and `test_accel_vulkan` run them; the Vulkan one runs on every device, llvmpipe included through the flag. Each exits 77 (skipped) without a hardware device.
+    - ASan needs `protect_shadow_gap=0` for CUDA, and `tests/lsan_drivers.supp` hides the drivers' libdbus allocations; ctest sets both.
+    - `bench_accel` (not in ctest) times exact search on each path, also on a copy of an existing database (`--file`), and a graph refresh (`--refresh`; `bench_graph --file` times it on the CPU).
+  - **Bulk search and the threshold:** `cdb_vec_search_bulk` searches many queries, 64 per device request and per hold of the lock. `accel_min_bytes` (default 1 MB) keeps requests that read less on the CPU. Graph refreshes use the device too, with results identical to the CPU's (`test_graph`, `accel_device.h`).
 - `src/cdb_fakeaccel.*`: a fake accelerator (spec 18.11) for the `cdb_env` accelerator hook: the CPU's distances plus noise up to the bound it reports, and calls scriptable to decline or fail. Test-only, like the fault devices. ctest reruns the vector and graph suites with it as `<suite>_accel` (`CDB_TEST_ACCEL=1`); they must give exactly the CPU's results.
 - **Locking.** Every public data call holds the database's re-entrant lock (`cdb_db_lock`) for its whole run, so worker-pool tasks (graph refresh, mirror refills) never overlap an application call. A new public call takes it too: wrap an unchanged static body. The lock is a no-op without thread hooks.
 - `src/cdb_faultdev.*`: an in-memory device that simulates power loss: unsynced writes are dropped, kept in part or torn. It is built only into the `combolite_testing` library, never into the production library.

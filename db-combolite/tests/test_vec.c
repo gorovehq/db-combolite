@@ -77,6 +77,7 @@ void setUp(void)
     cfg.doc_buffers = doc_buffers;
     cfg.vec_buffers = vec_buffers;
     cfg.durability = CDB_DURABILITY_FULL;
+    cfg.accel_min_bytes = 1; /* small test collections still reach the accelerator (spec 18.4) */
 }
 
 void tearDown(void) {}
@@ -1169,9 +1170,90 @@ static void test_accelerator_was_used(void)
 #endif
 }
 
+/* Spec 18.4: a bulk search gives each query exactly what a single search
+ * gives it, ties and order included (in the _accel run, through the fake
+ * accelerator's batches). */
+static void test_bulk_search(void)
+{
+    enum { NQ = 80, KB = 7 };
+    static vec qv[NQ];
+    static const void *qp[NQ];
+    static size_t ql[NQ], counts[NQ];
+    static cdb_vec_hit got[NQ * KB];
+    cdb_vec_hit want[KB];
+    uint64_t coll;
+    size_t i, j, nw;
+    rng = 4242u;
+    setUp();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    coll = make_coll("c", CDB_VEC_F32, CDB_VEC_COSINE);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    for (i = 0; i < 300; i++) {
+        vec v = make_vec(CDB_VEC_F32, 0);
+        insert(coll, &v, 0, 0);
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    for (i = 0; i < NQ; i++) {
+        qv[i] = make_vec(CDB_VEC_F32, 0);
+        qp[i] = qv[i].enc;
+        ql[i] = qv[i].n;
+    }
+    /* A first search asks for a mirror (with an accelerator); a tick fills it. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search(&db, coll, qp[0], ql[0], CDB_VEC_BASE, want, KB, &nw));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_bulk(&db, coll, qp, ql, NQ, CDB_VEC_BASE, CDB_VEC_AUTO, got, KB,
+                                                      counts));
+    for (i = 0; i < NQ; i++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search(&db, coll, qp[i], ql[i], CDB_VEC_BASE, want, KB, &nw));
+        TEST_ASSERT_EQUAL_size_t(nw, counts[i]);
+        for (j = 0; j < nw; j++) {
+            TEST_ASSERT_EQUAL_UINT64(want[j].entry, got[i * KB + j].entry);
+            TEST_ASSERT_TRUE(want[j].distance == got[i * KB + j].distance);
+        }
+    }
+    /* Nothing to search: no hits, no error. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_bulk(&db, coll, qp, ql, 0, CDB_VEC_BASE, CDB_VEC_AUTO, got, KB,
+                                                      counts));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+/* The f32 fast path (vectors in the host's byte order) gives exactly the
+ * general path's distances: the same vectors byte-swapped take the
+ * general path. Values span many magnitudes, so rounding differences in
+ * the order of adds would show. */
+static void test_f32_fast_path_is_exact(void)
+{
+    enum { D = 384 };
+    static uint8_t a[D * 4], b[D * 4], sa[D * 4], sb[D * 4];
+    static const unsigned measures[3] = { CDB_VEC_COSINE, CDB_VEC_DOT, CDB_VEC_EUCLIDEAN };
+    cdb_byte_order host = cdb_host_byte_order();
+    cdb_byte_order other = host == CDB_ORDER_LITTLE ? CDB_ORDER_BIG : CDB_ORDER_LITTLE;
+    int t, i, m;
+    rng = 99u;
+    for (t = 0; t < 200; t++) {
+        for (i = 0; i < D; i++) {
+            float x = (float)next_int(-1000000, 1000000) * powf(10.0f, (float)next_int(-6, 3));
+            float y = (float)next_int(-1000000, 1000000) * powf(10.0f, (float)next_int(-6, 3));
+            uint32_t bx, by;
+            memcpy(&bx, &x, 4);
+            memcpy(&by, &y, 4);
+            memcpy(a + i * 4, &x, 4);
+            memcpy(b + i * 4, &y, 4);
+            cdb_store_u32(sa + i * 4, bx, other);
+            cdb_store_u32(sb + i * 4, by, other);
+        }
+        for (m = 0; m < 3; m++) {
+            double fast = cdb_vec_cpu_distance(CDB_VEC_F32, D, measures[m], a, b, host);
+            double general = cdb_vec_cpu_distance(CDB_VEC_F32, D, measures[m], sa, sb, other);
+            TEST_ASSERT_TRUE(memcmp(&fast, &general, sizeof fast) == 0);
+        }
+    }
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_f32_fast_path_is_exact);
     RUN_TEST(test_create_and_describe);
     RUN_TEST(test_search_every_type_and_measure);
     RUN_TEST(test_changes_reuse_slots);
@@ -1182,6 +1264,7 @@ int main(void)
     RUN_TEST(test_change_log_and_cursors);
     RUN_TEST(test_track_changes_on_old_collection);
     RUN_TEST(test_crash_sweep);
+    RUN_TEST(test_bulk_search);
     RUN_TEST(test_accelerator_was_used);
     return UNITY_END();
 }

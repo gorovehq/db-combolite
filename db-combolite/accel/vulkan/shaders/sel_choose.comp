@@ -1,0 +1,37 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// After a pass, per query: the digit that holds the need-th candidate
+// joins the prefix; the candidates below it are kept. Keys are unique, so
+// the query is done once that digit's candidates are exactly the need.
+layout(push_constant) uniform P {
+    uvec2 state, hist;
+    uint nq, shift;
+} pc;
+
+void main()
+{
+    U32 s = U32(pc.state), hist = U32(pc.hist);
+    uint j = gl_GlobalInvocationID.x, b = j * 8u, cum = 0u, need, d;
+    if (j >= pc.nq || s.v[b + S_DONE] != 0u)
+        return;
+    need = s.v[b + S_NEED];
+    for (d = 0u; d < 255u; d++) {
+        uint c = hist.v[j * 256u + d];
+        if (cum + c >= need)
+            break;
+        cum += c;
+    }
+    need -= cum;
+    s.v[b + S_NEED] = need;
+    if (pc.shift >= 32u) {
+        s.v[b + S_PREFIX + 1u] |= d << (pc.shift - 32u);
+        s.v[b + S_MASK + 1u] |= 255u << (pc.shift - 32u);
+    } else {
+        s.v[b + S_PREFIX] |= d << pc.shift;
+        s.v[b + S_MASK] |= 255u << pc.shift;
+    }
+    if (hist.v[j * 256u + d] == need || pc.shift == 0u)
+        s.v[b + S_DONE] = 1u;
+}

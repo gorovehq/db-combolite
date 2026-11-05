@@ -18,6 +18,7 @@
  * Block pages are written in the file's byte order; every index key and
  * value is big-endian. */
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cdb_doc.h"
@@ -550,6 +551,45 @@ static unsigned popcount8(uint8_t b)
     return n;
 }
 
+/* distance for f32 vectors stored in the host's byte order: each element
+ * loaded as it is, then exactly distance's double arithmetic in the same
+ * order, so the result is the same to the bit (GCC in ISO C mode fuses no
+ * multiply into an add; test_vec checks the two agree). A neighbour-graph
+ * refresh spends most of its time here (bench_graph --file). */
+static double distance_f32(const coll *c, unsigned measure, const uint8_t *q, double qn, const uint8_t *v, double vn,
+                           cdb_byte_order o)
+{
+    uint32_t i, dims = c->dims;
+    if (measure == CDB_VEC_EUCLIDEAN) {
+        double sum = 0.0;
+        for (i = 0; i < dims; i++) {
+            float a, b;
+            double d;
+            memcpy(&a, q + i * 4u, sizeof a);
+            memcpy(&b, v + i * 4u, sizeof b);
+            d = (double)a - (double)b;
+            sum += d * d;
+        }
+        return sqrt(sum);
+    }
+    {
+        double dot = 0.0;
+        for (i = 0; i < dims; i++) {
+            float a, b;
+            memcpy(&a, q + i * 4u, sizeof a);
+            memcpy(&b, v + i * 4u, sizeof b);
+            dot += (double)a * (double)b;
+        }
+        if (measure == CDB_VEC_DOT)
+            return -dot;
+        if (vn < 0.0)
+            vn = norm_of(c, v, o);
+        if (qn == 0.0 || vn == 0.0)
+            return 1.0;
+        return 1.0 - dot / (qn * vn);
+    }
+}
+
 /* Distance between query q (norm qn) and stored vector v (norm vn, or a
  * negative value when not cached). Smaller is closer for every measure
  * (spec 14.12.3). Both vectors are in stored form, in byte order o.
@@ -558,6 +598,8 @@ static double distance(const coll *c, unsigned measure, const uint8_t *q, double
                        cdb_byte_order o)
 {
     uint32_t i;
+    if (c->elem == CDB_VEC_F32 && measure != CDB_VEC_HAMMING && o == cdb_host_byte_order())
+        return distance_f32(c, measure, q, qn, v, vn, o);
     /* Hamming: count differing bits, ignoring the unused high bits of the
      * last byte when dims is not a multiple of 8. */
     if (measure == CDB_VEC_HAMMING) {
@@ -1667,6 +1709,9 @@ static cdb_status check_coverage(cdb_db *db, coll *c, checks *k, uint8_t *mem, s
     return CDB_OK;
 }
 
+static cdb_status refresh_pass_accel(cdb_db *db, coll *c, uint8_t *items, size_t stride, size_t n,
+                                     int has_other_pending, checks *chk, int *used);
+
 /* Whether e is one of the n batch items. */
 static int in_batch(const uint8_t *items, size_t stride, size_t n, uint64_t e)
 {
@@ -1738,6 +1783,15 @@ static cdb_status refresh_in(cdb_db *db, coll *c, size_t budget, size_t *process
             any |= it->live;
         }
 
+        /* On the accelerator when it can take the batch (spec 18.4); the
+         * same lists either way. */
+        if (any) {
+            int used = 0;
+            if ((s = refresh_pass_accel(db, c, items, stride, n, has_other_pending, &chk, &used)) != CDB_OK)
+                return s;
+            if (used)
+                any = 0;
+        }
         /* One pass over every vector. */
         if (any && (s = cdb_index_seek(&cur, &c->blocks, vbuf(db, V_CURSOR), NULL, 0)) != CDB_OK)
             return s;
@@ -1940,6 +1994,9 @@ static cdb_status source_rev(cdb_db *db, uint64_t store, uint64_t entry, uint64_
 static void accel_note(cdb_db *db, const coll *c, uint64_t entry, uint64_t kind);
 static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned measure, cdb_vec_hit *hits, size_t k,
                               size_t *n, int *used);
+static cdb_status accel_exact_many(cdb_db *db, coll *c, const uint8_t *const *qs, size_t nq, unsigned measure,
+                                   cdb_vec_hit *hits, size_t k, size_t *counts, uint8_t *done);
+#define BULK_BATCH 64u /* a bulk search's queries per hold of the lock, and per nearest request */
 
 /* -------------------------------------------------------- change log */
 
@@ -2631,6 +2688,27 @@ static cdb_status search_approx(cdb_db *db, coll *c, const uint8_t *q, unsigned 
     return CDB_OK;
 }
 
+/* Whether a search of c under measure takes the approximate path: the
+ * caller's mode, else the operator's, else the automatic rule:
+ * approximate only with a graph, under the base measure, and with at
+ * least vec_exact_below live vectors. */
+static cdb_status search_path(cdb_db *db, coll *c, unsigned measure, unsigned mode, int *approx)
+{
+    *approx = 0;
+    if (mode == CDB_VEC_AUTO)
+        mode = db->cfg.vec_mode;
+    if (c->graph_on && mode == CDB_VEC_APPROX) {
+        *approx = 1;
+    } else if (c->graph_on && mode == CDB_VEC_AUTO && measure == c->measure) {
+        uint64_t live;
+        cdb_status s;
+        if ((s = meta_get(c, &live)) != CDB_OK)
+            return s;
+        *approx = live >= (db->cfg.vec_exact_below ? db->cfg.vec_exact_below : DEFAULT_EXACT_BELOW);
+    }
+    return CDB_OK;
+}
+
 /* Validates the query, picks the path (see cdb_vec.h), searches, then
  * fills in each hit's source state. Searches see committed vectors only. */
 static cdb_status vec_search_mode_in(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
@@ -2665,19 +2743,8 @@ static cdb_status vec_search_mode_in(cdb_db *db, uint64_t store, const void *que
         return s;
     if (k == 0)
         return CDB_OK;
-    /* The caller's mode, else the operator's, else the automatic rule:
-     * approximate only with a graph, under the base measure, and with at
-     * least vec_exact_below live vectors. */
-    if (mode == CDB_VEC_AUTO)
-        mode = db->cfg.vec_mode;
-    if (c->graph_on && mode == CDB_VEC_APPROX) {
-        approx = 1;
-    } else if (c->graph_on && mode == CDB_VEC_AUTO && measure == c->measure) {
-        uint64_t live;
-        if ((s = meta_get(c, &live)) != CDB_OK)
-            return s;
-        approx = live >= (db->cfg.vec_exact_below ? db->cfg.vec_exact_below : DEFAULT_EXACT_BELOW);
-    }
+    if ((s = search_path(db, c, measure, mode, &approx)) != CDB_OK)
+        return s;
     if (approx) {
         s = search_approx(db, c, q, measure, hits, k, n);
     } else {
@@ -2693,6 +2760,90 @@ cdb_status cdb_vec_search(cdb_db *db, uint64_t store, const void *query, size_t 
                           cdb_vec_hit *hits, size_t k, size_t *n)
 {
     return cdb_vec_search_mode(db, store, query, len, measure, CDB_VEC_AUTO, hits, k, n);
+}
+
+/* Every query is checked before any is searched. On the exact path, with
+ * an accelerator holding the collection and the environment's allocator
+ * for the batch, the queries' first shortlists go to the device together
+ * (accel_exact_many); each query it does not answer, and every query on
+ * the approximate path, is searched alone, exactly as vec_search_mode_in
+ * would. */
+static cdb_status vec_search_bulk_in(cdb_db *db, uint64_t store, const void *const *queries, const size_t *lens,
+                                     size_t nq, unsigned measure, unsigned mode, cdb_vec_hit *hits, size_t k,
+                                     size_t *counts)
+{
+    const uint8_t **qs = NULL;
+    uint8_t *done = NULL;
+    coll *c;
+    size_t i;
+    int approx;
+    cdb_status s;
+
+    for (i = 0; i < nq; i++)
+        counts[i] = 0;
+    if ((s = coll_get(db, store, &c)) != CDB_OK)
+        return s;
+    if (measure == CDB_VEC_BASE)
+        measure = c->measure;
+    if (!measure_fits(c->elem, measure) || (hits == NULL && k && nq) || mode > CDB_VEC_APPROX
+        || (nq && (queries == NULL || lens == NULL)))
+        return CDB_E_INVALID_ARG;
+    for (i = 0; i < nq; i++) {
+        const uint8_t *q;
+        if ((s = vector_of(db, c, (const uint8_t *)queries[i], lens[i], 1, &q)) != CDB_OK)
+            return s;
+    }
+    if (k == 0 || nq == 0)
+        return CDB_OK;
+    if ((s = search_path(db, c, measure, mode, &approx)) != CDB_OK)
+        return s;
+    if (!approx && db->env.accel != NULL && db->env.ops->alloc != NULL) {
+        qs = (const uint8_t **)db->env.ops->alloc(db->env.ctx, nq * sizeof *qs);
+        done = (uint8_t *)db->env.ops->alloc(db->env.ctx, nq);
+        if (qs != NULL && done != NULL) {
+            for (i = 0; i < nq && s == CDB_OK; i++) {
+                done[i] = 0;
+                s = vector_of(db, c, (const uint8_t *)queries[i], lens[i], 0, &qs[i]);
+            }
+            if (s == CDB_OK)
+                s = accel_exact_many(db, c, qs, nq, measure, hits, k, counts, done);
+            for (i = 0; i < nq && s == CDB_OK; i++)
+                if (done[i])
+                    s = source_states(db, c, hits + i * k, counts[i]);
+        }
+    }
+    for (i = 0; i < nq && s == CDB_OK; i++)
+        if (done == NULL || qs == NULL || !done[i])
+            s = vec_search_mode_in(db, store, queries[i], lens[i], measure, mode, hits + i * k, k, &counts[i]);
+    if (qs != NULL)
+        db->env.ops->free(db->env.ctx, (void *)qs);
+    if (done != NULL)
+        db->env.ops->free(db->env.ctx, done);
+    return s;
+}
+
+/* Checks every query under the lock (k = 0: nothing searched), then
+ * searches BULK_BATCH queries per hold of it, as a mirror refill does
+ * (spec 18.6), so a long bulk search never holds up other calls for more
+ * than one batch. Batches are separate searches: a later one may see
+ * commits made in between. */
+cdb_status cdb_vec_search_bulk(cdb_db *db, uint64_t store, const void *const *queries, const size_t *lens, size_t nq,
+                               unsigned measure, unsigned mode, cdb_vec_hit *hits, size_t k, size_t *counts)
+{
+    cdb_status r;
+    size_t b0;
+    cdb_db_lock(db);
+    r = vec_search_bulk_in(db, store, queries, lens, nq, measure, mode, hits, 0, counts);
+    cdb_db_unlock(db);
+    for (b0 = 0; r == CDB_OK && k > 0 && b0 < nq; b0 += BULK_BATCH) {
+        size_t bn = nq - b0 < BULK_BATCH ? nq - b0 : BULK_BATCH;
+        if (b0 > 0 && db->env.ops->sleep != NULL)
+            db->env.ops->sleep(db->env.ctx, 1000); /* let a waiting call take the lock */
+        cdb_db_lock(db);
+        r = vec_search_bulk_in(db, store, queries + b0, lens + b0, bn, measure, mode, hits + b0 * k, k, counts + b0);
+        cdb_db_unlock(db);
+    }
+    return r;
 }
 
 /* -------------------------------------------------------- graph upkeep */
@@ -3703,57 +3854,111 @@ void cdb_vec_accel_close(cdb_db *db)
             accel_drop(db, &db->accel[i]);
 }
 
+/* The mirror nq exact searches of c under measure may use, current (its
+ * queued changes sent), and the first shortlist's size for k (spec
+ * 18.10): NULL when the CPU path must answer (counted). That includes a
+ * request reading fewer than accel_min_bytes, which the CPU answers
+ * sooner than a device call (18.4); a larger one asks for a mirror the
+ * collection lacks. The size is the mirror's vector count, or without one
+ * the entry IDs handed out, which counts deleted entries too: an estimate
+ * that errs towards the device. */
+static cdb_accel_entry *accel_ready(cdb_db *db, coll *c, unsigned measure, size_t nq, size_t k, size_t *want,
+                                    cdb_status *s)
+{
+    uint64_t min = db->cfg.accel_min_bytes ? db->cfg.accel_min_bytes : CDB_ACCEL_MIN_BYTES_DEFAULT, size;
+    cdb_accel_entry *a;
+    size_t cap;
+    *s = CDB_OK;
+    if (!accel_on(db))
+        return NULL;
+    a = accel_find(db, c->slot.store_id);
+    size = a != NULL ? a->vectors : (c->next_entry > 0 ? c->next_entry - 1u : 0);
+    if ((double)size * (double)c->vec_bytes * (double)nq < (double)min) {
+        db->accel_stats.small++;
+        return NULL;
+    }
+    if (a == NULL) {
+        accel_want(db, c);
+        db->accel_stats.cpu++;
+        return NULL;
+    }
+    a->last_use = ++db->accel_clock;
+    if (a->state != CDB_ACCEL_READY || measure != c->measure) {
+        db->accel_stats.cpu++;
+        return NULL;
+    }
+    if ((*s = accel_send(db, c, a)) != CDB_OK)
+        return NULL;
+    if (a->state != CDB_ACCEL_READY) {
+        db->accel_stats.cpu++;
+        return NULL;
+    }
+    *want = 2u * k > k + 8u ? 2u * k : k + 8u;
+    cap = (size_t)(a->vectors / 8u);
+    if (*want >= a->vectors) {
+        *want = (size_t)a->vectors; /* the whole collection: exact by construction */
+    } else if (*want > cap) {
+        db->accel_stats.cpu++; /* too small to gain from a shortlist */
+        return NULL;
+    }
+    return a;
+}
+
+/* Rescores a shortlist of `count` candidates on the CPU as search_exact
+ * would (spec 18.3) into hits, and says whether it is certified complete
+ * (18.10): it held every vector, or nothing left out could be among the k
+ * nearest. */
+static cdb_status accel_rescore(cdb_db *db, coll *c, const cdb_accel_entry *a, const uint8_t *q, double qn,
+                                unsigned measure, const uint64_t *ids, const float *dists, size_t count, size_t want,
+                                double bound, cdb_vec_hit *hits, size_t k, size_t *n, int *ok)
+{
+    cdb_byte_order o = db->pager.order;
+    cdb_status s = CDB_OK;
+    size_t j;
+    *n = 0;
+    *ok = 0;
+    for (j = 0; j < count && s == CDB_OK; j++) {
+        uint8_t *tmp = vbuf(db, V_BUILD);
+        double vn;
+        int found;
+        if ((s = fetch_vector(db, c, ids[j], tmp, &vn, &found)) == CDB_OK && found)
+            add_hit(hits, k, n, ids[j], distance(c, measure, q, qn, tmp, measure == CDB_VEC_COSINE ? vn : -1.0, o));
+    }
+    if (s != CDB_OK)
+        return s;
+    *ok = count < want || want == a->vectors
+          || (*n == k
+              && (bound == 0.0 ? (double)dists[count - 1] >= hits[k - 1].distance
+                               : (double)dists[count - 1] - bound > hits[k - 1].distance));
+    if (!*ok)
+        *n = 0;
+    return CDB_OK;
+}
+
 /* The exact path on the accelerator (spec 18.3, 18.10): a shortlist from
- * the mirror, every candidate rescored on the CPU as search_exact would,
- * and the result certified complete, widening the shortlist while it stays
- * under an eighth of the collection. *used is 0 when the CPU path must
- * answer instead; *n is then 0. */
+ * the mirror, every candidate rescored on the CPU, and the result
+ * certified complete, widening the shortlist while it stays under an
+ * eighth of the collection. *used is 0 when the CPU path must answer
+ * instead; *n is then 0. */
 static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned measure, cdb_vec_hit *hits, size_t k,
                               size_t *n, int *used)
 {
-    cdb_byte_order o = db->pager.order;
     const cdb_accel_ops *ax = db->env.accel;
-    double qn = measure == CDB_VEC_COSINE ? norm_of(c, q, o) : 0.0;
-    uint64_t *ids;
-    float *dists;
-    size_t want, cap;
+    double qn = measure == CDB_VEC_COSINE ? norm_of(c, q, db->pager.order) : 0.0;
+    size_t want = 0;
     cdb_accel_entry *a;
     cdb_status s;
 
     *used = 0;
     *n = 0;
-    if (!accel_on(db))
-        return CDB_OK;
-    if ((a = accel_find(db, c->slot.store_id)) == NULL) {
-        accel_want(db, c);
-        db->accel_stats.cpu++;
-        return CDB_OK;
-    }
-    a->last_use = ++db->accel_clock;
-    if (a->state != CDB_ACCEL_READY || measure != c->measure) {
-        db->accel_stats.cpu++;
-        return CDB_OK;
-    }
-    if ((s = accel_send(db, c, a)) != CDB_OK)
+    if ((a = accel_ready(db, c, measure, 1, k, &want, &s)) == NULL)
         return s;
-    if (a->state != CDB_ACCEL_READY) {
-        db->accel_stats.cpu++;
-        return CDB_OK;
-    }
-    want = 2u * k > k + 8u ? 2u * k : k + 8u;
-    cap = (size_t)(a->vectors / 8u);
-    if (want >= a->vectors)
-        want = (size_t)a->vectors; /* the whole collection: exact by construction */
-    else if (want > cap) {
-        db->accel_stats.cpu++; /* too small to gain from a shortlist */
-        return CDB_OK;
-    }
     for (;;) {
-        size_t count = 0, j;
+        size_t count = 0;
         double bound = 0.0;
-        int ok;
-        ids = (uint64_t *)db->env.ops->alloc(db->env.ctx, (want ? want : 1u) * sizeof *ids);
-        dists = (float *)db->env.ops->alloc(db->env.ctx, (want ? want : 1u) * sizeof *dists);
+        uint64_t *ids = (uint64_t *)db->env.ops->alloc(db->env.ctx, (want ? want : 1u) * sizeof *ids);
+        float *dists = (float *)db->env.ops->alloc(db->env.ctx, (want ? want : 1u) * sizeof *dists);
+        int ok = 0;
         if (ids == NULL || dists == NULL
             || ax->nearest(db->env.accel_ctx, a->m, q, 1, want, ids, dists, &count, &bound) != CDB_OK
             || count > want) {
@@ -3764,22 +3969,7 @@ static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned me
             db->accel_stats.cpu++; /* declined: the CPU path (spec 18.7) */
             return CDB_OK;
         }
-        *n = 0;
-        for (j = 0; j < count && s == CDB_OK; j++) {
-            uint8_t *tmp = vbuf(db, V_BUILD);
-            double vn;
-            int found;
-            if ((s = fetch_vector(db, c, ids[j], tmp, &vn, &found)) == CDB_OK && found)
-                add_hit(hits, k, n, ids[j],
-                        distance(c, measure, q, qn, tmp, measure == CDB_VEC_COSINE ? vn : -1.0, o));
-        }
-        /* Complete when the shortlist held every vector, or when nothing
-         * left out could be among the k nearest. */
-        ok = s == CDB_OK
-             && (count < want || want == a->vectors
-                 || (*n == k
-                     && (bound == 0.0 ? (double)dists[count - 1] >= hits[k - 1].distance
-                                      : (double)dists[count - 1] - bound > hits[k - 1].distance)));
+        s = accel_rescore(db, c, a, q, qn, measure, ids, dists, count, want, bound, hits, k, n, &ok);
         db->env.ops->free(db->env.ctx, ids);
         db->env.ops->free(db->env.ctx, dists);
         if (s != CDB_OK)
@@ -3789,14 +3979,430 @@ static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned me
             db->accel_stats.certified++;
             return CDB_OK;
         }
-        *n = 0;
-        if (want * 2u > cap) {
+        if (want * 2u > (size_t)(a->vectors / 8u)) {
             db->accel_stats.cpu++; /* wider would cost more than the CPU path */
             return CDB_OK;
         }
         want *= 2u;
         db->accel_stats.widened++;
     }
+}
+
+
+/* Exact searches of many queries on the accelerator (spec 18.4): their
+ * first shortlists in requests of BULK_BATCH, each rescored and certified
+ * as accel_exact does. done[i] is set for each query answered; the others
+ * (declined, or not certified) are left to the single-query path, which
+ * widens them or uses the CPU. */
+static cdb_status accel_exact_many(cdb_db *db, coll *c, const uint8_t *const *qs, size_t nq, unsigned measure,
+                                   cdb_vec_hit *hits, size_t k, size_t *counts, uint8_t *done)
+{
+    const cdb_accel_ops *ax = db->env.accel;
+    size_t want = 0, b0, vb = c->vec_bytes;
+    cdb_accel_entry *a;
+    uint8_t *qbuf;
+    uint64_t *ids;
+    float *dists;
+    size_t *cnt;
+    double *bounds;
+    uint64_t cpu0 = db->accel_stats.cpu, small0 = db->accel_stats.small;
+    cdb_status s;
+
+    if (nq < 2u)
+        return CDB_OK;
+    if ((a = accel_ready(db, c, measure, nq, k, &want, &s)) == NULL) {
+        db->accel_stats.cpu = cpu0; /* each query's own path counts it */
+        db->accel_stats.small = small0;
+        return s;
+    }
+    qbuf = (uint8_t *)db->env.ops->alloc(db->env.ctx, BULK_BATCH * vb);
+    ids = (uint64_t *)db->env.ops->alloc(db->env.ctx, BULK_BATCH * (want ? want : 1u) * sizeof *ids);
+    dists = (float *)db->env.ops->alloc(db->env.ctx, BULK_BATCH * (want ? want : 1u) * sizeof *dists);
+    cnt = (size_t *)db->env.ops->alloc(db->env.ctx, BULK_BATCH * sizeof *cnt);
+    bounds = (double *)db->env.ops->alloc(db->env.ctx, BULK_BATCH * sizeof *bounds);
+    s = CDB_OK;
+    if (qbuf != NULL && ids != NULL && dists != NULL && cnt != NULL && bounds != NULL)
+        for (b0 = 0; b0 < nq && s == CDB_OK; b0 += BULK_BATCH) {
+            size_t bn = nq - b0 < BULK_BATCH ? nq - b0 : BULK_BATCH, i;
+            for (i = 0; i < bn; i++)
+                memcpy(qbuf + i * vb, qs[b0 + i], vb);
+            if ((s = accel_send(db, c, a)) != CDB_OK || a->state != CDB_ACCEL_READY
+                || ax->nearest(db->env.accel_ctx, a->m, qbuf, bn, want, ids, dists, cnt, bounds) != CDB_OK)
+                break; /* declined: these and the rest go one at a time */
+            for (i = 0; i < bn && s == CDB_OK; i++) {
+                size_t qi = b0 + i;
+                double qn = measure == CDB_VEC_COSINE ? norm_of(c, qs[qi], db->pager.order) : 0.0;
+                int ok = 0;
+                if (cnt[i] > want)
+                    continue;
+                s = accel_rescore(db, c, a, qs[qi], qn, measure, ids + i * want, dists + i * want, cnt[i], want,
+                                  bounds[i], hits + qi * k, k, &counts[qi], &ok);
+                if (s == CDB_OK && ok) {
+                    done[qi] = 1;
+                    db->accel_stats.certified++;
+                }
+            }
+        }
+    if (qbuf != NULL)
+        db->env.ops->free(db->env.ctx, qbuf);
+    if (ids != NULL)
+        db->env.ops->free(db->env.ctx, ids);
+    if (dists != NULL)
+        db->env.ops->free(db->env.ctx, dists);
+    if (cnt != NULL)
+        db->env.ops->free(db->env.ctx, cnt);
+    if (bounds != NULL)
+        db->env.ops->free(db->env.ctx, bounds);
+    return s;
+}
+
+/* -------------------------------------------------------- refresh on the accelerator
+ *
+ * A refresh batch's pass (refresh_in) does two things for every vector u:
+ * it offers u to each batch item's fresh list (forward), and it offers
+ * the batch's items to u's own list (reverse). On the accelerator:
+ *
+ *  - Forward: each live item's shortlist comes from the collection's
+ *    mirror, is rescored on the CPU and offered to its list. A list is
+ *    final when nothing left out could come before its K-th neighbour:
+ *    everything left out is at least g - e on the CPU (18.10), and must
+ *    round above the K-th distance, since an equal distance with a lower
+ *    ID would win. The order of offers does not matter for these lists.
+ *  - Reverse: a temporary mirror holds the batch, and the collection's
+ *    vectors are its queries: each u's shortlist of batch items. Here the
+ *    order matters, since an offer that goes in and is pushed out later
+ *    still queues a coverage check. So a shortlist is used only when u's
+ *    list was full before the batch and everything left out rounds above
+ *    its K-th distance then: every item left out would have been refused
+ *    at its turn, whatever came before it. The shortlisted items are
+ *    offered in batch order, as the CPU offers them.
+ *
+ * What the device does not settle, an item's list or u's offers, the pass
+ * computes on the CPU exactly as refresh_in does, so the lists, the
+ * reverse index and the coverage checks come out the same. A refresh is
+ * maintenance, so a mirror it needs is filled at once (spec 18.6). */
+
+#define REFRESH_CHUNK 1024u /* vectors per nearest request in an accelerated pass */
+
+/* A batch item's entry and position, sorted by entry. */
+typedef struct bpos {
+    uint64_t entry;
+    uint32_t i;
+} bpos;
+
+static int bpos_cmp(const void *a, const void *b)
+{
+    uint64_t x = ((const bpos *)a)->entry, y = ((const bpos *)b)->entry;
+    return x < y ? -1 : x > y;
+}
+
+static int u32_cmp(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* The batch position of entry e, or UINT32_MAX. */
+static uint32_t bpos_find(const bpos *p, size_t n, uint64_t e)
+{
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2u;
+        if (p[mid].entry < e)
+            lo = mid + 1u;
+        else
+            hi = mid;
+    }
+    return lo < n && p[lo].entry == e ? p[lo].i : UINT32_MAX;
+}
+
+/* Whether everything a device left out of a shortlist, at g or beyond
+ * with error bound e, has a CPU distance that rounds above kth. */
+static int left_out_beyond(float g, double e, float kth)
+{
+    return (double)g - e > (double)nextafterf(kth, INFINITY);
+}
+
+/* One reverse offer: item it, at d, to u's list ur (as refresh_in). */
+static cdb_status reverse_offer(coll *c, checks *chk, grec *ur, uint64_t u, const bitem *it, float d, int *changed)
+{
+    uint64_t dropped;
+    cdb_status s;
+    if (!rec_offer(ur, c->k, it->entry, d, &dropped))
+        return CDB_OK;
+    *changed = 1;
+    if ((s = rev_put(c, it->entry, u)) != CDB_OK || (dropped && (s = rev_del(c, dropped, u)) != CDB_OK))
+        return s;
+    check_add(chk, dropped); /* it lost a way in */
+    return CDB_OK;
+}
+
+static cdb_status refresh_pass_accel(cdb_db *db, coll *c, uint8_t *items, size_t stride, size_t n,
+                                     int has_other_pending, checks *chk, int *used)
+{
+    const cdb_accel_ops *ax = db->env.accel;
+    cdb_byte_order o = db->pager.order;
+    uint64_t min = db->cfg.accel_min_bytes ? db->cfg.accel_min_bytes : CDB_ACCEL_MIN_BYTES_DEFAULT, size;
+    size_t vb = c->vec_bytes, live = 0, i, j, wf, wr, w, nq, nfc = 0;
+    size_t ch = REFRESH_CHUNK > 2u * (size_t)c->slots ? REFRESH_CHUNK : 2u * (size_t)c->slots; /* holds whole blocks */
+    uint32_t k = c->k;
+    cdb_accel_entry *a;
+    cdb_accel_mirror *bm = NULL;
+    bpos *pos = NULL;
+    uint8_t *q = NULL, *fwd_cpu = NULL;
+    uint64_t *ids = NULL, *uid = NULL;
+    float *ds = NULL;
+    double *bounds = NULL, *unorm = NULL;
+    size_t *cnt = NULL;
+    uint32_t *pick = NULL, *fc = NULL;
+    int rev = 0;
+    cdb_status s = CDB_OK;
+
+#define ITEM(x) ((bitem *)(void *)(items + (x) * stride))
+    *used = 0;
+    if (!accel_on(db))
+        return CDB_OK;
+    for (i = 0; i < n; i++)
+        live += ITEM(i)->live != 0;
+    if (live == 0)
+        return CDB_OK;
+    a = accel_find(db, c->slot.store_id);
+    size = a != NULL ? a->vectors : (c->next_entry > 0 ? c->next_entry - 1u : 0);
+    if ((double)size * (double)vb * (double)live < (double)min) {
+        db->accel_stats.small++;
+        return CDB_OK;
+    }
+    if (a == NULL) {
+        accel_want(db, c);
+        if ((a = accel_find(db, c->slot.store_id)) == NULL)
+            return CDB_OK;
+    }
+    if ((a->state == CDB_ACCEL_WANTED || a->state == CDB_ACCEL_FILLING) && (s = accel_fill(db, a)) != CDB_OK)
+        return s;
+    if (a->state != CDB_ACCEL_READY || (s = accel_send(db, c, a)) != CDB_OK || a->state != CDB_ACCEL_READY)
+        return s;
+    a->last_use = ++db->accel_clock;
+    wf = 2u * k + 2u > k + 9u ? 2u * k + 2u : k + 9u; /* the item itself is among its candidates */
+    if (wf > a->vectors)
+        wf = (size_t)a->vectors;
+    wr = 2u * k > k + 8u ? 2u * k : k + 8u;
+    if (wr > live)
+        wr = live;
+    w = wf > wr ? wf : wr;
+    pos = (bpos *)db->env.ops->alloc(db->env.ctx, n * sizeof *pos);
+    fwd_cpu = (uint8_t *)db->env.ops->alloc(db->env.ctx, n);
+    fc = (uint32_t *)db->env.ops->alloc(db->env.ctx, n * sizeof *fc);
+    q = (uint8_t *)db->env.ops->alloc(db->env.ctx, ch * vb);
+    ids = (uint64_t *)db->env.ops->alloc(db->env.ctx, ch * w * sizeof *ids);
+    ds = (float *)db->env.ops->alloc(db->env.ctx, ch * w * sizeof *ds);
+    cnt = (size_t *)db->env.ops->alloc(db->env.ctx, ch * sizeof *cnt);
+    bounds = (double *)db->env.ops->alloc(db->env.ctx, ch * sizeof *bounds);
+    uid = (uint64_t *)db->env.ops->alloc(db->env.ctx, ch * sizeof *uid);
+    unorm = (double *)db->env.ops->alloc(db->env.ctx, ch * sizeof *unorm);
+    pick = (uint32_t *)db->env.ops->alloc(db->env.ctx, (wr ? wr : 1u) * sizeof *pick);
+    if (pos == NULL || fwd_cpu == NULL || fc == NULL || q == NULL || ids == NULL || ds == NULL || cnt == NULL
+        || bounds == NULL || uid == NULL || unorm == NULL || pick == NULL)
+        goto out; /* not used: the CPU pass */
+    for (i = 0; i < n; i++) {
+        pos[i].entry = ITEM(i)->entry;
+        pos[i].i = (uint32_t)i;
+        fwd_cpu[i] = 0;
+    }
+    qsort(pos, n, sizeof *pos, bpos_cmp);
+
+    /* Forward: each live item's list from the mirror. */
+    for (i = 0; i < n && s == CDB_OK;) {
+        uint32_t fi[REFRESH_CHUNK];
+        size_t nf = 0, r;
+        int ok_call;
+        for (; i < n && nf < REFRESH_CHUNK; i++)
+            if (ITEM(i)->live) {
+                memcpy(q + nf * vb, ITEM(i) + 1, vb);
+                fi[nf++] = (uint32_t)i;
+            }
+        ok_call = ax->nearest(db->env.accel_ctx, a->m, q, nf, wf, ids, ds, cnt, bounds) == CDB_OK;
+        for (r = 0; r < nf && s == CDB_OK; r++) {
+            bitem *it = ITEM(fi[r]);
+            float g;
+            int ok;
+            it->rec.count = 0;
+            if (!ok_call || cnt[r] > wf || cnt[r] == 0) {
+                fwd_cpu[fi[r]] = 1;
+                continue;
+            }
+            for (j = 0; j < cnt[r] && s == CDB_OK; j++) {
+                uint64_t e = ids[r * wf + j], dropped;
+                uint8_t *tmp = vbuf(db, V_BUILD);
+                double vn;
+                int found;
+                if (e == it->entry)
+                    continue;
+                if ((s = fetch_vector(db, c, e, tmp, &vn, &found)) == CDB_OK && found)
+                    (void)rec_offer(&it->rec, k, e, (float)distance(c, c->measure, (const uint8_t *)(it + 1), it->norm,
+                                                                   tmp, vn, o),
+                                    &dropped);
+            }
+            g = ds[r * wf + cnt[r] - 1u];
+            ok = cnt[r] < wf || wf >= a->vectors
+                 || (it->rec.count == k
+                     && (bounds[r] == 0.0 ? g >= it->rec.n[k - 1u].dist
+                                          : left_out_beyond(g, bounds[r], it->rec.n[k - 1u].dist)));
+            if (!ok) {
+                fwd_cpu[fi[r]] = 1;
+                it->rec.count = 0;
+            }
+        }
+    }
+    if (s != CDB_OK)
+        goto out;
+    for (i = 0; i < n; i++)
+        if (ITEM(i)->live && fwd_cpu[i])
+            fc[nfc++] = (uint32_t)i;
+
+    /* Reverse: the batch as a mirror of its own. */
+    if (ax->mirror_open(db->env.accel_ctx, c->slot.store_id, c->elem, c->dims, c->measure, o, live, &bm) == CDB_OK) {
+        rev = 1;
+        for (i = 0; i < n && rev;) {
+            size_t np = 0;
+            for (; i < n && np < ch; i++)
+                if (ITEM(i)->live) {
+                    memcpy(q + np * vb, ITEM(i) + 1, vb);
+                    uid[np++] = ITEM(i)->entry;
+                }
+            if (np > 0 && ax->mirror_put(db->env.accel_ctx, bm, uid, q, vb, np) != CDB_OK)
+                rev = 0;
+        }
+    }
+
+    /* The pass over every vector, a chunk at a time. */
+    {
+        cdb_index_cursor cur;
+        uint8_t key[8], val[BLOCKS_VAL];
+        size_t klen, vlen;
+        int done = 0;
+        if ((s = cdb_index_seek(&cur, &c->blocks, vbuf(db, V_CURSOR), NULL, 0)) != CDB_OK)
+            goto out;
+        while (!done && s == CDB_OK) {
+            size_t r;
+            int have;
+            nq = 0;
+            while (nq < ch) {
+                block b;
+                uint32_t sl;
+                if ((s = cdb_index_next(&cur, key, sizeof key, &klen, val, sizeof val, &vlen, &done)) != CDB_OK)
+                    goto out;
+                if (done)
+                    break;
+                if ((s = block_read(db, c, cdb_load_u64(key, CDB_ORDER_BIG), &b)) != CDB_OK)
+                    goto out;
+                for (sl = 0; sl < b.count; sl++) {
+                    uint64_t u = slot_entry(db, &b, sl);
+                    if (u == 0)
+                        continue;
+                    /* a block's slots all go into this chunk */
+                    if (nq == ch) {
+                        s = CDB_E_STATE;
+                        goto out;
+                    }
+                    memcpy(q + nq * vb, slot_data(db, c, &b, sl), vb);
+                    uid[nq] = u;
+                    unorm[nq] = slot_norm(db, c, &b, sl);
+                    nq++;
+                }
+                if (nq + c->slots > ch)
+                    break; /* the next block might not fit */
+            }
+            have = rev && nq > 0
+                   && ax->nearest(db->env.accel_ctx, bm, q, nq, wr, ids, ds, cnt, bounds) == CDB_OK;
+            for (r = 0; r < nq && s == CDB_OK; r++) {
+                uint64_t u = uid[r], dropped;
+                const uint8_t *ud = q + r * vb;
+                double un = unorm[r];
+                grec ur;
+                int pend = 0, found, changed = 0, ok;
+                size_t t;
+                for (t = 0; t < nfc; t++) {
+                    bitem *it = ITEM(fc[t]);
+                    if (it->entry != u)
+                        (void)rec_offer(&it->rec, k, u,
+                                        (float)distance(c, c->measure, (const uint8_t *)(it + 1), it->norm, ud, un, o),
+                                        &dropped);
+                }
+                if (bpos_find(pos, n, u) != UINT32_MAX)
+                    continue; /* a batch item: its own list is being built */
+                if (has_other_pending) {
+                    if ((s = pending_has(c, u, &pend)) != CDB_OK)
+                        goto out;
+                    if (pend)
+                        continue;
+                }
+                if ((s = rec_get(c, u, &ur, &found)) != CDB_OK)
+                    goto out;
+                if (!found)
+                    continue;
+                ok = have && cnt[r] > 0 && cnt[r] <= wr
+                     && (wr >= live
+                         || (ur.count == k && left_out_beyond(ds[r * wr + cnt[r] - 1u], bounds[r], ur.n[k - 1u].dist)));
+                if (ok) {
+                    size_t np = 0;
+                    for (j = 0; j < cnt[r]; j++) {
+                        uint32_t p = bpos_find(pos, n, ids[r * wr + j]);
+                        if (p != UINT32_MAX)
+                            pick[np++] = p;
+                    }
+                    qsort(pick, np, sizeof *pick, u32_cmp); /* batch order */
+                    for (t = 0; t < np && s == CDB_OK; t++) {
+                        bitem *it = ITEM(pick[t]);
+                        if (it->live)
+                            s = reverse_offer(c, chk, &ur, u, it,
+                                              (float)distance(c, c->measure, (const uint8_t *)(it + 1), it->norm, ud,
+                                                              un, o),
+                                              &changed);
+                    }
+                } else {
+                    for (i = 0; i < n && s == CDB_OK; i++) {
+                        bitem *it = ITEM(i);
+                        if (it->live)
+                            s = reverse_offer(c, chk, &ur, u, it,
+                                              (float)distance(c, c->measure, (const uint8_t *)(it + 1), it->norm, ud,
+                                                              un, o),
+                                              &changed);
+                    }
+                }
+                if (s == CDB_OK && changed)
+                    s = rec_put(c, u, &ur);
+            }
+        }
+    }
+    if (s == CDB_OK)
+        *used = 1;
+out:
+    if (bm != NULL)
+        ax->mirror_close(db->env.accel_ctx, bm);
+    if (pos != NULL)
+        db->env.ops->free(db->env.ctx, pos);
+    if (fwd_cpu != NULL)
+        db->env.ops->free(db->env.ctx, fwd_cpu);
+    if (fc != NULL)
+        db->env.ops->free(db->env.ctx, fc);
+    if (q != NULL)
+        db->env.ops->free(db->env.ctx, q);
+    if (ids != NULL)
+        db->env.ops->free(db->env.ctx, ids);
+    if (ds != NULL)
+        db->env.ops->free(db->env.ctx, ds);
+    if (cnt != NULL)
+        db->env.ops->free(db->env.ctx, cnt);
+    if (bounds != NULL)
+        db->env.ops->free(db->env.ctx, bounds);
+    if (uid != NULL)
+        db->env.ops->free(db->env.ctx, uid);
+    if (unorm != NULL)
+        db->env.ops->free(db->env.ctx, unorm);
+    if (pick != NULL)
+        db->env.ops->free(db->env.ctx, pick);
+    return s;
+#undef ITEM
 }
 
 #else /* mcu: no accelerator (spec 18.1) */
@@ -3819,6 +4425,19 @@ static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned me
 {
     (void)db, (void)c, (void)q, (void)measure, (void)hits, (void)k;
     *n = 0;
+    *used = 0;
+    return CDB_OK;
+}
+static cdb_status accel_exact_many(cdb_db *db, coll *c, const uint8_t *const *qs, size_t nq, unsigned measure,
+                                   cdb_vec_hit *hits, size_t k, size_t *counts, uint8_t *done)
+{
+    (void)db, (void)c, (void)qs, (void)nq, (void)measure, (void)hits, (void)k, (void)counts, (void)done;
+    return CDB_OK;
+}
+static cdb_status refresh_pass_accel(cdb_db *db, coll *c, uint8_t *items, size_t stride, size_t n,
+                                     int has_other_pending, checks *chk, int *used)
+{
+    (void)db, (void)c, (void)items, (void)stride, (void)n, (void)has_other_pending, (void)chk;
     *used = 0;
     return CDB_OK;
 }

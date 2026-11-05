@@ -102,3 +102,37 @@ foreach(name test_vec test_graph)
   add_test(NAME ${name}_accel COMMAND ${name})
   set_tests_properties(${name}_accel PROPERTIES ENVIRONMENT CDB_TEST_ACCEL=1)
 endforeach()
+
+# The real devices (spec 18.11), when their backend is built. Without a
+# usable device the test exits 77: skipped, not passed. AddressSanitizer
+# must leave the shadow gap unprotected for the CUDA driver to map memory.
+if(CDB_ACCEL_CUDA)
+  cdb_add_test(test_accel_cuda)
+  target_link_libraries(test_accel_cuda PRIVATE combolite_accel)
+  set_tests_properties(test_accel_cuda PROPERTIES
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "ASAN_OPTIONS=protect_shadow_gap=0")
+endif()
+if(CDB_ACCEL_CUDA OR CDB_ACCEL_VULKAN)
+  cdb_add_bench(bench_accel)
+  target_link_libraries(bench_accel PRIVATE combolite_accel)
+endif()
+if(CDB_ACCEL_CUDA OR CDB_ACCEL_VULKAN)
+  cdb_add_test(test_accel_open)
+  target_link_libraries(test_accel_open PRIVATE combolite_accel)
+  set_tests_properties(test_accel_open PROPERTIES
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "ASAN_OPTIONS=protect_shadow_gap=0;LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/lsan_drivers.supp")
+endif()
+if(CDB_ACCEL_VULKAN)
+  cdb_add_test(test_accel_vulkan)
+  target_link_libraries(test_accel_vulkan PRIVATE combolite_accel)
+  set_tests_properties(test_accel_vulkan PROPERTIES
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/lsan_drivers.supp")
+  # The checked-in SPIR-V must come from the shader sources (spec 18.5).
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_FOUND)
+    add_test(NAME check_spirv COMMAND Python3::Interpreter ${PROJECT_SOURCE_DIR}/tools/gen_spirv.py --check)
+  endif()
+endif()
