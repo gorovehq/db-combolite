@@ -1,6 +1,6 @@
 # Section 19: Replication between copies
 
-Status: **Draft. The decisions below are confirmed; the open questions are not.**
+Status: **Draft, to be redesigned.** The decisions below were confirmed, but a second review (2026-11-05) found that several of them don't yet fit together; the open questions list what must be settled before anything here is built. The byte layouts in 14.21 are withdrawn until then.
 
 Depends on: 4 (catalog), 5.9 (processes and reconciliation), 6 (keys and links), 8 (documents), 9 (relational), 10 (time series), 12 (security), 14.4 (delta records).
 
@@ -84,4 +84,11 @@ A replicated delete leaves a tombstone, so that an old change arriving late can'
 
 ## Open questions (do not specify until answered)
 
-None at present. The byte layouts are in 14.21; they are proposals until reviewed with the implementation plan.
+From the second review of this section; each needs a design decision, not a patch:
+
+- **Epochs and processes.** An epoch per writing session makes a copy with several processes look forked to itself, the replication record (kind 7) carries no epoch, and an epoch's parent is persisted only at reconciliation. Decide whether the epoch belongs to the copy or the session, and how it is made durable before its first change.
+- **Key versions across copies.** Two copies that rotate a group-wide domain key concurrently both make version N+1 with different keys. Decide who allocates key versions (as copy numbers are allocated), or how versions are named so they can't clash.
+- **One clock.** Changes are stamped from the commit stamp (5.9.4, wall-clock ns) in one place and from the hybrid clock, after the overwritten path's time, in another; a process writes its replication record before it can know the final stamp, and change and add identities (origin, epoch, clock, ordinal) can collide. Decide the single stamping rule and the identity.
+- **Held changes from replication.** A sealed change has no journal record kind, so a process without the baton has nowhere to journal it; holding advances the version vector before the change is merged; and the held log has no size policy. Decide the journal path, when the vector advances, and the bound.
+- **Trust and IDs.** How a new replica's principal, public key and roles reach the other copies; which ID kinds carry the copy number (enclaves, joined stores and group objects are missing from 19.2); what happens to catalog objects two fork branches made with the same ID.
+- **Layout details** (14.21): the member-report key (member, `0xFFFF`) collides with a legal copy number, and member reports are about 22 KB at the default limit, not 14 KB.
