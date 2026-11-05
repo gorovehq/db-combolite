@@ -859,6 +859,54 @@ static cdb_status proc_exec_mutation_core(cdb_proc_vm *vm, uint8_t op, uint8_t a
     return st;
 }
 
+/* The stack index of savepoint id, or -1. */
+static int find_savepoint(const cdb_proc_vm *vm, uint8_t id)
+{
+    int i;
+    for (i = (int)vm->n_savepoints - 1; i >= 0; i--)
+        if (vm->savepoints[i].id == id)
+            return i;
+    return -1;
+}
+
+/* The failures a procedure may check and recover from (spec 11.12.3). */
+static int mutation_logical(cdb_status s)
+{
+    switch (s) {
+    case CDB_E_NOT_FOUND:
+    case CDB_E_EXISTS:
+    case CDB_E_SCHEMA:
+    case CDB_E_OVERFLOW:
+    case CDB_E_INVALID_ARG:
+    case CDB_E_MALFORMED:
+    case CDB_E_NOT_CANONICAL:
+    case CDB_E_DEPTH:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Runs one mutation. A logical failure leaves its status in *dst and the
+ * procedure goes on; inside a transaction, whatever the mutation journaled
+ * before it failed is rolled back first, so it makes all its changes or none
+ * (spec 11.12.3). Any other failure is returned and ends the procedure. */
+static cdb_status proc_mutation(cdb_proc_vm *vm, uint8_t op, uint8_t argc, const uint8_t *args, cdb_value *dst)
+{
+    cdb_tx_mark mark;
+    int marked = vm->db != NULL && vm->db->in_tx && cdb_tx_savepoint(vm->db, &mark) == CDB_OK;
+    cdb_status st = proc_exec_mutation_core(vm, op, argc, args, dst);
+    if (st == CDB_OK || !mutation_logical(st) || (vm->db != NULL && vm->db->failed))
+        return st;
+    if (marked) {
+        cdb_status rs = cdb_tx_rollback_to(vm->db, &mark);
+        if (rs != CDB_OK)
+            return rs;
+    }
+    cdb_eval_make_int(dst, (int64_t)st);
+    return CDB_OK;
+}
+
 cdb_status cdb_proc_exec(cdb_proc_vm *vm, const uint8_t *bytecode, size_t len, cdb_value *out_ret)
 {
     const uint8_t *p;
@@ -885,6 +933,7 @@ cdb_status cdb_proc_exec(cdb_proc_vm *vm, const uint8_t *bytecode, size_t len, c
         return CDB_E_MALFORMED;
 
     vm->n_regs = n_regs;
+    vm->n_savepoints = 0;
     p = bytecode + 8;
     end = bytecode + len;
 
@@ -1050,7 +1099,7 @@ cdb_status cdb_proc_exec(cdb_proc_vm *vm, const uint8_t *bytecode, size_t len, c
             m_args[0] = store_r;
             m_args[1] = entry_r;
             m_args[2] = pay_r;
-            st = proc_exec_mutation_core(vm, mut_op, 3, m_args, &vm->regs[dst]);
+            st = proc_mutation(vm, mut_op, 3, m_args, &vm->regs[dst]);
             if (st != CDB_OK) goto cleanup;
             break;
         }
@@ -1068,7 +1117,7 @@ cdb_status cdb_proc_exec(cdb_proc_vm *vm, const uint8_t *bytecode, size_t len, c
                 m_args[a_idx] = *p++;
                 if (m_args[a_idx] >= vm->n_regs) { st = CDB_E_MALFORMED; goto cleanup; }
             }
-            st = proc_exec_mutation_core(vm, mut_op, argc, m_args, &vm->regs[dst]);
+            st = proc_mutation(vm, mut_op, argc, m_args, &vm->regs[dst]);
             if (st != CDB_OK) goto cleanup;
             break;
         }
@@ -1149,44 +1198,37 @@ cdb_status cdb_proc_exec(cdb_proc_vm *vm, const uint8_t *bytecode, size_t len, c
             goto cleanup;
         }
 
+        /* Savepoints (spec 11.12.3) are a stack: ROLLBACK_TO keeps its
+         * savepoint and forgets later ones, RELEASE_SP forgets it too. */
         case CDB_BC_SAVEPOINT: {
             uint8_t sp_id;
-            size_t r;
+            int sidx;
             if (p >= end) { st = CDB_E_TRUNCATED; goto cleanup; }
             sp_id = *p++;
-            if (vm->n_savepoints < CDB_PROC_MAX_SAVEPOINTS) {
-                cdb_proc_savepoint *sp = &vm->savepoints[vm->n_savepoints++];
-                sp->id = sp_id;
-                sp->is_active = 1;
-                sp->n_regs = vm->n_regs;
-                for (r = 0; r < vm->n_regs; r++) {
-                    sp->saved_regs[r] = vm->regs[r];
-                }
+            if (vm->db == NULL || !vm->db->in_tx) { st = CDB_E_STATE; goto cleanup; }
+            /* Setting an ID that is already set moves it to this point. */
+            sidx = find_savepoint(vm, sp_id);
+            if (sidx >= 0) {
+                memmove(&vm->savepoints[sidx], &vm->savepoints[sidx + 1],
+                        (size_t)(vm->n_savepoints - (unsigned)sidx - 1u) * sizeof vm->savepoints[0]);
+                vm->n_savepoints--;
             }
+            if (vm->n_savepoints >= CDB_PROC_MAX_SAVEPOINTS) { st = CDB_E_OUT_OF_BUDGET; goto cleanup; }
+            if ((st = cdb_tx_savepoint(vm->db, &vm->savepoints[vm->n_savepoints].mark)) != CDB_OK)
+                goto cleanup;
+            vm->savepoints[vm->n_savepoints++].id = sp_id;
             break;
         }
 
         case CDB_BC_ROLLBACK_TO: {
             uint8_t sp_id;
-            int found = 0;
             int sidx;
             if (p >= end) { st = CDB_E_TRUNCATED; goto cleanup; }
             sp_id = *p++;
-            for (sidx = (int)vm->n_savepoints - 1; sidx >= 0; sidx--) {
-                if (vm->savepoints[sidx].is_active && vm->savepoints[sidx].id == sp_id) {
-                    size_t r;
-                    for (r = 0; r < vm->savepoints[sidx].n_regs; r++) {
-                        vm->regs[r] = vm->savepoints[sidx].saved_regs[r];
-                    }
-                    vm->n_savepoints = (uint8_t)(sidx + 1);
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found) {
-                st = CDB_E_NOT_FOUND;
+            if ((sidx = find_savepoint(vm, sp_id)) < 0) { st = CDB_E_NOT_FOUND; goto cleanup; }
+            if ((st = cdb_tx_rollback_to(vm->db, &vm->savepoints[sidx].mark)) != CDB_OK)
                 goto cleanup;
-            }
+            vm->n_savepoints = (uint8_t)(sidx + 1);
             break;
         }
 
@@ -1195,15 +1237,8 @@ cdb_status cdb_proc_exec(cdb_proc_vm *vm, const uint8_t *bytecode, size_t len, c
             int sidx;
             if (p >= end) { st = CDB_E_TRUNCATED; goto cleanup; }
             sp_id = *p++;
-            for (sidx = (int)vm->n_savepoints - 1; sidx >= 0; sidx--) {
-                if (vm->savepoints[sidx].is_active && vm->savepoints[sidx].id == sp_id) {
-                    vm->savepoints[sidx].is_active = 0;
-                    if ((uint8_t)(sidx + 1) == vm->n_savepoints) {
-                        vm->n_savepoints--;
-                    }
-                    break;
-                }
-            }
+            if ((sidx = find_savepoint(vm, sp_id)) < 0) { st = CDB_E_NOT_FOUND; goto cleanup; }
+            vm->n_savepoints = (uint8_t)sidx;
             break;
         }
 

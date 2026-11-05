@@ -2296,11 +2296,12 @@ static cdb_status live_in_tx(cdb_db *db, coll *c, uint64_t entry, int *live)
         return s;
     for (off = db->tx_start; off < db->journal.end;) {
         cdb_record rec;
-        uint64_t next;
+        uint64_t next, at = off;
         if ((s = cdb_journal_read(&db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &rec, &next)) != CDB_OK)
             return s;
         off = next;
-        if (rec.kind != CDB_RECORD_DATA || rec.tx_id != db->tx_id || rec.store_id != c->slot.store_id
+        if (rec.kind != CDB_RECORD_DATA || rec.tx_id != db->tx_id || cdb_tx_dropped(db, at)
+            || rec.store_id != c->slot.store_id
             || rec.entry_id != entry || rec.payload_len < 1)
             continue;
         if (rec.payload[0] == CDB_OP_INSERT)

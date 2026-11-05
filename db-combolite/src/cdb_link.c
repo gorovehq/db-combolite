@@ -298,12 +298,13 @@ static cdb_status tx_next(cdb_db *db, uint64_t *off, txrec *r, int *done)
     *done = 0;
     while (*off < db->journal.end) {
         cdb_record rec;
-        uint64_t next;
+        uint64_t next, at = *off;
         cdb_status s = cdb_journal_read(&db->journal, *off, db->cfg.record_buf, db->cfg.record_buf_size, &rec, &next);
         if (s != CDB_OK)
             return s;
         *off = next;
-        if (rec.kind == CDB_RECORD_DATA && rec.tx_id == db->tx_id && rec.store_id == db->links.store_id
+        if (rec.kind == CDB_RECORD_DATA && rec.tx_id == db->tx_id && !cdb_tx_dropped(db, at)
+            && rec.store_id == db->links.store_id
             && rec.payload_len >= 1 && parse(rec.payload[0], rec.payload + 1, rec.payload_len - 1u, r))
             return CDB_OK;
     }

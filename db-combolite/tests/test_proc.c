@@ -153,35 +153,26 @@ static void test_proc_open_cursor_and_next(void)
     TEST_ASSERT_TRUE(ret.type == CDB_TYPE_NULL || ret.type == CDB_TYPE_INT);
 }
 
-static void test_proc_savepoint_and_rollback(void)
+/* A savepoint needs an open transaction (spec 11.12.3); with no database
+ * there is none. Rollbacks on a real database are in test_savepoint.c. */
+static void test_proc_savepoint_needs_transaction(void)
 {
     uint8_t bc[256];
-    uint8_t enc10[16], enc999[16];
+    uint8_t enc10[16];
     cdb_proc_writer pw;
     cdb_proc_vm vm;
     cdb_value ret;
-    size_t l10, l999;
+    size_t l10;
 
     l10 = make_int_literal(enc10, sizeof(enc10), 10);
-    l999 = make_int_literal(enc999, sizeof(enc999), 999);
 
-    /* Bytecode:
-     * LOAD_CONST R0, 10
-     * SAVEPOINT 1
-     * LOAD_CONST R0, 999
-     * ROLLBACK_TO 1
-     * RETURN R0 */
     cdb_proc_writer_init(&pw, bc, sizeof(bc), 8, 0);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_proc_write_load_const(&pw, 0, enc10, l10));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_proc_write_savepoint(&pw, 1));
-    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_proc_write_load_const(&pw, 0, enc999, l999));
-    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_proc_write_rollback_to(&pw, 1));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_proc_write_return(&pw, 0));
 
     cdb_proc_vm_init(&vm, NULL, CDB_ORDER_LITTLE, NULL, 0, 100);
-    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_proc_exec(&vm, bc, cdb_proc_writer_len(&pw), &ret));
-    TEST_ASSERT_EQUAL_INT(CDB_TYPE_INT, ret.type);
-    TEST_ASSERT_EQUAL_INT64(10, ret.as.i64);
+    TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_proc_exec(&vm, bc, cdb_proc_writer_len(&pw), &ret));
 }
 
 int main(void)
@@ -192,6 +183,6 @@ int main(void)
     RUN_TEST(test_proc_math_call);
     RUN_TEST(test_proc_instruction_budget);
     RUN_TEST(test_proc_open_cursor_and_next);
-    RUN_TEST(test_proc_savepoint_and_rollback);
+    RUN_TEST(test_proc_savepoint_needs_transaction);
     return UNITY_END();
 }
