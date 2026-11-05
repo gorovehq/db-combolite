@@ -150,11 +150,16 @@ An **encryption domain** is either the public domain (ID 0), an enclave, or a jo
 
 ### 12.10 Stored procedures in the catalog
 
-Stored procedures are catalog objects, with the source text, compiled form, dependencies and compiler version that Sections 4.5 and 4.10 list. Where one is stored follows Section 4.9:
+Stored procedures are catalog objects (14.3.6), with the source text, compiled form, dependencies and compiler version that Sections 4.5 and 4.10 list.
 
-- a procedure that touches only the public domain is in the public catalog;
-- a procedure that touches only one enclave is in that enclave's catalog;
-- a compound procedure, touching more than one domain, is in a joined store.
+- **Bodies.** Source and bytecode are stored inline in the record when they are small, and in overflow chains (14.15) otherwise, as document bodies are.
+- **Dependencies** are recorded per store and field: each is a store, a field of it or the whole store, and whether the procedure reads it, writes it or both; the procedures it calls are recorded too. They feed the quick-query index (4.2), placement (below), and the schema checks that find the procedures using a field.
+- **History.** Replacing a procedure keeps every earlier version (source, bytecode, dependencies) as a matter of record, like schema history (4.11): it is discarded only when the configuration allows it and the operator asks.
+- **Placement** follows Section 4.9:
+  - a procedure whose dependencies are all in the public domain is in the public catalog;
+  - one whose dependencies are all in one enclave is in that enclave's catalog;
+  - a compound procedure, touching more than one domain, is in a joined store, named when the procedure is created, whose member domains (12.9) include every domain it touches.
+- **Moving with stores.** Placement is kept right as stores move. A store move (12.8) re-places every procedure that depends on the store, in the same archive commit. A move that would leave a compound procedure in a joined store that does not list the store's new domain is refused with `CDB_E_STATE`, before anything changes.
 
 ## Open questions (do not specify until answered)
 
@@ -162,4 +167,3 @@ The decisions in 12.8–12.10 are confirmed; these byte-level details are still 
 
 - **RBAC records**: principals and role grants as catalog objects, public ones in the public catalog and an enclave's roles in its own (14.3.5): their kinds and fields.
 - **Replication slices**: the byte form of a sealed domain change in a slice, how a receiving copy holds changes it can't apply, and **nonce uniqueness across copies**: two copies sharing a domain key number their records from their own slots and sequences, so their nonces can coincide under the same key. The design must add a per-copy part to the nonce or derive per-copy subkeys.
-- **Procedure records**: their object kind in the catalog (14.3.3) and their fields.

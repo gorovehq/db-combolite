@@ -270,6 +270,8 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
   | `05` | store ID + field ID | field name |
   | `06` | none | next object ID: a copy of the root slot's counter |
   | `07` | joined store ID (8 bytes, big-endian) | empty: a joined store that links into this catalog's domain (12.9) |
+  | `08` | procedure ID + version (4 bytes, big-endian) | record reference: every version of a procedure (14.3.6) |
+  | `09` | store ID + procedure ID | empty: a procedure in this catalog that depends on the store (14.3.6) |
 
 - **Record pages.** Records live in pages of type `0x0004`. Each record is written twice, and a **record reference** is the two logical page IDs, 16 bytes.
 - **Store records** use the shared value encoding (14.6), with these field IDs:
@@ -290,7 +292,7 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
 
 - **Moving a store (12.8).** While field 22 is present, field 5 names the domain the store is moving into, and the record lives in that domain's catalog. The walk cursor is a binary value whose meaning is the data model's: the structure and key the walk stopped at. Empty means start from the beginning; restarting is always correct, because a page already in the new domain is passed over by its header alone. The finish call, or the walk reaching its end, removes field 22 in the archive commit that re-encrypts the last old page.
 
-- **Object kinds** (field 1, and the kind in key `02`): 1 store · 2 link type (14.13.1) · 3 enclave · 4 joined store (14.3.4). Reading an object as the wrong kind finds nothing. **Data models** (field 4): 1 relational · 2 document · 3 vector · 4 time series · 5 the link store.
+- **Object kinds** (field 1, and the kind in key `02`): 1 store · 2 link type (14.13.1) · 3 enclave · 4 joined store (14.3.4) · 5 procedure (14.3.6). Reading an object as the wrong kind finds nothing. **Data models** (field 4): 1 relational · 2 document · 3 vector · 4 time series · 5 the link store.
 
 - **Writing the root slots.** The first catalog commit writes both root slots. Later commits alternate between them.
 - **Choosing a slot on open.**
@@ -356,6 +358,32 @@ An enclave or joined store keeps its own catalog (12.8, Section 4.4). It has the
 - **The body** is one mirrored B+tree with the public body's key prefixes (14.3.3): objects (`01`), names (`02`), schema versions (`03`, `04`, `05`). Its records use the same field IDs and kinds. Prefix `06` is not used: object IDs come from the **public** counter (14.3.2 offset 88), so an ID is unique across the whole database and survives a move between domains (12.8). An outsider can see that an object was created, and when, but not in which domain or of what kind.
 - **What it holds:** the records of the domain's stores (including its own link store, model 5), link types, schema history, field dictionaries, procedures (12.10) and roles (12.5).
 - **Changes commit as public catalog changes do** (14.3.3): they reconcile first, are refused while a transaction is open, and commit immediately. A change that touches both catalogs, such as creating a store in an enclave (which advances the public counter) or moving a store between domains, writes both in one archive commit.
+
+### 14.3.6 Procedure records (12.10)
+
+A stored procedure is a catalog object of kind 5, named in key `02` like a store, in the catalog its placement chooses (12.10). Key `01` + its ID leads to its current version's record; key `08` + its ID + a version leads to each version's record, the current one included. Every version is a separate record, and none is rewritten.
+
+- **Record fields**, in the shared value encoding (14.6). Fields 1, 2, 3, 10 and 11 mean what they mean in a store record; field 10 is the commit that created this version.
+
+  | ID | Field |
+  |---|---|
+  | 1 | kind: 5 |
+  | 2 | ID |
+  | 3 | name |
+  | 10 | creating commit |
+  | 11 | flags; bit 0 = dropped |
+  | 23 | version, from 1 |
+  | 24 | compiler version (4.10) |
+  | 25 | source text: a body (below) |
+  | 26 | compiled form: a body holding the bytecode (14.20) |
+  | 27 | dependencies: an array of objects `{1: store ID, 2: field ID, 0 for the whole store, 3: access, bit 0 read, bit 1 write}` |
+  | 28 | calls: an array of the procedure IDs it calls |
+  | 29 | joined store (compound procedures): the joined store named at creation, kept when the procedure becomes single-domain |
+
+- **Bodies.** A body is an object: `{1: bytes}` inline, when the bytes are at most a quarter of the page size; otherwise `{2: total length, 3: first logical page ID}` of an overflow chain (14.15) in the procedure's domain. A body stored the other way is rejected as not canonical.
+- **Dependents.** For each store in a version's dependencies, the catalog that holds the procedure has key `09` + store ID + procedure ID, for the current version only. A store move (12.8) finds the procedures to re-place through key `09` in the public catalog, the store's old domain's catalog and the catalogs of the joined stores linking into it, all of which are open during a move.
+- **Re-placing** a procedure moves its records (every version), its key `02` and its keys `08` and `09` to the catalog its placement now chooses, in the store move's archive commit. Its ID does not change. Overflow chains move with it, re-encrypted in the new domain.
+- **Dropping** a procedure sets bit 0 of field 11 on its current record; its history stays (4.11).
 
 ## 14.4 Companion files, delta records and commit records
 
