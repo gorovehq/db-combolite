@@ -231,7 +231,7 @@ Logical IDs in this structure are always 8 bytes, even in 32-bit files, so the s
 | 24 | 8 | Root write counter | identifies the newest slot in a flash ring |
 | 32 | 8 | Catalog body root | logical page ID of the primary copy |
 | 40 | 8 | Catalog mirror root | logical page ID of the mirrored copy (Section 3.5) |
-| 48 | 8 | Enclave directory root | public list of opaque enclave IDs and key references only (Section 4.4) |
+| 48 | 8 | Reserved | zero (the enclave directory is in the catalog body, 14.3.4) |
 | 56 | 8 | Schema-history root | Sections 4.3, 4.11 |
 | 64 | 8 | Public quick-query index root | derived, can be rebuilt (Section 4.2) |
 | 72 | 8 | Public dedup index root | |
@@ -274,7 +274,7 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
 
   Optional fields that are absent read as zero.
 
-- **Object kinds** (field 1, and the kind in key `02`): 1 store · 2 link type (14.13.1). Reading an object as the wrong kind finds nothing. **Data models** (field 4): 1 relational · 2 document · 3 vector · 4 time series · 5 the link store.
+- **Object kinds** (field 1, and the kind in key `02`): 1 store · 2 link type (14.13.1) · 3 enclave · 4 joined store (14.3.4). Reading an object as the wrong kind finds nothing. **Data models** (field 4): 1 relational · 2 document · 3 vector · 4 time series · 5 the link store.
 
 - **Writing the root slots.** The first catalog commit writes both root slots. Later commits alternate between them.
 - **Choosing a slot on open.**
@@ -283,6 +283,35 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
 - **The ID counter.** The next object ID is the larger of the root slot's value and the body's `06` value. A fallback to an older slot therefore never reuses an ID.
 - **Catalog changes commit immediately.** At the database level they reconcile first, and they are refused while a transaction is open.
 - **Names.** Names are 1–64 bytes of valid UTF-8. A name's key must fit within the index key limit. Field names must also fit within the index value limit.
+
+### 14.3.4 Enclave directory
+
+The enclave directory is the public half of every enclave and joined store (12.8, 12.9). It holds what is needed to find a domain's key and its encrypted catalog, and nothing that names or describes what is inside (Section 4.4).
+
+- **Where.** Each enclave or joined store is a catalog object in the public catalog body (14.3.3), of kind 3 (enclave) or 4 (joined store). Its record is stored like a store record, under key `01` + its object ID, mirrored and committed with the catalog. It takes its ID from the shared object ID counter (4.12).
+- **No name.** A directory record has no name and no key `02` entry. An enclave is found by its ID; names exist only inside its own catalog.
+- **Record fields**, in the shared value encoding (14.6). Fields 1, 2, 10 and 11 mean what they mean in a store record:
+
+  | ID | Field |
+  |---|---|
+  | 1 | kind: 3 enclave, 4 joined store |
+  | 2 | ID |
+  | 10 | creating commit |
+  | 11 | flags; bit 0 = dropped |
+  | 17 | key versions: an array of objects `{1: version, 2: key reference}`, one for each version that encrypts at least one page or record, in increasing version order |
+  | 18 | current key version: the version new writes use; it is in field 17 |
+  | 19 | enclave root: an array of two logical page IDs, the primary and the mirror enclave root page (below) |
+  | 20 | rotation: an object `{1: last rotated, 2: interval, 3: overdue response}` |
+
+- **Key versions.** Each key reference (12.3) addresses that version's key, wrapped under the master key, in the external keystore. Rotating the key appends a version and makes it current. A version is removed from field 17 once compaction has re-encrypted the last page and the last held record (12.8) that used it. A page or record whose key version is not in field 17 is corrupt.
+- **Enclave root pages.** The two pages named in field 19 are in the domain's own encryption domain, encrypted under its current page subkey, and hold the roots of the domain's own catalog (layout: to be confirmed). The primary and the mirror are written alike, as the public catalog's body is (3.5); their logical IDs never change.
+- **Opening.** Opening an enclave or joined store fetches and unwraps the current key version and reads the primary root page, or the mirror when the primary is damaged. A key that does not authenticate either page is the wrong key: the open fails with `CDB_E_SECURITY` and nothing is cached.
+- **Rotation state** is public, so that it can be checked before any key is fetched:
+  - *last rotated*: a timestamp in nanoseconds since the Unix epoch, from the environment's clock, as commit timestamps are (14.4.4); the creation time until the first rotation;
+  - *interval*: nanoseconds; 0 means the database configuration's default (12.4);
+  - *overdue response*: 0 the configuration's default, 1 warn, 2 refuse writes to the domain, 3 refuse to open it.
+
+  An outsider can learn when a domain's keys were rotated and how its rotation is configured, but nothing about its contents.
 
 ## 14.4 Companion files, delta records and commit records
 
@@ -1307,7 +1336,7 @@ Every owner refers to a record by a page ID, and adds a 2-byte slot when the rec
 
 ### 14.18.3 Free-space index
 
-- **Where it lives.** The public domain's free-space index is an ordered index whose root is recorded in the catalog root slot (14.3.2, offset 96), beside the public dedup and audit roots. It is created with the first nibblet, which can happen during an apply or a recovery replay, and its root reaches the archive with the next commit. Enclave domains will record their roots in the enclave directory, as their dedup indexes do.
+- **Where it lives.** The public domain's free-space index is an ordered index whose root is recorded in the catalog root slot (14.3.2, offset 96), beside the public dedup and audit roots. It is created with the first nibblet, which can happen during an apply or a recovery replay, and its root reaches the archive with the next commit. Enclave and joined-store domains record theirs in their enclave root pages (14.3.4), beside their dedup roots.
 - **Keys** are big-endian: (domain ID 8, free bytes 2, page ID 8). The value is empty.
 - **Best fit** seeks to (domain, record size, 0) and takes the first key in that domain. Every placement, removal and merge updates the page's key.
 

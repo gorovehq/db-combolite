@@ -112,7 +112,7 @@ An **encryption domain** is either the public domain (ID 0), an enclave, or a jo
   - maintenance compaction re-encrypts the store's older pages within the scrub budget (Section 3.5);
   - the store stays readable throughout, because each page's header names the domain it was written in.
 - **Shared pages stay within a domain.** Pages that several stores share, such as nibblet pages (Section 16), only ever hold records of one domain. Each domain has its own nibblet free-space index.
-- **The enclave's catalog.** An enclave keeps its own catalog, encrypted under its key, as Section 4.4 requires: its stores' records, names, schemas, field dictionaries, link types, procedures and roles. The public catalog lists only each enclave's opaque ID and key reference (the enclave directory). Without the key, the names, schemas and contents of an enclave can't be learned, and finding a store in an enclave by name needs the enclave open.
+- **The enclave's catalog.** An enclave keeps its own catalog, encrypted under its key, as Section 4.4 requires: its stores' records, names, schemas, field dictionaries, link types, procedures and roles. The public catalog lists only each enclave's opaque ID, key references and rotation state (the enclave directory, 14.3.4). Without the key, the names, schemas and contents of an enclave can't be learned, and finding a store in an enclave by name needs the enclave open.
 - **Each enclave has its own link store** for links whose ends are both inside it. A link between domains goes in a joined store (12.9).
 - **Wrapped keys stay in the keystore.** A key reference (12.3) points at the enclave's key **wrapped under the master key** in the external keystore. The library fetches the wrapped key and unwraps it with the master key; the archive holds only references, never key material (Section 1.4).
 - **What stays readable.** Page headers and delta record headers of an enclave or joined store are authenticated but not encrypted, and they carry **only the domain ID**. The store ID and entry ID of an encrypted page or record are kept inside its encrypted payload, and the readable fields hold 0. An outsider with the file can learn which domain wrote how much and when, but not which store or entry changed, nor any name, schema, content or key.
@@ -142,10 +142,9 @@ Stored procedures are catalog objects, with the source text, compiled form, depe
 
 The decisions in 12.8–12.10 are confirmed; these byte-level details are still to be proposed and confirmed:
 
-- **Enclave directory** (catalog root slot, offset 48): the layout of each entry (opaque ID, key reference, key version, kind: enclave or joined store) and where the enclave's own catalog root is recorded.
-- **An enclave's catalog**: its record kinds and roots (catalog body, schema history, field dictionaries, nibblet free-space index, deduplication index, audit series, quick-query index, link store).
+- **An enclave's catalog**: the enclave root pages' layout (the directory is in 14.3.4), its record kinds and roots (catalog body, schema history, field dictionaries, nibblet free-space index, deduplication index, audit series, quick-query index, link store).
 - **Hidden IDs**: where the store ID and entry ID sit inside an encrypted page payload and an encrypted delta record (Sections 13, 14.2, 14.4.2).
 - **Held records**: how recovery records the transactions it holds, how holding interacts with journal rotation (14.4.7) and with other processes (Section 5.9), and the crash cases.
 - **Moving a store**: the store record's target-domain field, and how compaction finds and re-encrypts the pages still in the old domain.
 - **Joined stores**: the index layout of their links and the byte form of an opaque pointer.
-- **Procedure records**: object kind 3 in the catalog (14.3.3) and its fields.
+- **Procedure records**: their object kind in the catalog (14.3.3) and their fields.
