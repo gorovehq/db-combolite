@@ -1817,7 +1817,7 @@ static cdb_status replay_tx(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entr
         cdb_record r;
         cdb_delta d;
         uint64_t next, at = off;
-        if ((s = cdb_journal_read(&db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next)) != CDB_OK)
+        if ((s = cdb_db_read_record(db, off, &r, &next)) != CDB_OK)
             return s;
         off = next;
         if (cdb_tx_dropped(db, at))
@@ -2391,7 +2391,7 @@ cdb_status cdb_doc_tx_entries(cdb_db *db, uint64_t store, cdb_doc_entry_fn fn, v
     for (joff = db->tx_start; joff < db->journal.end;) {
         cdb_record r;
         uint64_t next, at = joff;
-        if ((s = cdb_journal_read(&db->journal, joff, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next))
+        if ((s = cdb_db_read_record(db, joff, &r, &next))
             != CDB_OK)
             return s;
         joff = next;

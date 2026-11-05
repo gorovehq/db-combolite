@@ -2297,7 +2297,7 @@ static cdb_status live_in_tx(cdb_db *db, coll *c, uint64_t entry, int *live)
     for (off = db->tx_start; off < db->journal.end;) {
         cdb_record rec;
         uint64_t next, at = off;
-        if ((s = cdb_journal_read(&db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &rec, &next)) != CDB_OK)
+        if ((s = cdb_db_read_record(db, off, &rec, &next)) != CDB_OK)
             return s;
         off = next;
         if (rec.kind != CDB_RECORD_DATA || rec.tx_id != db->tx_id || cdb_tx_dropped(db, at)

@@ -577,6 +577,10 @@ cdb_status cdb_tx_rollback_to(cdb_db *db, const cdb_tx_mark *mark);
 /* Whether the open transaction's journal record at offset off was dropped by
  * a rollback. Readers of the transaction's own records skip those. */
 int cdb_tx_dropped(const cdb_db *db, uint64_t off);
+/* Reads the journal record at offset off into cfg.record_buf, decrypting it
+ * with its enclave's key when it is encrypted (spec 12). Readers of the
+ * transaction's own records use this, never cdb_journal_read. */
+cdb_status cdb_db_read_record(cdb_db *db, uint64_t off, cdb_record *r, uint64_t *next);
 
 /* Folds every applied change into the archive (spec 3.2) and starts a new
  * journal. With other processes open it takes the baton, waiting for it if

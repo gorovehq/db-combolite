@@ -324,6 +324,11 @@ static cdb_status read_record(cdb_db *db, cdb_journal *j, uint64_t offset,
     return cdb_journal_read(j, offset, buf, buf_size, r, next);
 }
 
+cdb_status cdb_db_read_record(cdb_db *db, uint64_t off, cdb_record *r, uint64_t *next)
+{
+    return read_record(db, &db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, r, next);
+}
+
 /* Adds the dropped ordinals [from, to), at journal offsets [from_off,
  * to_off), to a transaction's n ranges (spec 14.4.9 rule 3). Every range
  * already there ends at or before `to`, so one starting at or after `from`
