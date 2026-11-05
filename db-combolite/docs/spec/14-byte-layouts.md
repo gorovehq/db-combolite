@@ -283,8 +283,11 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
   | 6 | page-size code (log₂) | 12 | document pools: head index root; link store: forward index root (optional) |
   | 13 | document pools: revisions index root; link store: reverse index root (optional) | 14 | document pools: next entry ID (optional) |
   | 15 | document pools: full-text settings, an object (14.14.1; optional) | 16 | settings, an object: vector collections (14.12.3), time-series stores (14.11.1) |
+  | 22 | moving (optional): an object `{1: the domain being moved out of, 2: walk cursor}`; absent when no move is under way (12.8) | | |
 
   Optional fields that are absent read as zero.
+
+- **Moving a store (12.8).** While field 22 is present, field 5 names the domain the store is moving into, and the record lives in that domain's catalog. The walk cursor is a binary value whose meaning is the data model's: the structure and key the walk stopped at. Empty means start from the beginning; restarting is always correct, because a page already in the new domain is passed over by its header alone. The finish call, or the walk reaching its end, removes field 22 in the archive commit that re-encrypts the last old page.
 
 - **Object kinds** (field 1, and the kind in key `02`): 1 store · 2 link type (14.13.1) · 3 enclave · 4 joined store (14.3.4). Reading an object as the wrong kind finds nothing. **Data models** (field 4): 1 relational · 2 document · 3 vector · 4 time series · 5 the link store.
 

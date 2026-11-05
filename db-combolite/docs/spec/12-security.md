@@ -108,10 +108,12 @@ An **encryption domain** is either the public domain (ID 0), an enclave, or a jo
 
 - **Joining at creation.** Creating a store (a document pool, table, vector collection or time-series store) can name an enclave. The store is in that enclave's domain from its first write: its data pages, index nodes, overflow chains, revisions, nibblet pages and derived indexes (full text, neighbour graph, deduplication) are all written in that domain, under the enclave's page subkey (12.2).
 - **Moving later.** An existing store can be moved into an enclave, out of one, or between two. The move runs in the background, like key rotation (12.4):
-  - an explicit call records the target domain in the store's record;
-  - new writes go to the target domain at once;
-  - maintenance compaction re-encrypts the store's older pages within the scrub budget (Section 3.5);
-  - the store stays readable throughout, because each page's header names the domain it was written in.
+  - an explicit call, made with both domains open, moves the store's record from the old domain's catalog to the new one's and records the domain it is moving out of (14.3.3). The store keeps its ID. The old domain's held log is drained first (14.4.10);
+  - new writes go to the new domain at once, and the store's nibblet records are re-placed in the new domain's nibblet pages;
+  - maintenance compaction walks the store's structures and re-encrypts the pages still in the old domain, within the scrub budget (Section 3.5); the walk resumes where it stopped;
+  - until the move completes, reading or writing the store needs both domains open, because each page's header names the domain it was written in;
+  - a **finish** call completes the re-encryption at once, for an operator who needs single-key access sooner or wants to retire the old key;
+  - starting and finishing a move are audit events in the public audit series (store and domain IDs only) and in the audit series of each enclave or joined store involved (12.7), so a move out to the public domain is always on record.
 - **Shared pages stay within a domain.** Pages that several stores share, such as nibblet pages (Section 16), only ever hold records of one domain. Each domain has its own nibblet free-space index.
 - **The enclave's catalog.** An enclave keeps its own catalog, encrypted under its key, as Section 4.4 requires: its stores' records, names, schemas, field dictionaries, link types, procedures and roles. The public catalog lists only each enclave's opaque ID, key references and rotation state (the enclave directory, 14.3.4). Without the key, the names, schemas and contents of an enclave can't be learned, and finding a store in an enclave by name needs the enclave open.
 - **Each enclave has its own link store** for links whose ends are both inside it. A link between domains goes in a joined store (12.9).
@@ -152,6 +154,5 @@ The decisions in 12.8–12.10 are confirmed; these byte-level details are still 
 
 - **RBAC records**: principals and role grants as catalog objects, public ones in the public catalog and an enclave's roles in its own (14.3.5): their kinds and fields.
 - **Replication slices**: the byte form of a sealed domain change in a slice, how a receiving copy holds changes it can't apply, and **nonce uniqueness across copies**: two copies sharing a domain key number their records from their own slots and sequences, so their nonces can coincide under the same key. The design must add a per-copy part to the nonce or derive per-copy subkeys.
-- **Moving a store**: the store record's target-domain field, and how compaction finds and re-encrypts the pages still in the old domain.
 - **Joined stores**: the index layout of their links and the byte form of an opaque pointer.
 - **Procedure records**: their object kind in the catalog (14.3.3) and their fields.
