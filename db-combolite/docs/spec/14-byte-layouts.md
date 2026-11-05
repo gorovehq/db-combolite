@@ -209,15 +209,17 @@ AES-GCM and ChaCha20-Poly1305 both take a 12-byte nonce:
 - **Zero means "none".** Logical page ID `0` and physical page `0` both mean "no page".
 - **Physical page numbers** count from the start of the file, in units of the file's page size. The **data area** starts after the two header slots (1,024 bytes) and the location-0 area (1,024 bytes), rounded up to a page boundary. System pages that are addressed physically, such as anchor-map and free-space pages, carry logical ID `0`, store `0` and domain `0`.
 
-### 14.2.7 Hidden IDs on encrypted pages
+### 14.2.7 The store ID slot, and hidden IDs on encrypted pages
 
-A page in an enclave or a joined store hides its owning store (12.8):
+Every page's payload starts with a **store ID slot**, in every domain, so that a page type has the same room whether its page is public or encrypted, and a store can move between domains page by page (12.8).
 
-- **Header.** The owning store ID field holds 0. The encryption domain ID field names the domain, so the reader finds the key without the catalog.
-- **Payload.** The encrypted plaintext starts with the **owning store ID**, at the file's ID width (2, 4 or 8 bytes) and in the file's byte order. It is 0 for a page that no single store owns, such as a nibblet page or an enclave root page. The page type's own layout follows it.
-- **Lengths.** The header's payload length counts the store ID. An encrypted page therefore holds that many bytes less than a public page of the same size; page types size themselves from the payload room left.
-- **Order of operations.** The store ID is written outside compression: the plaintext is the store ID followed by the page type's payload, compressed when the page is compressed (Section 15), and the whole plaintext is then encrypted.
-- **Checks.** After decryption, a reader that expects a page of a known store checks the store ID, as it checks the header's store ID on a public page.
+- **The slot** holds the owning store ID, at the file's ID width (2, 4 or 8 bytes) and in the file's byte order. It is 0 for a page that no single store owns, such as a nibblet page or an enclave root page. The page type's own layout follows it.
+- **Public pages.** The slot repeats the header's owning store ID; a page whose two disagree is corrupt.
+- **Encrypted pages** (an enclave or a joined store) hide their store (12.8): the header's owning store ID field holds 0, and the encryption domain ID field names the domain, so the reader finds the key without the catalog. The slot, inside the encryption, is the only record of the store.
+- **Lengths.** The header's payload length counts the slot. Page types size themselves from the payload room after it, which is the same in every domain.
+- **Order of operations.** The slot is written outside compression: the plaintext is the slot followed by the page type's payload, compressed when the page is compressed (Section 15), and on an encrypted page the whole plaintext is then encrypted.
+- **Checks.** A reader that expects a page of a known store checks the slot, after decryption on an encrypted page.
+- **Files written before the slot** have page layouts without it; how they are migrated is an open item (12, open questions).
 
 ## 14.3 Catalog root slot (location 0)
 

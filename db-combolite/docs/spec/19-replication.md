@@ -39,6 +39,9 @@ Every ID a replicated object or entry takes is unique across the group: **its to
 - **Hybrid logical clock.** Every replicated change carries a hybrid-logical-clock time: physical time, a logical counter and the copy number. Times are totally ordered, and a copy's clock moves past every time it receives.
 - **Version vector.** Each copy keeps, per origin copy, the latest change it has applied from that origin. A slice for a receiver holds the changes above the receiver's vector.
 - **Persistence.** The copy number, the clock and the vector are stored in the database, and the vector advances only when the transaction that applied the changes commits. A reopened copy remembers what it has seen.
+- **Clock readings.** Copies are not continuously connected, so they exchange no heartbeats. Instead, every sync handshake carries the sender's wall-clock reading and the clock offsets it has measured for other copies. The receiver records, for each copy, its estimated offset from the local clock with an error bound (the transit time can't be known), in a built-in **replication-clock time series**, and relays the estimates in its own handshakes. Every copy thus knows the estimated drift of the whole group, and governance can show which copy was off, by how much, and when.
+- **Clocks are never adjusted** from these readings: the library sets no system clock, and changing clock times would change who won past conflicts.
+- **Drift bound.** A configured bound limits how far ahead of the local clock a received change may be stamped. A change beyond it is still applied, since every copy must treat it alike to converge, but it is recorded as an audit event naming the copy and its offset, and the local hybrid clock moves at most to the local time plus the bound because of it. A fast copy still wins its own conflicts, visibly.
 
 ### 19.5 Merging concurrent changes
 
@@ -67,5 +70,6 @@ A replicated delete leaves a tombstone, so that an old change arriving late can'
 - **Per-field clocks**: where each replicated document and row keeps its fields' clock times, and their cost.
 - **Copy and group records**: the copy number range a copy owns, the group limit, members and their last reported vectors, retired copies.
 - **Conflict list**: its layout and the calls that list and resolve conflicts.
-- **Wire format**: the handshake and the slice, with sealed domain changes; versioning of the wire format.
+- **Wire format**: the handshake (with clock readings and relayed offsets) and the slice, with sealed domain changes; versioning of the wire format.
+- **Replication-clock series**: its layout, the offset estimate and error bound, and the drift bound's default.
 - **Migration**: what becomes of databases written by the first implementation, and of IDs allocated before a database joins a group.
