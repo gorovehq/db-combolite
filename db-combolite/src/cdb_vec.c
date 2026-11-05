@@ -1942,6 +1942,7 @@ static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned me
                               size_t *n, int *used);
 static cdb_status accel_exact_many(cdb_db *db, coll *c, const uint8_t *const *qs, size_t nq, unsigned measure,
                                    cdb_vec_hit *hits, size_t k, size_t *counts, uint8_t *done);
+#define BULK_BATCH 64u /* a bulk search's queries per hold of the lock, and per nearest request */
 
 /* -------------------------------------------------------- change log */
 
@@ -2767,13 +2768,27 @@ static cdb_status vec_search_bulk_in(cdb_db *db, uint64_t store, const void *con
     return s;
 }
 
+/* Checks every query under the lock (k = 0: nothing searched), then
+ * searches BULK_BATCH queries per hold of it, as a mirror refill does
+ * (spec 18.6), so a long bulk search never holds up other calls for more
+ * than one batch. Batches are separate searches: a later one may see
+ * commits made in between. */
 cdb_status cdb_vec_search_bulk(cdb_db *db, uint64_t store, const void *const *queries, const size_t *lens, size_t nq,
                                unsigned measure, unsigned mode, cdb_vec_hit *hits, size_t k, size_t *counts)
 {
     cdb_status r;
+    size_t b0;
     cdb_db_lock(db);
-    r = vec_search_bulk_in(db, store, queries, lens, nq, measure, mode, hits, k, counts);
+    r = vec_search_bulk_in(db, store, queries, lens, nq, measure, mode, hits, 0, counts);
     cdb_db_unlock(db);
+    for (b0 = 0; r == CDB_OK && k > 0 && b0 < nq; b0 += BULK_BATCH) {
+        size_t bn = nq - b0 < BULK_BATCH ? nq - b0 : BULK_BATCH;
+        if (b0 > 0 && db->env.ops->sleep != NULL)
+            db->env.ops->sleep(db->env.ctx, 1000); /* let a waiting call take the lock */
+        cdb_db_lock(db);
+        r = vec_search_bulk_in(db, store, queries + b0, lens + b0, bn, measure, mode, hits + b0 * k, k, counts + b0);
+        cdb_db_unlock(db);
+    }
     return r;
 }
 
@@ -3785,18 +3800,30 @@ void cdb_vec_accel_close(cdb_db *db)
             accel_drop(db, &db->accel[i]);
 }
 
-/* The mirror an exact search of c under measure may use, current (its
+/* The mirror nq exact searches of c under measure may use, current (its
  * queued changes sent), and the first shortlist's size for k (spec
- * 18.10): NULL when the CPU path must answer (counted), which also asks
- * for a mirror the collection lacks. */
-static cdb_accel_entry *accel_ready(cdb_db *db, coll *c, unsigned measure, size_t k, size_t *want, cdb_status *s)
+ * 18.10): NULL when the CPU path must answer (counted). That includes a
+ * request reading fewer than accel_min_bytes, which the CPU answers
+ * sooner than a device call (18.4); a larger one asks for a mirror the
+ * collection lacks. The size is the mirror's vector count, or without one
+ * the entry IDs handed out, which counts deleted entries too: an estimate
+ * that errs towards the device. */
+static cdb_accel_entry *accel_ready(cdb_db *db, coll *c, unsigned measure, size_t nq, size_t k, size_t *want,
+                                    cdb_status *s)
 {
+    uint64_t min = db->cfg.accel_min_bytes ? db->cfg.accel_min_bytes : CDB_ACCEL_MIN_BYTES_DEFAULT, size;
     cdb_accel_entry *a;
     size_t cap;
     *s = CDB_OK;
     if (!accel_on(db))
         return NULL;
-    if ((a = accel_find(db, c->slot.store_id)) == NULL) {
+    a = accel_find(db, c->slot.store_id);
+    size = a != NULL ? a->vectors : (c->next_entry > 0 ? c->next_entry - 1u : 0);
+    if ((double)size * (double)c->vec_bytes * (double)nq < (double)min) {
+        db->accel_stats.small++;
+        return NULL;
+    }
+    if (a == NULL) {
         accel_want(db, c);
         db->accel_stats.cpu++;
         return NULL;
@@ -3870,7 +3897,7 @@ static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned me
 
     *used = 0;
     *n = 0;
-    if ((a = accel_ready(db, c, measure, k, &want, &s)) == NULL)
+    if ((a = accel_ready(db, c, measure, 1, k, &want, &s)) == NULL)
         return s;
     for (;;) {
         size_t count = 0;
@@ -3907,7 +3934,6 @@ static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned me
     }
 }
 
-#define BULK_BATCH 64u /* queries per nearest request in a bulk search */
 
 /* Exact searches of many queries on the accelerator (spec 18.4): their
  * first shortlists in requests of BULK_BATCH, each rescored and certified
@@ -3925,13 +3951,14 @@ static cdb_status accel_exact_many(cdb_db *db, coll *c, const uint8_t *const *qs
     float *dists;
     size_t *cnt;
     double *bounds;
-    uint64_t cpu0 = db->accel_stats.cpu;
+    uint64_t cpu0 = db->accel_stats.cpu, small0 = db->accel_stats.small;
     cdb_status s;
 
     if (nq < 2u)
         return CDB_OK;
-    if ((a = accel_ready(db, c, measure, k, &want, &s)) == NULL) {
+    if ((a = accel_ready(db, c, measure, nq, k, &want, &s)) == NULL) {
         db->accel_stats.cpu = cpu0; /* each query's own path counts it */
+        db->accel_stats.small = small0;
         return s;
     }
     qbuf = (uint8_t *)db->env.ops->alloc(db->env.ctx, BULK_BATCH * vb);

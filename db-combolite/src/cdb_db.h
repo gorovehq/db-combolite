@@ -168,6 +168,12 @@ typedef struct cdb_db_config {
      * together, counted as their vectors' bytes; 0 leaves it to the
      * accelerator (spec 18.8). */
     uint64_t accel_mem;
+    /* Host profile: the least vector bytes a request must read for the
+     * accelerator to take it (queries x the collection's vectors' bytes);
+     * smaller requests, and collections never searched with that much,
+     * stay on the CPU, which answers them sooner than a device call.
+     * 0 means CDB_ACCEL_MIN_BYTES_DEFAULT; 1 sends everything (spec 18.4). */
+    uint64_t accel_min_bytes;
 } cdb_db_config;
 
 /* Mirrors of vector collections on the environment's accelerator (spec
@@ -213,6 +219,7 @@ typedef struct cdb_accel_stats {
     uint64_t catchups;          /* mirrors caught up from a change log at a rebase */
     uint64_t stale;             /* mirrors dropped to be filled again */
     uint64_t evicted;           /* mirrors dropped to make room */
+    uint64_t small;             /* requests below accel_min_bytes, left to the CPU */
 } cdb_accel_stats;
 
 /* An open document pool (cdb_doc.h). */

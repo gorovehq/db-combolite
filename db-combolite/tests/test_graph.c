@@ -77,6 +77,7 @@ void setUp(void)
     cfg.vec_work = vec_work;
     cfg.vec_work_size = sizeof vec_work;
     cfg.durability = CDB_DURABILITY_NORMAL;
+    cfg.accel_min_bytes = 1; /* small test collections still reach the accelerator (spec 18.4) */
 }
 
 void tearDown(void) {}
@@ -508,8 +509,8 @@ static void test_approximate_recall(void)
                 TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_mode(&db, coll, qp[t], ql[t], 0, mode, ex, 10, &ne));
                 TEST_ASSERT_EQUAL_size_t(ne, counts[t]);
                 for (a = 0; a < ne; a++) {
-                    TEST_ASSERT_EQUAL_UINT64(ex[a].entry, got[t * 10 + a].entry);
-                    TEST_ASSERT_TRUE(ex[a].distance == got[t * 10 + a].distance);
+                    TEST_ASSERT_EQUAL_UINT64(ex[a].entry, got[(size_t)t * 10u + a].entry);
+                    TEST_ASSERT_TRUE(ex[a].distance == got[(size_t)t * 10u + a].distance);
                 }
             }
         }

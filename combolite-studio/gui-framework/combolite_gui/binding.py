@@ -394,6 +394,7 @@ class cdb_db_config(Structure):
         ("query_mem", c_size_t),   # host profile: a query's memory budget (spec 17.4); 0 = default
         ("vec_mem", c_size_t),     # host profile: a graph refresh's memory budget (spec 17.4); 0 = default
         ("accel_mem", c_uint64),   # host profile: device memory for accelerator mirrors (spec 18.8); 0 = its own
+        ("accel_min_bytes", c_uint64),  # host profile: least bytes a request reads to go to the accelerator (spec 18.4); 0 = default
     ]
 
 

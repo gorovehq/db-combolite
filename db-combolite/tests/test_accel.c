@@ -63,6 +63,7 @@ static void config(proc *p)
     p->cfg.doc_buffers = p->doc_buffers;
     p->cfg.vec_buffers = p->vec_buffers;
     p->cfg.durability = CDB_DURABILITY_FULL;
+    p->cfg.accel_min_bytes = 1; /* small test collections still reach the accelerator (spec 18.4) */
 }
 
 void setUp(void)
@@ -532,6 +533,47 @@ static void test_bulk_search(void)
     TEST_ASSERT_TRUE(db.accel_stats.widened + db.accel_stats.cpu > 0); /* some went one at a time */
 }
 
+/* Spec 18.4: a request reading less than accel_min_bytes stays on the CPU
+ * and never makes a mirror; a bulk search of the same collection that
+ * reads more goes to the device. */
+static void test_small_requests_stay_on_cpu(void)
+{
+    enum { NQ = 4 };
+    static vec qv[NQ];
+    static const void *qp[NQ];
+    static size_t ql[NQ], counts[NQ];
+    static cdb_vec_hit got[NQ * K];
+    uint64_t coll, certified;
+    size_t i;
+    setUp();
+    rng = 61u;
+    pa.cfg.accel_min_bytes = 50000u; /* 300 vectors of 64 bytes: one query reads 19,200 */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&pa));
+    coll = make_coll(&db, "c", CDB_VEC_F32, CDB_VEC_COSINE);
+    fill(&db, coll, CDB_VEC_F32, 300);
+    mirror(&db, coll, CDB_VEC_F32);
+    TEST_ASSERT_EQUAL_UINT64(0, fake.opens); /* never wanted */
+    TEST_ASSERT_TRUE(db.accel_stats.small > 0);
+    for (i = 0; i < NQ; i++) {
+        qv[i] = make_vec(CDB_VEC_F32);
+        qp[i] = qv[i].enc;
+        ql[i] = qv[i].n;
+    }
+    /* Four queries read 76,800 bytes: the bulk search asks for a mirror. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_bulk(&db, coll, qp, ql, NQ, CDB_VEC_BASE, CDB_VEC_AUTO, got, K,
+                                                      counts));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&db));
+    TEST_ASSERT_EQUAL_UINT64(1, db.accel_stats.fills);
+    certified = db.accel_stats.certified;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_bulk(&db, coll, qp, ql, NQ, CDB_VEC_BASE, CDB_VEC_AUTO, got, K,
+                                                      counts));
+    TEST_ASSERT_EQUAL_UINT64(certified + NQ, db.accel_stats.certified);
+    for (i = 0; i < NQ; i++)
+        same_as_cpu(&db, coll, &qv[i]); /* one query alone: still the CPU, the same answer */
+    TEST_ASSERT_EQUAL_UINT64(certified + NQ, db.accel_stats.certified);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -546,5 +588,6 @@ int main(void)
     RUN_TEST(test_budget_and_eviction);
     RUN_TEST(test_catch_up_across_processes);
     RUN_TEST(test_bulk_search);
+    RUN_TEST(test_small_requests_stay_on_cpu);
     return UNITY_END();
 }

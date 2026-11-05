@@ -19,6 +19,12 @@
  * database configuration says otherwise (cdb_db_config.vec_mem; spec 17.4).
  * Provisional: spec 17 leaves the default to measurement. */
 #define CDB_VEC_MEM_DEFAULT (64u * 1024u * 1024u)
+/* A request goes to the accelerator only when it reads at least this many
+ * vector bytes, unless the configuration says otherwise
+ * (cdb_db_config.accel_min_bytes; spec 18.4). Provisional: a device call
+ * costs about 0.25 ms, the CPU's exact pass about that per 300 KB on the
+ * development machine. */
+#define CDB_ACCEL_MIN_BYTES_DEFAULT (1024u * 1024u)
 #else
 #define CDB_PROFILE_NAME "mcu"
 #define CDB_QUERY_MEM_DEFAULT 0u /* no growth: caller memory only */

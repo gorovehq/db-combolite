@@ -146,7 +146,11 @@ cdb_status cdb_vec_search_mode(cdb_db *db, uint64_t store, const void *query, si
  * the collection, the exact searches go to the device in batches; without
  * one, they run on the CPU one by one. Every query is checked before any
  * is searched: one that is not a vector of the collection is
- * CDB_E_INVALID_ARG, with nothing searched. */
+ * CDB_E_INVALID_ARG, with nothing searched. The database's lock is let go
+ * between batches of 64 queries, so other calls run meanwhile; a later
+ * batch may see commits made in between, as separate searches would.
+ * Requests that read fewer than cdb_db_config.accel_min_bytes stay on
+ * the CPU. */
 cdb_status cdb_vec_search_bulk(cdb_db *db, uint64_t store, const void *const *queries, const size_t *lens, size_t nq,
                                unsigned measure, unsigned mode, cdb_vec_hit *hits, size_t k, size_t *counts);
 

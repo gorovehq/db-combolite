@@ -652,6 +652,7 @@ static void test_worker_refills_in_chunks(void)
     cfg.doc_buffers = big_doc;
     cfg.vec_buffers = big_vec;
     cfg.durability = CDB_DURABILITY_NORMAL;
+    cfg.accel_min_bytes = 1; /* small test collections still reach the accelerator (spec 18.4) */
     cfg.worker_threads = 1;
     h.default_page_log2 = 12u;
     cdb_fakeaccel_init(&fake, &env);
@@ -717,6 +718,129 @@ static void test_worker_refills_in_chunks(void)
     env.accel_ctx = NULL;
 }
 
+/* A worker task making data calls until told to stop, counting those that
+ * finished while a bulk search was running. */
+typedef struct bulk_watch {
+    cdb_db *db;
+    cdb_mutex *m; /* guards the rest */
+    int started, running, stop, during;
+} bulk_watch;
+
+static void call_until_stopped(void *arg)
+{
+    bulk_watch *w = (bulk_watch *)arg;
+    for (;;) {
+        uint64_t id = 0;
+        int found = 0, stop;
+        (void)cdb_db_find_store(w->db, "x", 1, &id, &found); /* a data call: takes the lock */
+        env.ops->mutex_lock(env.ctx, w->m);
+        w->started = 1;
+        w->during += w->running;
+        stop = w->stop;
+        env.ops->mutex_unlock(env.ctx, w->m);
+        if (stop)
+            return;
+        env.ops->sleep(env.ctx, 10000); /* 10 us */
+    }
+}
+
+/* Spec 18.6, 18.4: a bulk search lets go of the database's lock between
+ * batches of queries, so another thread's calls run before it finishes. */
+static void test_bulk_search_lets_others_in(void)
+{
+    enum { NQ = 3200 }; /* 50 batches */
+    static cdb_db db;
+    static bulk_watch w;
+    static uint8_t qenc[NQ][64];
+    static const void *qp[NQ];
+    static size_t ql[NQ], counts[NQ];
+    static cdb_vec_hit hits[NQ * 5];
+    cdb_db_config cfg;
+    cdb_header h = test_hdr();
+    cdb_vec_config vc;
+    uint64_t vcoll = 0, eid = 0, task = 0;
+    float v[4];
+    int k, started = 0;
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.pager.arena = big_arena;
+    cfg.pager.arena_size = sizeof big_arena;
+    cfg.pager.nodes = big_nodes;
+    cfg.pager.node_cap = BIG_NODES;
+    cfg.pager.free_list = big_free;
+    cfg.pager.free_cap = sizeof big_free / sizeof big_free[0];
+    cfg.record_buf = big_record;
+    cfg.record_buf_size = sizeof big_record;
+    cfg.catalog_work.bytes = big_cat_work;
+    cfg.catalog_work.bytes_size = cdb_index_work_size(BIG_PAGE);
+    cfg.catalog_work.entries = big_cat_entries;
+    cfg.catalog_work.entries_cap = cdb_index_entries_needed(BIG_PAGE);
+    cfg.catalog_page = big_cat_page;
+    cfg.doc_buffers = big_doc;
+    cfg.vec_buffers = big_vec;
+    cfg.durability = CDB_DURABILITY_NORMAL;
+    cfg.worker_threads = 1;
+    h.default_page_log2 = 12u;
+    env.accel = NULL; /* the CPU path: the slow case */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open(&db, &env, base_path, &cfg, &h));
+    memset(&vc, 0, sizeof vc);
+    vc.elem = CDB_VEC_F32;
+    vc.dims = 4;
+    vc.measure = CDB_VEC_EUCLIDEAN;
+    vc.model = "test";
+    vc.model_len = 4;
+    vc.model_version = "1";
+    vc.model_version_len = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_create(&db, "bulk", 4, &vc, &vcoll));
+    for (k = 0; k < 5000; k++) {
+        cdb_value_writer wr;
+        if (k % 100 == 0)
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+        v[0] = (float)(k % 97);
+        v[1] = (float)(k % 89);
+        v[2] = (float)(k % 83);
+        v[3] = (float)(k % 7);
+        cdb_value_writer_init(&wr, qenc[k % NQ], sizeof qenc[0], CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_write_vector(&wr, CDB_VEC_F32, 4, v));
+        ql[k % NQ] = cdb_value_writer_len(&wr);
+        qp[k % NQ] = qenc[k % NQ];
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_insert(&db, vcoll, qenc[k % NQ], ql[k % NQ], 0, 0, &eid));
+        if (k % 100 == 99)
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    }
+
+    memset(&w, 0, sizeof w);
+    w.db = &db;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->mutex_create(env.ctx, &w.m));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_submit(&db.workers, call_until_stopped, &w, &task));
+    while (!started) {
+        env.ops->mutex_lock(env.ctx, w.m);
+        started = w.started;
+        env.ops->mutex_unlock(env.ctx, w.m);
+        if (!started)
+            env.ops->sleep(env.ctx, 100000);
+    }
+    env.ops->mutex_lock(env.ctx, w.m);
+    w.running = 1;
+    env.ops->mutex_unlock(env.ctx, w.m);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_bulk(&db, vcoll, qp, ql, NQ, CDB_VEC_BASE, CDB_VEC_AUTO, hits, 5,
+                                                      counts));
+    env.ops->mutex_lock(env.ctx, w.m);
+    w.running = 0;
+    w.stop = 1;
+    env.ops->mutex_unlock(env.ctx, w.m);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_wait(&db.workers, task));
+    {
+        char msg[64];
+        snprintf(msg, sizeof msg, "%d calls ran during the bulk search", w.during);
+        TEST_MESSAGE(msg);
+    }
+    TEST_ASSERT_TRUE(w.during >= 5);
+    TEST_ASSERT_EQUAL_size_t(5, counts[NQ - 1]);
+    env.ops->mutex_destroy(env.ctx, w.m);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -735,5 +859,6 @@ int main(void)
     RUN_TEST(test_db_worker_threads_and_vec_refresh_async);
     RUN_TEST(test_worker_task_excludes_data_calls);
     RUN_TEST(test_worker_refills_in_chunks);
+    RUN_TEST(test_bulk_search_lets_others_in);
     return UNITY_END();
 }

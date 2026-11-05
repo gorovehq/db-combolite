@@ -77,6 +77,7 @@ void setUp(void)
     cfg.doc_buffers = doc_buffers;
     cfg.vec_buffers = vec_buffers;
     cfg.durability = CDB_DURABILITY_FULL;
+    cfg.accel_min_bytes = 1; /* small test collections still reach the accelerator (spec 18.4) */
 }
 
 void tearDown(void) {}

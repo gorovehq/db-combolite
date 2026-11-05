@@ -364,6 +364,7 @@ static void open_db(void)
     cfg.doc_buffers = doc_buffers;
     cfg.vec_buffers = vec_buffers;
     cfg.durability = CDB_DURABILITY_FULL;
+    cfg.accel_min_bytes = 1; /* small test collections still reach the accelerator (spec 18.4) */
     memset(&h, 0, sizeof h);
     h.order = CDB_ORDER_LITTLE;
     h.layout_flags = CDB_LAYOUT_ADDR64;
