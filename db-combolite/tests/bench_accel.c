@@ -33,6 +33,7 @@
 #endif
 #include "combolite/cdb_env.h"
 #include "combolite/cdb_value.h"
+#include "bench_file.h"
 #include "cdb_catalog.h"
 #include "cdb_doc.h"
 #include "cdb_fts.h"
@@ -236,95 +237,23 @@ static void run(unsigned n, unsigned dims, unsigned queries)
 
 /* ------------------------------------------------------------ --file */
 
-static void *take(size_t n)
-{
-    void *p = calloc(1, n ? n : 1u);
-    if (p == NULL) {
-        fprintf(stderr, "out of memory\n");
-        exit(1);
-    }
-    return p;
-}
-
-/* Opens an existing database with buffers sized for 4 KB pages and 8 MB
- * documents (as GutenFree Diet opens its own). */
-static void open_file(const char *base)
-{
-    const size_t page = 4096u, doc_max = 8u * 1024u * 1024u, nodes_n = 1024u;
-    size_t tokens = cdb_fts_tokens_needed(page, doc_max), entries = cdb_index_entries_needed(page);
-    cdb_header h;
-    memset(&cfg, 0, sizeof cfg);
-    cfg.pager.node_cap = nodes_n;
-    cfg.pager.arena_size = nodes_n * 2u * page + 2u * page;
-    cfg.pager.arena = take(cfg.pager.arena_size);
-    cfg.pager.nodes = take(nodes_n * sizeof(cdb_pager_node));
-    cfg.pager.free_cap = 16384u;
-    cfg.pager.free_list = take(cfg.pager.free_cap * sizeof(cdb_free_extent));
-    cfg.record_buf_size = doc_max + 2u * page + 64u;
-    cfg.record_buf = take(cfg.record_buf_size);
-    cfg.catalog_work.bytes_size = cdb_index_work_size(page);
-    cfg.catalog_work.bytes = take(cfg.catalog_work.bytes_size);
-    cfg.catalog_work.entries_cap = entries;
-    cfg.catalog_work.entries = take(entries * sizeof(cdb_index_entry));
-    cfg.catalog_page = take(page);
-    cfg.doc_max = doc_max;
-    cfg.doc_buffers = take(cdb_doc_buffers_size(page, doc_max));
-    cfg.doc_stage_size = 1024u * 1024u;
-    cfg.doc_stage = take(cfg.doc_stage_size);
-    cfg.fts_buffers = take(cdb_fts_buffers_size(page, doc_max));
-    cfg.fts_tokens_cap = tokens;
-    cfg.fts_tokens = take(tokens * sizeof(cdb_fts_token));
-    cfg.table_buffers = take(cdb_table_buffers_size(page, doc_max));
-    cfg.vec_buffers = take(3u * page);
-    cfg.vec_work_size = cdb_vec_work_size(CDB_VEC_F32, 384u, 16u);
-    cfg.vec_work = take(cfg.vec_work_size);
-    cfg.vec_refresh_budget = 1u; /* reconciliation leaves the graph alone */
-    cfg.ts_buffers = take(3u * page);
-    cfg.ts_work_size = cdb_ts_work_size();
-    cfg.ts_work = take(cfg.ts_work_size);
-    cfg.durability = CDB_DURABILITY_NORMAL;
-    memset(&h, 0, sizeof h);
-    h.order = CDB_ORDER_LITTLE;
-    h.layout_flags = CDB_LAYOUT_ADDR64;
-    h.default_page_log2 = 12u;
-    check(cdb_db_open(&db, &env, base, &cfg, &h), "open");
-}
-
 static int get_vec(uint64_t coll, uint64_t id, uint8_t *out, size_t cap, size_t *len)
 {
-    uint64_t ss, se;
-    return cdb_vec_get(&db, coll, id, out, cap, len, &ss, &se) == CDB_OK;
+    return bench_get_vec(&db, coll, id, out, cap, len);
 }
 
 static void run_file(const char *base, const char *name, unsigned queries, unsigned k)
 {
     static cdb_vec_hit cpu[256], dev[256];
     static uint8_t enc[MAX_DIMS * 4u + 16u];
-    uint64_t coll, hi = 1, lo, fills, id;
+    uint64_t coll, lo, fills, id;
     size_t len, nc, nd;
     unsigned t, done = 0, misses = 0;
     double t0, t_fill, t_cpu = 0, t_dev = 0, gap_sum = 0;
     cdb_accel_stats st;
-    int found;
-    open_file(base);
-    check(cdb_catalog_find_store(&db.catalog, name, strlen(name), &coll, &found), "find");
-    if (!found) {
-        fprintf(stderr, "no collection %s\n", name);
-        exit(1);
-    }
-    /* Entry IDs are dense from 1: the highest live one, by doubling and
-     * bisecting. */
-    while (get_vec(coll, hi * 2u, enc, sizeof enc, &len))
-        hi *= 2u;
-    lo = hi;
-    hi *= 2u;
-    while (hi - lo > 1u) {
-        uint64_t mid = lo + (hi - lo) / 2u;
-        if (get_vec(coll, mid, enc, sizeof enc, &len))
-            lo = mid;
-        else
-            hi = mid;
-    }
+    bench_open_file(&db, &cfg, &env, base, NULL);
+    coll = bench_find(&db, name);
+    lo = bench_last_id(&db, coll, enc, sizeof enc);
     printf("%s in %s: entry IDs up to %llu; %u queries, k=%u\n", name, base, (unsigned long long)lo, queries, k);
 
     fills = db.accel_stats.fills;
