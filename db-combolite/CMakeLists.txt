@@ -157,13 +157,15 @@ endif()
 message(STATUS "CDB_PROFILE=${CDB_PROFILE}")
 
 # The optional accelerator library, combolite_accel (spec 18.1, 18.5):
-# never part of the core, host profile only. CUDA is enabled here, at the
-# top, because the tests link its kernels too.
+# never part of the core, host profile only, with a CUDA backend, a Vulkan
+# one, or both. CUDA is enabled here, at the top, because the tests link
+# its kernels too.
 option(CDB_ACCEL_CUDA "Build the CUDA accelerator (needs the CUDA toolkit with cuBLAS)" OFF)
+option(CDB_ACCEL_VULKAN "Build the Vulkan accelerator (needs the Vulkan loader and headers)" OFF)
+if((CDB_ACCEL_CUDA OR CDB_ACCEL_VULKAN) AND NOT CDB_PROFILE STREQUAL "host")
+  message(FATAL_ERROR "The accelerator exists only in the host profile (spec 18.1)")
+endif()
 if(CDB_ACCEL_CUDA)
-  if(NOT CDB_PROFILE STREQUAL "host")
-    message(FATAL_ERROR "The accelerator exists only in the host profile (spec 18.1)")
-  endif()
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES native)
   endif()
@@ -174,6 +176,11 @@ if(CDB_ACCEL_CUDA)
   endif()
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+endif()
+if(CDB_ACCEL_VULKAN)
+  find_package(Vulkan REQUIRED)
+endif()
+if(CDB_ACCEL_CUDA OR CDB_ACCEL_VULKAN)
   add_subdirectory(accel)
 endif()
 
