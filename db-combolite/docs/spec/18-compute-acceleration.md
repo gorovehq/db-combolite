@@ -45,6 +45,13 @@ So stored neighbour lists and their distances, and search results, are always th
 - **Neighbour-graph refresh batches.** The pass that finds each pending entry's K nearest (14.12.4). Coverage checks and their walks stay on the CPU: they follow lists through index pages, which is not arithmetic.
 - **Exact vector search.** Searches below `vec_exact_below` (7.7), and the direct pass over pending vectors in approximate search (7.4).
 - **Bulk search.** A new batched call that searches many query vectors in one request, for work such as building `similar_to`-style links, or an agent retrieving memories for several prompts. It is defined for both paths: without an accelerator it runs the same searches on the CPU.
+  - **Batches.** Each query gets exactly the answer a single search would give it. Every query is checked before any is searched.
+  - **The lock.** It is let go between batches of 64 queries, as a refill does between chunks (18.6), so a long bulk search never holds up other calls for more than one batch. A later batch may therefore see commits made in between, as separate searches would.
+- **Small requests stay on the CPU.** A device call has a fixed cost, about 0.25 ms on the development machine. The CPU's exact pass reads about 300 KB of vectors in that time.
+  - **The rule.** A request goes to the accelerator only when it reads at least `accel_min_bytes`: queries × the collection's vector bytes.
+  - **Below the line.** A smaller request takes the CPU path, and a collection never searched with that much gets no mirror.
+  - **Bulk searches cross it sooner.** A bulk search of the same collection may still go to the device, since it pays the fixed cost once.
+  - **The default** is provisional, 1 MB, to be measured. The field is the database configuration's, like `accel_mem` (18.8); 1 sends every request to the device.
 
 ### 18.5 Kernels and dependencies
 
