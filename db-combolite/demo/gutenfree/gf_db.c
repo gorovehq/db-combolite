@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "gf_db.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -10,6 +11,44 @@
 #include "cdb_table.h"
 #include "cdb_ts.h"
 #include "cdb_vec.h"
+#ifdef GF_ACCEL
+#include "combolite/cdb_accel.h"
+#endif
+
+/* Installs the accelerator in the environment, before the database opens
+ * with it (gf_db.h: GUTENFREE_ACCEL). */
+static void accel_open(gf_db *g)
+{
+#ifdef GF_ACCEL
+    const char *want = getenv("GUTENFREE_ACCEL");
+    unsigned flags = 0;
+    cdb_accel *ax;
+    if (want != NULL && strcmp(want, "off") == 0) {
+        snprintf(g->accel_name, sizeof g->accel_name, "off (GUTENFREE_ACCEL)");
+        return;
+    }
+    if (want != NULL && strcmp(want, "software") == 0)
+        flags |= CDB_ACCEL_SOFTWARE;
+    if (cdb_accel_open(flags, &ax) != CDB_OK) {
+        snprintf(g->accel_name, sizeof g->accel_name, "none found");
+        return;
+    }
+    cdb_accel_attach(ax, &g->env);
+    g->accel = ax;
+    snprintf(g->accel_name, sizeof g->accel_name, "%s", cdb_accel_name(ax));
+#else
+    snprintf(g->accel_name, sizeof g->accel_name, "not built (CDB_ACCEL_CUDA, CDB_ACCEL_VULKAN)");
+#endif
+}
+
+static void accel_close(gf_db *g)
+{
+#ifdef GF_ACCEL
+    if (g->accel != NULL)
+        cdb_accel_close((cdb_accel *)g->accel);
+#endif
+    g->accel = NULL;
+}
 
 static void *take(gf_db *g, size_t size)
 {
@@ -58,6 +97,7 @@ cdb_status gf_db_open(gf_db *g, const char *base)
 
     memset(g, 0, sizeof *g);
     cdb_hostenv_init(&g->he, &g->env);
+    accel_open(g);
     memset(&cfg, 0, sizeof cfg);
 
     cfg.pager.node_cap = GF_NODES;
@@ -101,6 +141,7 @@ cdb_status gf_db_open(gf_db *g, const char *base)
 
     if (g->failed) { /* out of memory: the engine has no code of its own for it */
         release(g);
+        accel_close(g);
         return CDB_E_BUFFER_TOO_SMALL;
     }
 
@@ -113,6 +154,7 @@ cdb_status gf_db_open(gf_db *g, const char *base)
     s = cdb_db_open(&g->db, &g->env, base, &cfg, &h);
     if (s != CDB_OK) {
         release(g);
+        accel_close(g);
         return s;
     }
     g->open = 1;
@@ -133,5 +175,6 @@ cdb_status gf_db_close(gf_db *g)
         s = cdb_db_close(&g->db);
     g->open = 0;
     release(g);
+    accel_close(g); /* after the database, which used it */
     return s;
 }

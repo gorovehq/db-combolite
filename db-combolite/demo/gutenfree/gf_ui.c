@@ -897,6 +897,11 @@ void gf_screen_diag(gf_app *a)
         if (load && has_colors())
             attroff(COLOR_PAIR(3) | A_BOLD);
         printw("   build: %s", GF_BUILD_LABEL);
+        {
+            const cdb_accel_stats *as = &a->g->db.accel_stats;
+            printw("   accel: %s (%llu searches on it, %llu on the CPU)", a->g->accel_name,
+                   (unsigned long long)as->certified, (unsigned long long)(as->cpu + as->small));
+        }
         mvprintw(1, 4, "%-28s %10s %10s %10s %10s  %-*s", "measure", "last", "avg", "min", "max", SPARK, "recent");
         for (m = 0; m < gf_nmeasures && y < LINES - 5; m++, y++) {
             const gf_measure *ms = &gf_measures[m];

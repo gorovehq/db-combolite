@@ -239,9 +239,13 @@ cdb_status gf_vec_refresh_graph(gf_db *g, const gf_vec *v, gf_graph_progress_fn 
 
     if (s == CDB_OK)
         done = 1;
+    /* About GF_GRAPH_STEPS slices, never smaller than GF_GRAPH_SLICE: each
+     * slice is a pass over every vector, so fewer, larger ones finish
+     * sooner, and give an accelerator more to do per pass. */
+    size_t slice = pending / GF_GRAPH_STEPS > GF_GRAPH_SLICE ? pending / GF_GRAPH_STEPS : GF_GRAPH_SLICE;
     while (s == CDB_OK && pending > 0) {
         before = pending;
-        s = cdb_vec_refresh(&g->db, v->passages, GF_GRAPH_SLICE, &pending);
+        s = cdb_vec_refresh(&g->db, v->passages, slice, &pending);
         done += before > pending ? before - pending : 0;
         if (progress != NULL)
             progress(done, pending, gf_now_ms() - t0, ctx);
@@ -251,46 +255,92 @@ cdb_status gf_vec_refresh_graph(gf_db *g, const gf_vec *v, gf_graph_progress_fn 
     return s;
 }
 
+/* One book vector, read for the bulk search below. */
+typedef struct book_vec {
+    uint8_t enc[VEC_BYTES];
+    size_t len;
+    uint64_t src_store, src_entry;
+} book_vec;
+
 cdb_status gf_vec_link_similar(gf_db *g, const gf_vec *v, uint64_t *added)
 {
-    static uint8_t enc[VEC_BYTES];
-    cdb_vec_hit hits[GF_SIMILAR + 1];
-    uint64_t entry = 0, src_store, src_entry;
-    size_t len, n, i;
+    book_vec *bv = NULL;
+    const void **qp = NULL;
+    size_t *ql = NULL, *counts = NULL, nb = 0, cap = 0, b, i;
+    cdb_vec_hit *hits = NULL;
     cdb_status s = CDB_OK;
 
     *added = 0;
-    if ((s = cdb_tx_begin(&g->db, CDB_DURABILITY_DEFAULT)) != CDB_OK)
-        return s;
-    /* Book vectors have entry IDs 1, 2, ...: walk until one is missing. The
-     * links join the books themselves, the library rows the vectors come
-     * from, so they read as "this book is similar to that one". */
-    for (entry = 1; s == CDB_OK; entry++) {
-        cdb_ref from, to;
-        s = cdb_vec_get(&g->db, v->books, entry, enc, sizeof enc, &len, &src_store, &src_entry);
+    /* Book vectors have entry IDs 1, 2, ...: read until one is missing. */
+    for (;;) {
+        if (nb == cap) {
+            size_t ncap = cap ? cap * 2u : 256u;
+            book_vec *nbv = (book_vec *)realloc(bv, ncap * sizeof *bv);
+            if (nbv == NULL) {
+                s = CDB_E_OUT_OF_BUDGET;
+                goto out;
+            }
+            bv = nbv;
+            cap = ncap;
+        }
+        s = cdb_vec_get(&g->db, v->books, (uint64_t)nb + 1u, bv[nb].enc, sizeof bv[nb].enc, &bv[nb].len,
+                        &bv[nb].src_store, &bv[nb].src_entry);
         if (s == CDB_E_NOT_FOUND) {
             s = CDB_OK;
             break;
         }
-        if (s != CDB_OK || (s = cdb_vec_search(&g->db, v->books, enc, len, CDB_VEC_BASE, hits, GF_SIMILAR + 1, &n))
-                               != CDB_OK)
-            break;
-        from = cdb_ref_entry(src_store, src_entry);
-        for (i = 0; i < n; i++) {
+        if (s != CDB_OK)
+            goto out;
+        nb++;
+    }
+    if (nb == 0)
+        goto out;
+    /* Every book's nearest at once: one bulk search (spec 18.4), on the
+     * accelerator when there is one. */
+    qp = (const void **)malloc(nb * sizeof *qp);
+    ql = (size_t *)malloc(nb * sizeof *ql);
+    counts = (size_t *)malloc(nb * sizeof *counts);
+    hits = (cdb_vec_hit *)malloc(nb * (GF_SIMILAR + 1u) * sizeof *hits);
+    if (qp == NULL || ql == NULL || counts == NULL || hits == NULL) {
+        s = CDB_E_OUT_OF_BUDGET;
+        goto out;
+    }
+    for (b = 0; b < nb; b++) {
+        qp[b] = bv[b].enc;
+        ql[b] = bv[b].len;
+    }
+    if ((s = cdb_vec_search_bulk(&g->db, v->books, qp, ql, nb, CDB_VEC_BASE, CDB_VEC_AUTO, hits, GF_SIMILAR + 1u,
+                                 counts))
+        != CDB_OK)
+        goto out;
+    /* The links join the books themselves, the library rows the vectors
+     * come from, so they read as "this book is similar to that one". */
+    if ((s = cdb_tx_begin(&g->db, CDB_DURABILITY_DEFAULT)) != CDB_OK)
+        goto out;
+    for (b = 0; b < nb && s == CDB_OK; b++) {
+        const cdb_vec_hit *h = hits + b * (GF_SIMILAR + 1u);
+        cdb_ref from = cdb_ref_entry(bv[b].src_store, bv[b].src_entry);
+        for (i = 0; i < counts[b]; i++) {
             cdb_status ls;
-            if (hits[i].entry == entry)
+            if (h[i].entry == (uint64_t)b + 1u)
                 continue;
-            to = cdb_ref_entry(hits[i].source_store, hits[i].source_entry);
-            ls = cdb_link_add(&g->db, v->similar, from, to, (float)(1.0 - hits[i].distance), 0);
+            ls = cdb_link_add(&g->db, v->similar, from, cdb_ref_entry(h[i].source_store, h[i].source_entry),
+                              (float)(1.0 - h[i].distance), 0);
             if (ls == CDB_OK)
                 (*added)++;
             else if (ls != CDB_E_EXISTS)
                 s = ls;
         }
     }
-    if (s != CDB_OK) {
+    if (s != CDB_OK)
         cdb_tx_abort(&g->db);
-        return s;
-    }
-    return cdb_tx_commit(&g->db);
+    else
+        s = cdb_tx_commit(&g->db);
+out:
+    free(bv);
+    free(qp);
+    free(ql);
+    free(counts);
+    free(hits);
+    return s;
 }

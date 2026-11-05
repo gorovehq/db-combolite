@@ -32,6 +32,21 @@ cmake --build build-demo-rel -j --target gutenfree
 
 The binary goes into this folder, next to its scripts, as `./gutenfree`. `-DCDB_BUILD_DEMO=ON` is required: the engine's default build never needs ncurses or llama.cpp. A Debug build (`-B build-demo`, without a build type) turns on AddressSanitizer and UBSan. That is good for finding bugs, but every timing it shows is about 9 times slower. The screens show which build is running, and the build made last is the one in this folder.
 
+### With a GPU
+
+The engine's optional accelerator (spec 18) can run vector searches and neighbour-graph refreshes on a GPU. Add `-DCDB_ACCEL_CUDA=ON` (NVIDIA, needs the CUDA toolkit) and/or `-DCDB_ACCEL_VULKAN=ON` (any Vulkan 1.2 GPU):
+
+```sh
+cmake -S . -B build-demo-accel -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCDB_BUILD_DEMO=ON -DCDB_BUILD_TESTS=OFF \
+      -DCDB_ACCEL_CUDA=ON -DCDB_ACCEL_VULKAN=ON
+cmake --build build-demo-accel -j --target gutenfree
+```
+
+- **Which device:** the demo uses CUDA when there is an NVIDIA GPU, otherwise the best Vulkan GPU. The main screen, the diagnostics screen and every command show which one, and the diagnostics screen counts the searches it took.
+- **Results:** they are the same with or without it; only the time changes.
+- **Turning it off:** `GUTENFREE_ACCEL=off` runs without it. `GUTENFREE_ACCEL=software` also allows a device that emulates a GPU on the CPU, such as llvmpipe, which is usually slower than having none.
+- **Measured** on an RTX 4060 laptop, building the graph of 15,521 passages (`bench-graph`): 107 s with CUDA, 150 s without.
+
 ## Get the data and run
 
 Everything runs from this folder, and everything it downloads or builds lands in `data/`, which git ignores. The scripts fetch only from a Gutenberg mirror, never from www.gutenberg.org. The default is Project Gutenberg's own pglaf.org mirror; `--mirror URL` picks another one from MIRRORS.ALL.
@@ -73,6 +88,9 @@ The database is `data/gutenfree.cdbarch`. Set `GUTENFREE_DB=/some/path` (no exte
 ./gutenfree filter genre="science fiction" type=Text author=verne   # the catalog filter, from the shell
 ./gutenfree probe 15                                                # 15 s of probe load
 ./gutenfree metrics                                                 # what every gauge holds
+./gutenfree graph                                                   # refresh the passages' neighbour graph
+./gutenfree link-similar                                            # link similar books (one bulk search)
+./gutenfree bench-graph data/copy                                   # time a whole graph build, on a copy of the database
 ./gutenfree --help
 ```
 

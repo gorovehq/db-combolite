@@ -35,9 +35,15 @@ typedef struct gf_db {
     size_t bytes;             /* their total, for the diagnostics screen */
     int failed;               /* an allocation failed */
     int open;
+    void *accel;              /* the accelerator, a cdb_accel (spec 18), or NULL */
+    char accel_name[160];     /* which, or why none, for the screens */
 } gf_db;
 
-/* Opens <base>.cdbarch, creating it if it does not exist. */
+/* Opens <base>.cdbarch, creating it if it does not exist. In a build with
+ * combolite_accel, it first opens the accelerator the machine has (CUDA,
+ * then Vulkan) for vector search and graph refreshes: GUTENFREE_ACCEL=off
+ * goes without one, GUTENFREE_ACCEL=software also allows a device that
+ * runs on the CPU (llvmpipe). */
 cdb_status gf_db_open(gf_db *g, const char *base);
 
 /* Closes the database (one file at rest) and frees the buffers. */
