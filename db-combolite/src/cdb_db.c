@@ -1287,7 +1287,7 @@ static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg
         if (s != CDB_OK)
             return s;
         db->has_master_key = 1;
-        s = cdb_crypto_derive_subkey(db->master_key, CDB_SUBKEY_INTEGRITY, db->integrity_key);
+        s = cdb_crypto_derive_subkey(db->master_key, CDB_SUBKEY_INTEGRITY, NULL, db->integrity_key);
         if (s != CDB_OK)
             return s;
         db->has_integrity_key = 1;
@@ -3059,11 +3059,11 @@ static cdb_status db_create_enclave_in(cdb_db *db, uint64_t enclave_id, const ch
     db->enclaves[free_idx].key_version = 1;
     memcpy(db->enclaves[free_idx].enclave_key, raw_key, 32);
 
-    s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_PAGE, db->enclaves[free_idx].page_key);
+    s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_PAGE, NULL, db->enclaves[free_idx].page_key);
     if (s == CDB_OK)
-        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_CONTENT_HASH, db->enclaves[free_idx].hash_key);
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_CONTENT_HASH, NULL, db->enclaves[free_idx].hash_key);
     if (s == CDB_OK)
-        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, db->enclaves[free_idx].index_key);
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, NULL, db->enclaves[free_idx].index_key);
 
     cdb_crypto_wipe(raw_key, sizeof raw_key);
 
@@ -3116,11 +3116,11 @@ static cdb_status db_open_enclave_in(cdb_db *db, uint64_t enclave_id, const char
         db->enclaves[idx].key_version = 1;
     memcpy(db->enclaves[idx].enclave_key, raw_key, 32);
 
-    s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_PAGE, db->enclaves[idx].page_key);
+    s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_PAGE, NULL, db->enclaves[idx].page_key);
     if (s == CDB_OK)
-        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_CONTENT_HASH, db->enclaves[idx].hash_key);
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_CONTENT_HASH, NULL, db->enclaves[idx].hash_key);
     if (s == CDB_OK)
-        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, db->enclaves[idx].index_key);
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, NULL, db->enclaves[idx].index_key);
 
     cdb_crypto_wipe(raw_key, sizeof raw_key);
 
@@ -3170,7 +3170,7 @@ static cdb_status db_rotate_master_key_in(cdb_db *db, const char *new_master_key
     cdb_crypto_wipe(wrapped, sizeof wrapped);
 
     /* Derive new integrity key */
-    s = cdb_crypto_derive_subkey(new_mk, CDB_SUBKEY_INTEGRITY, db->integrity_key);
+    s = cdb_crypto_derive_subkey(new_mk, CDB_SUBKEY_INTEGRITY, NULL, db->integrity_key);
     if (s != CDB_OK) {
         cdb_crypto_wipe(new_mk, sizeof new_mk);
         return s;
@@ -3231,11 +3231,11 @@ static cdb_status db_rotate_enclave_key_in(cdb_db *db, uint64_t enclave_id, cons
     db->enclaves[idx].key_version++;
     memcpy(db->enclaves[idx].enclave_key, raw_key, 32);
 
-    s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_PAGE, db->enclaves[idx].page_key);
+    s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_PAGE, NULL, db->enclaves[idx].page_key);
     if (s == CDB_OK)
-        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_CONTENT_HASH, db->enclaves[idx].hash_key);
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_CONTENT_HASH, NULL, db->enclaves[idx].hash_key);
     if (s == CDB_OK)
-        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, db->enclaves[idx].index_key);
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, NULL, db->enclaves[idx].index_key);
 
     cdb_crypto_wipe(raw_key, sizeof raw_key);
     if (s == CDB_OK)
