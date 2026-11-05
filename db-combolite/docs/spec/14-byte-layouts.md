@@ -603,7 +603,8 @@ A domain's held log keeps the committed changes of that domain that a process co
 5. **Draining** happens in a reconciliation by a process that holds the domain's key. It applies the entries in log order, frees every page but the head, and empties the head, all in one archive commit; then it applies the domain's new changes.
 6. **Reading.** A process with the domain open reads the log's entries in order, after the archive and before the journals, when it builds its view of the domain.
 7. **Key versions.** A held record names the key version that encrypted it. That version stays in the directory record's field 17 until the record is drained (14.3.4).
-8. **Replication form.** An entry that holds sealed replication changes (14.21.5) has transaction ID 0, track ID 0, commit number 0 and a zero session salt, and its commit stamp is the newest change's clock physical time; its records are the changes, each exactly as received. Draining merges them (19.5) instead of applying them, in log order.
+8. **Collisions.** Held entries keep no write-set keys, and need none: holding happens in an archive commit, which rejects every transaction open across it (5.9.4), and a transaction begun later reads the held log as part of its view (rule 6), so it sees the held changes it would clash with.
+9. **Replication form.** An entry that holds sealed replication changes (14.21.5) has transaction ID 0, track ID 0, commit number 0 and a zero session salt, and its commit stamp is the newest change's clock physical time; its records are the changes, each exactly as received. Draining merges them (19.5) instead of applying them, in log order.
 
 ## 14.5 Coordinator slot
 
@@ -1679,7 +1680,8 @@ and ends with the sender's signature: a 2-byte length, then an ECDSA P-256 signa
   - the epochs it knows: a 2-byte count, then per epoch copy number 2 · epoch 8 · parent epoch 8 (0 for a copy's first);
   - the member reports it knows (19.6): a 2-byte count, then per member copy number 2 · reported at 8 · vector entry count 2 · entries as above;
   - the group's retirements: a 2-byte count, then per retirement retired copy number 2 · retiring copy number 2 · principal ID 8 · time 8 · signature length 2 · signature over the preceding 20 bytes and the group ID;
-  - the clock offsets it knows: a 2-byte count, then per copy copy number 2 · offset 8 (signed) · error bound 8 · measured at 8.
+  - the clock offsets it knows: a 2-byte count, then per copy copy number 2 · offset 8 (signed) · error bound 8 · measured at 8;
+  - the domains the sender carries (19.8): a 2-byte count, then the domain IDs (8 each).
 - **Slice** body: a 4-byte change count, then the changes in each origin's clock order.
 
 ### 14.21.5 Changes
@@ -1695,6 +1697,7 @@ Each change:
 | 2 | Ordinal: the change's position among its origin's changes with the same clock time |
 | 1 | Kind (below) |
 | 8 | Domain ID: 0 public, else the enclave or joined store |
+| 4 | Key version that sealed the body; 0 when the domain ID is 0 |
 | 4 | Body length |
 | n | Body: in plain bytes when the domain ID is 0, else sealed |
 
@@ -1713,4 +1716,4 @@ Change kinds and bodies (references are store ID 8 · entry ID 8; paths are a 1-
 | 9 | a schema version | store (8) · version (4) · the schema record |
 
 - **Sealed bodies.** The body is encrypted with the file's AEAD algorithm under the domain's replication subkey, derived from the domain key without a session salt (14.2.8), so every copy that holds the domain key can open it. The associated data is the change's header (the bytes before the body). The nonce is the first 12 bytes of HMAC-SHA-256, under the domain's replication nonce subkey, of the header and the plaintext body: it repeats only for an identical change, even between forks that share a copy number. The sealed body is the ciphertext followed by the 16-byte tag.
-- **Holding.** A copy without the domain key holds the change, sealed as received, in the domain's held log (14.4.10), in a held entry of the replication form (14.4.10 rule 8). Holding advances the version vector: the copy has the change and relays it, still sealed, in its own slices. It is merged when a key holder drains the log.
+- **Holding.** A copy without the domain key holds the change, sealed as received, in the domain's held log (14.4.10), in a held entry of the replication form (14.4.10 rule 9). Holding advances the version vector: the copy has the change and relays it, still sealed, in its own slices. It is merged when a key holder drains the log.

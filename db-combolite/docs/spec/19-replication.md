@@ -78,6 +78,9 @@ A replicated delete leaves a tombstone, so that an old change arriving late can'
 
 - **Nonces across copies.** Every session that writes a copy draws its own salt, and subkeys are derived with it (12.1). Two copies sharing an enclave key therefore encrypt under different subkeys, and their nonces may repeat harmlessly. The nonce layout (14.2.5) does not change, and replicas need no subkeys of their own.
 - **Sealed for the receiver.** A domain's changes are exported only while the domain is open on the sending copy, sealed in the slice under the domain's key, never in plaintext (12.8). The receiving copy needs the same domain key to apply them; until it has it, it holds them in the domain's held log (14.4.10).
+- **Group-wide domains.** An enclave or joined store that holds a replicated store is a group object: its ID, kind and key version numbers replicate (a catalog-object change, 14.21.5 kind 8), never key material or key references. Each copy's operator sets that copy's own key reference for each version (14.3.4 field 17). A sealed change names the key version that sealed it.
+- **Rotation across the group.** Rotating a domain key on one copy is a replicated event that adds the version. A copy that has no key reference for that version yet holds the changes sealed under it until its operator adds one.
+- **Carried domains.** Each copy declares, in its handshakes, the domains it carries: those it holds keys for, and those it relays without keys. A sender sends a copy only changes of the public domain and of the domains it carries. A copy that does not carry a domain neither holds nor relays it, so a small device carries only what it needs. A domain's changes reach every copy that carries it as long as a chain of carriers connects them.
 
 ## Open questions (do not specify until answered)
 
