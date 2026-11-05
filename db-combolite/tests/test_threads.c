@@ -8,6 +8,8 @@
 #include "unity.h"
 #include "cdb_db.h"
 #include "cdb_doc.h"
+#include "cdb_fakeaccel.h"
+#include "cdb_profile.h"
 #include "cdb_vec.h"
 #include "cdb_worker.h"
 #include "combolite/cdb_env.h"
@@ -541,6 +543,180 @@ static void test_db_worker_threads_and_vec_refresh_async(void)
     TEST_ASSERT_EQUAL_UINT(0, db.workers.nthreads);
 }
 
+/* A worker task that holds the database's lock, as a background refresh or
+ * mirror refill does. */
+typedef struct lock_holder {
+    cdb_db *db;
+    cdb_mutex *m;   /* guards started */
+    int started;
+    int finished;   /* written under the database lock */
+} lock_holder;
+
+static void hold_lock(void *arg)
+{
+    lock_holder *h = (lock_holder *)arg;
+    cdb_db_lock(h->db);
+    env.ops->mutex_lock(env.ctx, h->m);
+    h->started = 1;
+    env.ops->mutex_unlock(env.ctx, h->m);
+    env.ops->sleep(env.ctx, 150000000); /* 150 ms */
+    h->finished = 1;
+    cdb_db_unlock(h->db);
+}
+
+/* Every public data call takes the database's lock, so one made while a
+ * worker task holds it waits for the task (spec 5.9.6). */
+static void test_worker_task_excludes_data_calls(void)
+{
+    static cdb_db db;
+    static lock_holder h;
+    cdb_db_config cfg;
+    cdb_header hd = test_hdr();
+    uint64_t task = 0, id = 0;
+    int found = 1, started = 0;
+
+    init_db_cfg(&cfg, arena1, nodes1, free_list1, record_buf1, cat_work1, cat_entries1, cat_page1);
+    cfg.worker_threads = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open(&db, &env, base_path, &cfg, &hd));
+    TEST_ASSERT_EQUAL_UINT(1, db.workers.nthreads);
+    memset(&h, 0, sizeof h);
+    h.db = &db;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->mutex_create(env.ctx, &h.m));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_submit(&db.workers, hold_lock, &h, &task));
+    while (!started) {
+        env.ops->mutex_lock(env.ctx, h.m);
+        started = h.started;
+        env.ops->mutex_unlock(env.ctx, h.m);
+        if (!started)
+            env.ops->sleep(env.ctx, 1000000);
+    }
+    /* The task holds the lock now: this call must wait for it. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_find_store(&db, "nothing", 7, &id, &found));
+    TEST_ASSERT_EQUAL_INT(1, h.finished);
+    TEST_ASSERT_FALSE(found);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_wait(&db.workers, task));
+    env.ops->mutex_destroy(env.ctx, h.m);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+/* Spec 18.6: with worker threads, a mirror is filled on the pool a chunk
+ * at a time, and the application's calls run between chunks: the main
+ * thread sees the mirror part-filled at least once. Then searches use it
+ * and match the CPU path. */
+#define BIG_PAGE 4096u
+#define BIG_NODES 128u
+static uint8_t big_arena[BIG_NODES * 2u * BIG_PAGE + 2u * BIG_PAGE];
+static cdb_pager_node big_nodes[BIG_NODES];
+static cdb_free_extent big_free[4096];
+static uint8_t big_record[2u * BIG_PAGE];
+static uint8_t big_cat_work[256u * 1024u];
+static cdb_index_entry big_cat_entries[4096];
+static uint8_t big_cat_page[BIG_PAGE];
+static uint8_t big_doc[8u * BIG_PAGE];
+static uint8_t big_vec[3u * BIG_PAGE];
+
+static void test_worker_refills_in_chunks(void)
+{
+    static cdb_db db;
+    static cdb_fakeaccel fake;
+    cdb_db_config cfg;
+    cdb_header h = test_hdr();
+    cdb_vec_config vc;
+    cdb_vec_hit got[5], want[5];
+    uint64_t vcoll = 0, eid = 0, id = 0;
+    uint8_t enc[64];
+    size_t qlen = 0, ng, nw, i;
+    float v[4];
+    int found, seen_filling = 0, ready = 0, k;
+
+#ifndef CDB_PROFILE_HOST
+    TEST_IGNORE_MESSAGE("the mcu profile has no accelerator (spec 18.1)");
+#endif
+    /* Larger than the other tests' buffers: 5000 vectors on 4 KB pages. */
+    memset(&cfg, 0, sizeof cfg);
+    cfg.pager.arena = big_arena;
+    cfg.pager.arena_size = sizeof big_arena;
+    cfg.pager.nodes = big_nodes;
+    cfg.pager.node_cap = BIG_NODES;
+    cfg.pager.free_list = big_free;
+    cfg.pager.free_cap = sizeof big_free / sizeof big_free[0];
+    cfg.record_buf = big_record;
+    cfg.record_buf_size = sizeof big_record;
+    cfg.catalog_work.bytes = big_cat_work;
+    cfg.catalog_work.bytes_size = cdb_index_work_size(BIG_PAGE);
+    cfg.catalog_work.entries = big_cat_entries;
+    cfg.catalog_work.entries_cap = cdb_index_entries_needed(BIG_PAGE);
+    TEST_ASSERT_TRUE(cfg.catalog_work.bytes_size <= sizeof big_cat_work);
+    TEST_ASSERT_TRUE(cfg.catalog_work.entries_cap <= sizeof big_cat_entries / sizeof big_cat_entries[0]);
+    cfg.catalog_page = big_cat_page;
+    cfg.doc_buffers = big_doc;
+    cfg.vec_buffers = big_vec;
+    cfg.durability = CDB_DURABILITY_NORMAL;
+    cfg.worker_threads = 1;
+    h.default_page_log2 = 12u;
+    cdb_fakeaccel_init(&fake, &env);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open(&db, &env, base_path, &cfg, &h));
+    memset(&vc, 0, sizeof vc);
+    vc.elem = CDB_VEC_F32;
+    vc.dims = 4;
+    vc.measure = CDB_VEC_EUCLIDEAN;
+    vc.model = "test";
+    vc.model_len = 4;
+    vc.model_version = "1";
+    vc.model_version_len = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_create(&db, "chunks", 6, &vc, &vcoll));
+    for (k = 0; k < 5000; k++) {
+        cdb_value_writer w;
+        if (k % 100 == 0)
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+        v[0] = (float)(k % 97);
+        v[1] = (float)(k % 89);
+        v[2] = (float)(k % 83);
+        v[3] = (float)(k % 7);
+        cdb_value_writer_init(&w, enc, sizeof enc, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_value_write_vector(&w, CDB_VEC_F32, 4, v));
+        qlen = cdb_value_writer_len(&w);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_insert(&db, vcoll, enc, qlen, 0, 0, &eid));
+        if (k % 100 == 99)
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db)); /* this fixture's pager is small */
+        if (k % 1000 == 999)
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db));
+    }
+
+    /* The first search asks for the mirror: a fill is queued on the pool. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search(&db, vcoll, enc, qlen, CDB_VEC_BASE, got, 5, &ng));
+    for (k = 0; k < 20000 && !ready; k++) {
+        int state;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_find_store(&db, "x", 1, &id, &found)); /* a data call */
+        cdb_db_lock(&db);
+        state = db.accel[0].state;
+        cdb_db_unlock(&db);
+        seen_filling |= state == CDB_ACCEL_FILLING;
+        ready = state == CDB_ACCEL_READY;
+        if (!ready)
+            env.ops->sleep(env.ctx, 100000); /* 0.1 ms */
+    }
+    TEST_ASSERT_TRUE(ready);
+    TEST_ASSERT_TRUE(seen_filling); /* a call ran while the mirror was part-filled */
+    TEST_ASSERT_EQUAL_UINT64(1, db.accel_stats.fills);
+    TEST_ASSERT_TRUE(fake.puts >= 5000u / 256u); /* in chunks */
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search(&db, vcoll, enc, qlen, CDB_VEC_BASE, got, 5, &ng));
+    db.env.accel = NULL;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search(&db, vcoll, enc, qlen, CDB_VEC_BASE, want, 5, &nw));
+    db.env.accel = env.accel;
+    TEST_ASSERT_EQUAL_size_t(nw, ng);
+    for (i = 0; i < nw; i++) {
+        TEST_ASSERT_EQUAL_UINT64(want[i].entry, got[i].entry);
+        TEST_ASSERT_TRUE(want[i].distance == got[i].distance);
+    }
+    TEST_ASSERT_TRUE(db.accel_stats.certified >= 1);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    TEST_ASSERT_EQUAL_UINT(0, fake.live);
+    env.accel = NULL; /* the other tests run without it */
+    env.accel_ctx = NULL;
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -557,5 +733,7 @@ int main(void)
     RUN_TEST(test_worker_pool_queue_full);
     RUN_TEST(test_worker_pool_sync_fallback);
     RUN_TEST(test_db_worker_threads_and_vec_refresh_async);
+    RUN_TEST(test_worker_task_excludes_data_calls);
+    RUN_TEST(test_worker_refills_in_chunks);
     return UNITY_END();
 }

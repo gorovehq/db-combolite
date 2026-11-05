@@ -367,7 +367,9 @@ static cdb_status trim_log(cdb_db *db, coll *c);
 
 /* At reconciliation: trim each change log (spec 14.12.5), refresh up to
  * the budget of each graph (spec 6.8), then record next entry IDs. Only
- * open collections are trimmed; the others are when they are next open. */
+ * open collections are trimmed; the others are when they are next open.
+ * Then the wanted accelerator mirrors are filled (spec 18.6), after the
+ * loop, since filling opens collections. */
 cdb_status cdb_vec_flush(cdb_db *db)
 {
     cdb_slot_iter it;
@@ -385,14 +387,25 @@ cdb_status cdb_vec_flush(cdb_db *db)
         if ((s = save_coll(db, c)) != CDB_OK)
             return s;
     }
-    return CDB_OK;
+    return cdb_vec_accel_maintain(db);
 }
 
 /* Validates the settings, checks one vector fits a page, then (as a
  * catalog change) creates the indexes, the change log among them (spec
  * 14.12.5), and the store record in one commit. Norms are cached only for
  * cosine. */
+static cdb_status vec_create_in(cdb_db *db, const char *name, size_t len, const cdb_vec_config *cfg, uint64_t *id);
+
 cdb_status cdb_vec_create(cdb_db *db, const char *name, size_t len, const cdb_vec_config *cfg, uint64_t *id)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_create_in(db, name, len, cfg, id);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_create_in(cdb_db *db, const char *name, size_t len, const cdb_vec_config *cfg, uint64_t *id)
 {
     uint8_t settings[CDB_CATALOG_SETTINGS_MAX];
     size_t slen;
@@ -448,7 +461,18 @@ cdb_status cdb_vec_create(cdb_db *db, const char *name, size_t len, const cdb_ve
     return cdb_db_catalog_end(db, s);
 }
 
+static cdb_status vec_describe_in(cdb_db *db, uint64_t store, cdb_vec_config *cfg, char *model, char *model_version);
+
 cdb_status cdb_vec_describe(cdb_db *db, uint64_t store, cdb_vec_config *cfg, char *model, char *model_version)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_describe_in(db, store, cfg, model, model_version);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_describe_in(cdb_db *db, uint64_t store, cdb_vec_config *cfg, char *model, char *model_version)
 {
     cdb_store_info info;
     uint64_t roots[7];
@@ -1905,6 +1929,18 @@ static cdb_status source_rev(cdb_db *db, uint64_t store, uint64_t entry, uint64_
 
 /* The vector apply. Like the document apply it never fails for logical
  * reasons: it runs again during recovery. */
+/* Mirror upkeep on the accelerator (spec 18; the accelerator section at
+ * the end of this file). A queued change carries its kind in the top two
+ * bits of the entry ID. */
+#define Q_REPLACE UINT64_C(0)
+#define Q_NEW (UINT64_C(1) << 62)
+#define Q_PUT (UINT64_C(2) << 62) /* inserted or replaced, from a change log: counted as new */
+#define Q_DEL (UINT64_C(3) << 62)
+#define Q_KIND (UINT64_C(3) << 62)
+static void accel_note(cdb_db *db, const coll *c, uint64_t entry, uint64_t kind);
+static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned measure, cdb_vec_hit *hits, size_t k,
+                              size_t *n, int *used);
+
 /* -------------------------------------------------------- change log */
 
 /* Rows of the changes index (spec 14.12.5): (sequence, entry) -> kind;
@@ -2124,6 +2160,7 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
                 return s;
             if (c->graph_on && ((s = pending_put(c, d->entry_id)) != CDB_OK || (s = meta_live(c, +1)) != CDB_OK))
                 return s;
+            accel_note(db, c, d->entry_id, Q_NEW);
             return log_change(db, c, d->entry_id, CH_PUT);
         } else {
             /* Replace (an insert of an existing entry also lands here):
@@ -2138,6 +2175,7 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
             if ((s = block_write(db, c, r.block, &b, b.count, r.slot, d->entry_id, data)) != CDB_OK
                 || (s = log_change(db, c, d->entry_id, CH_PUT)) != CDB_OK)
                 return s;
+            accel_note(db, c, d->entry_id, Q_REPLACE);
             /* A new vector: its place in the graph is worked out again. */
             if (c->graph_on && ((s = graph_detach(db, c, d->entry_id)) != CDB_OK
                                 || (s = pending_put(c, d->entry_id)) != CDB_OK))
@@ -2168,6 +2206,7 @@ cdb_status cdb_vec_apply(cdb_db *db, const cdb_delta *d, int *handled)
         if ((s = cdb_index_delete(&c->entries, k, k_u64(k, d->entry_id), &found)) != CDB_OK
             || (s = log_change(db, c, d->entry_id, CH_DEL)) != CDB_OK)
             return s;
+        accel_note(db, c, d->entry_id, Q_DEL);
         return cdb_link_on_delete(db, d->store_id, d->entry_id); /* its links (spec 6.7) */
     default:
         return CDB_OK;
@@ -2244,8 +2283,21 @@ static cdb_status put_vector(cdb_db *db, coll *c, uint64_t entry, uint8_t op, co
 
 /* The entry ID comes from the collection's counter, which advances only
  * after the change is journaled. The source is not checked to exist. */
+static cdb_status vec_insert_in(cdb_db *db, uint64_t store, const void *vec, size_t len,
+                                uint64_t source_store, uint64_t source_entry, uint64_t *entry);
+
 cdb_status cdb_vec_insert(cdb_db *db, uint64_t store, const void *vec, size_t len,
                           uint64_t source_store, uint64_t source_entry, uint64_t *entry)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_insert_in(db, store, vec, len, source_store, source_entry, entry);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_insert_in(cdb_db *db, uint64_t store, const void *vec, size_t len,
+                                uint64_t source_store, uint64_t source_entry, uint64_t *entry)
 {
     coll *c;
     uint64_t id;
@@ -2261,7 +2313,18 @@ cdb_status cdb_vec_insert(cdb_db *db, uint64_t store, const void *vec, size_t le
     return CDB_OK;
 }
 
+static cdb_status vec_replace_in(cdb_db *db, uint64_t store, uint64_t entry, const void *vec, size_t len);
+
 cdb_status cdb_vec_replace(cdb_db *db, uint64_t store, uint64_t entry, const void *vec, size_t len)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_replace_in(db, store, entry, vec, len);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_replace_in(cdb_db *db, uint64_t store, uint64_t entry, const void *vec, size_t len)
 {
     coll *c;
     int live;
@@ -2277,7 +2340,18 @@ cdb_status cdb_vec_replace(cdb_db *db, uint64_t store, uint64_t entry, const voi
     return put_vector(db, c, entry, CDB_OP_REPLACE, vec, len, 0, 0);
 }
 
+static cdb_status vec_delete_in(cdb_db *db, uint64_t store, uint64_t entry);
+
 cdb_status cdb_vec_delete(cdb_db *db, uint64_t store, uint64_t entry)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_delete_in(db, store, entry);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_delete_in(cdb_db *db, uint64_t store, uint64_t entry)
 {
     coll *c;
     int live;
@@ -2298,7 +2372,18 @@ cdb_status cdb_vec_delete(cdb_db *db, uint64_t store, uint64_t entry)
     return CDB_OK;
 }
 
+static cdb_status vec_live_in_tx_in(cdb_db *db, uint64_t store, uint64_t entry, int *live);
+
 cdb_status cdb_vec_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *live)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_live_in_tx_in(db, store, entry, live);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_live_in_tx_in(cdb_db *db, uint64_t store, uint64_t entry, int *live)
 {
     coll *c;
     entry_rec r;
@@ -2315,8 +2400,21 @@ cdb_status cdb_vec_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *l
 
 /* Re-encodes the stored elements as a vector value in out. A small out
  * gives the value writer's CDB_E_BUFFER_TOO_SMALL. */
+static cdb_status vec_get_in(cdb_db *db, uint64_t store, uint64_t entry, void *out, size_t cap, size_t *len,
+                             uint64_t *source_store, uint64_t *source_entry);
+
 cdb_status cdb_vec_get(cdb_db *db, uint64_t store, uint64_t entry, void *out, size_t cap, size_t *len,
                        uint64_t *source_store, uint64_t *source_entry)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_get_in(db, store, entry, out, cap, len, source_store, source_entry);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_get_in(cdb_db *db, uint64_t store, uint64_t entry, void *out, size_t cap, size_t *len,
+                             uint64_t *source_store, uint64_t *source_entry)
 {
     cdb_value_writer w;
     entry_rec r;
@@ -2346,8 +2444,21 @@ cdb_status cdb_vec_get(cdb_db *db, uint64_t store, uint64_t entry, void *out, si
     return CDB_OK;
 }
 
+static cdb_status vec_by_source_in(cdb_db *db, uint64_t store, uint64_t source_store, uint64_t source_entry,
+                                   uint64_t *entries, size_t max, size_t *n);
+
 cdb_status cdb_vec_by_source(cdb_db *db, uint64_t store, uint64_t source_store, uint64_t source_entry,
                              uint64_t *entries, size_t max, size_t *n)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_by_source_in(db, store, source_store, source_entry, entries, max, n);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_by_source_in(cdb_db *db, uint64_t store, uint64_t source_store, uint64_t source_entry,
+                                   uint64_t *entries, size_t max, size_t *n)
 {
     cdb_index_cursor cur;
     uint8_t k[24], got[24];
@@ -2522,8 +2633,21 @@ static cdb_status search_approx(cdb_db *db, coll *c, const uint8_t *q, unsigned 
 
 /* Validates the query, picks the path (see cdb_vec.h), searches, then
  * fills in each hit's source state. Searches see committed vectors only. */
+static cdb_status vec_search_mode_in(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
+                                     unsigned mode, cdb_vec_hit *hits, size_t k, size_t *n);
+
 cdb_status cdb_vec_search_mode(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
                                unsigned mode, cdb_vec_hit *hits, size_t k, size_t *n)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_search_mode_in(db, store, query, len, measure, mode, hits, k, n);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_search_mode_in(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
+                                     unsigned mode, cdb_vec_hit *hits, size_t k, size_t *n)
 {
     const uint8_t *q;
     coll *c;
@@ -2554,7 +2678,14 @@ cdb_status cdb_vec_search_mode(cdb_db *db, uint64_t store, const void *query, si
             return s;
         approx = live >= (db->cfg.vec_exact_below ? db->cfg.vec_exact_below : DEFAULT_EXACT_BELOW);
     }
-    s = approx ? search_approx(db, c, q, measure, hits, k, n) : search_exact(db, c, q, measure, hits, k, n);
+    if (approx) {
+        s = search_approx(db, c, q, measure, hits, k, n);
+    } else {
+        int used;
+        /* The accelerator first, when it has this collection (spec 18.4). */
+        if ((s = accel_exact(db, c, q, measure, hits, k, n, &used)) == CDB_OK && !used)
+            s = search_exact(db, c, q, measure, hits, k, n);
+    }
     return s == CDB_OK ? source_states(db, c, hits, *n) : s;
 }
 
@@ -2569,7 +2700,18 @@ cdb_status cdb_vec_search(cdb_db *db, uint64_t store, const void *query, size_t 
 /* A catalog change: checks K and the working memory, creates the graph,
  * reverse and pending indexes, queues every existing entry, sets the live
  * count, and rewrites the settings with fields 10-13 (spec 14.12.4). */
+static cdb_status vec_create_graph_in(cdb_db *db, uint64_t store, uint32_t k);
+
 cdb_status cdb_vec_create_graph(cdb_db *db, uint64_t store, uint32_t k)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_create_graph_in(db, store, k);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_create_graph_in(cdb_db *db, uint64_t store, uint32_t k)
 {
     char model[CDB_VEC_MODEL_MAX], version[CDB_VEC_MODEL_MAX];
     uint8_t settings[CDB_CATALOG_SETTINGS_MAX];
@@ -2711,8 +2853,21 @@ cdb_status cdb_vec_refresh_async(cdb_db *db, cdb_vec_refresh_task *task, uint64_
 
 /* Copies the stored list (base-measure distances, as stored in f32) and
  * the neighbours' source states. CDB_E_STATE without a graph. */
+static cdb_status vec_neighbours_in(cdb_db *db, uint64_t store, uint64_t entry, cdb_vec_hit *hits, size_t max,
+                                    size_t *n, int *fresh);
+
 cdb_status cdb_vec_neighbours(cdb_db *db, uint64_t store, uint64_t entry, cdb_vec_hit *hits, size_t max,
                               size_t *n, int *fresh)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_neighbours_in(db, store, entry, hits, max, n, fresh);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_neighbours_in(cdb_db *db, uint64_t store, uint64_t entry, cdb_vec_hit *hits, size_t max,
+                                    size_t *n, int *fresh)
 {
     entry_rec er;
     grec r;
@@ -2748,7 +2903,18 @@ cdb_status cdb_vec_neighbours(cdb_db *db, uint64_t store, uint64_t entry, cdb_ve
 /* A catalog change: creates the changes index, records that it holds
  * every change after the archive's committed sequence now, and rewrites
  * the settings with field 14 (spec 14.12.5). */
+static cdb_status vec_track_changes_in(cdb_db *db, uint64_t store);
+
 cdb_status cdb_vec_track_changes(cdb_db *db, uint64_t store)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_track_changes_in(db, store);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_track_changes_in(cdb_db *db, uint64_t store)
 {
     char model[CDB_VEC_MODEL_MAX], version[CDB_VEC_MODEL_MAX];
     uint8_t settings[CDB_CATALOG_SETTINGS_MAX], k[16], v[8];
@@ -2827,7 +2993,18 @@ static cdb_status change_stamp(cdb_db *db, coll *c, uint64_t *stamp, uint64_t *o
     return CDB_OK;
 }
 
+static cdb_status vec_change_stamp_in(cdb_db *db, uint64_t store, uint64_t *stamp, uint64_t *oldest);
+
 cdb_status cdb_vec_change_stamp(cdb_db *db, uint64_t store, uint64_t *stamp, uint64_t *oldest)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_change_stamp_in(db, store, stamp, oldest);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_change_stamp_in(cdb_db *db, uint64_t store, uint64_t *stamp, uint64_t *oldest)
 {
     coll *c;
     cdb_status s;
@@ -2838,23 +3015,17 @@ cdb_status cdb_vec_change_stamp(cdb_db *db, uint64_t store, uint64_t *stamp, uin
     return change_stamp(db, c, stamp, oldest);
 }
 
-cdb_status cdb_vec_changes(cdb_db *db, uint64_t store, uint64_t *seq, uint64_t *entry, cdb_vec_change *out,
-                           size_t max, size_t *n)
+/* cdb_vec_changes for an open collection, also from inside a rebase. */
+static cdb_status changes_in(cdb_db *db, coll *c, uint64_t *seq, uint64_t *entry, cdb_vec_change *out, size_t max,
+                             size_t *n)
 {
     cdb_index_cursor cur;
     uint8_t k[16], key[16], kind;
     uint64_t through, from_seq, from_entry;
     size_t klen, vlen;
-    coll *c;
     cdb_status s;
 
     *n = 0;
-    if (db->in_tx || db->failed)
-        return CDB_E_STATE;
-    if (out == NULL && max)
-        return CDB_E_INVALID_ARG;
-    if ((s = coll_get(db, store, &c)) != CDB_OK)
-        return s;
     if (!c->changes_on)
         return CDB_E_STATE;
     if ((s = trimmed_through(c, &through)) != CDB_OK)
@@ -2900,6 +3071,23 @@ cdb_status cdb_vec_changes(cdb_db *db, uint64_t store, uint64_t *seq, uint64_t *
     return CDB_OK;
 }
 
+cdb_status cdb_vec_changes(cdb_db *db, uint64_t store, uint64_t *seq, uint64_t *entry, cdb_vec_change *out,
+                           size_t max, size_t *n)
+{
+    coll *c;
+    cdb_status s;
+    *n = 0;
+    cdb_db_lock(db);
+    if (db->in_tx || db->failed)
+        s = CDB_E_STATE;
+    else if (out == NULL && max)
+        s = CDB_E_INVALID_ARG;
+    else if ((s = coll_get(db, store, &c)) == CDB_OK)
+        s = changes_in(db, c, seq, entry, out, max, n);
+    cdb_db_unlock(db);
+    return s;
+}
+
 static int cursor_name_ok(const char *name, size_t len)
 {
     return name != NULL && len > 0 && len <= CDB_VEC_CURSOR_NAME_MAX;
@@ -2907,7 +3095,18 @@ static int cursor_name_ok(const char *name, size_t len)
 
 /* Opening and dropping are catalog changes (spec 14.12.5): the index pages
  * they write commit at once, as a refresh's do. */
+static cdb_status vec_cursor_open_in(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t *seq);
+
 cdb_status cdb_vec_cursor_open(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t *seq)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_cursor_open_in(db, store, name, len, seq);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_cursor_open_in(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t *seq)
 {
     uint8_t k[16], val[CURSOR_VAL];
     uint64_t oldest;
@@ -2949,7 +3148,18 @@ cdb_status cdb_vec_cursor_open(cdb_db *db, uint64_t store, const char *name, siz
     return cdb_db_catalog_end(db, s);
 }
 
+static cdb_status vec_cursor_advance_in(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t seq);
+
 cdb_status cdb_vec_cursor_advance(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t seq)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_cursor_advance_in(db, store, name, len, seq);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_cursor_advance_in(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t seq)
 {
     uint8_t p[8];
     cursor_scan sc;
@@ -2973,7 +3183,18 @@ cdb_status cdb_vec_cursor_advance(cdb_db *db, uint64_t store, const char *name, 
     return CDB_OK;
 }
 
+static cdb_status vec_cursor_drop_in(cdb_db *db, uint64_t store, const char *name, size_t len);
+
 cdb_status cdb_vec_cursor_drop(cdb_db *db, uint64_t store, const char *name, size_t len)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_cursor_drop_in(db, store, name, len);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_cursor_drop_in(cdb_db *db, uint64_t store, const char *name, size_t len)
 {
     uint8_t k[16];
     cursor_scan sc;
@@ -3000,3 +3221,624 @@ cdb_status cdb_vec_cursor_drop(cdb_db *db, uint64_t store, const char *name, siz
         s = cdb_pager_commit(&db->pager);
     return cdb_db_catalog_end(db, s);
 }
+
+/* -------------------------------------------------------- accelerator */
+
+/* The distance the CPU path computes between a query and a stored vector
+ * (stored norms are f32, so cosine uses the rounded norm, as a collection
+ * with cached norms does). For an accelerator to compare against. */
+double cdb_vec_cpu_distance(unsigned elem, uint32_t dims, unsigned measure, const uint8_t *q, const uint8_t *v,
+                            cdb_byte_order o)
+{
+    coll c;
+    memset(&c, 0, sizeof c);
+    c.elem = (uint8_t)elem;
+    c.dims = dims;
+    c.vec_bytes = vector_bytes(c.elem, dims);
+    if (measure == CDB_VEC_COSINE)
+        return distance(&c, measure, q, norm_of(&c, q, o), v, (double)(float)norm_of(&c, v, o), o);
+    return distance(&c, measure, q, 0.0, v, -1.0, o);
+}
+
+#ifdef CDB_PROFILE_HOST
+
+/* Mirrors (spec 18.6-18.8). A collection searched exactly under its base
+ * measure is wanted; reconciliation or a tick fills it from the vector
+ * blocks; changes applied in this process are queued and sent before its
+ * next use; at a rebase its change log catches it up. A mirror that cannot
+ * keep up is stale: dropped and wanted again. */
+
+#define ACCEL_BATCH 256u /* vectors per put or delete, and per chunk of a fill (spec 18.6) */
+
+static void accel_schedule(cdb_db *db, cdb_accel_entry *a);
+
+/* A mirror that has an accelerator copy: complete, or being filled. Both
+ * take changes and catch-ups; only a complete one serves requests. */
+static int accel_held(const cdb_accel_entry *a)
+{
+    return a->state == CDB_ACCEL_READY || a->state == CDB_ACCEL_FILLING;
+}
+
+static int accel_on(const cdb_db *db)
+{
+    const cdb_env_ops *ops = db->env.ops;
+    return db->env.accel != NULL && ops != NULL && ops->alloc != NULL && ops->free != NULL;
+}
+
+static cdb_accel_entry *accel_find(cdb_db *db, uint64_t store)
+{
+    unsigned i;
+    for (i = 0; i < CDB_ACCEL_MIRRORS; i++)
+        if (db->accel[i].state != CDB_ACCEL_FREE && db->accel[i].store == store)
+            return &db->accel[i];
+    return NULL;
+}
+
+/* Closes the mirror, if any, and frees the entry. Its token moves on, so a
+ * fill already queued for it finds out and stops. */
+static void accel_drop(cdb_db *db, cdb_accel_entry *a)
+{
+    uint64_t token = a->token + 1u;
+    int queued = a->task_queued; /* the queued task clears it when it runs */
+    if (a->m != NULL)
+        db->env.accel->mirror_close(db->env.accel_ctx, a->m);
+    db->accel_bytes -= a->bytes;
+    if (a->queue != NULL)
+        db->env.ops->free(db->env.ctx, a->queue);
+    memset(a, 0, sizeof *a);
+    a->token = token;
+    a->task_queued = queued;
+}
+
+/* The mirror goes; the collection stays wanted, to be filled again. */
+static void accel_stale(cdb_db *db, cdb_accel_entry *a)
+{
+    uint64_t store = a->store, last = a->last_use;
+    accel_drop(db, a);
+    a->store = store;
+    a->state = CDB_ACCEL_WANTED;
+    a->last_use = last;
+    db->accel_stats.stale++;
+    accel_schedule(db, a);
+}
+
+/* Makes room for need more bytes under accel_mem by dropping the least
+ * recently used other mirrors (spec 18.8); 0 if it still does not fit. */
+static int accel_room(cdb_db *db, const cdb_accel_entry *keep, uint64_t need)
+{
+    uint64_t limit = db->cfg.accel_mem, others = 0;
+    unsigned j;
+    if (limit == 0 || db->accel_bytes + need <= limit)
+        return 1;
+    /* Nothing is evicted for a mirror that would not fit even then. */
+    for (j = 0; j < CDB_ACCEL_MIRRORS; j++)
+        if (&db->accel[j] != keep && db->accel[j].state == CDB_ACCEL_READY)
+            others += db->accel[j].bytes;
+    if (db->accel_bytes - others + need > limit)
+        return 0;
+    while (db->accel_bytes + need > limit) {
+        cdb_accel_entry *v = NULL;
+        unsigned i;
+        for (i = 0; i < CDB_ACCEL_MIRRORS; i++) {
+            cdb_accel_entry *a = &db->accel[i];
+            if (a != keep && a->state == CDB_ACCEL_READY && (v == NULL || a->last_use < v->last_use))
+                v = a;
+        }
+        if (v == NULL)
+            return 0;
+        accel_drop(db, v); /* evicted: wanted again when next searched */
+        db->accel_stats.evicted++;
+    }
+    return 1;
+}
+
+/* A search wants collection c mirrored: an entry is taken, the least
+ * recently used one if none is free. */
+static void accel_want(cdb_db *db, const coll *c)
+{
+    cdb_accel_entry *a = NULL;
+    unsigned i;
+    for (i = 0; i < CDB_ACCEL_MIRRORS && a == NULL; i++)
+        if (db->accel[i].state == CDB_ACCEL_FREE)
+            a = &db->accel[i];
+    if (a == NULL) {
+        a = &db->accel[0];
+        for (i = 1; i < CDB_ACCEL_MIRRORS; i++)
+            if (db->accel[i].last_use < a->last_use)
+                a = &db->accel[i];
+    }
+    if (a->state != CDB_ACCEL_FREE) {
+        accel_drop(db, a);
+        db->accel_stats.evicted++;
+    }
+    a->store = c->slot.store_id;
+    a->state = CDB_ACCEL_WANTED;
+    a->last_use = ++db->accel_clock;
+    accel_schedule(db, a);
+}
+
+/* Queues a change for collection c's mirror, applied in this process
+ * (spec 18.7: sent in one batch before the mirror's next use). */
+static void accel_note(cdb_db *db, const coll *c, uint64_t entry, uint64_t kind)
+{
+    cdb_accel_entry *a;
+    if (!accel_on(db) || (a = accel_find(db, c->slot.store_id)) == NULL || !accel_held(a))
+        return;
+    if (a->queue == NULL
+        && (a->queue = (uint64_t *)db->env.ops->alloc(db->env.ctx, CDB_ACCEL_QUEUE * sizeof(uint64_t))) == NULL) {
+        accel_stale(db, a);
+        return;
+    }
+    if (a->queued == CDB_ACCEL_QUEUE) {
+        accel_stale(db, a); /* more than the list holds: filled again instead */
+        return;
+    }
+    a->queue[a->queued++] = (entry & ~Q_KIND) | kind;
+}
+
+/* The oldest archive any ready mirror reflects: the reader pin this
+ * process publishes is held at or below it, so no baton holder trims a
+ * change log past what a mirror still has to catch up on (spec 18.12).
+ * UINT64_MAX when there is none. */
+uint64_t cdb_vec_accel_floor(const cdb_db *db)
+{
+    uint64_t floor = UINT64_MAX;
+    unsigned i;
+    for (i = 0; i < CDB_ACCEL_MIRRORS; i++)
+        if (accel_held(&db->accel[i]) && db->accel[i].seen < floor)
+            floor = db->accel[i].seen;
+    return floor;
+}
+
+/* After this process's own reconciliation commits: every change that
+ * commit holds, from any slot's journal, reached each mirror through the
+ * apply, so each reflects the archive it made. */
+void cdb_vec_accel_committed(cdb_db *db)
+{
+    unsigned i;
+    if (!accel_on(db))
+        return;
+    for (i = 0; i < CDB_ACCEL_MIRRORS; i++)
+        if (accel_held(&db->accel[i]) && db->accel[i].seen < db->pager.hs.record.committed_seq)
+            db->accel[i].seen = db->pager.hs.record.committed_seq;
+}
+
+/* Sends batches of puts (vectors read back from the blocks, as they are
+ * now) and deletes. A refused call or a budget that cannot grow makes the
+ * mirror stale. */
+static cdb_status accel_send(cdb_db *db, coll *c, cdb_accel_entry *a)
+{
+    const cdb_accel_ops *ax = db->env.accel;
+    uint64_t put_ids[ACCEL_BATCH], del_ids[ACCEL_BATCH], grow = 0;
+    size_t np = 0, nd = 0, i;
+    uint8_t *vecs;
+    cdb_status s = CDB_OK;
+
+    if (a->queued == 0)
+        return CDB_OK;
+    for (i = 0; i < a->queued; i++)
+        if ((a->queue[i] & Q_KIND) == Q_NEW || (a->queue[i] & Q_KIND) == Q_PUT)
+            grow++;
+    if (!accel_room(db, a, grow * a->vec_bytes)) {
+        accel_stale(db, a); /* it no longer fits (spec 18.8) */
+        return CDB_OK;
+    }
+    if ((vecs = (uint8_t *)db->env.ops->alloc(db->env.ctx, ACCEL_BATCH * a->vec_bytes)) == NULL) {
+        accel_stale(db, a);
+        return CDB_OK;
+    }
+    for (i = 0; i <= a->queued && s == CDB_OK; i++) {
+        if (i < a->queued) {
+            uint64_t q = a->queue[i], e = q & ~Q_KIND;
+            int found = 0;
+            if ((q & Q_KIND) != Q_DEL
+                && (s = fetch_vector(db, c, e, vecs + np * a->vec_bytes, NULL, &found)) != CDB_OK)
+                break;
+            if (found)
+                put_ids[np++] = e;
+            else
+                del_ids[nd++] = e; /* deleted, or deleted again since */
+            if ((q & Q_KIND) == Q_NEW || (q & Q_KIND) == Q_PUT)
+                a->vectors++;
+            else if ((q & Q_KIND) == Q_DEL && a->vectors > 0)
+                a->vectors--;
+        }
+        if (np == ACCEL_BATCH || (i == a->queued && np > 0)) {
+            if (ax->mirror_put(db->env.accel_ctx, a->m, put_ids, vecs, a->vec_bytes, np) != CDB_OK)
+                s = CDB_E_STATE;
+            np = 0;
+        }
+        if (s == CDB_OK && (nd == ACCEL_BATCH || (i == a->queued && nd > 0))) {
+            if (ax->mirror_del(db->env.accel_ctx, a->m, del_ids, nd) != CDB_OK)
+                s = CDB_E_STATE;
+            nd = 0;
+        }
+    }
+    db->env.ops->free(db->env.ctx, vecs);
+    if (s == CDB_E_STATE) {
+        accel_stale(db, a); /* the accelerator refused: filled again later */
+        return CDB_OK;
+    }
+    if (s != CDB_OK)
+        return s;
+    a->queued = 0;
+    db->accel_bytes += a->vectors * a->vec_bytes - a->bytes;
+    a->bytes = a->vectors * a->vec_bytes;
+    return CDB_OK;
+}
+
+/* Fills are made of steps, each under the database's lock (spec 18.6):
+ * fill_begin opens the mirror, fill_step adds one chunk of vectors in
+ * entry order from fill_from. Changes applied between steps are queued for
+ * the mirror like a ready one's, so what a later chunk reads, or the queue
+ * sends, is always the current vector. The size is counted as it fills,
+ * all or nothing against the budget (spec 18.8). */
+static cdb_status fill_begin(cdb_db *db, cdb_accel_entry *a)
+{
+    coll *c;
+    cdb_status s;
+    if ((s = coll_get(db, a->store, &c)) != CDB_OK) {
+        accel_drop(db, a); /* dropped, or no longer a collection */
+        return s == CDB_E_NOT_FOUND || s == CDB_E_INVALID_ARG ? CDB_OK : s;
+    }
+    a->vec_bytes = c->vec_bytes;
+    /* next_entry bounds how many there are: the size to expect. */
+    if (db->env.accel->mirror_open(db->env.accel_ctx, a->store, c->elem, c->dims, c->measure, db->pager.order,
+                                   c->next_entry > 0 ? c->next_entry - 1u : 0u, &a->m)
+        != CDB_OK) {
+        a->m = NULL;
+        a->state = CDB_ACCEL_DECLINED;
+        return CDB_OK;
+    }
+    a->state = CDB_ACCEL_FILLING;
+    a->seen = db->pager.hs.record.committed_seq;
+    a->fill_from = 1;
+    a->vectors = a->bytes = 0;
+    a->queued = 0;
+    return CDB_OK;
+}
+
+/* *done is set once the mirror is complete (or gone). */
+static cdb_status fill_step(cdb_db *db, cdb_accel_entry *a, int *done)
+{
+    cdb_index_cursor cur;
+    uint8_t k[8], key[8], val[ENTRY_VAL], *vecs;
+    uint64_t ids[ACCEL_BATCH];
+    size_t klen, vlen, n = 0;
+    int end = 0;
+    coll *c;
+    cdb_status s;
+
+    *done = 0;
+    if ((s = coll_get(db, a->store, &c)) != CDB_OK) {
+        accel_drop(db, a);
+        *done = 1;
+        return s == CDB_E_NOT_FOUND || s == CDB_E_INVALID_ARG ? CDB_OK : s;
+    }
+    if ((vecs = (uint8_t *)db->env.ops->alloc(db->env.ctx, ACCEL_BATCH * c->vec_bytes)) == NULL) {
+        accel_stale(db, a);
+        *done = 1;
+        return CDB_OK;
+    }
+    if ((s = cdb_index_seek(&cur, &c->entries, vbuf(db, V_CURSOR), k, k_u64(k, a->fill_from))) == CDB_OK) {
+        while (n < ACCEL_BATCH) {
+            int found;
+            if ((s = cdb_index_next(&cur, key, sizeof key, &klen, val, sizeof val, &vlen, &end)) != CDB_OK || end)
+                break;
+            ids[n] = cdb_load_u64(key, CDB_ORDER_BIG);
+            if ((s = fetch_vector(db, c, ids[n], vecs + n * c->vec_bytes, NULL, &found)) != CDB_OK)
+                break;
+            n++;
+        }
+    }
+    if (s == CDB_OK && n > 0) {
+        if (!accel_room(db, a, (uint64_t)n * c->vec_bytes)
+            || db->env.accel->mirror_put(db->env.accel_ctx, a->m, ids, vecs, c->vec_bytes, n) != CDB_OK)
+            s = CDB_E_STATE; /* no room left, or refused: filled again later */
+    }
+    db->env.ops->free(db->env.ctx, vecs);
+    if (s != CDB_OK) {
+        accel_stale(db, a);
+        *done = 1;
+        return s == CDB_E_STATE ? CDB_OK : s;
+    }
+    a->vectors += n;
+    a->bytes += (uint64_t)n * c->vec_bytes;
+    db->accel_bytes += (uint64_t)n * c->vec_bytes;
+    if (n > 0)
+        a->fill_from = ids[n - 1] + 1u;
+    if (end || n < ACCEL_BATCH) {
+        a->state = CDB_ACCEL_READY;
+        db->accel_stats.fills++;
+        *done = 1;
+    }
+    return CDB_OK;
+}
+
+/* A whole fill at once: reconciliation or tick on a host without worker
+ * threads, which is already doing its own maintenance (spec 18.6). */
+static cdb_status accel_fill(cdb_db *db, cdb_accel_entry *a)
+{
+    int done = 0;
+    cdb_status s = CDB_OK;
+    if (a->state == CDB_ACCEL_WANTED && (s = fill_begin(db, a)) != CDB_OK)
+        return s;
+    while (s == CDB_OK && !done && a->state == CDB_ACCEL_FILLING)
+        s = fill_step(db, a, &done);
+    return s;
+}
+
+/* A fill on the worker pool: one step per hold of the lock, so the
+ * application's calls run between chunks (spec 18.6). It stops when the
+ * entry it was queued for is dropped or reused (its token moves on). */
+static void accel_fill_task(void *arg)
+{
+    const cdb_accel_task *t = (const cdb_accel_task *)arg;
+    cdb_db *db = t->db;
+    for (;;) {
+        cdb_accel_entry *a;
+        int done = 0;
+        cdb_db_lock(db);
+        a = &db->accel[t->index];
+        if (a->token != t->token || db->failed || !accel_on(db)
+            || (a->state != CDB_ACCEL_WANTED && a->state != CDB_ACCEL_FILLING)) {
+            a->task_queued = 0;
+            cdb_db_unlock(db);
+            return;
+        }
+        if (a->state == CDB_ACCEL_WANTED)
+            (void)fill_begin(db, a);
+        else
+            (void)fill_step(db, a, &done); /* a failure leaves it stale or gone: wanted again */
+        if (a->token != t->token || (a->state != CDB_ACCEL_WANTED && a->state != CDB_ACCEL_FILLING)) {
+            a->task_queued = 0; /* complete, declined, stale or dropped: this task is done */
+            cdb_db_unlock(db);
+            return;
+        }
+        cdb_db_unlock(db);
+        /* A lock need not be fair: give a waiting call its turn first. */
+        if (db->env.ops->sleep != NULL)
+            db->env.ops->sleep(db->env.ctx, 1000);
+    }
+}
+
+/* Queues a fill on the worker pool when it has threads; otherwise the next
+ * reconciliation or tick fills it (cdb_vec_accel_maintain). */
+static void accel_schedule(cdb_db *db, cdb_accel_entry *a)
+{
+    unsigned i = (unsigned)(a - db->accel);
+    cdb_accel_task *t = &db->accel_tasks[i];
+    if (db->workers.nthreads == 0 || a->task_queued)
+        return;
+    t->db = db;
+    t->index = i;
+    t->token = a->token;
+    a->task_queued = 1;
+    if (cdb_worker_pool_submit(&db->workers, accel_fill_task, t, NULL) != CDB_OK)
+        a->task_queued = 0; /* the queue is full: maintain will do it */
+}
+
+/* At reconciliation and at each tick: wanted mirrors are filled, on the
+ * worker pool where there are threads, else here, at once. */
+cdb_status cdb_vec_accel_maintain(cdb_db *db)
+{
+    unsigned i;
+    cdb_status s;
+    if (!accel_on(db))
+        return CDB_OK;
+    for (i = 0; i < CDB_ACCEL_MIRRORS; i++) {
+        cdb_accel_entry *a = &db->accel[i];
+        if (a->state != CDB_ACCEL_WANTED && a->state != CDB_ACCEL_FILLING)
+            continue;
+        if (db->workers.nthreads > 0) {
+            accel_schedule(db, a);
+            if (a->task_queued)
+                continue;
+        }
+        if (!a->task_queued && (s = accel_fill(db, a)) != CDB_OK)
+            return s;
+    }
+    return CDB_OK;
+}
+
+/* At the end of a rebase: each mirror catches up from its collection's
+ * change log, from the archive it reflects to the one now (spec 18.12).
+ * The rows go to its queue, sent before its next use. */
+cdb_status cdb_vec_accel_rebase(cdb_db *db)
+{
+    cdb_vec_change ch[64];
+    unsigned i;
+    cdb_status s;
+    if (!accel_on(db))
+        return CDB_OK;
+    for (i = 0; i < CDB_ACCEL_MIRRORS; i++) {
+        cdb_accel_entry *a = &db->accel[i];
+        uint64_t seq, entry = UINT64_MAX, now = db->pager.hs.record.committed_seq;
+        size_t n, j;
+        coll *c;
+        if (!accel_held(a) || a->seen >= now)
+            continue;
+        if ((s = coll_get(db, a->store, &c)) != CDB_OK) {
+            accel_drop(db, a);
+            if (s == CDB_E_NOT_FOUND || s == CDB_E_INVALID_ARG)
+                continue;
+            return s;
+        }
+        seq = a->seen;
+        do {
+            s = changes_in(db, c, &seq, &entry, ch, sizeof ch / sizeof ch[0], &n);
+            if (s == CDB_E_STATE) {
+                accel_stale(db, a); /* no log, or trimmed past it: filled again */
+                break;
+            }
+            if (s != CDB_OK)
+                return s;
+            for (j = 0; j < n && accel_held(a); j++)
+                accel_note(db, c, ch[j].entry, ch[j].live ? Q_PUT : Q_DEL);
+        } while (n > 0 && accel_held(a));
+        if (accel_held(a)) {
+            a->seen = now;
+            db->accel_stats.catchups++;
+        }
+    }
+    return CDB_OK;
+}
+
+/* A dropped collection's mirror goes with it. */
+void cdb_vec_accel_forget(cdb_db *db, uint64_t store)
+{
+    cdb_accel_entry *a;
+    if (accel_on(db) && (a = accel_find(db, store)) != NULL)
+        accel_drop(db, a);
+}
+
+/* At close: every mirror is closed. */
+void cdb_vec_accel_close(cdb_db *db)
+{
+    unsigned i;
+    if (!accel_on(db))
+        return;
+    for (i = 0; i < CDB_ACCEL_MIRRORS; i++)
+        if (db->accel[i].state != CDB_ACCEL_FREE)
+            accel_drop(db, &db->accel[i]);
+}
+
+/* The exact path on the accelerator (spec 18.3, 18.10): a shortlist from
+ * the mirror, every candidate rescored on the CPU as search_exact would,
+ * and the result certified complete, widening the shortlist while it stays
+ * under an eighth of the collection. *used is 0 when the CPU path must
+ * answer instead; *n is then 0. */
+static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned measure, cdb_vec_hit *hits, size_t k,
+                              size_t *n, int *used)
+{
+    cdb_byte_order o = db->pager.order;
+    const cdb_accel_ops *ax = db->env.accel;
+    double qn = measure == CDB_VEC_COSINE ? norm_of(c, q, o) : 0.0;
+    uint64_t *ids;
+    float *dists;
+    size_t want, cap;
+    cdb_accel_entry *a;
+    cdb_status s;
+
+    *used = 0;
+    *n = 0;
+    if (!accel_on(db))
+        return CDB_OK;
+    if ((a = accel_find(db, c->slot.store_id)) == NULL) {
+        accel_want(db, c);
+        db->accel_stats.cpu++;
+        return CDB_OK;
+    }
+    a->last_use = ++db->accel_clock;
+    if (a->state != CDB_ACCEL_READY || measure != c->measure) {
+        db->accel_stats.cpu++;
+        return CDB_OK;
+    }
+    if ((s = accel_send(db, c, a)) != CDB_OK)
+        return s;
+    if (a->state != CDB_ACCEL_READY) {
+        db->accel_stats.cpu++;
+        return CDB_OK;
+    }
+    want = 2u * k > k + 8u ? 2u * k : k + 8u;
+    cap = (size_t)(a->vectors / 8u);
+    if (want >= a->vectors)
+        want = (size_t)a->vectors; /* the whole collection: exact by construction */
+    else if (want > cap) {
+        db->accel_stats.cpu++; /* too small to gain from a shortlist */
+        return CDB_OK;
+    }
+    for (;;) {
+        size_t count = 0, j;
+        double bound = 0.0;
+        int ok;
+        ids = (uint64_t *)db->env.ops->alloc(db->env.ctx, (want ? want : 1u) * sizeof *ids);
+        dists = (float *)db->env.ops->alloc(db->env.ctx, (want ? want : 1u) * sizeof *dists);
+        if (ids == NULL || dists == NULL
+            || ax->nearest(db->env.accel_ctx, a->m, q, 1, want, ids, dists, &count, &bound) != CDB_OK
+            || count > want) {
+            if (ids != NULL)
+                db->env.ops->free(db->env.ctx, ids);
+            if (dists != NULL)
+                db->env.ops->free(db->env.ctx, dists);
+            db->accel_stats.cpu++; /* declined: the CPU path (spec 18.7) */
+            return CDB_OK;
+        }
+        *n = 0;
+        for (j = 0; j < count && s == CDB_OK; j++) {
+            uint8_t *tmp = vbuf(db, V_BUILD);
+            double vn;
+            int found;
+            if ((s = fetch_vector(db, c, ids[j], tmp, &vn, &found)) == CDB_OK && found)
+                add_hit(hits, k, n, ids[j],
+                        distance(c, measure, q, qn, tmp, measure == CDB_VEC_COSINE ? vn : -1.0, o));
+        }
+        /* Complete when the shortlist held every vector, or when nothing
+         * left out could be among the k nearest. */
+        ok = s == CDB_OK
+             && (count < want || want == a->vectors
+                 || (*n == k
+                     && (bound == 0.0 ? (double)dists[count - 1] >= hits[k - 1].distance
+                                      : (double)dists[count - 1] - bound > hits[k - 1].distance)));
+        db->env.ops->free(db->env.ctx, ids);
+        db->env.ops->free(db->env.ctx, dists);
+        if (s != CDB_OK)
+            return s;
+        if (ok) {
+            *used = 1;
+            db->accel_stats.certified++;
+            return CDB_OK;
+        }
+        *n = 0;
+        if (want * 2u > cap) {
+            db->accel_stats.cpu++; /* wider would cost more than the CPU path */
+            return CDB_OK;
+        }
+        want *= 2u;
+        db->accel_stats.widened++;
+    }
+}
+
+#else /* mcu: no accelerator (spec 18.1) */
+
+static void accel_note(cdb_db *db, const coll *c, uint64_t entry, uint64_t kind)
+{
+    (void)db, (void)c, (void)entry, (void)kind;
+}
+void cdb_vec_accel_committed(cdb_db *db)
+{
+    (void)db;
+}
+uint64_t cdb_vec_accel_floor(const cdb_db *db)
+{
+    (void)db;
+    return UINT64_MAX;
+}
+static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned measure, cdb_vec_hit *hits, size_t k,
+                              size_t *n, int *used)
+{
+    (void)db, (void)c, (void)q, (void)measure, (void)hits, (void)k;
+    *n = 0;
+    *used = 0;
+    return CDB_OK;
+}
+cdb_status cdb_vec_accel_maintain(cdb_db *db)
+{
+    (void)db;
+    return CDB_OK;
+}
+cdb_status cdb_vec_accel_rebase(cdb_db *db)
+{
+    (void)db;
+    return CDB_OK;
+}
+void cdb_vec_accel_forget(cdb_db *db, uint64_t store)
+{
+    (void)db, (void)store;
+}
+void cdb_vec_accel_close(cdb_db *db)
+{
+    (void)db;
+}
+
+#endif

@@ -221,6 +221,28 @@ cdb_status cdb_vec_cursor_advance(cdb_db *db, uint64_t store, const char *name, 
  * immediately. CDB_E_NOT_FOUND if there is no such cursor. */
 cdb_status cdb_vec_cursor_drop(cdb_db *db, uint64_t store, const char *name, size_t len);
 
+/* ---- Accelerator mirrors (spec 18), host profile; no-ops on mcu ---- */
+
+/* Fills the mirrors searches have asked for; run at reconciliation and at
+ * each cdb_db_tick. */
+cdb_status cdb_vec_accel_maintain(cdb_db *db);
+/* At the end of a rebase: catches each mirror up from its change log. */
+cdb_status cdb_vec_accel_rebase(cdb_db *db);
+/* After this process's own reconciliation has committed the archive. */
+void cdb_vec_accel_committed(cdb_db *db);
+/* The oldest archive sequence a ready mirror reflects (UINT64_MAX: none):
+ * the reader pin is held at or below it (spec 18.12). */
+uint64_t cdb_vec_accel_floor(const cdb_db *db);
+/* The store was dropped: its mirror goes. */
+void cdb_vec_accel_forget(cdb_db *db, uint64_t store);
+/* At close: every mirror is closed. */
+void cdb_vec_accel_close(cdb_db *db);
+/* The distance the CPU path computes between a query and a stored vector,
+ * both in their stored form: for an accelerator, or a test, to compare
+ * its own against. */
+double cdb_vec_cpu_distance(unsigned elem, uint32_t dims, unsigned measure, const uint8_t *q, const uint8_t *v,
+                            cdb_byte_order o);
+
 /* Bytes of vec_work a collection with this shape and k needs. */
 size_t cdb_vec_work_size(cdb_vector_elem elem, uint32_t dims, uint32_t k);
 

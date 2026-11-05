@@ -1,11 +1,13 @@
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "unity.h"
 #include "combolite/cdb_value.h"
 #include "cdb_doc.h"
 #include "cdb_endian.h"
+#include "cdb_fakeaccel.h"
 #include "cdb_faultenv.h"
 #include "cdb_profile.h"
 #include "cdb_vec.h"
@@ -22,6 +24,8 @@ static uint8_t env_arena[CDB_FAULTENV_MAX_FILES * 3u * FCAP];
 static cdb_fault_record env_records[CDB_FAULTENV_MAX_FILES * 8192u];
 static cdb_faultenv fe;
 static cdb_env env;
+static cdb_fakeaccel fake;
+static uint64_t accel_used; /* nearest calls the fake answered, over the whole run */
 
 static uint8_t arena[NODES * 2u * PAGE + 2u * PAGE];
 static cdb_pager_node nodes[NODES];
@@ -44,6 +48,11 @@ static void init_env(void)
     c.records = env_records;
     c.records_per_file = 8192;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_faultenv_init(&fe, &c, &env));
+    if (getenv("CDB_TEST_ACCEL") != NULL) { /* the accelerator runs (tests/CMakeLists.txt, spec 18.11) */
+        accel_used += fake.nearests;
+        cdb_fakeaccel_init(&fake, &env);
+        fake.noise = 0.05;
+    }
 }
 
 void setUp(void)
@@ -727,6 +736,18 @@ static void test_crash_sweep(void)
     }
 }
 
+/* In the accelerator run: graph refresh and approximate search are not
+ * accelerated yet (spec 18.4, a later layer), so this suite shows only
+ * that the accelerator, installed, changes nothing, its crash sweep
+ * included. Says so rather than passing quietly. */
+static void test_accelerator_was_used(void)
+{
+    if (getenv("CDB_TEST_ACCEL") == NULL)
+        TEST_IGNORE_MESSAGE("not the accelerator run");
+    if (accel_used + fake.nearests == 0)
+        TEST_IGNORE_MESSAGE("the accelerator was installed but not reached: graph refresh is not accelerated yet");
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -737,6 +758,7 @@ int main(void)
     RUN_TEST(test_vec_mem_limit_falls_back);
     RUN_TEST(test_rejects_bad_use);
     RUN_TEST(test_crash_sweep);
+    RUN_TEST(test_accelerator_was_used);
     graph_k = K;
     return UNITY_END();
 }
