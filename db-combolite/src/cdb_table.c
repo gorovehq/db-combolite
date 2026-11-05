@@ -837,7 +837,18 @@ static cdb_status replace_row(cdb_db *db, uint64_t store, uint64_t entry, const 
     return write_keys(db, t, entry, n);
 }
 
+static cdb_status table_insert_in(cdb_db *db, uint64_t store, const void *row, size_t len, uint64_t *entry);
+
 cdb_status cdb_table_insert(cdb_db *db, uint64_t store, const void *row, size_t len, uint64_t *entry)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_insert_in(db, store, row, len, entry);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_insert_in(cdb_db *db, uint64_t store, const void *row, size_t len, uint64_t *entry)
 {
     cdb_status s;
     db->via_table = 1;
@@ -846,7 +857,18 @@ cdb_status cdb_table_insert(cdb_db *db, uint64_t store, const void *row, size_t 
     return s;
 }
 
+static cdb_status table_replace_in(cdb_db *db, uint64_t store, uint64_t entry, const void *row, size_t len);
+
 cdb_status cdb_table_replace(cdb_db *db, uint64_t store, uint64_t entry, const void *row, size_t len)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_replace_in(db, store, entry, row, len);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_replace_in(cdb_db *db, uint64_t store, uint64_t entry, const void *row, size_t len)
 {
     cdb_status s;
     db->via_table = 1;
@@ -855,7 +877,18 @@ cdb_status cdb_table_replace(cdb_db *db, uint64_t store, uint64_t entry, const v
     return s;
 }
 
+static cdb_status table_update_in(cdb_db *db, uint64_t store, uint64_t entry, const void *changes, size_t len);
+
 cdb_status cdb_table_update(cdb_db *db, uint64_t store, uint64_t entry, const void *changes, size_t len)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_update_in(db, store, entry, changes, len);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_update_in(cdb_db *db, uint64_t store, uint64_t entry, const void *changes, size_t len)
 {
     cdb_status s;
     db->via_table = 1;
@@ -864,7 +897,18 @@ cdb_status cdb_table_update(cdb_db *db, uint64_t store, uint64_t entry, const vo
     return s;
 }
 
+static cdb_status table_delete_in(cdb_db *db, uint64_t store, uint64_t entry);
+
 cdb_status cdb_table_delete(cdb_db *db, uint64_t store, uint64_t entry)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_delete_in(db, store, entry);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_delete_in(cdb_db *db, uint64_t store, uint64_t entry)
 {
     table *t;
     cdb_status s;
@@ -907,7 +951,18 @@ static cdb_status read_row(cdb_db *db, table *t, uint64_t entry, void *out, size
     return project(db, t, tbuf(db, T_OTHER), raw, info.schema_version, (uint8_t *)out, cap, len);
 }
 
+static cdb_status table_live_in_tx_in(cdb_db *db, uint64_t store, uint64_t entry, int *live);
+
 cdb_status cdb_table_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *live)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_live_in_tx_in(db, store, entry, live);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_live_in_tx_in(cdb_db *db, uint64_t store, uint64_t entry, int *live)
 {
     cdb_store_info info;
     cdb_status s;
@@ -923,7 +978,18 @@ cdb_status cdb_table_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int 
     return cdb_doc_live_in_tx(db, store, entry, live);
 }
 
+static cdb_status table_is_column_in(cdb_db *db, uint64_t store, int *is_col);
+
 cdb_status cdb_table_is_column(cdb_db *db, uint64_t store, int *is_col)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_is_column_in(db, store, is_col);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_is_column_in(cdb_db *db, uint64_t store, int *is_col)
 {
     table *t;
     cdb_status s;
@@ -1113,7 +1179,18 @@ cdb_status cdb_table_col_apply(cdb_db *db, uint64_t store, const cdb_delta *d)
     return CDB_OK;
 }
 
+static cdb_status table_get_in(cdb_db *db, uint64_t store, uint64_t entry, void *out, size_t cap, size_t *len);
+
 cdb_status cdb_table_get(cdb_db *db, uint64_t store, uint64_t entry, void *out, size_t cap, size_t *len)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_get_in(db, store, entry, out, cap, len);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_get_in(cdb_db *db, uint64_t store, uint64_t entry, void *out, size_t cap, size_t *len)
 {
     table *t;
     cdb_status s;
@@ -1162,7 +1239,18 @@ static cdb_status find_row(cdb_db *db, uint64_t store, const void *key, size_t k
     return CDB_OK;
 }
 
+static cdb_status table_find_in(cdb_db *db, uint64_t store, const void *key, size_t key_len, uint64_t *entry, int *found);
+
 cdb_status cdb_table_find(cdb_db *db, uint64_t store, const void *key, size_t key_len, uint64_t *entry, int *found)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_find_in(db, store, key, key_len, entry, found);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_find_in(cdb_db *db, uint64_t store, const void *key, size_t key_len, uint64_t *entry, int *found)
 {
     cdb_status s;
     db->via_table = 1;
@@ -1239,9 +1327,24 @@ static cdb_status scan(cdb_db *db, uint64_t store, uint32_t index, const void *f
     return CDB_OK;
 }
 
+static cdb_status table_scan_in(cdb_db *db, uint64_t store, uint32_t index, const void *from, size_t from_len,
+                                const void *to, size_t to_len, cdb_table_cursor *cur, uint64_t *entries, size_t max,
+                                size_t *n);
+
 cdb_status cdb_table_scan(cdb_db *db, uint64_t store, uint32_t index, const void *from, size_t from_len,
                           const void *to, size_t to_len, cdb_table_cursor *cur, uint64_t *entries, size_t max,
                           size_t *n)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_scan_in(db, store, index, from, from_len, to, to_len, cur, entries, max, n);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_scan_in(cdb_db *db, uint64_t store, uint32_t index, const void *from, size_t from_len,
+                                const void *to, size_t to_len, cdb_table_cursor *cur, uint64_t *entries, size_t max,
+                                size_t *n)
 {
     cdb_status s;
     db->via_table = 1;
@@ -1544,7 +1647,18 @@ static cdb_status change(cdb_db *db, uint64_t store, change_fn fn, const void *a
     return cdb_db_catalog_end(db, s);
 }
 
+static cdb_status table_create_in(cdb_db *db, const char *name, size_t len, const cdb_table_def *def, uint64_t *store);
+
 cdb_status cdb_table_create(cdb_db *db, const char *name, size_t len, const cdb_table_def *def, uint64_t *store)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_create_in(db, name, len, def, store);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_create_in(cdb_db *db, const char *name, size_t len, const cdb_table_def *def, uint64_t *store)
 {
     uint8_t settings[CDB_CATALOG_SETTINGS_MAX];
     size_t slen, used = 0;
@@ -1655,8 +1769,21 @@ cdb_status cdb_table_create(cdb_db *db, const char *name, size_t len, const cdb_
     return cdb_db_catalog_end(db, s);
 }
 
+static cdb_status table_describe_in(cdb_db *db, uint64_t store, cdb_table_column_info *cols, unsigned cap, unsigned *n,
+                                    uint32_t *version, uint32_t *keep);
+
 cdb_status cdb_table_describe(cdb_db *db, uint64_t store, cdb_table_column_info *cols, unsigned cap, unsigned *n,
                               uint32_t *version, uint32_t *keep)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_describe_in(db, store, cols, cap, n, version, keep);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_describe_in(cdb_db *db, uint64_t store, cdb_table_column_info *cols, unsigned cap, unsigned *n,
+                                    uint32_t *version, uint32_t *keep)
 {
     table *t;
     unsigned i, j;
@@ -1682,7 +1809,18 @@ cdb_status cdb_table_describe(cdb_db *db, uint64_t store, cdb_table_column_info 
     return CDB_OK;
 }
 
+static cdb_status table_column_id_in(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t *field_id);
+
 cdb_status cdb_table_column_id(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t *field_id)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_column_id_in(db, store, name, len, field_id);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_column_id_in(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t *field_id)
 {
     char got[CDB_CATALOG_NAME_MAX];
     size_t glen;
@@ -1732,7 +1870,18 @@ static cdb_status do_add_column(cdb_db *db, uint64_t store, table *t, uint64_t n
     return save(db, store, t, next, 1);
 }
 
+static cdb_status table_add_column_in(cdb_db *db, uint64_t store, const cdb_table_column *col_in, uint64_t *field_id);
+
 cdb_status cdb_table_add_column(cdb_db *db, uint64_t store, const cdb_table_column *col_in, uint64_t *field_id)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_add_column_in(db, store, col_in, field_id);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_add_column_in(cdb_db *db, uint64_t store, const cdb_table_column *col_in, uint64_t *field_id)
 {
     cdb_status s;
     if (col_in == NULL)
@@ -1768,7 +1917,18 @@ static cdb_status do_drop_column(cdb_db *db, uint64_t store, table *t, uint64_t 
     return cdb_catalog_field_rename(&db->catalog, store, id, NULL, 0); /* the name is free again */
 }
 
+static cdb_status table_drop_column_in(cdb_db *db, uint64_t store, uint64_t field_id);
+
 cdb_status cdb_table_drop_column(cdb_db *db, uint64_t store, uint64_t field_id)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_drop_column_in(db, store, field_id);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_drop_column_in(cdb_db *db, uint64_t store, uint64_t field_id)
 {
     return change(db, store, do_drop_column, &field_id);
 }
@@ -1788,7 +1948,18 @@ static cdb_status do_rename(cdb_db *db, uint64_t store, table *t, uint64_t next,
     return cdb_catalog_field_rename(&db->catalog, store, r->id, r->name, r->len);
 }
 
+static cdb_status table_rename_column_in(cdb_db *db, uint64_t store, uint64_t field_id, const char *name, size_t len);
+
 cdb_status cdb_table_rename_column(cdb_db *db, uint64_t store, uint64_t field_id, const char *name, size_t len)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_rename_column_in(db, store, field_id, name, len);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_rename_column_in(cdb_db *db, uint64_t store, uint64_t field_id, const char *name, size_t len)
 {
     rename_arg r;
     if (name == NULL || len == 0)
@@ -1824,7 +1995,18 @@ static cdb_status do_widen(cdb_db *db, uint64_t store, table *t, uint64_t next, 
     return save(db, store, t, next, 1);
 }
 
+static cdb_status table_widen_column_in(cdb_db *db, uint64_t store, uint64_t field_id, cdb_value_type type);
+
 cdb_status cdb_table_widen_column(cdb_db *db, uint64_t store, uint64_t field_id, cdb_value_type type)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_widen_column_in(db, store, field_id, type);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_widen_column_in(cdb_db *db, uint64_t store, uint64_t field_id, cdb_value_type type)
 {
     widen_arg a;
     a.id = field_id;
@@ -1838,7 +2020,18 @@ static cdb_status do_keep(cdb_db *db, uint64_t store, table *t, uint64_t next, c
     return save(db, store, t, next, 0);
 }
 
+static cdb_status table_set_keep_in(cdb_db *db, uint64_t store, uint32_t keep);
+
 cdb_status cdb_table_set_keep(cdb_db *db, uint64_t store, uint32_t keep)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_set_keep_in(db, store, keep);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_set_keep_in(cdb_db *db, uint64_t store, uint32_t keep)
 {
     return change(db, store, do_keep, &keep);
 }
@@ -1862,8 +2055,21 @@ static cdb_status do_create_index(cdb_db *db, uint64_t store, table *t, uint64_t
     return save(db, store, t, next + 1u, 0);
 }
 
+static cdb_status table_create_index_in(cdb_db *db, uint64_t store, const uint64_t *fields, unsigned n, int unique,
+                                        uint32_t *index);
+
 cdb_status cdb_table_create_index(cdb_db *db, uint64_t store, const uint64_t *fields, unsigned n, int unique,
                                   uint32_t *index)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_create_index_in(db, store, fields, n, unique, index);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_create_index_in(cdb_db *db, uint64_t store, const uint64_t *fields, unsigned n, int unique,
+                                        uint32_t *index)
 {
     index_arg a;
     if (fields == NULL || index == NULL)
@@ -1893,7 +2099,18 @@ static cdb_status do_drop_index(cdb_db *db, uint64_t store, table *t, uint64_t n
     return CDB_E_NOT_FOUND;
 }
 
+static cdb_status table_drop_index_in(cdb_db *db, uint64_t store, uint32_t index);
+
 cdb_status cdb_table_drop_index(cdb_db *db, uint64_t store, uint32_t index)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_drop_index_in(db, store, index);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_drop_index_in(cdb_db *db, uint64_t store, uint32_t index)
 {
     return change(db, store, do_drop_index, &index);
 }
@@ -1916,7 +2133,18 @@ static cdb_status rowgroups(cdb_db *db, uint64_t store, cdb_rg *g)
                        db->cfg.col_work_size);
 }
 
+static cdb_status table_rowgroups_in(cdb_db *db, uint64_t store, struct cdb_rg *g);
+
 cdb_status cdb_table_rowgroups(cdb_db *db, uint64_t store, struct cdb_rg *g)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = table_rowgroups_in(db, store, g);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status table_rowgroups_in(cdb_db *db, uint64_t store, struct cdb_rg *g)
 {
     cdb_status s;
     db->via_table = 1;
