@@ -176,11 +176,24 @@ typedef struct cdb_db_config {
 #define CDB_ACCEL_MIRRORS 16u      /* collections mirrored at once */
 #define CDB_ACCEL_QUEUE 4096u      /* changes held for a mirror between uses */
 
-enum { CDB_ACCEL_FREE = 0, CDB_ACCEL_WANTED, CDB_ACCEL_READY };
+/* WANTED: to be filled (on the worker pool where there are threads, else at
+ * reconciliation or tick); FILLING: being filled, a chunk at a time;
+ * DECLINED: the accelerator would not mirror it, the CPU serves it. */
+enum { CDB_ACCEL_FREE = 0, CDB_ACCEL_WANTED, CDB_ACCEL_READY, CDB_ACCEL_FILLING, CDB_ACCEL_DECLINED };
+
+/* A fill queued on the worker pool, for entry `index` as it was at `token`. */
+typedef struct cdb_accel_task {
+    struct cdb_db *db;
+    unsigned index;
+    uint64_t token;
+} cdb_accel_task;
 
 typedef struct cdb_accel_entry {
     uint64_t store;
-    int state;                  /* CDB_ACCEL_*: WANTED is filled at reconciliation or tick */
+    int state;                  /* CDB_ACCEL_* */
+    uint64_t token;             /* changes whenever the entry is dropped, so a queued fill can tell */
+    int task_queued;            /* a fill task for it is on the worker pool */
+    uint64_t fill_from;         /* FILLING: the next entry ID to read */
     cdb_accel_mirror *m;        /* READY only */
     uint64_t seen;              /* reflects the archive at this committed sequence, plus what was applied since */
     uint64_t vectors;           /* in the mirror */
@@ -401,6 +414,7 @@ typedef struct cdb_db {
     uint64_t vec_full_checks;
     /* The accelerator's mirrors (spec 18). */
     cdb_accel_entry accel[CDB_ACCEL_MIRRORS];
+    cdb_accel_task accel_tasks[CDB_ACCEL_MIRRORS];
     uint64_t accel_bytes;       /* the mirrors' bytes together */
     uint64_t accel_clock;       /* counts mirror uses, for least recently used */
     cdb_accel_stats accel_stats;
