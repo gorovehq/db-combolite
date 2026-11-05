@@ -550,6 +550,45 @@ static unsigned popcount8(uint8_t b)
     return n;
 }
 
+/* distance for f32 vectors stored in the host's byte order: each element
+ * loaded as it is, then exactly distance's double arithmetic in the same
+ * order, so the result is the same to the bit (GCC in ISO C mode fuses no
+ * multiply into an add; test_vec checks the two agree). A neighbour-graph
+ * refresh spends most of its time here (bench_graph --file). */
+static double distance_f32(const coll *c, unsigned measure, const uint8_t *q, double qn, const uint8_t *v, double vn,
+                           cdb_byte_order o)
+{
+    uint32_t i, dims = c->dims;
+    if (measure == CDB_VEC_EUCLIDEAN) {
+        double sum = 0.0;
+        for (i = 0; i < dims; i++) {
+            float a, b;
+            double d;
+            memcpy(&a, q + i * 4u, sizeof a);
+            memcpy(&b, v + i * 4u, sizeof b);
+            d = (double)a - (double)b;
+            sum += d * d;
+        }
+        return sqrt(sum);
+    }
+    {
+        double dot = 0.0;
+        for (i = 0; i < dims; i++) {
+            float a, b;
+            memcpy(&a, q + i * 4u, sizeof a);
+            memcpy(&b, v + i * 4u, sizeof b);
+            dot += (double)a * (double)b;
+        }
+        if (measure == CDB_VEC_DOT)
+            return -dot;
+        if (vn < 0.0)
+            vn = norm_of(c, v, o);
+        if (qn == 0.0 || vn == 0.0)
+            return 1.0;
+        return 1.0 - dot / (qn * vn);
+    }
+}
+
 /* Distance between query q (norm qn) and stored vector v (norm vn, or a
  * negative value when not cached). Smaller is closer for every measure
  * (spec 14.12.3). Both vectors are in stored form, in byte order o.
@@ -558,6 +597,8 @@ static double distance(const coll *c, unsigned measure, const uint8_t *q, double
                        cdb_byte_order o)
 {
     uint32_t i;
+    if (c->elem == CDB_VEC_F32 && measure != CDB_VEC_HAMMING && o == cdb_host_byte_order())
+        return distance_f32(c, measure, q, qn, v, vn, o);
     /* Hamming: count differing bits, ignoring the unused high bits of the
      * last byte when dims is not a multiple of 8. */
     if (measure == CDB_VEC_HAMMING) {
