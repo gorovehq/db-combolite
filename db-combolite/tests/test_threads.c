@@ -541,6 +541,62 @@ static void test_db_worker_threads_and_vec_refresh_async(void)
     TEST_ASSERT_EQUAL_UINT(0, db.workers.nthreads);
 }
 
+/* A worker task that holds the database's lock, as a background refresh or
+ * mirror refill does. */
+typedef struct lock_holder {
+    cdb_db *db;
+    cdb_mutex *m;   /* guards started */
+    int started;
+    int finished;   /* written under the database lock */
+} lock_holder;
+
+static void hold_lock(void *arg)
+{
+    lock_holder *h = (lock_holder *)arg;
+    cdb_db_lock(h->db);
+    env.ops->mutex_lock(env.ctx, h->m);
+    h->started = 1;
+    env.ops->mutex_unlock(env.ctx, h->m);
+    env.ops->sleep(env.ctx, 150000000); /* 150 ms */
+    h->finished = 1;
+    cdb_db_unlock(h->db);
+}
+
+/* Every public data call takes the database's lock, so one made while a
+ * worker task holds it waits for the task (spec 5.9.6). */
+static void test_worker_task_excludes_data_calls(void)
+{
+    static cdb_db db;
+    static lock_holder h;
+    cdb_db_config cfg;
+    cdb_header hd = test_hdr();
+    uint64_t task = 0, id = 0;
+    int found = 1, started = 0;
+
+    init_db_cfg(&cfg, arena1, nodes1, free_list1, record_buf1, cat_work1, cat_entries1, cat_page1);
+    cfg.worker_threads = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open(&db, &env, base_path, &cfg, &hd));
+    TEST_ASSERT_EQUAL_UINT(1, db.workers.nthreads);
+    memset(&h, 0, sizeof h);
+    h.db = &db;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->mutex_create(env.ctx, &h.m));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_submit(&db.workers, hold_lock, &h, &task));
+    while (!started) {
+        env.ops->mutex_lock(env.ctx, h.m);
+        started = h.started;
+        env.ops->mutex_unlock(env.ctx, h.m);
+        if (!started)
+            env.ops->sleep(env.ctx, 1000000);
+    }
+    /* The task holds the lock now: this call must wait for it. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_find_store(&db, "nothing", 7, &id, &found));
+    TEST_ASSERT_EQUAL_INT(1, h.finished);
+    TEST_ASSERT_FALSE(found);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_worker_pool_wait(&db.workers, task));
+    env.ops->mutex_destroy(env.ctx, h.m);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -557,5 +613,6 @@ int main(void)
     RUN_TEST(test_worker_pool_queue_full);
     RUN_TEST(test_worker_pool_sync_fallback);
     RUN_TEST(test_db_worker_threads_and_vec_refresh_async);
+    RUN_TEST(test_worker_task_excludes_data_calls);
     return UNITY_END();
 }

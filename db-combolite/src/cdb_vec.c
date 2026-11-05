@@ -392,7 +392,18 @@ cdb_status cdb_vec_flush(cdb_db *db)
  * catalog change) creates the indexes, the change log among them (spec
  * 14.12.5), and the store record in one commit. Norms are cached only for
  * cosine. */
+static cdb_status vec_create_in(cdb_db *db, const char *name, size_t len, const cdb_vec_config *cfg, uint64_t *id);
+
 cdb_status cdb_vec_create(cdb_db *db, const char *name, size_t len, const cdb_vec_config *cfg, uint64_t *id)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_create_in(db, name, len, cfg, id);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_create_in(cdb_db *db, const char *name, size_t len, const cdb_vec_config *cfg, uint64_t *id)
 {
     uint8_t settings[CDB_CATALOG_SETTINGS_MAX];
     size_t slen;
@@ -448,7 +459,18 @@ cdb_status cdb_vec_create(cdb_db *db, const char *name, size_t len, const cdb_ve
     return cdb_db_catalog_end(db, s);
 }
 
+static cdb_status vec_describe_in(cdb_db *db, uint64_t store, cdb_vec_config *cfg, char *model, char *model_version);
+
 cdb_status cdb_vec_describe(cdb_db *db, uint64_t store, cdb_vec_config *cfg, char *model, char *model_version)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_describe_in(db, store, cfg, model, model_version);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_describe_in(cdb_db *db, uint64_t store, cdb_vec_config *cfg, char *model, char *model_version)
 {
     cdb_store_info info;
     uint64_t roots[7];
@@ -2244,8 +2266,21 @@ static cdb_status put_vector(cdb_db *db, coll *c, uint64_t entry, uint8_t op, co
 
 /* The entry ID comes from the collection's counter, which advances only
  * after the change is journaled. The source is not checked to exist. */
+static cdb_status vec_insert_in(cdb_db *db, uint64_t store, const void *vec, size_t len,
+                                uint64_t source_store, uint64_t source_entry, uint64_t *entry);
+
 cdb_status cdb_vec_insert(cdb_db *db, uint64_t store, const void *vec, size_t len,
                           uint64_t source_store, uint64_t source_entry, uint64_t *entry)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_insert_in(db, store, vec, len, source_store, source_entry, entry);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_insert_in(cdb_db *db, uint64_t store, const void *vec, size_t len,
+                                uint64_t source_store, uint64_t source_entry, uint64_t *entry)
 {
     coll *c;
     uint64_t id;
@@ -2261,7 +2296,18 @@ cdb_status cdb_vec_insert(cdb_db *db, uint64_t store, const void *vec, size_t le
     return CDB_OK;
 }
 
+static cdb_status vec_replace_in(cdb_db *db, uint64_t store, uint64_t entry, const void *vec, size_t len);
+
 cdb_status cdb_vec_replace(cdb_db *db, uint64_t store, uint64_t entry, const void *vec, size_t len)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_replace_in(db, store, entry, vec, len);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_replace_in(cdb_db *db, uint64_t store, uint64_t entry, const void *vec, size_t len)
 {
     coll *c;
     int live;
@@ -2277,7 +2323,18 @@ cdb_status cdb_vec_replace(cdb_db *db, uint64_t store, uint64_t entry, const voi
     return put_vector(db, c, entry, CDB_OP_REPLACE, vec, len, 0, 0);
 }
 
+static cdb_status vec_delete_in(cdb_db *db, uint64_t store, uint64_t entry);
+
 cdb_status cdb_vec_delete(cdb_db *db, uint64_t store, uint64_t entry)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_delete_in(db, store, entry);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_delete_in(cdb_db *db, uint64_t store, uint64_t entry)
 {
     coll *c;
     int live;
@@ -2298,7 +2355,18 @@ cdb_status cdb_vec_delete(cdb_db *db, uint64_t store, uint64_t entry)
     return CDB_OK;
 }
 
+static cdb_status vec_live_in_tx_in(cdb_db *db, uint64_t store, uint64_t entry, int *live);
+
 cdb_status cdb_vec_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *live)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_live_in_tx_in(db, store, entry, live);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_live_in_tx_in(cdb_db *db, uint64_t store, uint64_t entry, int *live)
 {
     coll *c;
     entry_rec r;
@@ -2315,8 +2383,21 @@ cdb_status cdb_vec_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *l
 
 /* Re-encodes the stored elements as a vector value in out. A small out
  * gives the value writer's CDB_E_BUFFER_TOO_SMALL. */
+static cdb_status vec_get_in(cdb_db *db, uint64_t store, uint64_t entry, void *out, size_t cap, size_t *len,
+                             uint64_t *source_store, uint64_t *source_entry);
+
 cdb_status cdb_vec_get(cdb_db *db, uint64_t store, uint64_t entry, void *out, size_t cap, size_t *len,
                        uint64_t *source_store, uint64_t *source_entry)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_get_in(db, store, entry, out, cap, len, source_store, source_entry);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_get_in(cdb_db *db, uint64_t store, uint64_t entry, void *out, size_t cap, size_t *len,
+                             uint64_t *source_store, uint64_t *source_entry)
 {
     cdb_value_writer w;
     entry_rec r;
@@ -2346,8 +2427,21 @@ cdb_status cdb_vec_get(cdb_db *db, uint64_t store, uint64_t entry, void *out, si
     return CDB_OK;
 }
 
+static cdb_status vec_by_source_in(cdb_db *db, uint64_t store, uint64_t source_store, uint64_t source_entry,
+                                   uint64_t *entries, size_t max, size_t *n);
+
 cdb_status cdb_vec_by_source(cdb_db *db, uint64_t store, uint64_t source_store, uint64_t source_entry,
                              uint64_t *entries, size_t max, size_t *n)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_by_source_in(db, store, source_store, source_entry, entries, max, n);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_by_source_in(cdb_db *db, uint64_t store, uint64_t source_store, uint64_t source_entry,
+                                   uint64_t *entries, size_t max, size_t *n)
 {
     cdb_index_cursor cur;
     uint8_t k[24], got[24];
@@ -2522,8 +2616,21 @@ static cdb_status search_approx(cdb_db *db, coll *c, const uint8_t *q, unsigned 
 
 /* Validates the query, picks the path (see cdb_vec.h), searches, then
  * fills in each hit's source state. Searches see committed vectors only. */
+static cdb_status vec_search_mode_in(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
+                                     unsigned mode, cdb_vec_hit *hits, size_t k, size_t *n);
+
 cdb_status cdb_vec_search_mode(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
                                unsigned mode, cdb_vec_hit *hits, size_t k, size_t *n)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_search_mode_in(db, store, query, len, measure, mode, hits, k, n);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_search_mode_in(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
+                                     unsigned mode, cdb_vec_hit *hits, size_t k, size_t *n)
 {
     const uint8_t *q;
     coll *c;
@@ -2569,7 +2676,18 @@ cdb_status cdb_vec_search(cdb_db *db, uint64_t store, const void *query, size_t 
 /* A catalog change: checks K and the working memory, creates the graph,
  * reverse and pending indexes, queues every existing entry, sets the live
  * count, and rewrites the settings with fields 10-13 (spec 14.12.4). */
+static cdb_status vec_create_graph_in(cdb_db *db, uint64_t store, uint32_t k);
+
 cdb_status cdb_vec_create_graph(cdb_db *db, uint64_t store, uint32_t k)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_create_graph_in(db, store, k);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_create_graph_in(cdb_db *db, uint64_t store, uint32_t k)
 {
     char model[CDB_VEC_MODEL_MAX], version[CDB_VEC_MODEL_MAX];
     uint8_t settings[CDB_CATALOG_SETTINGS_MAX];
@@ -2711,8 +2829,21 @@ cdb_status cdb_vec_refresh_async(cdb_db *db, cdb_vec_refresh_task *task, uint64_
 
 /* Copies the stored list (base-measure distances, as stored in f32) and
  * the neighbours' source states. CDB_E_STATE without a graph. */
+static cdb_status vec_neighbours_in(cdb_db *db, uint64_t store, uint64_t entry, cdb_vec_hit *hits, size_t max,
+                                    size_t *n, int *fresh);
+
 cdb_status cdb_vec_neighbours(cdb_db *db, uint64_t store, uint64_t entry, cdb_vec_hit *hits, size_t max,
                               size_t *n, int *fresh)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_neighbours_in(db, store, entry, hits, max, n, fresh);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_neighbours_in(cdb_db *db, uint64_t store, uint64_t entry, cdb_vec_hit *hits, size_t max,
+                                    size_t *n, int *fresh)
 {
     entry_rec er;
     grec r;
@@ -2748,7 +2879,18 @@ cdb_status cdb_vec_neighbours(cdb_db *db, uint64_t store, uint64_t entry, cdb_ve
 /* A catalog change: creates the changes index, records that it holds
  * every change after the archive's committed sequence now, and rewrites
  * the settings with field 14 (spec 14.12.5). */
+static cdb_status vec_track_changes_in(cdb_db *db, uint64_t store);
+
 cdb_status cdb_vec_track_changes(cdb_db *db, uint64_t store)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_track_changes_in(db, store);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_track_changes_in(cdb_db *db, uint64_t store)
 {
     char model[CDB_VEC_MODEL_MAX], version[CDB_VEC_MODEL_MAX];
     uint8_t settings[CDB_CATALOG_SETTINGS_MAX], k[16], v[8];
@@ -2827,7 +2969,18 @@ static cdb_status change_stamp(cdb_db *db, coll *c, uint64_t *stamp, uint64_t *o
     return CDB_OK;
 }
 
+static cdb_status vec_change_stamp_in(cdb_db *db, uint64_t store, uint64_t *stamp, uint64_t *oldest);
+
 cdb_status cdb_vec_change_stamp(cdb_db *db, uint64_t store, uint64_t *stamp, uint64_t *oldest)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_change_stamp_in(db, store, stamp, oldest);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_change_stamp_in(cdb_db *db, uint64_t store, uint64_t *stamp, uint64_t *oldest)
 {
     coll *c;
     cdb_status s;
@@ -2838,8 +2991,21 @@ cdb_status cdb_vec_change_stamp(cdb_db *db, uint64_t store, uint64_t *stamp, uin
     return change_stamp(db, c, stamp, oldest);
 }
 
+static cdb_status vec_changes_in(cdb_db *db, uint64_t store, uint64_t *seq, uint64_t *entry, cdb_vec_change *out,
+                                 size_t max, size_t *n);
+
 cdb_status cdb_vec_changes(cdb_db *db, uint64_t store, uint64_t *seq, uint64_t *entry, cdb_vec_change *out,
                            size_t max, size_t *n)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_changes_in(db, store, seq, entry, out, max, n);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_changes_in(cdb_db *db, uint64_t store, uint64_t *seq, uint64_t *entry, cdb_vec_change *out,
+                                 size_t max, size_t *n)
 {
     cdb_index_cursor cur;
     uint8_t k[16], key[16], kind;
@@ -2907,7 +3073,18 @@ static int cursor_name_ok(const char *name, size_t len)
 
 /* Opening and dropping are catalog changes (spec 14.12.5): the index pages
  * they write commit at once, as a refresh's do. */
+static cdb_status vec_cursor_open_in(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t *seq);
+
 cdb_status cdb_vec_cursor_open(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t *seq)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_cursor_open_in(db, store, name, len, seq);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_cursor_open_in(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t *seq)
 {
     uint8_t k[16], val[CURSOR_VAL];
     uint64_t oldest;
@@ -2949,7 +3126,18 @@ cdb_status cdb_vec_cursor_open(cdb_db *db, uint64_t store, const char *name, siz
     return cdb_db_catalog_end(db, s);
 }
 
+static cdb_status vec_cursor_advance_in(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t seq);
+
 cdb_status cdb_vec_cursor_advance(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t seq)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_cursor_advance_in(db, store, name, len, seq);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_cursor_advance_in(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t seq)
 {
     uint8_t p[8];
     cursor_scan sc;
@@ -2973,7 +3161,18 @@ cdb_status cdb_vec_cursor_advance(cdb_db *db, uint64_t store, const char *name, 
     return CDB_OK;
 }
 
+static cdb_status vec_cursor_drop_in(cdb_db *db, uint64_t store, const char *name, size_t len);
+
 cdb_status cdb_vec_cursor_drop(cdb_db *db, uint64_t store, const char *name, size_t len)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_cursor_drop_in(db, store, name, len);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status vec_cursor_drop_in(cdb_db *db, uint64_t store, const char *name, size_t len)
 {
     uint8_t k[16];
     cursor_scan sc;
