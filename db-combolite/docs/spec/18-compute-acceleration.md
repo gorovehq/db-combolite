@@ -99,8 +99,9 @@ The device may be shared with the application's own work, such as computing embe
 ### 18.10 Certified shortlists
 
 - **The error bound.** With each shortlist, `nearest` returns a bound *e* on how far any distance it computed, for that query, can be from the CPU's distance for the same pair. The accelerator derives it from the element type's precision, the dimensions and the vectors' norms. A bound that is too small breaks the guarantee below, so an accelerator that cannot bound its error declines (18.7).
-- **The check.** Let *g* be the accelerator's distance for the last candidate in the shortlist, and *d* the CPU's distance for the K-th nearest after rescoring. Every vector left out had an accelerator distance of at least *g*, so a CPU distance of at least *g* − *e*. If *g* − *e* > *d*, none of them could be among the K nearest: the result is the CPU path's. Ties at *d* go to the lower entry ID, as on the CPU path, so equality does not certify.
-- **Widening.** If the check fails, the engine asks again for a shortlist twice as long, and repeats until the check passes or the shortlist holds the whole collection, when every vector has been rescored and the result is exact by construction.
+- **The check.** Let *g* be the accelerator's distance for the last candidate in the shortlist, and *d* the CPU's distance for the K-th nearest after rescoring. Every vector left out had an accelerator distance of at least *g*, so a CPU distance of at least *g* − *e*. If *g* − *e* > *d*, none of them could be among the K nearest: the result is the CPU path's. Ties at *d* go to the lower entry ID, as on the CPU path, so in general equality does not certify.
+- **Exact distances.** An accelerator may report *e* = 0 only for distances it computes exactly, such as Hamming bit counts, and then must order ties by lower entry ID, as the CPU does. Then a vector left out at distance *g* has a higher entry ID than every shortlisted vector at that distance, so it cannot win a tie, and *g* ≥ *d* certifies. Binary collections, whose distances tie constantly, therefore never widen.
+- **Widening.** If the check fails, the engine asks again for a shortlist twice as long, and repeats while the shortlist stays under a fraction of the collection, provisionally one eighth. Past that, the query takes the CPU path: every candidate is rescored on the CPU anyway, so a longer shortlist would cost more than the CPU path alone. The results are the same either way.
 - **The first size.** A shortlist starts at 2K candidates, at least K + 8. This is provisional: measuring on real data, such as GutenFree's passages, may give the lower-precision types (f16, bf16, i8, binary) a larger factor.
 
 ### 18.11 Testing
@@ -127,5 +128,5 @@ A mirror that falls behind fetches only what changed, not the whole collection, 
 
 These need measuring, not deciding:
 
-- **First shortlist sizes by element type (18.10).** The factor for each type, measured by how often a first shortlist fails its check.
+- **First shortlist sizes by element type (18.10).** The factor for each type, measured by how often a first shortlist fails its check, and with them the widening limit (provisionally an eighth of the collection).
 - **Profiling first.** Measured, a refresh slice of GutenFree took 22 s, while the arithmetic is estimated at under a second. Most of the time is probably in coverage walks and index work, which stay on the CPU. Profile a refresh before implementation, to show what acceleration gains and what else needs fixing.
