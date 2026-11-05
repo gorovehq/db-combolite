@@ -1,0 +1,4 @@
+# LeakSanitizer suppressions for the accelerator device tests: allocations
+# that system graphics drivers, loaded by the Vulkan loader, make through
+# libdbus and keep for the life of the process. Nothing of combolite's.
+leak:libdbus-1.so

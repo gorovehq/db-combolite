@@ -1,11 +1,15 @@
-/* Exact search on the CUDA accelerator against the CPU path (spec 18.4):
- * for growing collections, the time to fill the mirror, and the time of an
+/* Exact search on an accelerator against the CPU path (spec 18.4): for
+ * growing collections, the time to fill the mirror, and the time of an
  * exact search on each path, with how the device's searches ended
  * (certified, widened, or sent to the CPU, spec 18.10). Every device
  * answer is compared with the CPU's. Runs on real files; not part of ctest.
  *
- *   bench_accel_cuda [max_n] [dims] [queries]
- *   bench_accel_cuda --file <base> <collection> [queries] [k]
+ *   bench_accel [backend] [max_n] [dims] [queries]
+ *   bench_accel [backend] --file <base> <collection> [queries] [k]
+ *
+ * backend: --cuda, --vulkan or --vulkan=<device>; by default whatever
+ * cdb_accel_open finds. --software (before it) also allows a device that
+ * runs on the CPU, such as llvmpipe.
  *
  * Data as bench_graph: clusters of about 50 vectors (f32, cosine), queries
  * near random cluster centres. No neighbour graph, so every search is
@@ -20,7 +24,13 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "combolite/cdb_accel.h"
+#ifdef CDB_ACCEL_CUDA
 #include "combolite/cdb_accel_cuda.h"
+#endif
+#ifdef CDB_ACCEL_VULKAN
+#include "combolite/cdb_accel_vulkan.h"
+#endif
 #include "combolite/cdb_env.h"
 #include "combolite/cdb_value.h"
 #include "cdb_catalog.h"
@@ -50,9 +60,23 @@ static cdb_db_config cfg;
 static cdb_db db;
 static cdb_hostenv he;
 static cdb_env env;
+/* The accelerator under test, one of these. */
+static cdb_accel *any;
+#ifdef CDB_ACCEL_CUDA
 static cdb_accel_cuda *cuda;
+#endif
+#ifdef CDB_ACCEL_VULKAN
+static cdb_accel_vulkan *vulkan;
+#endif
+static char backend_name[300];
 
 static float centres[4096][MAX_DIMS];
+
+/* The synthetic run's queries and both paths' answers. */
+#define MAX_QUERIES 1000u
+static uint8_t qenc[MAX_QUERIES][MAX_DIMS * 4u + 16u];
+static size_t qlen[MAX_QUERIES], cpu_n[MAX_QUERIES], dev_n[MAX_QUERIES];
+static cdb_vec_hit cpu_hits[MAX_QUERIES][TOPK], dev_hits[MAX_QUERIES][TOPK];
 static uint32_t rng = 12345u;
 
 static double now(void)
@@ -122,11 +146,11 @@ static void run(unsigned n, unsigned dims, unsigned queries)
     char base[256], path[300];
     unsigned clusters = n / 50u ? n / 50u : 1u, i, j, t;
     cdb_vec_config vc;
-    cdb_vec_hit cpu[TOPK], dev[TOPK];
+    cdb_vec_hit dev[TOPK];
     uint8_t enc[MAX_DIMS * 4u + 16u];
     uint64_t coll, e, fills;
-    size_t len, nc, nd;
-    double t0, t_insert, t_fill, t_cpu = 0, t_dev = 0;
+    size_t len, nd;
+    double t0, t_insert, t_fill, t_cpu, t_dev;
     cdb_accel_stats st;
 
     if (clusters > 4096u)
@@ -173,24 +197,29 @@ static void run(unsigned n, unsigned dims, unsigned queries)
     }
     t_fill = now() - t0;
 
+    /* Every CPU search first, then every device search, so neither path
+     * runs while the other has just left the device or caches idle. */
+    for (t = 0; t < queries; t++)
+        qlen[t] = near(dims, (unsigned)(rng >> 8) % clusters, qenc[t], sizeof qenc[t]);
+    db.env.accel = NULL;
+    t0 = now();
+    for (t = 0; t < queries; t++)
+        check(cdb_vec_search(&db, coll, qenc[t], qlen[t], 0, cpu_hits[t], TOPK, &cpu_n[t]), "cpu search");
+    t_cpu = now() - t0;
+    db.env.accel = env.accel;
     st = db.accel_stats;
+    t0 = now();
+    for (t = 0; t < queries; t++)
+        check(cdb_vec_search(&db, coll, qenc[t], qlen[t], 0, dev_hits[t], TOPK, &dev_n[t]), "device search");
+    t_dev = now() - t0;
     for (t = 0; t < queries; t++) {
         size_t a;
-        len = near(dims, (unsigned)(rng >> 8) % clusters, enc, sizeof enc);
-        db.env.accel = NULL;
-        t0 = now();
-        check(cdb_vec_search(&db, coll, enc, len, 0, cpu, TOPK, &nc), "cpu search");
-        t_cpu += now() - t0;
-        db.env.accel = env.accel;
-        t0 = now();
-        check(cdb_vec_search(&db, coll, enc, len, 0, dev, TOPK, &nd), "device search");
-        t_dev += now() - t0;
-        if (nc != nd) {
-            fprintf(stderr, "query %u: %zu hits on the CPU, %zu on the device\n", t, nc, nd);
+        if (cpu_n[t] != dev_n[t]) {
+            fprintf(stderr, "query %u: %zu hits on the CPU, %zu on the device\n", t, cpu_n[t], dev_n[t]);
             exit(1);
         }
-        for (a = 0; a < nc; a++)
-            if (cpu[a].entry != dev[a].entry || cpu[a].distance != dev[a].distance) {
+        for (a = 0; a < cpu_n[t]; a++)
+            if (cpu_hits[t][a].entry != dev_hits[t][a].entry || cpu_hits[t][a].distance != dev_hits[t][a].distance) {
                 fprintf(stderr, "query %u: hit %zu differs\n", t, a);
                 exit(1);
             }
@@ -355,47 +384,101 @@ static void run_file(const char *base, const char *name, unsigned queries, unsig
     check(cdb_db_close(&db), "close");
 }
 
+/* Opens the backend `flag` names (NULL: cdb_accel_open's choice) into env,
+ * with open flags `flags`. */
+static int open_backend(const char *flag, unsigned flags)
+{
+    cdb_hostenv_init(&he, &env);
+    if (flag == NULL) {
+        if (cdb_accel_open(flags, &any) != CDB_OK)
+            return 0;
+        cdb_accel_attach(any, &env);
+        snprintf(backend_name, sizeof backend_name, "%s", cdb_accel_name(any));
+        return 1;
+    }
+#ifdef CDB_ACCEL_CUDA
+    (void)flags; /* CUDA devices are never software */
+    if (strcmp(flag, "--cuda") == 0) {
+        if (cdb_accel_cuda_open(-1, &cuda) != CDB_OK)
+            return 0;
+        cdb_accel_cuda_attach(cuda, &env);
+        snprintf(backend_name, sizeof backend_name, "CUDA: %s", cdb_accel_cuda_name(cuda));
+        return 1;
+    }
+#endif
+#ifdef CDB_ACCEL_VULKAN
+    if (strncmp(flag, "--vulkan", 8) == 0) {
+        int dev = flag[8] == '=' ? atoi(flag + 9) : -1;
+        if (cdb_accel_vulkan_open(dev, flags, &vulkan) != CDB_OK)
+            return 0;
+        cdb_accel_vulkan_attach(vulkan, &env);
+        snprintf(backend_name, sizeof backend_name, "Vulkan: %s", cdb_accel_vulkan_name(vulkan));
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+static void close_backend(void)
+{
+    if (any != NULL)
+        cdb_accel_close(any);
+#ifdef CDB_ACCEL_CUDA
+    if (cuda != NULL)
+        cdb_accel_cuda_close(cuda);
+#endif
+#ifdef CDB_ACCEL_VULKAN
+    if (vulkan != NULL)
+        cdb_accel_vulkan_close(vulkan);
+#endif
+}
+
 int main(int argc, char **argv)
 {
     static const unsigned sizes[] = { 2000, 5000, 10000, 30000, 100000, 300000, 1000000 };
-    if (argc >= 4 && strcmp(argv[1], "--file") == 0) {
-        unsigned queries = argc > 4 ? (unsigned)strtoul(argv[4], NULL, 10) : 200u;
-        unsigned k = argc > 5 ? (unsigned)strtoul(argv[5], NULL, 10) : TOPK;
-        if (queries == 0 || k == 0 || k > 256u) {
-            fprintf(stderr, "usage: bench_accel_cuda --file <base> <collection> [queries] [k 1..256]\n");
-            return 2;
-        }
-        if (cdb_accel_cuda_open(-1, &cuda) != CDB_OK) {
-            fprintf(stderr, "no usable CUDA device\n");
-            return 1;
-        }
-        cdb_hostenv_init(&he, &env);
-        cdb_accel_cuda_attach(cuda, &env);
-        printf("%s\n", cdb_accel_cuda_name(cuda));
-        run_file(argv[2], argv[3], queries, k);
-        cdb_accel_cuda_close(cuda);
-        return 0;
-    }
-    unsigned max_n = argc > 1 ? (unsigned)strtoul(argv[1], NULL, 10) : 100000u;
-    unsigned dims = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 384u;
-    unsigned queries = argc > 3 ? (unsigned)strtoul(argv[3], NULL, 10) : 50u;
+    const char *flag = NULL;
+    unsigned max_n, dims, queries, flags = 0;
     size_t i;
-    if (dims == 0 || dims > MAX_DIMS || queries == 0) {
-        fprintf(stderr, "usage: bench_accel_cuda [max_n] [dims 1..%u] [queries]\n", MAX_DIMS);
-        return 2;
+    if (argc > 1 && strcmp(argv[1], "--software") == 0) {
+        flags |= CDB_ACCEL_SOFTWARE;
+        argv++;
+        argc--;
     }
-    if (cdb_accel_cuda_open(-1, &cuda) != CDB_OK) {
-        fprintf(stderr, "no usable CUDA device\n");
+    if (argc > 1 && strncmp(argv[1], "--", 2) == 0 && strcmp(argv[1], "--file") != 0) {
+        flag = argv[1];
+        argv++;
+        argc--;
+    }
+    if (!open_backend(flag, flags)) {
+        fprintf(stderr, "no usable accelerator%s%s in this build and machine\n", flag ? " for " : "",
+                flag ? flag : "");
         return 1;
     }
-    cdb_hostenv_init(&he, &env);
-    cdb_accel_cuda_attach(cuda, &env);
-    printf("%s; dims %u, cosine, f32, k=%u, %u queries, page %u\n", cdb_accel_cuda_name(cuda), dims, TOPK, queries,
-           PAGE);
+    if (argc >= 4 && strcmp(argv[1], "--file") == 0) {
+        unsigned k = argc > 5 ? (unsigned)strtoul(argv[5], NULL, 10) : TOPK;
+        queries = argc > 4 ? (unsigned)strtoul(argv[4], NULL, 10) : 200u;
+        if (queries == 0 || k == 0 || k > 256u) {
+            fprintf(stderr, "usage: bench_accel [backend] --file <base> <collection> [queries] [k 1..256]\n");
+            return 2;
+        }
+        printf("%s\n", backend_name);
+        run_file(argv[2], argv[3], queries, k);
+        close_backend();
+        return 0;
+    }
+    max_n = argc > 1 ? (unsigned)strtoul(argv[1], NULL, 10) : 100000u;
+    dims = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 384u;
+    queries = argc > 3 ? (unsigned)strtoul(argv[3], NULL, 10) : 50u;
+    if (dims == 0 || dims > MAX_DIMS || queries == 0 || queries > MAX_QUERIES) {
+        fprintf(stderr, "usage: bench_accel [backend] [max_n] [dims 1..%u] [queries 1..%u]\n", MAX_DIMS,
+                MAX_QUERIES);
+        return 2;
+    }
+    printf("%s; dims %u, cosine, f32, k=%u, %u queries, page %u\n", backend_name, dims, TOPK, queries, PAGE);
     printf("%8s %10s %8s %10s %10s %8s %6s %6s %6s\n", "n", "insert s", "fill s", "cpu ms", "device ms", "speedup",
            "cert", "widen", "cpu");
     for (i = 0; i < sizeof sizes / sizeof sizes[0] && sizes[i] <= max_n; i++)
         run(sizes[i], dims, queries);
-    cdb_accel_cuda_close(cuda);
+    close_backend();
     return 0;
 }

@@ -2,7 +2,7 @@
 # application links it and installs its hook in cdb_env; the core never
 # calls a GPU API. The host code is C99 under the project's warnings.
 
-add_library(combolite_accel STATIC common/cax.c)
+add_library(combolite_accel STATIC common/cax.c common/cdb_accel.c)
 target_include_directories(combolite_accel
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
