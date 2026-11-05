@@ -364,6 +364,7 @@ static void open_db(void)
     cfg.doc_buffers = doc_buffers;
     cfg.vec_buffers = vec_buffers;
     cfg.durability = CDB_DURABILITY_FULL;
+    cfg.accel_min_bytes = 1; /* small test collections still reach the accelerator (spec 18.4) */
     memset(&h, 0, sizeof h);
     h.order = CDB_ORDER_LITTLE;
     h.layout_flags = CDB_LAYOUT_ADDR64;
@@ -427,6 +428,37 @@ static void same_as_cpu(uint64_t coll, const vec *q)
     }
 }
 
+/* Spec 18.4: a bulk search of 100 queries (two device requests) gives
+ * each query the CPU path's answer. */
+static void bulk_same_as_cpu(uint64_t coll, cdb_vector_elem elem)
+{
+    enum { NQ = 100 };
+    static vec qv[NQ];
+    static const void *qp[NQ];
+    static size_t ql[NQ], counts[NQ];
+    static cdb_vec_hit got[NQ * K];
+    cdb_vec_hit want[K];
+    const cdb_accel_ops *ax = db.env.accel;
+    size_t i, j, nw;
+    for (i = 0; i < NQ; i++) {
+        qv[i] = make_vec(elem);
+        qp[i] = qv[i].enc;
+        ql[i] = qv[i].n;
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_bulk(&db, coll, qp, ql, NQ, CDB_VEC_BASE, CDB_VEC_AUTO, got, K,
+                                                      counts));
+    db.env.accel = NULL;
+    for (i = 0; i < NQ; i++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search(&db, coll, qp[i], ql[i], CDB_VEC_BASE, want, K, &nw));
+        TEST_ASSERT_EQUAL_size_t(nw, counts[i]);
+        for (j = 0; j < nw; j++) {
+            TEST_ASSERT_EQUAL_UINT64(want[j].entry, got[i * K + j].entry);
+            TEST_ASSERT_TRUE(want[j].distance == got[i * K + j].distance);
+        }
+    }
+    db.env.accel = ax;
+}
+
 static void engine_case(cdb_vector_elem elem, unsigned measure)
 {
     cdb_vec_config c;
@@ -459,6 +491,7 @@ static void engine_case(cdb_vector_elem elem, unsigned measure)
         q = make_vec(elem);
         same_as_cpu(coll, &q);
     }
+    bulk_same_as_cpu(coll, elem);
     /* Changes reach the mirror before its next use (spec 18.7). */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
     for (i = 0; i < 50; i++) {
