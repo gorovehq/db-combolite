@@ -20,6 +20,11 @@
 #define CDB_COMMIT_PAYLOAD_SIZE 34u
 #define CDB_WRITE_KEY_PAYLOAD_SIZE 8u
 #define CDB_PREPARE_PAYLOAD_SIZE 8u
+#define CDB_ROLLBACK_PAYLOAD_SIZE 8u
+
+/* Format limit (spec 14.4.9 rule 4): disjoint ranges of dropped data records
+ * in one transaction. */
+#define CDB_TX_MAX_DROPS 32u
 
 /* Companion type IDs (spec 1.12.3). */
 #define CDB_COMPANION_MAIN_JOURNAL 1u
@@ -31,12 +36,14 @@
 #define CDB_RECORD_WEIGHT 3u
 #define CDB_RECORD_WRITE_KEY 4u
 #define CDB_RECORD_PREPARE 5u
+#define CDB_RECORD_ROLLBACK 6u
 
 /* Record flags (spec 14.4.2). */
 #define CDB_RECORD_FLAG_ENCRYPTED 0x01u
 #define CDB_RECORD_FLAG_COMPRESSED 0x02u
 #define CDB_RECORD_FLAG_CONTINUED 0x04u
 #define CDB_RECORD_FLAG_REPLICATED 0x08u
+#define CDB_RECORD_FLAG_ROLLBACKS 0x10u /* commit record: the transaction holds a rollback record (14.4.9) */
 
 /* Data-change operation codes (spec 14.4.5). */
 #define CDB_OP_INSERT 1u

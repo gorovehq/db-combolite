@@ -1668,6 +1668,22 @@ static void stage_reindex(cdb_db *db)
     }
 }
 
+void cdb_doc_stage_rewind(cdb_db *db, size_t used, int overflow, uint32_t removals)
+{
+    if (db->stage_removals != removals) {
+        /* A record from before the savepoint may have been replaced since,
+         * so the stage cannot be cut back. Empty it: with the overflow flag
+         * set, every document is read from the journal (replay_tx), which
+         * skips the dropped records. */
+        db->stage_used = 0;
+        db->stage_overflow = 1;
+    } else {
+        db->stage_used = used;
+        db->stage_overflow = overflow;
+    }
+    stage_reindex(db);
+}
+
 /* Hash lookup of the staging record for (store, entry). */
 static void stage_find(const cdb_db *db, uint64_t store, uint64_t entry, staged *st)
 {
@@ -1711,6 +1727,7 @@ static void stage_put(cdb_db *db, uint64_t store, uint64_t entry, const staged *
         size_t size = STAGE_HDR + old->len;
         memmove(p + old->off, p + old->off + size, db->stage_used - old->off - size);
         db->stage_used -= size;
+        db->stage_removals++;
     }
     avail = p ? db->cfg.doc_stage_size - db->stage_used : 0u;
     if (avail < STAGE_HDR || len > avail - STAGE_HDR) {
@@ -1799,10 +1816,12 @@ static cdb_status replay_tx(cdb_db *db, struct cdb_doc_pool *pool, uint64_t entr
     for (off = db->tx_start; off < db->journal.end;) {
         cdb_record r;
         cdb_delta d;
-        uint64_t next;
+        uint64_t next, at = off;
         if ((s = cdb_journal_read(&db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next)) != CDB_OK)
             return s;
         off = next;
+        if (cdb_tx_dropped(db, at))
+            continue;
         if (r.kind != CDB_RECORD_DATA || r.tx_id != db->tx_id || r.store_id != pool->slot.store_id
             || r.entry_id != entry || r.payload_len < 1)
             continue;
@@ -2371,11 +2390,13 @@ cdb_status cdb_doc_tx_entries(cdb_db *db, uint64_t store, cdb_doc_entry_fn fn, v
         return CDB_OK;
     for (joff = db->tx_start; joff < db->journal.end;) {
         cdb_record r;
-        uint64_t next;
+        uint64_t next, at = joff;
         if ((s = cdb_journal_read(&db->journal, joff, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next))
             != CDB_OK)
             return s;
         joff = next;
+        if (cdb_tx_dropped(db, at))
+            continue;
         if (r.kind == CDB_RECORD_DATA && r.tx_id == db->tx_id && r.store_id == store && r.entry_id != 0
             && (s = fn(ctx, r.entry_id, CDB_STAGE_OFF_NONE)) != CDB_OK)
             return s;

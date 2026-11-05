@@ -136,13 +136,13 @@ static void test_compile_proc_with_savepoints(void) {
 
     TEST_ASSERT_EQUAL(CDB_OK, cdb_compile_proc(script, strlen(script), NULL, bc, sizeof(bc), &bc_len, &err));
 
+    /* With no database there is no transaction to set a savepoint in
+     * (spec 11.12.3); rollbacks themselves are tested in test_savepoint.c. */
     cdb_proc_vm vm;
     cdb_proc_vm_init(&vm, NULL, CDB_ORDER_LITTLE, NULL, 0, 100);
     cdb_value ret;
     memset(&ret, 0, sizeof(ret));
-    TEST_ASSERT_EQUAL(CDB_OK, cdb_proc_exec(&vm, bc, bc_len, &ret));
-    TEST_ASSERT_EQUAL(CDB_TYPE_INT, ret.type);
-    TEST_ASSERT_EQUAL_INT64(10, ret.as.i64);
+    TEST_ASSERT_EQUAL(CDB_E_STATE, cdb_proc_exec(&vm, bc, bc_len, &ret));
 }
 
 static void test_compile_error_reporting(void) {

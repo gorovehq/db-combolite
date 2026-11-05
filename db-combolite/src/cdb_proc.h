@@ -42,12 +42,11 @@
 
 #define CDB_PROC_MAX_SAVEPOINTS 8u
 
-/* Savepoint frame for error trapping and rollback */
+/* A savepoint set by the procedure (spec 11.12.3): its ID and the point in
+ * the open transaction to roll back to. Registers are not saved. */
 typedef struct cdb_proc_savepoint {
     uint8_t id;
-    int is_active;
-    cdb_value saved_regs[CDB_PROC_MAX_REGISTERS];
-    uint8_t n_regs;
+    cdb_tx_mark mark;
 } cdb_proc_savepoint;
 
 /* Mutation opcodes for CALL_MUTATION & CALL_MUTATION_EX */

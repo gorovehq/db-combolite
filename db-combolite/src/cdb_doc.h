@@ -133,6 +133,10 @@ typedef cdb_status (*cdb_doc_entry_fn)(void *ctx, uint64_t entry, size_t staged_
 cdb_status cdb_doc_get_in_tx(cdb_db *db, uint64_t store, uint64_t entry, size_t staged_off, void *body,
                              size_t cap, size_t *len, int *live, uint32_t *schema);
 cdb_status cdb_doc_tx_entries(cdb_db *db, uint64_t store, cdb_doc_entry_fn fn, void *ctx);
+/* For cdb_tx_rollback_to: puts the document stage back to its length and
+ * overflow flag at a savepoint. When a staged record was replaced since
+ * (removals differs), the stage is emptied and marked overflowed instead. */
+void cdb_doc_stage_rewind(cdb_db *db, size_t used, int overflow, uint32_t removals);
 /* The first committed live entry after `after`, in entry order; *done 1 at
  * the end. Uses the page buffer, so calls must not interleave with reads. */
 cdb_status cdb_doc_next_live(cdb_db *db, uint64_t store, uint64_t after, uint64_t *entry, int *done);

@@ -330,6 +330,26 @@ size_t cdb_db_slot_mem_size(unsigned n);
 size_t cdb_db_struct_size(void);
 size_t cdb_db_config_size(void);
 
+/* A range of the open transaction's dropped data records (spec 14.4.9): the
+ * ordinals [from, to) and the journal offsets [from_off, to_off) they lie in. */
+typedef struct cdb_tx_drop {
+    uint32_t from, to;
+    uint64_t from_off, to_off;
+} cdb_tx_drop;
+
+/* A point in the open transaction to roll back to (spec 11.12.3). */
+typedef struct cdb_tx_mark {
+    uint64_t tx_id;
+    uint64_t off;            /* the journal's end */
+    uint32_t data;           /* data records journaled so far: the next ordinal */
+    uint32_t deltas;         /* of which not dropped */
+    size_t stage_used;
+    int stage_overflow;
+    uint32_t stage_removals;
+    size_t stage_idx_used;
+    int stage_idx_overflow;
+} cdb_tx_mark;
+
 /* An open database. All fields are internal to the engine. */
 typedef struct cdb_db {
     cdb_env env;
@@ -362,7 +382,10 @@ typedef struct cdb_db {
     int in_tx;            /* a transaction is open */
     uint64_t tx_id;
     uint64_t tx_start;    /* journal offset of the open transaction's first record */
-    uint32_t tx_deltas;   /* data records the open transaction has written */
+    uint32_t tx_deltas;   /* data records the open transaction has written, not counting dropped ones */
+    uint32_t tx_data;     /* data records journaled, dropped ones included: the next ordinal (14.4.9) */
+    uint32_t tx_ndrops;   /* ranges in tx_drops, in ordinal order */
+    cdb_tx_drop tx_drops[CDB_TX_MAX_DROPS];
     cdb_durability tx_durability;
     unsigned unsynced;    /* commits since the journal was last synced */
     int failed;           /* an apply failed: the database must be reopened */
@@ -390,6 +413,7 @@ typedef struct cdb_db {
     int schema_trivial;   /* it accepts every document */
     size_t stage_used;    /* bytes of doc_stage in use by the open transaction */
     int stage_overflow;   /* a change could not be staged: consult the journal */
+    uint32_t stage_removals; /* staged records replaced in place, for rollbacks (cdb_tx_rollback_to) */
     uint32_t stage_buckets[CDB_STAGE_BUCKETS]; /* head offset in doc_stage or CDB_STAGE_NIL */
     uint8_t *idx_stage;
     size_t idx_stage_size;
@@ -541,6 +565,18 @@ uint64_t cdb_db_take_entry(cdb_db *db, uint64_t store, uint64_t *next_entry, int
  * the changes to the pages. */
 cdb_status cdb_tx_commit(cdb_db *db);
 cdb_status cdb_tx_abort(cdb_db *db);
+/* Savepoints (spec 11.12.3, 14.4.9). cdb_tx_savepoint fills *mark with the
+ * open transaction's current point; CDB_E_STATE when none is open.
+ * cdb_tx_rollback_to drops every change made since mark: it journals a
+ * rollback record and rewinds the staging. The mark stays usable. CDB_E_STATE
+ * when mark belongs to another transaction; CDB_E_OUT_OF_BUDGET, with
+ * nothing changed, when the transaction would hold more than
+ * CDB_TX_MAX_DROPS dropped ranges. */
+cdb_status cdb_tx_savepoint(cdb_db *db, cdb_tx_mark *mark);
+cdb_status cdb_tx_rollback_to(cdb_db *db, const cdb_tx_mark *mark);
+/* Whether the open transaction's journal record at offset off was dropped by
+ * a rollback. Readers of the transaction's own records skip those. */
+int cdb_tx_dropped(const cdb_db *db, uint64_t off);
 
 /* Folds every applied change into the archive (spec 3.2) and starts a new
  * journal. With other processes open it takes the baton, waiting for it if

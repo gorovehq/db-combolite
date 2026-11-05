@@ -324,22 +324,115 @@ static cdb_status read_record(cdb_db *db, cdb_journal *j, uint64_t offset,
     return cdb_journal_read(j, offset, buf, buf_size, r, next);
 }
 
-/* Applies the data records of transaction tx_id found between start and end.
- * Used both by a live commit and by recovery, so both run exactly the same
- * code on exactly the same bytes. Each data record's payload is one op byte
- * (CDB_OP_*) followed by the model-specific data (spec 14.4.5). Reads into
- * cfg.record_buf, so the delta's data pointer is only valid during the apply
- * call. */
-static cdb_status apply_range(cdb_db *db, cdb_journal *j, uint64_t tx_id, uint64_t start, uint64_t end,
-                              uint64_t commit_number)
+/* Adds the dropped ordinals [from, to), at journal offsets [from_off,
+ * to_off), to a transaction's n ranges (spec 14.4.9 rule 3). Every range
+ * already there ends at or before `to`, so one starting at or after `from`
+ * is covered by the new range, and one reaching `from` is extended.
+ * CDB_E_OUT_OF_BUDGET, with d and *n unchanged, past CDB_TX_MAX_DROPS. */
+static cdb_status drops_add(cdb_tx_drop *d, uint32_t *n, uint32_t from, uint32_t to,
+                            uint64_t from_off, uint64_t to_off)
+{
+    uint32_t k = *n;
+    while (k > 0 && d[k - 1u].from >= from) {
+        if (d[k - 1u].from_off < from_off)
+            from_off = d[k - 1u].from_off;
+        k--;
+    }
+    if (k > 0 && d[k - 1u].to >= from) {
+        d[k - 1u].to = to;
+        d[k - 1u].to_off = to_off;
+    } else {
+        if (k == CDB_TX_MAX_DROPS)
+            return CDB_E_OUT_OF_BUDGET;
+        d[k].from = from;
+        d[k].to = to;
+        d[k].from_off = from_off;
+        d[k].to_off = to_off;
+        k++;
+    }
+    *n = k;
+    return CDB_OK;
+}
+
+static int drops_has(const cdb_tx_drop *d, uint32_t n, uint32_t ord)
+{
+    uint32_t i;
+    for (i = 0; i < n; i++)
+        if (ord >= d[i].from && ord < d[i].to)
+            return 1;
+    return 0;
+}
+
+int cdb_tx_dropped(const cdb_db *db, uint64_t off)
+{
+    uint32_t i;
+    if (db == NULL || !db->in_tx)
+        return 0;
+    for (i = 0; i < db->tx_ndrops; i++)
+        if (off >= db->tx_drops[i].from_off && off < db->tx_drops[i].to_off)
+            return 1;
+    return 0;
+}
+
+/* Reads transaction tx_id's records between start and end once and
+ * collects the data-record ordinals its rollback records drop (spec 14.4.9).
+ * A rollback record that does not match the data records before it, or a
+ * transaction with too many ranges, is CDB_E_MALFORMED. */
+static cdb_status collect_drops(cdb_db *db, cdb_journal *j, uint64_t tx_id, uint64_t start, uint64_t end,
+                                cdb_tx_drop *d, uint32_t *n)
 {
     uint64_t off = start;
+    uint32_t data = 0;
+    *n = 0;
     while (off < end) {
         cdb_record r;
         uint64_t next;
         cdb_status s = read_record(db, j, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
         if (s != CDB_OK)
             return s;
+        if (r.tx_id == tx_id && r.kind == CDB_RECORD_DATA) {
+            data++;
+        } else if (r.tx_id == tx_id && r.kind == CDB_RECORD_ROLLBACK) {
+            uint32_t p, before;
+            if (r.payload_len != CDB_ROLLBACK_PAYLOAD_SIZE)
+                return CDB_E_MALFORMED;
+            p = cdb_load_u32(r.payload, j->order);
+            before = cdb_load_u32(r.payload + 4, j->order);
+            if (before != data || p >= before)
+                return CDB_E_MALFORMED;
+            if (drops_add(d, n, p, before, 0, 0) != CDB_OK)
+                return CDB_E_MALFORMED;
+        }
+        off = next;
+    }
+    return CDB_OK;
+}
+
+/* Applies the data records of transaction tx_id found between start and end.
+ * Used both by a live commit and by recovery, so both run exactly the same
+ * code on exactly the same bytes. Each data record's payload is one op byte
+ * (CDB_OP_*) followed by the model-specific data (spec 14.4.5). With
+ * rollbacks (the commit record's flag), the records rollback records dropped
+ * are skipped (spec 14.4.9). Reads into cfg.record_buf, so the delta's data
+ * pointer is only valid during the apply call. */
+static cdb_status apply_range(cdb_db *db, cdb_journal *j, uint64_t tx_id, uint64_t start, uint64_t end,
+                              uint64_t commit_number, int rollbacks)
+{
+    cdb_tx_drop drops[CDB_TX_MAX_DROPS];
+    uint32_t ndrops = 0, ord = 0;
+    uint64_t off = start;
+    cdb_status s;
+    if (rollbacks && (s = collect_drops(db, j, tx_id, start, end, drops, &ndrops)) != CDB_OK)
+        return s;
+    while (off < end) {
+        cdb_record r;
+        uint64_t next;
+        if ((s = read_record(db, j, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next)) != CDB_OK)
+            return s;
+        if (r.kind == CDB_RECORD_DATA && r.tx_id == tx_id && drops_has(drops, ndrops, ord++)) {
+            off = next;
+            continue;
+        }
         if (r.kind == CDB_RECORD_DATA && r.tx_id == tx_id) {
             cdb_delta d;
             if (r.payload_len < 1)
@@ -401,6 +494,7 @@ struct jcursor {
     uint64_t unsealed;  /* the archive state the journal was started from */
     int have;           /* there is a next transaction to apply: */
     uint64_t stamp, counter, tx_id, start, commit_at;
+    int rollbacks;      /* its commit record says it holds rollback records (14.4.9) */
 };
 
 /* The merge order (spec 5.9.2): stamp, then slot, then counter. */
@@ -457,6 +551,7 @@ static cdb_status scan_next(cdb_db *db, struct jcursor *c)
                 c->tx_id = r.tx_id;
                 c->start = start;
                 c->commit_at = off;
+                c->rollbacks = (r.flags & CDB_RECORD_FLAG_ROLLBACKS) != 0;
                 off = next;
                 break;
             }
@@ -722,7 +817,7 @@ static cdb_status merge_journals(cdb_db *db, int keep_in_use)
             break;
         if ((s = open_journal(db, best->slot)) != CDB_OK)
             return s;
-        s = apply_range(db, &db->rj, best->tx_id, best->start, best->commit_at, db->applied + 1u);
+        s = apply_range(db, &db->rj, best->tx_id, best->start, best->commit_at, db->applied + 1u, best->rollbacks);
         cdb_storage_close(&db->rj_st);
         if (s != CDB_OK)
             return s;
@@ -961,14 +1056,28 @@ static cdb_status rebase_pages(cdb_db *db)
         c.off = CDB_JOURNAL_HEADER_SIZE;
         while ((s = scan_next(db, &c)) == CDB_OK && c.have) {
             uint64_t off = c.start;
+            cdb_tx_drop drops[CDB_TX_MAX_DROPS];
+            uint32_t ndrops = 0, ord = 0;
             if ((s = open_journal(db, c.slot)) != CDB_OK)
                 return s;
+            /* The copy leaves out rollback records and what they dropped,
+             * and its commit record loses the flag (14.4.7 rule 2). */
+            if (c.rollbacks && (s = collect_drops(db, &db->rj, c.tx_id, c.start, c.commit_at, drops, &ndrops)) != CDB_OK) {
+                cdb_storage_close(&db->rj_st);
+                return s;
+            }
             while (off < c.off) {
                 cdb_record r;
                 uint64_t next;
                 if ((s = read_record(db, &db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next))
                     != CDB_OK)
                     break;
+                if (r.kind == CDB_RECORD_DATA && r.tx_id == c.tx_id && drops_has(drops, ndrops, ord++)) {
+                    off = next;
+                    continue;
+                }
+                if (r.kind == CDB_RECORD_COMMIT)
+                    r.flags = (uint8_t)(r.flags & ~CDB_RECORD_FLAG_ROLLBACKS);
                 if ((r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_WRITE_KEY || r.kind == CDB_RECORD_COMMIT)
                     && r.tx_id == c.tx_id) {
                     if (r.flags & CDB_RECORD_FLAG_ENCRYPTED) {
@@ -1482,8 +1591,11 @@ static cdb_status tx_begin_locked(cdb_db *db, cdb_durability durability)
      * commit applies records from here. */
     db->tx_start = db->journal.end;
     db->tx_deltas = 0;
+    db->tx_data = 0;
+    db->tx_ndrops = 0;
     db->stage_used = 0;
     db->stage_overflow = 0;
+    db->stage_removals = 0;
     memset(db->stage_buckets, 0xFF, sizeof db->stage_buckets);
     db->stage_idx_used = 0;
     db->stage_idx_overflow = (db->idx_stage == NULL || db->idx_stage_size == 0) ? 1 : 0;
@@ -1613,6 +1725,7 @@ static cdb_status tx_put_in(cdb_db *db, uint64_t store_id, uint64_t entry_id, ui
     cdb_record r;
     const uint8_t *enc_key = NULL;
     unsigned i;
+    cdb_status s;
 
     if (usable(db) != CDB_OK || !db->in_tx)
         return CDB_E_STATE;
@@ -1635,7 +1748,6 @@ static cdb_status tx_put_in(cdb_db *db, uint64_t store_id, uint64_t entry_id, ui
     r.payload_len = (uint32_t)(len + 1u);
     if (db->in_crdt_import)
         r.flags |= (uint8_t)CDB_RECORD_FLAG_REPLICATED;
-    db->tx_deltas++;
 
     for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
         if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == store_id) {
@@ -1661,10 +1773,17 @@ static cdb_status tx_put_in(cdb_db *db, uint64_t store_id, uint64_t entry_id, ui
 
     if (enc_key != NULL && db->aead_alg != CDB_AEAD_NONE) {
         r.flags |= CDB_RECORD_FLAG_ENCRYPTED;
-        return cdb_journal_append_crypto(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size,
-                                         db->aead_alg, enc_key);
+        s = cdb_journal_append_crypto(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size,
+                                      db->aead_alg, enc_key);
+    } else {
+        s = cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size);
     }
-    return cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size);
+    /* Counted only once journaled: tx_data is the next record's ordinal. */
+    if (s == CDB_OK) {
+        db->tx_deltas++;
+        db->tx_data++;
+    }
+    return s;
 }
 
 /* Journals a write-set key record (kind 4, spec 5.9.4, 14.4.7 rule 3):
@@ -1833,10 +1952,12 @@ cdb_status cdb_db_now(cdb_db *db, int64_t *ns, int *have)
     return s;
 }
 
+/* A transaction that journaled nothing needs no abort record. One whose
+ * data records were all dropped still has records to close (14.4.9). */
 static cdb_status append_abort(cdb_db *db)
 {
     cdb_record r;
-    if (db->tx_deltas == 0)
+    if (db->journal.end == db->tx_start)
         return CDB_OK;
     memset(&r, 0, sizeof r);
     r.kind = (uint8_t)CDB_RECORD_ABORT;
@@ -1885,11 +2006,12 @@ static cdb_status own_has_item(cdb_db *db, const struct ws_item *own, unsigned n
         cdb_record r;
         struct ws_item it;
         uint64_t next;
+        uint64_t at = off;
         cdb_status s = read_record(db, &db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
         if (s != CDB_OK)
             return s;
         off = next;
-        if (r.tx_id == db->tx_id && ws_from_record(&r, &it)
+        if (r.tx_id == db->tx_id && !cdb_tx_dropped(db, at) && ws_from_record(&r, &it)
             && it.store == needle->store && it.entry == needle->entry && it.key_tag == needle->key_tag) {
             *match = 1;
             return CDB_OK;
@@ -2010,7 +2132,7 @@ static cdb_status check_collisions(cdb_db *db, uint64_t own_end, uint64_t my_sta
         uint64_t next;
         if ((s = read_record(db, &db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next)) != CDB_OK)
             return s;
-        if (r.tx_id == db->tx_id && ws_from_record(&r, &it)) {
+        if (r.tx_id == db->tx_id && !cdb_tx_dropped(db, off) && ws_from_record(&r, &it)) {
             if (nown < WS_CACHE_CAP) {
                 own[nown++] = it;
             } else {
@@ -2099,10 +2221,13 @@ static cdb_status tx_commit_locked(cdb_db *db)
 
     if (usable(db) != CDB_OK || !db->in_tx)
         return CDB_E_STATE;
-    /* An empty transaction leaves no trace and uses no commit number. */
+    /* An empty transaction leaves no trace and uses no commit number. One
+     * whose changes were all rolled back ends with an abort record, which
+     * closes its run of records (14.4.9 rule 5). */
     if (db->tx_deltas == 0) {
+        s = db->failed ? CDB_OK : append_abort(db);
         db->in_tx = 0;
-        return CDB_OK;
+        return s;
     }
 
     s = coordinate_commit(db, &stamp);
@@ -2141,6 +2266,8 @@ static cdb_status tx_commit_locked(cdb_db *db)
     }
     memset(&r, 0, sizeof r);
     r.kind = (uint8_t)CDB_RECORD_COMMIT;
+    if (db->tx_ndrops > 0)
+        r.flags = (uint8_t)CDB_RECORD_FLAG_ROLLBACKS;
     r.tx_id = db->tx_id;
     r.payload = info;
     r.payload_len = (uint32_t)(CDB_COMMIT_PAYLOAD_SIZE + sig_len);
@@ -2174,7 +2301,8 @@ static cdb_status tx_commit_locked(cdb_db *db)
     /* The transaction is committed; make it visible through the pager. Its
      * commit number is the one reconciliation will give it while this
      * session is the only one contributing, and 0 on an overlay (spec 5.9.2). */
-    s = apply_range(db, &db->journal, db->tx_id, db->tx_start, record_at, db->fresh ? db->applied + 1u : 0u);
+    s = apply_range(db, &db->journal, db->tx_id, db->tx_start, record_at, db->fresh ? db->applied + 1u : 0u,
+                    db->tx_ndrops > 0);
     if (s == CDB_E_BUSY && cdb_coord_baton_held(&db->coord)) {
         /* A standing baton expired while applying: give it up and replay
          * onto the overlay instead (spec 5.9.8). */
@@ -2235,24 +2363,111 @@ cdb_status cdb_tx_commit(cdb_db *db)
  * commit record are never applied. */
 cdb_status cdb_tx_abort(cdb_db *db)
 {
-    cdb_record r;
     cdb_status s;
     db_lock(db);
     if (usable(db) != CDB_OK || !db->in_tx) {
         db_unlock(db);
         return CDB_E_STATE;
     }
+    s = append_abort(db);
     db->in_tx = 0;
-    if (db->tx_deltas == 0) {
-        db_unlock(db);
-        return CDB_OK;
-    }
-    memset(&r, 0, sizeof r);
-    r.kind = (uint8_t)CDB_RECORD_ABORT;
-    r.tx_id = db->tx_id;
-    s = cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size);
     db_unlock(db);
     return s;
+}
+
+/* -------------------------------------------------------- savepoints */
+
+cdb_status cdb_tx_savepoint(cdb_db *db, cdb_tx_mark *mark)
+{
+    cdb_status s = CDB_OK;
+    if (mark == NULL)
+        return CDB_E_INVALID_ARG;
+    db_lock(db);
+    if (usable(db) != CDB_OK || !db->in_tx) {
+        s = CDB_E_STATE;
+    } else {
+        memset(mark, 0, sizeof *mark);
+        mark->tx_id = db->tx_id;
+        mark->off = db->journal.end;
+        mark->data = db->tx_data;
+        mark->deltas = db->tx_deltas;
+        mark->stage_used = db->stage_used;
+        mark->stage_overflow = db->stage_overflow;
+        mark->stage_removals = db->stage_removals;
+        mark->stage_idx_used = db->stage_idx_used;
+        mark->stage_idx_overflow = db->stage_idx_overflow;
+    }
+    db_unlock(db);
+    return s;
+}
+
+/* The index stage only ever appends (cdb_stage_idx_put), so cutting it
+ * back to an earlier length and relinking its chains gives exactly the
+ * stage it was then. */
+static void stage_idx_rewind(cdb_db *db, size_t used, int overflow)
+{
+    size_t off = 0;
+    db->stage_idx_used = used;
+    db->stage_idx_overflow = overflow;
+    memset(db->stage_idx_buckets, 0xFF, sizeof db->stage_idx_buckets);
+    while (off + STAGE_IDX_HDR <= used) {
+        uint8_t *r = db->idx_stage + off;
+        size_t klen = cdb_load_u16(r + 20, CDB_ORDER_BIG);
+        unsigned b = stage_idx_bucket(cdb_load_u64(r, CDB_ORDER_BIG), r[22], r + STAGE_IDX_HDR, klen);
+        cdb_store_u32(r + 16, db->stage_idx_buckets[b], CDB_ORDER_BIG);
+        db->stage_idx_buckets[b] = (uint32_t)off;
+        off += STAGE_IDX_HDR + klen;
+    }
+}
+
+/* Drops every change the open transaction made after mark (spec 11.12.3,
+ * 14.4.9): a rollback record names the dropped ordinals for replay, the
+ * in-memory ranges let the transaction's own reads skip them, and the
+ * staging goes back to what it was at the mark. */
+cdb_status cdb_tx_rollback_to(cdb_db *db, const cdb_tx_mark *mark)
+{
+    cdb_tx_drop drops[CDB_TX_MAX_DROPS];
+    uint32_t ndrops;
+    cdb_status s = CDB_OK;
+    if (mark == NULL)
+        return CDB_E_INVALID_ARG;
+    db_lock(db);
+    if (usable(db) != CDB_OK || !db->in_tx || mark->tx_id != db->tx_id || mark->off > db->journal.end
+        || mark->data > db->tx_data) {
+        db_unlock(db);
+        return CDB_E_STATE;
+    }
+    /* Only data records are ever dropped; a rollback that drops none
+     * writes nothing (14.4.9 rule 2). */
+    if (mark->data < db->tx_data) {
+        uint8_t payload[CDB_ROLLBACK_PAYLOAD_SIZE];
+        cdb_record r;
+        memcpy(drops, db->tx_drops, sizeof drops);
+        ndrops = db->tx_ndrops;
+        if ((s = drops_add(drops, &ndrops, mark->data, db->tx_data, mark->off, db->journal.end)) != CDB_OK) {
+            db_unlock(db);
+            return s;
+        }
+        cdb_store_u32(payload, mark->data, db->pager.order);
+        cdb_store_u32(payload + 4, db->tx_data, db->pager.order);
+        memset(&r, 0, sizeof r);
+        r.kind = (uint8_t)CDB_RECORD_ROLLBACK;
+        r.tx_id = db->tx_id;
+        r.payload = payload;
+        r.payload_len = CDB_ROLLBACK_PAYLOAD_SIZE;
+        if ((s = cdb_journal_append(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size)) != CDB_OK) {
+            db_unlock(db);
+            return s;
+        }
+        memcpy(db->tx_drops, drops, sizeof drops);
+        db->tx_ndrops = ndrops;
+        db->tx_deltas = mark->deltas;
+    }
+    cdb_doc_stage_rewind(db, mark->stage_used, mark->stage_overflow, mark->stage_removals);
+    if (db->idx_stage != NULL)
+        stage_idx_rewind(db, mark->stage_idx_used, mark->stage_idx_overflow);
+    db_unlock(db);
+    return CDB_OK;
 }
 
 /* -------------------------------------------------------- reconcile/close */
@@ -3412,11 +3627,77 @@ static cdb_status db_get_crdt_vector_in(const cdb_db *db, cdb_crdt_vector *vecto
     return CDB_OK;
 }
 
+/* One exported delta: measured into *off when out is NULL, written at
+ * out + *off otherwise. */
+static void crdt_emit(const cdb_db *db, const cdb_record *r, uint8_t *out, size_t *off, uint32_t *count)
+{
+    size_t dlen = r->payload_len > 0 ? (size_t)(r->payload_len - 1u) : 0u;
+    if (out != NULL) {
+        cdb_store_u64(out + *off, r->store_id, CDB_ORDER_BIG);
+        cdb_store_u64(out + *off + 8, r->entry_id, CDB_ORDER_BIG);
+        out[*off + 16] = r->payload_len > 0 ? r->payload[0] : 0;
+        cdb_store_u64(out + *off + 17, r->tx_id & TX_COUNTER_MASK, CDB_ORDER_BIG);
+        cdb_store_u32(out + *off + 25, (uint32_t)r->seq, CDB_ORDER_BIG);
+        cdb_store_u32(out + *off + 29, db->peer_id, CDB_ORDER_BIG);
+        cdb_store_u32(out + *off + 33, (uint32_t)dlen, CDB_ORDER_BIG);
+        if (dlen > 0)
+            memcpy(out + *off + 37, r->payload + 1, dlen);
+    }
+    *off += 37u + dlen;
+    (*count)++;
+}
+
+/* Emits the data records of this journal's committed transactions with
+ * counters in (since, last_tx], as the replay scan finds them (scan_next):
+ * aborted transactions and records a rollback dropped are left out (spec
+ * 14.4.9 rule 6), and so are records that were themselves replicated in. */
+static cdb_status crdt_walk(cdb_db *db, uint64_t since, uint8_t *out, size_t *out_off, uint32_t *count)
+{
+    uint64_t off = CDB_JOURNAL_HEADER_SIZE, start = 0, cur = 0;
+    cdb_status s;
+    while (off < db->journal.end) {
+        cdb_record r;
+        uint64_t next, counter;
+        if (read_record(db, &db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next) != CDB_OK)
+            break;
+        counter = r.tx_id & TX_COUNTER_MASK;
+        if ((r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_WRITE_KEY) && r.tx_id != cur) {
+            cur = r.tx_id;
+            start = off;
+        } else if (r.kind == CDB_RECORD_ABORT) {
+            cur = 0;
+        } else if (r.kind == CDB_RECORD_COMMIT && r.tx_id == cur && counter > since && counter <= db->last_tx) {
+            cdb_tx_drop drops[CDB_TX_MAX_DROPS];
+            uint32_t ndrops = 0, ord = 0;
+            uint64_t tx = cur, at = start;
+            if ((r.flags & CDB_RECORD_FLAG_ROLLBACKS)
+                && (s = collect_drops(db, &db->journal, tx, start, off, drops, &ndrops)) != CDB_OK)
+                return s;
+            while (at < off) {
+                cdb_record d;
+                uint64_t dnext;
+                if ((s = read_record(db, &db->journal, at, db->cfg.record_buf, db->cfg.record_buf_size, &d, &dnext))
+                    != CDB_OK)
+                    return s;
+                if (d.kind == CDB_RECORD_DATA && d.tx_id == tx && !drops_has(drops, ndrops, ord++)
+                    && !(d.flags & CDB_RECORD_FLAG_REPLICATED))
+                    crdt_emit(db, &d, out, out_off, count);
+                at = dnext;
+            }
+            cur = 0;
+        } else if (r.kind == CDB_RECORD_COMMIT) {
+            cur = 0;
+        }
+        off = next;
+    }
+    return CDB_OK;
+}
+
 cdb_status cdb_db_crdt_export_slice(cdb_db *db, const cdb_crdt_vector *since_vector,
                                     uint8_t *out_buf, size_t cap, size_t *out_len)
 {
     cdb_status s;
-    uint64_t off, since_counter = 0;
+    uint64_t since_counter = 0;
     size_t needed = 12u, out_off = 12u;
     uint32_t count = 0;
     cdb_crdt_peer_entry pe;
@@ -3436,21 +3717,9 @@ cdb_status cdb_db_crdt_export_slice(cdb_db *db, const cdb_crdt_vector *since_vec
     }
 
     /* First pass: measure needed size and count of committed records since since_counter */
-    off = CDB_JOURNAL_HEADER_SIZE;
-    while (off < db->journal.end) {
-        cdb_record r;
-        uint64_t next;
-        s = read_record(db, &db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
-        if (s != CDB_OK)
-            break;
-        if (r.kind == CDB_RECORD_DATA && !(r.flags & CDB_RECORD_FLAG_REPLICATED) &&
-            (r.tx_id & TX_COUNTER_MASK) > since_counter &&
-            (r.tx_id & TX_COUNTER_MASK) <= db->last_tx) {
-            size_t dlen = r.payload_len > 0 ? (size_t)(r.payload_len - 1u) : 0u;
-            needed += 37u + dlen;
-            count++;
-        }
-        off = next;
+    if ((s = crdt_walk(db, since_counter, NULL, &needed, &count)) != CDB_OK) {
+        db_unlock(db);
+        return s;
     }
 
     *out_len = needed;
@@ -3464,39 +3733,10 @@ cdb_status cdb_db_crdt_export_slice(cdb_db *db, const cdb_crdt_vector *since_vec
     cdb_store_u32(out_buf + 8, count, CDB_ORDER_BIG);
 
     /* Second pass: write delta records */
-    off = CDB_JOURNAL_HEADER_SIZE;
-    while (off < db->journal.end) {
-        cdb_record r;
-        uint64_t next;
-        s = read_record(db, &db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
-        if (s != CDB_OK)
-            break;
-        if (r.kind == CDB_RECORD_DATA && !(r.flags & CDB_RECORD_FLAG_REPLICATED) &&
-            (r.tx_id & TX_COUNTER_MASK) > since_counter &&
-            (r.tx_id & TX_COUNTER_MASK) <= db->last_tx) {
-            uint8_t op = r.payload_len > 0 ? r.payload[0] : 0;
-            const uint8_t *data = r.payload_len > 1 ? r.payload + 1 : NULL;
-            size_t dlen = r.payload_len > 0 ? (size_t)(r.payload_len - 1u) : 0u;
-            uint64_t tx_counter = r.tx_id & TX_COUNTER_MASK;
-
-            cdb_store_u64(out_buf + out_off, r.store_id, CDB_ORDER_BIG);
-            cdb_store_u64(out_buf + out_off + 8, r.entry_id, CDB_ORDER_BIG);
-            out_buf[out_off + 16] = op;
-            cdb_store_u64(out_buf + out_off + 17, tx_counter, CDB_ORDER_BIG);
-            cdb_store_u32(out_buf + out_off + 25, (uint32_t)r.seq, CDB_ORDER_BIG);
-            cdb_store_u32(out_buf + out_off + 29, db->peer_id, CDB_ORDER_BIG);
-            cdb_store_u32(out_buf + out_off + 33, (uint32_t)dlen, CDB_ORDER_BIG);
-            out_off += 37u;
-            if (dlen > 0 && data != NULL) {
-                memcpy(out_buf + out_off, data, dlen);
-                out_off += dlen;
-            }
-        }
-        off = next;
-    }
-
+    count = 0;
+    s = crdt_walk(db, since_counter, out_buf, &out_off, &count);
     db_unlock(db);
-    return CDB_OK;
+    return s;
 }
 
 cdb_status cdb_db_crdt_import_deltas(cdb_db *db, uint32_t remote_peer_id,
