@@ -9,6 +9,7 @@
 #include "cdb_doc.h"
 #include "cdb_table.h"
 #include "cdb_proc.h"
+#include "cdb_ts.h"
 #include "cdb_faultenv.h"
 
 #define FCAP (768u * 1024u)
@@ -32,6 +33,8 @@ static uint8_t doc_buffers[8u * PAGE];
 static uint8_t doc_stage[4096];
 static uint8_t idx_stage[4096];
 static uint8_t table_buffers[4u * PAGE];
+static uint8_t ts_buffers[3u * PAGE];
+static uint8_t ts_work[(CDB_TS_BLOCK_MAX_POINTS + 1u) * sizeof(cdb_ts_point)];
 static cdb_db_config cfg;
 static cdb_db db;
 
@@ -70,6 +73,9 @@ void setUp(void)
     cfg.idx_stage = idx_stage;
     cfg.idx_stage_size = sizeof idx_stage;
     cfg.table_buffers = table_buffers;
+    cfg.ts_buffers = ts_buffers;
+    cfg.ts_work = ts_work;
+    cfg.ts_work_size = sizeof ts_work;
     cfg.durability = CDB_DURABILITY_FULL;
     TEST_ASSERT_EQUAL_size_t(cdb_table_buffers_size(PAGE, 0), sizeof table_buffers);
 }
@@ -457,6 +463,99 @@ static void test_proc_logical_failure_continues(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+/* A point { 1: a } or, with b >= 0, { 1: a, 2: b }. */
+static enc make_point(int64_t a, int64_t b)
+{
+    enc d;
+    cdb_value_writer w;
+    cdb_value_writer_init(&w, d.b, sizeof d.b, CDB_ORDER_LITTLE, CDB_DECIMAL_COMPACT);
+    cdb_value_begin_object(&w);
+    cdb_value_field(&w, 1);
+    cdb_value_write_int(&w, a);
+    if (b >= 0) {
+        cdb_value_field(&w, 2);
+        cdb_value_write_int(&w, b);
+    }
+    cdb_value_end_object(&w);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, w.error);
+    d.n = cdb_value_writer_len(&w);
+    return d;
+}
+
+/* A mutation that journals and then fails logically (spec 11.12.3):
+ * downsampling appends one summary point per bucket, and the second bucket
+ * fails (an average written into a bool field is CDB_E_INVALID_ARG) after
+ * the first was journaled. The mutation's own savepoint drops the first, so
+ * the procedure goes on and the commit holds no summary at all. */
+static void test_proc_failed_mutation_leaves_nothing(void)
+{
+    uint8_t bc[512], args[7] = { 0, 1, 2, 3, 4, 5, 6 };
+    cdb_proc_writer pw;
+    cdb_value ret;
+    cdb_ts_def src, dst;
+    cdb_ts_in in[3];
+    cdb_ts_row rows[4];
+    enc p1 = make_point(1, -1), p2 = make_point(2, -1), p3 = make_point(3, 9);
+    enc r[7];
+    uint64_t store, s_src, s_dst;
+    int created;
+    size_t n = 9;
+    int64_t next;
+    unsigned i;
+
+    memset(&src, 0, sizeof src);
+    src.precision = CDB_TS_MILLIS;
+    src.nfields = 2;
+    src.fields[0].id = 1;
+    src.fields[0].type = CDB_TYPE_INT;
+    src.fields[1].id = 2;
+    src.fields[1].type = CDB_TYPE_INT;
+    dst = src;
+    dst.fields[1].type = CDB_TYPE_BOOL;
+    memset(in, 0, sizeof in);
+    in[0].ts = 100;
+    in[0].values = p1.b;
+    in[0].len = p1.n;
+    in[1].ts = 200;
+    in[1].values = p2.b;
+    in[1].len = p2.n;
+    in[2].ts = 1100; /* the second bucket: field 2 appears */
+    in[2].values = p3.b;
+    in[2].len = p3.n;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_create(&db, "t", 1, CDB_TS_LATE_ACCEPT, 0, &store));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_series(&db, store, "src", 3, NULL, 0, &src, &s_src, &created));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_series(&db, store, "dst", 3, NULL, 0, &dst, &s_dst, &created));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_append(&db, store, s_src, in, 3));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+
+    r[0] = make_int((int64_t)store);
+    r[1] = make_int((int64_t)s_src);
+    r[2] = make_int((int64_t)store);
+    r[3] = make_int((int64_t)s_dst);
+    r[4] = make_int(1000); /* bucket step */
+    r[5] = make_int(0);
+    r[6] = make_int(4000);
+    cdb_proc_writer_init(&pw, bc, sizeof bc, 8, 0);
+    for (i = 0; i < 7; i++)
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_proc_write_load_const(&pw, (uint8_t)i, r[i].b, r[i].n));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_proc_write_call_mutation_ex(&pw, 7, CDB_MUT_TS_DOWNSAMPLE, 7, args));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_proc_write_return(&pw, 7));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+    cdb_proc_vm_init(&vm, &db, CDB_ORDER_LITTLE, NULL, 0, 100);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_proc_exec(&vm, bc, cdb_proc_writer_len(&pw), &ret));
+    TEST_ASSERT_EQUAL_INT(CDB_TYPE_INT, ret.type);
+    TEST_ASSERT_EQUAL_INT64(CDB_E_INVALID_ARG, ret.as.i64);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_ts_range(&db, store, s_dst, 0, 4000, out, sizeof out, rows, 4, &n, &next));
+    TEST_ASSERT_EQUAL_size_t(0, n);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 static void test_proc_savepoint_limit(void)
 {
     uint8_t bc[256];
@@ -592,6 +691,7 @@ int main(void)
     RUN_TEST(test_rollback_frees_unique_key);
     RUN_TEST(test_proc_rollback_drops_writes);
     RUN_TEST(test_proc_logical_failure_continues);
+    RUN_TEST(test_proc_failed_mutation_leaves_nothing);
     RUN_TEST(test_proc_savepoint_limit);
     RUN_TEST(test_crash_sweep);
     return UNITY_END();

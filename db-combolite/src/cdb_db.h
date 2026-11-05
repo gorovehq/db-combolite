@@ -28,6 +28,7 @@
 #define CDB_STAGE_BUCKETS 512u
 #define CDB_STAGE_IDX_BUCKETS 512u
 #define CDB_STAGE_NIL 0xFFFFFFFFu
+#define CDB_CRDT_PEND_CAP 64u /* (import call, origin) pairs one transaction may apply */
 
 #define CDB_DB_PATH_MAX 200         /* longest path, including the terminating zero */
 
@@ -492,6 +493,13 @@ typedef struct cdb_db {
     cdb_hlc hlc;
     cdb_crdt_vector crdt_vector;
     int in_crdt_import;
+    /* Replicated changes the open transaction applied: per import call and
+     * origin, the latest one, and the data ordinal of the call's first
+     * record. The vector advances to them only at commit (spec 19.4); a
+     * rollback to a savepoint drops those at or past its mark. */
+    cdb_crdt_peer_entry crdt_pend[CDB_CRDT_PEND_CAP];
+    uint32_t crdt_pend_ord[CDB_CRDT_PEND_CAP];
+    uint32_t n_crdt_pend;
     /* Event triggers (spec 11.6). */
     cdb_trigger_registry triggers;
 } cdb_db;

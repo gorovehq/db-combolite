@@ -106,7 +106,9 @@ Features and follow-ups that were agreed and deferred. Each one becomes a milest
   - **A row holds at most `CDB_EXEC_MAX_FIELDS` (16) output fields,** fewer than some tables have columns (GutenFree's catalog has 17).
 - **Active keys are only in the spec (found while reorganizing GutenFree, 2026-11-03).** Spec 6.2 defines keys the application assigns, such as `1342/0005`, but nothing implements them: no uniqueness, no lookup by key. The demo stores passage keys as an ordinary field, so finding one means a scan. Tables come close (a primary key is unique and found directly), but a table cannot carry a full-text index, so passages stay a document pool.
 - **A table cannot have a full-text index.** `cdb_doc_create_full_text` and `cdb_doc_search` refuse a table's pool (`doc_pool` checks `is_table`).
-- **Savepoints: a mutation that fails after journaling (spec 11.12.3).** A procedure's mutation is rolled back to an internal savepoint when it fails logically, so it makes all its changes or none. No mutation journals and then fails logically today (table inserts check keys first, time-series appends check every point first), so no test reaches that rollback, and the core has no test hooks to force one. A mutation that can (a trigger fired after the write, say) should come with a test.
+- **Procedure steps and savepoints: what is still short (found 2026-11-05).**
+  - Some refusals a procedure would want to check end it instead, because they are `CDB_E_STATE`, which is not a logical failure (11.12.3): a delete refused by a refuse-type link, an enforced cardinality, a late time-series point in reject mode. A table delete refused that way also leaves its index-stage tombstones behind.
+  - A rollback to a savepoint does not undo what is not journaled: time-series retention settings (written straight to the series index), enclave, key, RBAC and trigger changes.
 - **Stores cannot join an enclave (found 2026-11-05).** Spec 1.4 and 4.4 put stores inside enclaves, but nothing implements that:
   - `cdb_db_create_store` and the model create calls take no enclave, and nothing writes a store's `domain_id`, so it is always 0.
   - Journal records are encrypted only when a store's ID happens to equal an enclave's ID (`tx_put_in`), which the tests use as a stand-in.
@@ -118,6 +120,8 @@ Features and follow-ups that were agreed and deferred. Each one becomes a milest
 
 Entries closed with nothing left open, one line each. Git history keeps their full text.
 
+- **A failed procedure step that had journaled** (2026-11-05): downsampling reaches it; `test_proc_failed_mutation_leaves_nothing`.
+- **Sync import advanced the peer vector before commit** (2026-11-05): an abort, a failure partway or a savepoint rollback lost the changes on re-import. The vector now advances at commit (`crdt_pend`), an import in the caller's transaction is atomic, and a sender is first known at the zero time; `test_import_vector_advances_at_commit`.
 - **Readers of an open transaction's journal ignored encryption** (2026-11-05): `cdb_db_read_record` decrypts for the document, link, time-series and vector readers; `tests/test_enclave_tx.c`.
 - **Savepoint rollbacks in other processes' views** (2026-11-05): the rebase copy is tested (`test_rebase_drops_rolled_back`), and the collision scan honours rollback records (`test_collision_skips_rolled_back`, spec 14.4.9 rule 7).
 - **A second process could open a database already in use** (demo, 2026-10-30): M19 joins the coordinators at open and lets several processes share the database (spec 5.9).
