@@ -17,7 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M2 | Storage backend interface, host-file backend, fault-injecting backend (spec 1.11.1) | done |
 | M3 | File header (spec 1.9, 14.1) | done |
 | M4 | Pages, anchor map, free-space list (spec 13, 14.2, 14.7) | done |
-| M5 | Delta tracks, transactions, reconciliation, recovery; the crash-point matrix becomes the main test suite (spec 3, 14.4) | done (single process) |
+| M5 | Delta tracks, transactions, reconciliation, recovery; the crash-point matrix becomes the main test suite (spec 3, 14.4) | done (multi-process completed in M19) |
 | M6 | Space reuse and compaction (spec 1.3, 3.4, 3.7) | done |
 | M7 | Ordered index: order-preserving keys and a B+tree over pager pages (spec 14.8) | done |
 | M8 | Catalog: root slots, mirrored body, stores, schema history, field dictionary (spec 4, 14.3) | done |
