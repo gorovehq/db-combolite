@@ -183,6 +183,7 @@ AES-GCM and ChaCha20-Poly1305 both take a 12-byte nonce:
 **nonce = track ID (4 bytes) ‖ sequence number (8 bytes)**
 
 - **Archive pages.** The track ID is the reserved value `0xFFFFFFFF`, and the sequence number is the page's write sequence number. Page sequence numbers are unique across the whole file (Section 12.1).
+- **Reserved track prefixes.** Coordinator slot numbers stop at `0xFFFD`, so a delta record's track ID (slot first) can never start with `0xFFFE` or `0xFFFF`, which the two page tracks use.
 - **Overlay pages** (5.9.1). The track ID is `0xFFFE` followed by the process's slot number (2 bytes), and the sequence number comes from a counter of the session's own, which starts at 1 and never goes back within the session, whatever rebases empty the overlay. The overlay's subkey is the session's (14.2.8), so its nonces can't meet another session's, and the track ID keeps them apart from the archive pages the same session writes once it holds the baton.
 - **Delta records.** The track ID is the coordinator slot number (2 bytes) followed by the companion type (2 bytes), and the sequence number is the delta sequence number. Delta sequences are reserved durably in the slot (Section 12.1), so numbering continues correctly when a later process reuses the slot.
 - **Associated data.** The page header, or the delta record header, is passed as AEAD associated data. It is authenticated, but not encrypted.
@@ -227,10 +228,10 @@ Every page's payload starts with a **store ID slot**, in every domain and for ev
 ### 14.2.8 Session salts (12.1)
 
 - **Drawing.** Opening a database that has a master key for writing draws a 16-byte salt from the environment's random hook (`cdb_env.random`), once, before its journal is created. Without the hook, such a database opens read-only. A database without a master key draws none, and its companion headers hold zero.
-- **Journal and overlay files** carry the salt in their companion header (14.4.1). Their records and overlay pages use it; a delta record names no salt, and an overlay page's salt index is `0xFFFF`, meaning "the salt in this file's header".
+- **Journal and overlay files** carry the salt in their companion header (14.4.1), and every record or overlay page in a file uses that file's salt. A process that takes over a dead slot reconciles that slot's journal and then starts a journal of its own, under its own salt (14.4.7 rule 9). Records and overlay pages use the header's salt; a delta record names no salt, and an overlay page's salt index is `0xFFFF`, meaning "the salt in this file's header".
 - **Held records** keep the salt they were written under in their held entry (14.4.10).
 - **Archive pages** name their salt in the salt index field of their header (14.2.1–14.2.3), 1–65,534; the field is part of the header, so it is authenticated as associated data. Index 0 means no salt and is used only by pages that are not encrypted.
-- **Salt table.** An ordered index (14.8) whose root is at catalog root slot offset 104 (14.3.2): key, the salt index (2 bytes, big-endian); value, the salt (16 bytes) and the last commit that used it (8 bytes, below). Only reconciliation writes archive pages, so only the baton holder adds entries: it takes the lowest free index for the salt of each session whose pages it writes, in the same archive commit as those pages. There is no crash window and no race between processes.
+- **Salt table.** An ordered index (14.8) whose root is at catalog root slot offset 104 (14.3.2): key, the salt index (2 bytes, big-endian); value, the salt (16 bytes) and the last commit that used it (8 bytes, below). Only reconciliation writes archive pages, so only the baton holder writes the table: in the archive commit that writes pages under a salt, it adds the salt at the lowest free index if it isn't there yet, and sets the salt's last-commit sequence to that commit. There is no crash window and no race between processes.
 - **Derivation.** The page subkey (12.2) is derived with HKDF-SHA-256 from the domain key, with the session salt as the HKDF salt and `cdb page` as the info. The other subkeys of 12.2 never produce a nonce from a counter and are derived without a session salt, so every copy and session computes the same values.
 - **Pruning.** A salt-table value is the salt (16 bytes) followed by the commit sequence of the last archive commit that wrote a page under it (8 bytes). A salt leaves the table only when a complete scrub pass (3.5) that **started after** that commit finds no archive page using it; a page written under the salt later moves the commit sequence on, so a salt still in use is never removed. When every index is taken, reconciliation re-encrypts pages under an older salt with the current session's (as for a key version, 12.4) until a scrub pass frees an index.
 
@@ -265,7 +266,7 @@ Logical IDs in this structure are always 8 bytes, even in 32-bit files, so the s
 | 80 | 8 | Public audit series root | Section 10.7 |
 | 88 | 8 | Next object ID | the store, enclave and procedure ID counter; IDs are never reused (Section 4.12) |
 | 96 | 8 | Public nibblet free-space root | the free-space index of public nibblet pages (14.18.3); 0 until the first nibblet |
-| 104 | 8 | Session salt table root | 14.2.8; 0 until the first encrypted write |
+| 104 | 8 | Session salt table root | 14.2.8; 0 until the first encrypted archive page |
 | 112 | 8 | Replication group record | object ID of the copy's group record (14.21.1); 0 when the database does not replicate |
 | 120 | 364 | Reserved | zero |
 | 484 | 8 | End magic | `0A 54 41 43 42 44 43 89` (the start magic reversed) |
@@ -335,7 +336,7 @@ The enclave directory is the public half of every enclave and joined store (12.8
   | 2 | ID |
   | 10 | creating commit |
   | 11 | flags; bit 0 = dropped |
-  | 17 | key versions: an array of objects `{1: version, 2: key reference}`, one for each version that encrypts at least one page or record, in increasing version order |
+  | 17 | key versions: an array of objects `{1: version, 2: key reference}`, one for each version still in use (below), in increasing version order |
   | 18 | current key version: the version new writes use; it is in field 17 |
   | 19 | enclave root: an array of two logical page IDs, the primary and the mirror enclave root page (below) |
   | 20 | rotation: an object `{1: last rotated, 2: interval, 3: overdue response}` |
@@ -443,7 +444,7 @@ A stored procedure is a catalog object of kind 5, named in key `02` like a store
 | 32 | 8 | Committed sequence of the archive this companion was unsealed from |
 | 40 | 8 | First delta sequence number in this file |
 | 48 | 8 | Encryption domain ID: the domain of a companion that belongs to one (named by its opaque ID, 1.12.1); 0 for a file that holds several domains, such as a main journal or an overlay, whose records and pages name their own domain (14.2, 14.4.2) |
-| 56 | 16 | Session salt (12.1, 14.2.8) of the session that writes this file; zero when the file holds nothing encrypted |
+| 56 | 16 | Session salt (12.1, 14.2.8) of the session that writes this file; zero when the database has no master key |
 | 72 | 4 | Reserved, zero |
 | 76 | 4 | CRC32C over bytes 0–75 |
 
@@ -599,7 +600,7 @@ A domain's held log keeps the committed changes of that domain that a process co
    | n | The records, each a complete delta record (14.4.2) copied byte for byte |
 
    Only the domain's records that the transaction keeps are copied: its data changes and neuron-weight updates, in journal order. Write-set keys, rollback records and the data records a rollback dropped (14.4.9) are left out.
-3. **Nonces.** Delta sequence numbers are never reused within a slot, even across rotation, which gives copied records fresh numbers from the slot's durable reservation (12.1). A held record keeps its header, sequence number and ciphertext, so it is decrypted with the nonce built from the entry's track ID and the record's own sequence number, under the page subkey derived with the entry's session salt. Copying it changes nothing that the nonce or the associated data covers, and delta sequence numbers are reserved durably (12.1), so no other record ever takes that nonce.
+3. **Nonces.** Delta sequence numbers are never reused within a slot (12.1). A held record keeps its header, sequence number and ciphertext, so it is decrypted with the nonce built from the entry's track ID and the record's own sequence number, under the page subkey derived with the entry's session salt. Copying it changes nothing that the nonce or the associated data covers, and delta sequence numbers are reserved durably (12.1), so no other record ever takes that nonce.
 4. **Holding** happens in the archive commit that applies the transaction's other domains and advances its slot's mark (5.9.2). The entry is appended to the log, and new pages are linked, in that same commit, so a crash leaves either both or neither.
 5. **Draining** happens in a reconciliation by a process that holds the domain's key. It applies the entries in log order, frees every page but the head, and empties the head, all in one archive commit; then it applies the domain's new changes.
 6. **Reading.** A process with the domain open reads the log's entries in order, after the archive and before the journals, when it builds its view of the domain.
