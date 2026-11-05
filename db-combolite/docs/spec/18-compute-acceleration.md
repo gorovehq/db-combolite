@@ -138,4 +138,8 @@ A mirror that falls behind fetches only what changed, not the whole collection, 
 These need measuring, not deciding:
 
 - **First shortlist sizes by element type (18.10).** The factor for each type, measured by how often a first shortlist fails its check, and with them the widening limit (provisionally an eighth of the collection).
-- **Profiling first.** Measured, a refresh slice of GutenFree took 22 s, while the arithmetic is estimated at under a second. Most of the time is probably in coverage walks and index work, which stay on the CPU. Profile a refresh before implementation, to show what acceleration gains and what else needs fixing.
+- **Profiling first.** *Profiled* (M25 layer 4, 2026-11-04, `bench_graph --file` on GutenFree's passages, 384 dims, k = 16), and the earlier guess was wrong: the arithmetic dominates.
+  - **Before any change:** 4,000 vectors took 14.2 s, about three quarters of it in distances, much of that spent decoding each element. The index work was most of the rest.
+  - **A faster CPU loop** with bit-identical results halved it, to 7.4 s.
+  - **At full size:** 16,033 vectors take 137 s. The arithmetic grows with n² and the index work about with n, so at that size the arithmetic is most of the time.
+  - **What acceleration gains:** on GutenFree, the refresh pass's arithmetic, in both directions, is the part worth accelerating.
