@@ -45,6 +45,13 @@ So stored neighbour lists and their distances, and search results, are always th
 - **Neighbour-graph refresh batches.** The pass that finds each pending entry's K nearest (14.12.4). Coverage checks and their walks stay on the CPU: they follow lists through index pages, which is not arithmetic.
 - **Exact vector search.** Searches below `vec_exact_below` (7.7), and the direct pass over pending vectors in approximate search (7.4).
 - **Bulk search.** A new batched call that searches many query vectors in one request, for work such as building `similar_to`-style links, or an agent retrieving memories for several prompts. It is defined for both paths: without an accelerator it runs the same searches on the CPU.
+  - **Batches.** Each query gets exactly the answer a single search would give it. Every query is checked before any is searched.
+  - **The lock.** It is let go between batches of 64 queries, as a refill does between chunks (18.6), so a long bulk search never holds up other calls for more than one batch. A later batch may therefore see commits made in between, as separate searches would.
+- **Small requests stay on the CPU.** A device call has a fixed cost, about 0.25 ms on the development machine. The CPU's exact pass reads about 300 KB of vectors in that time.
+  - **The rule.** A request goes to the accelerator only when it reads at least `accel_min_bytes`: queries × the collection's vector bytes.
+  - **Below the line.** A smaller request takes the CPU path, and a collection never searched with that much gets no mirror.
+  - **Bulk searches cross it sooner.** A bulk search of the same collection may still go to the device, since it pays the fixed cost once.
+  - **The default** is provisional, 1 MB, to be measured. The field is the database configuration's, like `accel_mem` (18.8); 1 sends every request to the device.
 
 ### 18.5 Kernels and dependencies
 
@@ -131,4 +138,8 @@ A mirror that falls behind fetches only what changed, not the whole collection, 
 These need measuring, not deciding:
 
 - **First shortlist sizes by element type (18.10).** The factor for each type, measured by how often a first shortlist fails its check, and with them the widening limit (provisionally an eighth of the collection).
-- **Profiling first.** Measured, a refresh slice of GutenFree took 22 s, while the arithmetic is estimated at under a second. Most of the time is probably in coverage walks and index work, which stay on the CPU. Profile a refresh before implementation, to show what acceleration gains and what else needs fixing.
+- **Profiling first.** *Profiled* (M25 layer 4, 2026-11-04, `bench_graph --file` on GutenFree's passages, 384 dims, k = 16), and the earlier guess was wrong: the arithmetic dominates.
+  - **Before any change:** 4,000 vectors took 14.2 s, about three quarters of it in distances, much of that spent decoding each element. The index work was most of the rest.
+  - **A faster CPU loop** with bit-identical results halved it, to 7.4 s.
+  - **At full size:** 16,033 vectors take 137 s. The arithmetic grows with n² and the index work about with n, so at that size the arithmetic is most of the time.
+  - **What acceleration gains:** on GutenFree, the refresh pass's arithmetic, in both directions, is the part worth accelerating.

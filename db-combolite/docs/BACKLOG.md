@@ -44,7 +44,17 @@ Features and follow-ups that were agreed and deferred. Each one becomes a milest
   - **The catch-up itself** (18.12): *implemented in M25 layer 1.*
   - **The stamp** is found by bisecting sequences (`change_stamp`): about 64 index seeks at most. Fine for now; a stored stamp would make it one read.
 - **Accelerator, what M25 layer 1 leaves open (spec 18, `feat_m25-accel-layer1`, 2026-11-04).** Layer 1 is the engine side and the fake accelerator: the `cdb_env` hook, mirrors (filled, kept in step through batched apply notes, caught up at rebase from the change log, evicted under `accel_mem`), and certified exact search. Not yet, or not as the spec says:
-  - **Graph refresh, approximate search's pending pass and bulk search are not accelerated** (18.4). Refresh needs the reverse direction too: each other entry against the batch, with its K-th distance as the threshold. Decide after profiling a refresh.
+  - **Graph refresh, approximate search's pending pass and bulk search are not accelerated** (18.4). *Bulk search done in layer 4* (`feat_m25-bulk-search`), with `accel_min_bytes` keeping small requests on the CPU.
+    - **Profiled** (spec 18, open questions): the arithmetic dominates. The f32 CPU loop is now 1.9× faster (`refactor_vec-f32-distance`).
+    - **The refresh: done** (`feat_m25-gpu-refresh`), with the existing `nearest` call and no new accelerator call. Each batch's lists come from the collection's mirror. The reverse offers come from a temporary mirror of the batch, with every collection vector as a query, which gives each entry's nearest batch members.
+      - All 16,033 GutenFree passages: CPU 137 s; CUDA 79 s; Vulkan on the RTX 4060 82 s; Vulkan on Intel UHD 110 s.
+    - **What now limits a refresh: the coverage checks' walks** (CPU, index-bound). gprof, 8,000 passages on CUDA: about 70% of the sampled time is in `check_entry` → `walk_run`.
+      - `ep_next` seeks the entry points index at every step: 2.9 million seeks in 7,910 walks.
+      - `reach` makes 3.5 million entry lookups.
+      - Index writes (`save_table`) take most of the rest.
+      - Reading the entry points once per check, and the entries' locations in batches, is the likely fix. It needs care, since a check can add reach points while it runs. This is an engine change, not the accelerator's.
+    - **Exactness:** each shortlist is rescored on the CPU. A reverse shortlist certifies only against the entry's K-th distance before the batch, because an offer accepted and later dropped still queues a coverage check. So every left-out batch member is one the CPU would have rejected at its turn. Anything uncertified takes the CPU for that entry.
+    - **Approximate search's pending pass** is still to do.
   - **Refills not on the worker pool** (18.6). *Fixed:* with worker threads, a fill runs on the pool one chunk (256 vectors) per hold of the lock, so application calls run between chunks (`accel_fill_task`, `tests/test_threads.c`); without threads, reconciliation or `cdb_db_tick` fills at once. Needed `fix_lock-data-calls` first, so that a worker never overlaps an application call.
   - **Catch-up after the pin is published** (18.12). *Fixed:* the published reader pin is held at or below the oldest archive a ready mirror reflects (`publish_pin`, `cdb_vec_accel_floor`), so no baton holder trims what a catch-up still reads; it moves up once the catch-up is done.
   - **A mirror's size is an estimate** between fills: a change-log put is counted as new even when it replaced a vector, so the budget is used conservatively until the next fill.
