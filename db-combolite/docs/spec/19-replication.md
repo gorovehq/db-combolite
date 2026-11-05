@@ -18,10 +18,10 @@ This section was written after a first implementation (the CRDT helpers and `cdb
 
 - **A copy** is a database file that takes part in replication. Copies of one database form its **replication group**.
 - **Creating a replica.** A new copy is made from an existing one by a dedicated call, never by copying the file alone. The call gives the new copy its own **copy number** and its own database ID; the group shares a **group ID** (14.21.1).
-- **Copying the file is not a replica.** A plain copy of the file that goes on being written beside the original is a fork, not a member of the group: it has the original's copy number, so the IDs it allocates (19.2) can collide with the original's. Its encryption is safe either way, because every session writes under its own salt (12.1).
+- **Copying the file is not a replica.** A plain copy of the file that goes on being written beside the original, or a restored backup, is a **fork**: it has the original's copy number, and its clock and vector may have gone back. Its encryption is safe, because every session writes under its own salt (12.1), and replication tells its changes apart by epoch (19.4).
 - **Copy numbers** are 16 bits. The first copy holds all of them. A copy creating a replica hands it **half of its remaining copy numbers**, so numbers are never handed out twice and no copy needs to ask another.
 - **Group size.** A per-database limit on the number of copies in the group, set when the database is created (default 32). A replica beyond it is refused. The version vector (19.4) is bounded by it, so it fits in fixed memory and in one page.
-- **Retiring a copy** removes it from the group, so that tombstones it has not seen can be purged (19.6).
+- **Retiring a copy** removes it from the group, so that tombstones it has not seen can be purged (19.6). A retirement is a signed group event, made by a member with the `admin` permission on the database (12.5) and relayed in handshakes (19.6) until every member has it. A retired copy's later messages are refused.
 - **64-bit files only.** IDs carry the copy number (19.2), which needs 64-bit IDs. Files with 32-bit addresses and compact files (Section 13.4) can't replicate.
 
 ### 19.2 Unique IDs across copies
@@ -37,7 +37,10 @@ Every ID a replicated object or entry takes is unique across the group: **its to
 ### 19.4 Clocks and version vectors
 
 - **Hybrid logical clock.** Every replicated change carries a hybrid-logical-clock time: physical time, a logical counter and the copy number. Times are totally ordered. A copy's clock moves past every time it receives, up to the drift bound (below), and **every write is stamped later than what it overwrites**: a write to a path takes a time after both the copy's clock and the path's current clock time (19.5), so a local change always supersedes the value it replaces, even one stamped by a fast clock.
-- **Version vector.** Each copy keeps, per origin copy, the latest change it has applied from that origin. A slice for a receiver holds the changes above the receiver's vector.
+- **Stamped at commit.** A copy's own replicated changes take their clock time when their transaction commits, from the copy's clock in commit order (the commit stamp of 5.9.4), whichever process made them. Each origin's changes are therefore stamped in the order they became visible, and filtering by clock time never skips one.
+- **Epochs.** Every session that opens a copy for writing has a random 8-byte **epoch** (drawn with its session salt, 12.1) and records the epoch it continues from. A change is identified by its origin copy, its epoch and its clock time. A copy's epochs normally form a chain, one session after another.
+- **Version vector.** Each copy keeps, per origin copy, the latest epoch and change it has applied from that origin. A change from an epoch that continues the known one advances the entry. A slice for a receiver holds the changes above the receiver's vector.
+- **Forks.** Two epochs that continue from the same epoch are a fork. The receiver keeps a vector entry for each branch (each counts toward the group limit), records a fork event in the audit series, and goes on merging both branches' changes, so neither is mistaken for one already seen. Two branches can allocate the same IDs (19.2): an entry created on both is merged as one only if nothing conflicts; otherwise the later one goes to the conflict list (19.5).
 - **Persistence.** The copy number, the clock and the vector are stored in the database, and the vector advances only when the transaction that applied the changes commits: each such transaction journals its clock and vector advances with its commit, and reconciliation folds them into the copy's group record (14.21.1). A reopened copy remembers what it has seen.
 - **Clock readings.** Copies are not continuously connected, so they exchange no heartbeats. Instead, every sync handshake carries the sender's wall-clock reading and the clock offsets it has measured for other copies. The receiver records, for each copy, its estimated offset from the local clock with an error bound (the transit time can't be known), in a built-in **replication-clock time series**, and relays the estimates in its own handshakes. Every copy thus knows the estimated drift of the whole group, and governance can show which copy was off, by how much, and when.
 - **Clocks are never adjusted** from these readings: the library sets no system clock, and changing clock times would change who won past conflicts.
@@ -53,14 +56,18 @@ All copies end up identical, whatever order the syncs happen in. Each data model
 - **Clock index.** Each replicated store keeps the clock times in an ordered index of its own, keyed by entry and path, holding each path's latest clock time and whether it is a tombstone. Revisions are unchanged and local stores pay nothing. The index holds only the latest clocks; revision history keeps the values, not their past clocks.
 - **Deletes** compare with writes like any write: a delete newer than every write to the entry removes it; a write newer than the delete revives the entry, with only the fields written after the delete.
 - **Unique keys and primary keys.** When two copies insert rows with the same unique key, the row with the earlier clock time keeps the key. The other row is kept, with its key set aside, in a **per-store conflict list**, and a conflict event goes to the audit series (12.7). Nothing is lost silently; the application resolves listed conflicts.
-- **Links** merge as an **add-wins observed-remove set**: a link added on one copy and removed concurrently on another stays. Weight and time take the later write.
+- **Links** merge as an **add-wins observed-remove set**: every add of a link carries its identity (origin copy, epoch, clock time), and a remove lists the adds it observed and removes only those. A link added on one copy and removed concurrently on another therefore stays. A replicated link row keeps the identities of its live adds, usually one. Weight and time take the later write.
 - **Vector entries** are replaced whole by the later write.
 - **Time-series points** with the same series and timestamp merge by the collision rule of Section 10 (field by field, later clock time wins), and the replaced values go to the audit series.
 - **Schemas** merge too: added columns and fields are united, drops are tombstones, and two incompatible changes to one column keep the change with the earlier clock time and record a conflict event. Data keeps reading through the merged schema (Section 9).
 
 ### 19.6 Tombstones
 
-A replicated delete leaves a tombstone, so that an old change arriving late can't undo it. A copy purges a tombstone once **every member copy's version vector**, as last reported to it, covers the delete. A copy that stays offline keeps tombstones alive everywhere until it syncs or is retired (19.1).
+A replicated delete leaves a tombstone, so that an old change arriving late can't undo it. A copy purges a tombstone once **every member copy's version vector**, as last reported, covers the delete.
+
+- **Reports travel.** A handshake carries every member's vector the sender knows, each with the time of its report, and the group's retirements (19.1). A receiver keeps the newest report per member, so in a chain of syncs (A with B, B with C) every copy learns every member's progress.
+- **Bound.** Reports are at most the group limit squared vector entries (about 14 KB at the default limit of 32).
+- A copy that stays offline keeps tombstones alive everywhere until it syncs or is retired (19.1).
 
 ### 19.7 Slices
 

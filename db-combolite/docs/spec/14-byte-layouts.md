@@ -1628,7 +1628,9 @@ Each copy keeps one **group record**, a public catalog object of kind 8 (14.3.3)
 | 35 | copy numbers this copy may still hand out: an object `{1: lowest, 2: highest}`, empty when none are left |
 | 36 | group limit (19.1) |
 | 37 | hybrid clock: an object `{1: physical, ns since the Unix epoch, 2: logical}` |
-| 38 | version vector: an array of objects `{1: copy number, 2: physical, 3: logical}`, one per origin, at most the group limit |
+| 38 | version vector: an array of objects `{1: copy number, 2: epoch, 3: physical, 4: logical}`, one per origin branch (19.4), at most the group limit |
+| 46 | epochs: an ordered index keyed by copy number (2) then epoch (8), valued the parent epoch (8): every epoch this copy has seen, for telling a chain from a fork |
+| 47 | this copy's current epoch (8) and the epoch it continues from (8) |
 | 39 | member vectors root: an ordered index keyed by member copy number (2) then origin copy number (2), valued physical (8) · logical (4): each member's vector as it last reported it, for purging tombstones (19.6). Key (member, 0xFFFF) holds the last message sequence received from that member (8) |
 | 40 | retired copies: an array of copy numbers |
 | 41 | principal: the ID of the principal (14.3.7) whose key signs this copy's slices |
@@ -1647,7 +1649,8 @@ Each copy keeps one **group record**, a public catalog object of kind 8 (14.3.3)
 
 A replicated store's record has field 23 (14.3.3): an object `{1: clock index root, 2: conflict list root, 3: next conflict number}`. Marking a store replicated later writes a clock entry for every live path of every entry, at the clock time of the marking.
 
-- **Clock index.** An ordered index. Key: entry ID (8), then the path, one field ID (8) per level; an empty path stands for the whole entry. Value: physical (8) · logical (4) · copy number (2) · flags (1, bit 0 tombstone).
+- **Clock index.** An ordered index. Key: entry ID (8), then the path, one field ID (8) per level; an empty path stands for the whole entry. Value: physical (8) · logical (4) · copy number (2) · epoch (8) · flags (1, bit 0 tombstone).
+- **Link adds.** In a replicated store's links, the forward row's value is followed by a 2-byte count and the identities of the link's live adds (copy number 2 · epoch 8 · physical 8 · logical 4 · ordinal 2).
 - **Conflict list** (19.5). An ordered index keyed by conflict number (8). Value, an object: `{1: index number, 2: the key's bytes, 3: entry that kept the key, 4: entry set aside, 5: winner's clock time, 6: set-aside entry's clock time}`. Resolving a conflict removes its key.
 
 ### 14.21.3 Replication-clock series
@@ -1671,7 +1674,12 @@ Every message starts with:
 
 and ends with the sender's signature: a 2-byte length, then an ECDSA P-256 signature over SHA-256 of every byte before the length (ASN.1 DER). A receiver refuses a message whose principal is unknown or retired, whose signature does not verify, or whose group ID is not its own. A message whose sequence is not above the last one received from that sender is a replay: its clock reading and offsets are ignored, and its changes are filtered as any others are.
 
-- **Handshake** body: the sender's version vector (2-byte count, then per origin: copy number 2 · physical 8 · logical 4), then the offsets it knows (2-byte count, then: copy number 2 · offset 8 (signed) · error bound 8 · measured at 8).
+- **Handshake** body:
+  - the sender's version vector: a 2-byte count, then per entry copy number 2 · epoch 8 · physical 8 · logical 4 (one entry per origin branch, 19.4);
+  - the epochs it knows: a 2-byte count, then per epoch copy number 2 · epoch 8 · parent epoch 8 (0 for a copy's first);
+  - the member reports it knows (19.6): a 2-byte count, then per member copy number 2 · reported at 8 · vector entry count 2 · entries as above;
+  - the group's retirements: a 2-byte count, then per retirement retired copy number 2 · retiring copy number 2 · principal ID 8 · time 8 · signature length 2 · signature over the preceding 20 bytes and the group ID;
+  - the clock offsets it knows: a 2-byte count, then per copy copy number 2 · offset 8 (signed) · error bound 8 · measured at 8.
 - **Slice** body: a 4-byte change count, then the changes in each origin's clock order.
 
 ### 14.21.5 Changes
@@ -1681,6 +1689,7 @@ Each change:
 | Size | Field |
 |---|---|
 | 2 | Origin copy number |
+| 8 | Origin epoch (19.4) |
 | 8 | Clock time: physical |
 | 4 | Clock time: logical |
 | 2 | Ordinal: the change's position among its origin's changes with the same clock time |
@@ -1696,8 +1705,8 @@ Change kinds and bodies (references are store ID 8 · entry ID 8; paths are a 1-
 | 1 | set a path | reference · path · value |
 | 2 | remove a path | reference · path |
 | 3 | delete an entry | reference |
-| 4 | add or reinforce a link | link type (8) · source end · target end · weight (4) · time (8); ends as in 14.13.1, or 14.13.2 in a joined store |
-| 5 | remove a link | link type · source end · target end |
+| 4 | add or reinforce a link | link type (8) · source end · target end · weight (4) · time (8); ends as in 14.13.1, or 14.13.2 in a joined store. The change's own identity (origin, epoch, clock) is the add's identity |
+| 5 | remove a link | link type · source end · target end · a 2-byte count, then the identities of the adds it removes (copy number 2 · epoch 8 · physical 8 · logical 4 · ordinal 2) |
 | 6 | a time-series point | store (8) · series (8) · timestamp (8) · values (an object) |
 | 7 | replace a vector | reference · vector value |
 | 8 | a catalog object a replicated store needs (19.3) | the object's record, as stored (14.3) |
