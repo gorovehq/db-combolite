@@ -456,6 +456,52 @@ static void test_db_multi_peer_replication_sync(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db2));
 }
 
+/* The export sends only what this database kept (spec 14.4.9 rule 6): an
+ * aborted transaction before a committed one, and a change a savepoint
+ * rollback dropped inside the committed one, stay out of the slice. */
+static void test_export_skips_aborted_and_rolled_back(void)
+{
+    cdb_header h = settings();
+    uint8_t slice[1024];
+    size_t slice_len = 0;
+    size_t applied = 0;
+    cdb_crdt_vector v2;
+    cdb_tx_mark mark;
+    uint8_t page_buf[PAGE];
+    cdb_page_header ph;
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open(&db1, &env, "peer1", &cfg1, &h));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open(&db2, &env, "peer2", &cfg2, &h));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_set_peer_id(&db1, 1u));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_set_peer_id(&db2, 2u));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db1, CDB_DURABILITY_FULL));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&db1, STORE, 7u, CDB_OP_INSERT, "Aborted", 7u));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_abort(&db1));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db1, CDB_DURABILITY_FULL));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&db1, STORE, 8u, CDB_OP_INSERT, "Kept", 4u));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_savepoint(&db1, &mark));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&db1, STORE, 9u, CDB_OP_INSERT, "Dropped", 7u));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_rollback_to(&db1, &mark));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db1));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_get_crdt_vector(&db2, &v2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_crdt_export_slice(&db1, &v2, slice, sizeof slice, &slice_len));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_crdt_import_slice(&db2, slice, slice_len, &applied));
+    TEST_ASSERT_EQUAL_UINT32(1u, (uint32_t)applied);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db2.pager, 8u, page_buf, &ph));
+    TEST_ASSERT_EQUAL_STRING_LEN("Kept", page_buf + sizeof(cdb_page_header), 4);
+    if (cdb_pager_read(&db2.pager, 7u, page_buf, &ph) == CDB_OK)
+        TEST_ASSERT_TRUE(memcmp("Aborted", page_buf + sizeof(cdb_page_header), 7) != 0);
+    if (cdb_pager_read(&db2.pager, 9u, page_buf, &ph) == CDB_OK)
+        TEST_ASSERT_TRUE(memcmp("Dropped", page_buf + sizeof(cdb_page_header), 7) != 0);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db2));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -466,5 +512,6 @@ int main(void)
     RUN_TEST(test_graph_link_aworset);
     RUN_TEST(test_replication_handshake_and_slice_wire_codec);
     RUN_TEST(test_db_multi_peer_replication_sync);
+    RUN_TEST(test_export_skips_aborted_and_rolled_back);
     return UNITY_END();
 }
