@@ -156,6 +156,27 @@ else()
 endif()
 message(STATUS "CDB_PROFILE=${CDB_PROFILE}")
 
+# The optional accelerator library, combolite_accel (spec 18.1, 18.5):
+# never part of the core, host profile only. CUDA is enabled here, at the
+# top, because the tests link its kernels too.
+option(CDB_ACCEL_CUDA "Build the CUDA accelerator (needs the CUDA toolkit with cuBLAS)" OFF)
+if(CDB_ACCEL_CUDA)
+  if(NOT CDB_PROFILE STREQUAL "host")
+    message(FATAL_ERROR "The accelerator exists only in the host profile (spec 18.1)")
+  endif()
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+  endif()
+  # NVIDIA's packages install outside PATH; CUDACXX or CMAKE_CUDA_COMPILER
+  # still choose another.
+  if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX} AND EXISTS /usr/local/cuda/bin/nvcc)
+    set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
+  endif()
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  add_subdirectory(accel)
+endif()
+
 if(CDB_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)

@@ -102,3 +102,16 @@ foreach(name test_vec test_graph)
   add_test(NAME ${name}_accel COMMAND ${name})
   set_tests_properties(${name}_accel PROPERTIES ENVIRONMENT CDB_TEST_ACCEL=1)
 endforeach()
+
+# The real devices (spec 18.11), when their backend is built. Without a
+# usable device the test exits 77: skipped, not passed. AddressSanitizer
+# must leave the shadow gap unprotected for the CUDA driver to map memory.
+if(CDB_ACCEL_CUDA)
+  cdb_add_test(test_accel_cuda)
+  target_link_libraries(test_accel_cuda PRIVATE combolite_accel)
+  set_tests_properties(test_accel_cuda PROPERTIES
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "ASAN_OPTIONS=protect_shadow_gap=0")
+  cdb_add_bench(bench_accel_cuda)
+  target_link_libraries(bench_accel_cuda PRIVATE combolite_accel)
+endif()
