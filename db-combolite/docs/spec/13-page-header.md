@@ -17,8 +17,8 @@ Every page starts with the same small header and ends with an integrity trailer,
 | Page type ID | The page type. Its compatibility class comes from the registry (Section 2.6). | 2 B |
 | Layout version | Version of the page type's internal layout. A page type can change its layout without needing a new type ID. | 1 B |
 | Flags | Compressed, member of an extent, overflow continuation, tamper-evident, written in `danger_mode`. | 1 B |
-| Owning store ID | The store that owns the page (Sections 2.2, 4.6). | 4 / 8 B |
-| Encryption domain ID | The page's enclave or joined store; 0 means public. It is redundant with the store ID **on purpose**, so a page can be decrypted without the catalog. | 4 / 8 B |
+| Owning store ID | The store that owns the page (Sections 2.2, 4.6). 0 on an encrypted page, whose store ID is inside the encrypted payload (Section 12.8). | 4 / 8 B |
+| Encryption domain ID | The page's enclave or joined store; 0 means public. It is recorded apart from the store ID **on purpose**, so a page can be decrypted without the catalog. | 4 / 8 B |
 | Key version | The key version that encrypted the page (Section 12.4). | 4 B |
 | Logical page ID | The page's anchor address (Sections 1.7, 2.4). | 4 / 8 B |
 | Write sequence number | Breadcrumb watermarks (Section 1.3) and nonce uniqueness (Section 12.1). | 8 B |

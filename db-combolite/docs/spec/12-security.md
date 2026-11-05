@@ -101,6 +101,51 @@ db-combolite is a serverless library, so RBAC checks run **inside the applicatio
 - **Hash-chained audit series.** Every audit series (Section 10.7) is **hash-chained**, including each enclave's own series: every entry includes the hash of the entry before it. Editing or deleting an entry breaks the chain.
 - **On by default for every database whenever governance mode is active.**
 
+### 12.8 Stores in enclaves
+
+An **encryption domain** is either the public domain (ID 0), an enclave, or a joined store (12.9). Every store belongs to exactly one domain at a time, and so does every page (Section 2).
+
+- **Joining at creation.** Creating a store (a document pool, table, vector collection or time-series store) can name an enclave. The store is in that enclave's domain from its first write: its data pages, index nodes, overflow chains, revisions, nibblet pages and derived indexes (full text, neighbour graph, deduplication) are all written in that domain, under the enclave's page subkey (12.2).
+- **Moving later.** An existing store can be moved into an enclave, out of one, or between two. The move runs in the background, like key rotation (12.4):
+  - an explicit call records the target domain in the store's record;
+  - new writes go to the target domain at once;
+  - maintenance compaction re-encrypts the store's older pages within the scrub budget (Section 3.5);
+  - the store stays readable throughout, because each page's header names the domain it was written in.
+- **Shared pages stay within a domain.** Pages that several stores share, such as nibblet pages (Section 16), only ever hold records of one domain. Each domain has its own nibblet free-space index.
+- **The enclave's catalog.** An enclave keeps its own catalog, encrypted under its key, as Section 4.4 requires: its stores' records, names, schemas, field dictionaries, link types, procedures and roles. The public catalog lists only each enclave's opaque ID and key reference (the enclave directory). Without the key, the names, schemas and contents of an enclave can't be learned, and finding a store in an enclave by name needs the enclave open.
+- **Each enclave has its own link store** for links whose ends are both inside it. A link between domains goes in a joined store (12.9).
+- **Wrapped keys stay in the keystore.** A key reference (12.3) points at the enclave's key **wrapped under the master key** in the external keystore. The library fetches the wrapped key and unwraps it with the master key; the archive holds only references, never key material (Section 1.4).
+- **What stays readable.** Page headers and delta record headers of an enclave or joined store are authenticated but not encrypted, and they carry **only the domain ID**. The store ID and entry ID of an encrypted page or record are kept inside its encrypted payload, and the readable fields hold 0. An outsider with the file can learn which domain wrote how much and when, but not which store or entry changed, nor any name, schema, content or key.
+- **Recovery with a closed enclave.** Recovery replays every transaction it can. A committed transaction's records for an enclave whose key isn't available are **held** until that enclave is opened, and are applied then, in commit order. The journal that holds them is kept until they are applied.
+- **Accelerator mirrors.** A vector collection in an enclave is mirrored on an accelerator (Section 18) only while its enclave is open. Closing the enclave evicts the mirror and zeroes its device memory, as the decrypted page cache is wiped (12.6).
+
+### 12.9 Joined stores and links between domains
+
+- **What a joined store is.** A joined store is an encryption domain of its own, created explicitly by an operator, like an enclave: it has an object ID and a key reference, and its key is wrapped in the keystore and rotated like an enclave key (12.2, 12.4).
+- **Links between domains.** A link whose two ends are in different domains is stored in a joined store. A link type whose ends may be in different domains names the joined store its links go into.
+- **Opaque pointers.** Inside a joined store, an end that lies in an enclave is an **opaque pointer** with two parts:
+  - **a keyed hash** of the entry reference under that enclave's index subkey (12.2), used as the index key, so that equal references match and a pair can be looked up;
+  - **the sealed reference**: the entry reference encrypted under the enclave's page subkey, so that only holders of the enclave key can follow it.
+
+  A joined store therefore reveals neither the names nor the structure of the enclaves it points into. An end in the public domain is stored as is.
+- **Compound procedures.** A stored procedure that touches more than one domain is stored in a joined store (Section 4.9).
+
+### 12.10 Stored procedures in the catalog
+
+Stored procedures are catalog objects, with the source text, compiled form, dependencies and compiler version that Sections 4.5 and 4.10 list. Where one is stored follows Section 4.9:
+
+- a procedure that touches only the public domain is in the public catalog;
+- a procedure that touches only one enclave is in that enclave's catalog;
+- a compound procedure, touching more than one domain, is in a joined store.
+
 ## Open questions (do not specify until answered)
 
-None at present.
+The decisions in 12.8–12.10 are confirmed; these byte-level details are still to be proposed and confirmed:
+
+- **Enclave directory** (catalog root slot, offset 48): the layout of each entry (opaque ID, key reference, key version, kind: enclave or joined store) and where the enclave's own catalog root is recorded.
+- **An enclave's catalog**: its record kinds and roots (catalog body, schema history, field dictionaries, nibblet free-space index, deduplication index, audit series, quick-query index, link store).
+- **Hidden IDs**: where the store ID and entry ID sit inside an encrypted page payload and an encrypted delta record (Sections 13, 14.2, 14.4.2).
+- **Held records**: how recovery records the transactions it holds, how holding interacts with journal rotation (14.4.7) and with other processes (Section 5.9), and the crash cases.
+- **Moving a store**: the store record's target-domain field, and how compaction finds and re-encrypts the pages still in the old domain.
+- **Joined stores**: the index layout of their links and the byte form of an opaque pointer.
+- **Procedure records**: object kind 3 in the catalog (14.3.3) and its fields.
