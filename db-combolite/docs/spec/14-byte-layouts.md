@@ -310,8 +310,8 @@ A delta record is a 48-byte header, followed by the payload, followed by the tra
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 2 | Record marker: `C0 DE` |
-| 2 | 1 | Record kind: 0 = data change · 1 = commit record · 2 = abort · 3 = neuron-weight update (Section 6.10) · 4 = write-set key · 5 = prepare (both 5.9.4) |
-| 3 | 1 | Flags: encrypted, compressed |
+| 2 | 1 | Record kind: 0 = data change · 1 = commit record · 2 = abort · 3 = neuron-weight update (Section 6.10) · 4 = write-set key · 5 = prepare (both 5.9.4) · 6 = rollback (14.4.9) |
+| 3 | 1 | Flags: `0x01` encrypted · `0x02` compressed · `0x04` continued · `0x08` replicated · `0x10` on a commit record only: the transaction holds a rollback record (14.4.9) |
 | 4 | 4 | Payload length |
 | 8 | 8 | Delta sequence number, which is the nonce source (14.2.5) |
 | 16 | 8 | Transaction ID (14.4.3) |
@@ -344,7 +344,7 @@ Commit record payload:
 | 8 | Global commit number (14.1.8). Written as 0 (5.9.2); the number is assigned at reconciliation |
 | 8 | Commit timestamp from the primary coordinator's clock: ns since the Unix epoch. Until the coordinator exists, the environment's clock; 0 when the platform has none. When a prepare record was written, the same stamp as that record. This is the stamp used for merge order (5.9.4) |
 | 8 | Principal identity ID (Section 5.1) |
-| 4 | Number of deltas in the transaction |
+| 4 | Number of deltas in the transaction, not counting data records a rollback dropped (14.4.9) |
 | 4 | Bitmask of the companion types the transaction touched |
 | 2 | Signature length; 0 if the record is unsigned |
 | n | Signature, present when the signing policy requires one (Section 12.5) |
@@ -383,7 +383,7 @@ The exact encoding of each operation, per data model, is defined with the data-m
 ### 14.4.7 Multi-process rules (5.9)
 
 1. **One journal per slot.** Slot *s* writes `main.<s>.cdb`. Rules 2–4 of 14.4.6 apply per slot. The slot's coordinator file (14.5) records *journal in use*, because the header's companion slot can't record one flag per process.
-2. **Rotation.** A process rotates its own journal after it sees a new archive. The new journal keeps the transactions above its slot's mark, copied in their original order. The baton holder never rotates another slot's journal.
+2. **Rotation.** A process rotates its own journal after it sees a new archive. The new journal keeps the transactions above its slot's mark, copied in their original order. A transaction with rollback records is copied without them and without the data records they dropped, and its commit record loses flag `0x10` (14.4.9). The baton holder never rotates another slot's journal.
 3. **Write-set key record (kind 4).** Target store: the table. Target entry: 0. Payload: index number (4 bytes), then the CRC32C of the encoded key (4 bytes). A hash collision can only cause a needless collision, never a missed one.
 4. **Prepare record (kind 5).** Payload: the stamp (8 bytes), from the primary's clock in ns.
 5. **Replay after a crash.** For every slot's journal, the committed transactions above the slot's mark are merged in (stamp, slot, counter) order and numbered on from the watermark. Rule 3 of 14.4.6 becomes: a journal with a transaction to replay must have been started from the archive's committed state or an earlier one; one started from a later state is set aside.
@@ -400,6 +400,25 @@ A B+tree (14.8) whose root logical ID is at header offset 484.
 |---|---|
 | Key | Coordinator slot number, encoded as an unsigned integer key (14.8) |
 | Value | 8 bytes: the transaction counter (the 6-byte counter of 14.4.3, widened) through which this slot's journal is reconciled |
+
+### 14.4.9 Rollback record (savepoints, 11.12.3)
+
+Rolling back to a savepoint drops the data records an open transaction has journaled since the savepoint. The journal stays append-only: nothing is rewritten, and no delta sequence number is used twice, so no nonce is reused (14.2.5).
+
+1. **Ordinals.** A transaction's data records (kind 0) are numbered 0, 1, 2, … in journal order. Other record kinds are not numbered. Rotation can give records new sequence numbers but keeps their order, so ordinals stay valid.
+2. **Rollback record (kind 6).** Target store and entry: 0. Payload, 8 bytes in the archive's byte order:
+
+   | Size | Field |
+   |---|---|
+   | 4 | First dropped ordinal *p* |
+   | 4 | Number *n* of the transaction's data records that precede this record |
+
+   It drops the data records with ordinals *p* to *n* − 1. A record with *p* > *n*, or whose *n* does not match the data records before it, is malformed. A writer never writes one that drops nothing (*p* = *n*).
+3. **Several rollbacks.** A transaction's dropped ordinals are the union of what each of its rollback records drops. A later rollback to an earlier savepoint covers the earlier ones' ranges.
+4. **Limit.** The dropped ordinals of one transaction form at most **32** disjoint ranges. This is a format limit (17.2): a writer refuses a rollback that would make a 33rd range with `CDB_E_OUT_OF_BUDGET`, before writing anything, and a reader treats a transaction with more as malformed.
+5. **Commit.** A transaction with at least one rollback record sets flag `0x10` on its commit record. A reader that finds the flag reads the transaction's records once to collect the dropped ranges before it applies any. A reader that does not find it does not look for rollback records. The commit's delta count leaves dropped records out. A transaction whose data records were all dropped ends with an abort record, not a commit record.
+6. **Readers.** Everything that takes a committed transaction's changes skips dropped records: the apply at commit, replay after a crash, rotation (14.4.7 rule 2) and replication export. An open transaction's own reads of its journal (its view of its own changes) skip them too.
+7. **Collisions.** Write-set key records (kind 4) are never dropped, and another process's collision scan (5.9.4) does not look for rollback records. Dropped changes can therefore cause a needless collision, never a missed one.
 
 ## 14.5 Coordinator slot
 
@@ -1370,12 +1389,16 @@ Every instruction starts with a 1-byte opcode:
 | `0x05` | `JUMP_IF_TRUE` | `cond` (uint8), `rel_off` (int16 big-endian) | Branch if $R_{cond}$ is truthy |
 | `0x06` | `JUMP_IF_FALSE` | `cond` (uint8), `rel_off` (int16 big-endian) | Branch if $R_{cond}$ is falsy or NULL |
 | `0x07` | `CALL_MATH` | `dst` (uint8), `fn_id` (uint16 big-endian), `argc` (uint8), `args` ($argc \times$ uint8) | Dispatches math/DSP function; result into $R_{dst}$ |
-| `0x08` | `CALL_MUTATION` | `dst` (uint8), `op` (uint8), `store` (uint8), `entry` (uint8), `payload` (uint8) | Invokes engine mutation; returns status into $R_{dst}$ |
+| `0x08` | `CALL_MUTATION` | `dst` (uint8), `op` (uint8), `store` (uint8), `entry` (uint8), `payload` (uint8) | Invokes engine mutation; returns its result or status into $R_{dst}$ (11.12.3) |
 | `0x09` | `OPEN_CURSOR` | `slot` (uint8), `len` (varint), `wire` | Opens query plan cursor in $slot$ using wire bytes |
 | `0x0A` | `CURSOR_NEXT` | `has_row` (uint8), `row_dst` (uint8), `slot` (uint8) | Fetches next row from cursor slot |
 | `0x0B` | `CURSOR_CLOSE`| `slot` (uint8) | Closes cursor in slot |
 | `0x0C` | `RETURN` | `src` (uint8) | Returns $R_{src}$ and halts |
 | `0x0D` | `HALT` | none | Halts procedure execution |
+| `0x0E` | `SAVEPOINT` | `id` (uint8) | Sets savepoint $id$ in the open transaction (11.12.3) |
+| `0x0F` | `ROLLBACK_TO` | `id` (uint8) | Undoes the transaction's changes since savepoint $id$; the savepoint stays set |
+| `0x10` | `RELEASE_SP` | `id` (uint8) | Forgets savepoint $id$ and every later one, keeping their changes |
+| `0x11` | `CALL_MUTATION_EX` | `dst` (uint8), `op` (uint8), `argc` (uint8), `args` ($argc \times$ uint8, at most 16) | As `CALL_MUTATION`, with any number of argument registers |
 
 ## Open questions (do not specify until answered)
 
