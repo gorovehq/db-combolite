@@ -17,7 +17,7 @@ This is a clean-room specification for a portable, serverless, multi-model embed
 | 9 | [Relational](09-relational.md) | 2, 4, 6, 8 | — |
 | 10 | [Time series](10-time-series.md) | 2, 4, 5, 9 | — |
 | 11 | [Query layer and stored procedures](11-query.md) | 3–10 | — |
-| 12 | [Security](12-security.md) | 1, 2, 4, 5, 6 | — |
+| 12 | [Security](12-security.md) | 1, 2, 4, 5, 6 | proposed details awaiting confirmation (12.11) |
 | 13 | [Common page header](13-page-header.md) | 1, 2, 12 | — |
 | 14 | [Byte layouts](14-byte-layouts.md) | all | — |
 | 15 | [Compression](15-compression.md) | 1, 2, 9, 12, 13, 14 | the performance budget for page and journal compression (set after M18's benchmarks) |

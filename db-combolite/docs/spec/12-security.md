@@ -183,6 +183,22 @@ Stored procedures are catalog objects (14.3.6), with the source text, compiled f
   - a compound procedure, touching more than one domain, is in a joined store, named when the procedure is created, whose member domains (12.9) include every domain it touches.
 - **Moving with stores.** Placement is kept right as stores move. A store move (12.8) re-places every procedure that depends on the store, in the same archive commit. A move that would leave a compound procedure in a joined store that does not list the store's new domain is refused with `CDB_E_STATE`, before anything changes.
 
+### 12.11 Proposed details awaiting confirmation
+
+The project owner confirmed the decisions of 12.1 and 12.4–12.10 (what is encrypted and hidden, where keys live, how stores join and move, held changes, joined stores, procedures and RBAC, session salts, the store ID slot, no migration). The details below were filled in while writing the byte layouts and are **proposals, not yet confirmed**. They are written into Sections 12 and 14 so the layouts are complete, but each may still change before it is built.
+
+- **Numbers.** Object kinds 3–7 (14.3.3); page types `0x000A` and `0x000B` (14.2); catalog key prefixes `07`–`0A`; store record fields 22–23, directory fields 17–21, procedure fields 23–29, principal fields 30–32, role field 33; catalog root slot offsets 104 and 112; incompatible feature flag bit 0 (14.1.10); the enclave root page magic `\x89CDBENC\n` and its field layout (14.3.5).
+- **Hidden IDs.** Store and entry IDs as varints at the front of an encrypted record's plaintext (14.4.2); the store ID slot at the file's ID width, outside compression, on every page type including system pages (14.2.7).
+- **Session salts.** The 2-byte salt index (1–65,534; `0xFFFF` for overlay pages) in reserved header bytes; the salt table's place and value (salt, last-use commit); pruning only by a scrub pass that started after the last use; re-encrypting under a newer salt when the table is full; salts drawn only for databases with a master key; the companion header grown to 80 bytes; overlay track `0xFFFE` + slot; slot numbers capped at `0xFFFD` (14.2.5, 14.2.8, 14.4.1).
+- **Subkeys.** The HKDF construction and labels of the 12.2 table; which subkeys take the session salt.
+- **Domains.** A directory record has no name; the held log's head page is allocated when the domain is created; a process closes a domain only after reconciling its own changes to it (12.8); a key version retires only when nothing listed in 14.3.4 uses it, and lookups try every live version meanwhile (12.4).
+- **Held log.** Its page and entry layouts; holding and draining each inside one archive commit; entries keep only data changes and neuron-weight updates (write-set keys, rollbacks and dropped records left out) (14.4.10).
+- **Moves.** The walk cursor's meaning and the restart rule; field 22 removed in the commit that re-encrypts the last old page (14.3.3); re-making joined-store ends and refusing a move a joined store wouldn't cover (12.8).
+- **Joined stores.** 40-byte ends with public ends zero-padded; the joined store's ID mixed into tags and synthetic nonces; key versions stored per enclave end; membership keys written when a cross-domain link type is defined (12.9, 14.13.2).
+- **Collisions.** Decrypting every domain a transaction touched, and a link change counting as a write of both its ends (12.8).
+- **Procedures.** Bodies inline up to a quarter page; a compound procedure names its joined store at creation; a store move refused when that joined store doesn't cover the new domain; the dependents index covering current versions only; dropping by flag (12.10, 14.3.6).
+- **RBAC.** Signature algorithm 1 = ECDSA P-256; retired principals keep their record; a role may name only stores and procedures of its own catalog, whole-database scope only in public roles; a permission check unions the public roles and the object's domain roles over the object, its domain and the whole database; repeated grants and revokes are no-ops and not audited (12.5, 14.3.7).
+
 ## Open questions (do not specify until answered)
 
 None at present. The byte layouts for 12.1 and 12.8–12.10 are in Section 14 (14.2.7, 14.2.8, 14.3.4–14.3.7, 14.4.10, 14.13.2, 14.21.5).
