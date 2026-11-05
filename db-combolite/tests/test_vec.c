@@ -1217,9 +1217,43 @@ static void test_bulk_search(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+/* The f32 fast path (vectors in the host's byte order) gives exactly the
+ * general path's distances: the same vectors byte-swapped take the
+ * general path. Values span many magnitudes, so rounding differences in
+ * the order of adds would show. */
+static void test_f32_fast_path_is_exact(void)
+{
+    enum { D = 384 };
+    static uint8_t a[D * 4], b[D * 4], sa[D * 4], sb[D * 4];
+    static const unsigned measures[3] = { CDB_VEC_COSINE, CDB_VEC_DOT, CDB_VEC_EUCLIDEAN };
+    cdb_byte_order host = cdb_host_byte_order();
+    cdb_byte_order other = host == CDB_ORDER_LITTLE ? CDB_ORDER_BIG : CDB_ORDER_LITTLE;
+    int t, i, m;
+    rng = 99u;
+    for (t = 0; t < 200; t++) {
+        for (i = 0; i < D; i++) {
+            float x = (float)next_int(-1000000, 1000000) * powf(10.0f, (float)next_int(-6, 3));
+            float y = (float)next_int(-1000000, 1000000) * powf(10.0f, (float)next_int(-6, 3));
+            uint32_t bx, by;
+            memcpy(&bx, &x, 4);
+            memcpy(&by, &y, 4);
+            memcpy(a + i * 4, &x, 4);
+            memcpy(b + i * 4, &y, 4);
+            cdb_store_u32(sa + i * 4, bx, other);
+            cdb_store_u32(sb + i * 4, by, other);
+        }
+        for (m = 0; m < 3; m++) {
+            double fast = cdb_vec_cpu_distance(CDB_VEC_F32, D, measures[m], a, b, host);
+            double general = cdb_vec_cpu_distance(CDB_VEC_F32, D, measures[m], sa, sb, other);
+            TEST_ASSERT_TRUE(memcmp(&fast, &general, sizeof fast) == 0);
+        }
+    }
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_f32_fast_path_is_exact);
     RUN_TEST(test_create_and_describe);
     RUN_TEST(test_search_every_type_and_measure);
     RUN_TEST(test_changes_reuse_slots);

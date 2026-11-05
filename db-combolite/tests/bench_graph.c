@@ -3,6 +3,7 @@
  * the recall of the approximate one. Runs on real files; not part of ctest.
  *
  *   bench_graph [max_n] [dims] [queries]
+ *   bench_graph --file <base> <collection> [n] [k]   (see run_file)
  *
  * Data: clusters of about 50 vectors (f32, cosine), queries near random
  * cluster centres. The exact path is the reference for recall@10. */
@@ -16,6 +17,7 @@
 
 #include "combolite/cdb_env.h"
 #include "combolite/cdb_value.h"
+#include "bench_file.h"
 #include "cdb_doc.h"
 #include "cdb_vec.h"
 
@@ -184,9 +186,68 @@ static void run(unsigned n, unsigned dims, unsigned queries)
     unlink(path);
 }
 
+/* --file: a refresh over real vectors. The first n vectors of an existing
+ * collection are copied into a new collection of the same settings in the
+ * same database (give it a copy), which gets a graph of k neighbours and
+ * is refreshed to the end, timed. For profiling refreshes (spec 18). */
+/* GutenFree Diet's verified-page cache (gf_db.h), so pages read once are
+ * not read and checked again. */
+static void with_page_cache(cdb_db_config *c)
+{
+    c->pager.page_cache_size = 128u * 1024u * 1024u;
+    c->pager.page_cache = bench_take(c->pager.page_cache_size);
+}
+
+static void run_file(const char *base, const char *name, uint64_t n, uint32_t k)
+{
+    static uint8_t enc[MAX_DIMS * 4u + 16u];
+    static char model[CDB_VEC_MODEL_MAX], version[CDB_VEC_MODEL_MAX];
+    char dst_name[64];
+    cdb_vec_config vc;
+    uint64_t src, dst, last, id, e;
+    size_t len, left;
+    double t0, t_copy, t_refresh;
+    bench_open_file(&db, &cfg, &env, base, with_page_cache);
+    src = bench_find(&db, name);
+    last = bench_last_id(&db, src, enc, sizeof enc);
+    if (n == 0 || n > last)
+        n = last;
+    check(cdb_vec_describe(&db, src, &vc, model, version), "describe");
+    snprintf(dst_name, sizeof dst_name, "bench_refresh_%ld", (long)getpid());
+    check(cdb_vec_create(&db, dst_name, strlen(dst_name), &vc, &dst), "create");
+    t0 = now();
+    check(cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT), "begin");
+    for (id = 1; id <= n; id++) {
+        if (!bench_get_vec(&db, src, id, enc, sizeof enc, &len))
+            continue;
+        check(cdb_vec_insert(&db, dst, enc, len, 0, 0, &e), "insert");
+        if (id % PER_TX == 0) {
+            check(cdb_tx_commit(&db), "commit");
+            check(cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT), "begin");
+        }
+    }
+    check(cdb_tx_commit(&db), "commit");
+    t_copy = now() - t0;
+    t0 = now();
+    check(cdb_vec_create_graph(&db, dst, k), "graph");
+    check(cdb_vec_refresh(&db, dst, 0, &left), "refresh");
+    t_refresh = now() - t0;
+    printf("%s in %s: %llu vectors, %u dims, k=%u: copy %.2f s, refresh %.2f s (%.2f ms a vector), "
+           "%llu full coverage checks\n",
+           name, base, (unsigned long long)n, (unsigned)vc.dims, (unsigned)k, t_copy, t_refresh,
+           t_refresh * 1e3 / (double)n, (unsigned long long)db.vec_full_checks);
+    check(cdb_db_close(&db), "close");
+}
+
 int main(int argc, char **argv)
 {
     static const unsigned sizes[] = { 250, 500, 1000, 2000, 4000, 8000, 16000, 32000, 64000 };
+    if (argc >= 4 && strcmp(argv[1], "--file") == 0) {
+        cdb_hostenv_init(&he, &env);
+        run_file(argv[2], argv[3], argc > 4 ? strtoull(argv[4], NULL, 10) : 0,
+                 argc > 5 ? (uint32_t)strtoul(argv[5], NULL, 10) : 16u);
+        return 0;
+    }
     unsigned max_n = argc > 1 ? (unsigned)strtoul(argv[1], NULL, 10) : 8000u;
     unsigned dims = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 128u;
     unsigned queries = argc > 3 ? (unsigned)strtoul(argv[3], NULL, 10) : 100u;
