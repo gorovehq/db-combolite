@@ -208,6 +208,16 @@ AES-GCM and ChaCha20-Poly1305 both take a 12-byte nonce:
 - **Zero means "none".** Logical page ID `0` and physical page `0` both mean "no page".
 - **Physical page numbers** count from the start of the file, in units of the file's page size. The **data area** starts after the two header slots (1,024 bytes) and the location-0 area (1,024 bytes), rounded up to a page boundary. System pages that are addressed physically, such as anchor-map and free-space pages, carry logical ID `0`, store `0` and domain `0`.
 
+### 14.2.7 Hidden IDs on encrypted pages
+
+A page in an enclave or a joined store hides its owning store (12.8):
+
+- **Header.** The owning store ID field holds 0. The encryption domain ID field names the domain, so the reader finds the key without the catalog.
+- **Payload.** The encrypted plaintext starts with the **owning store ID**, at the file's ID width (2, 4 or 8 bytes) and in the file's byte order. It is 0 for a page that no single store owns, such as a nibblet page or an enclave root page. The page type's own layout follows it.
+- **Lengths.** The header's payload length counts the store ID. An encrypted page therefore holds that many bytes less than a public page of the same size; page types size themselves from the payload room left.
+- **Order of operations.** The store ID is written outside compression: the plaintext is the store ID followed by the page type's payload, compressed when the page is compressed (Section 15), and the whole plaintext is then encrypted.
+- **Checks.** After decryption, a reader that expects a page of a known store checks the store ID, as it checks the header's store ID on a public page.
+
 ## 14.3 Catalog root slot (location 0)
 
 ### 14.3.1 Placement
@@ -380,6 +390,14 @@ A delta record is a 48-byte header, followed by the payload, followed by the tra
 | 48+n | 16 | Trailer: the AEAD tag, or a checksum padded with zeros |
 
 The header is the AEAD associated data: it is authenticated but not encrypted.
+
+**Hidden IDs.** A record that targets a store in an enclave or a joined store (12.8) is encrypted, and hides its target:
+
+- the target store field (offset 24) holds the record's **encryption domain ID**, and the target entry field (offset 32) holds 0;
+- the encrypted plaintext starts with the real **target store ID** and **target entry ID**, as two unsigned varints (14.6, shortest form only), followed by the payload. The payload length counts them;
+- they are written outside compression: the varints, then the payload (compressed when flag `0x02` is set), all encrypted together.
+
+This applies to every record kind that names a store: data changes, write-set keys (kind 4) and neuron-weight updates. Commit, abort, prepare and rollback records name no store; they are never encrypted and are unchanged. A record that is not encrypted keeps its IDs in the header.
 
 ### 14.4.3 Transaction IDs
 
