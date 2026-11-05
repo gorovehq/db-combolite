@@ -1181,6 +1181,12 @@ cdb_db_crdt_import_slice(&amp;db, slice, slice_len, &amp;imported_count);</code>
       <!-- Section 12: Security & Governance -->
       <section id="security-guide">
         <h2>12. Security, Enclaves &amp; Cryptographic Audit</h2>
+        <div class="alert important" style="margin-bottom: 1.5rem;">
+          <div class="alert-title">Enclaves do not encrypt your stores yet</div>
+          <p>
+            A store (document pool, table, vector collection, time series or links) can't be placed in an enclave yet, so its data is written <strong>unencrypted</strong>, whatever enclaves exist. Enclaves are also not saved: after a reopen the database no longer knows them. Don't rely on enclaves to keep data confidential until the enclave work described in spec sections 12.8&ndash;12.10 is built. The audit hash chain is not affected.
+          </p>
+        </div>
         <p>
           Protect tenant enclaves with AEAD encryption and verify governance integrity:
         </p>
