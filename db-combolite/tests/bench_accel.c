@@ -6,6 +6,11 @@
  *
  *   bench_accel [backend] [max_n] [dims] [queries]
  *   bench_accel [backend] --file <base> <collection> [queries] [k]
+ *   bench_accel [backend] --refresh <base> <collection> [n] [k]
+ *
+ * --refresh times a neighbour-graph refresh over a collection's own
+ * vectors with the accelerator (bench_refresh_file; bench_graph --file
+ * times the same on the CPU).
  *
  * backend: --cuda, --vulkan or --vulkan=<device>; by default whatever
  * cdb_accel_open finds. --software (before it) also allows a device that
@@ -382,6 +387,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "no usable accelerator%s%s in this build and machine\n", flag ? " for " : "",
                 flag ? flag : "");
         return 1;
+    }
+    if (argc >= 4 && strcmp(argv[1], "--refresh") == 0) {
+        printf("%s\n", backend_name);
+        bench_refresh_file(&db, &cfg, &env, argv[2], argv[3], argc > 4 ? strtoull(argv[4], NULL, 10) : 0,
+                           argc > 5 ? (uint32_t)strtoul(argv[5], NULL, 10) : 16u);
+        close_backend();
+        return 0;
     }
     if (argc >= 4 && strcmp(argv[1], "--file") == 0) {
         unsigned k = argc > 5 ? (unsigned)strtoul(argv[5], NULL, 10) : TOPK;

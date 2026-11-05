@@ -330,6 +330,7 @@ static cdb_index_entry cat_entries[1024];
 static uint8_t cat_page[PAGE];
 static uint8_t doc_buffers[8u * PAGE];
 static uint8_t vec_buffers[3u * PAGE];
+static uint8_t vec_work[256u * 1024u]; /* graph refreshes (they grow past it through vec_mem) */
 static cdb_db_config cfg;
 static cdb_db db;
 
@@ -363,6 +364,8 @@ static void open_db(void)
     cfg.catalog_page = cat_page;
     cfg.doc_buffers = doc_buffers;
     cfg.vec_buffers = vec_buffers;
+    cfg.vec_work = vec_work;
+    cfg.vec_work_size = sizeof vec_work;
     cfg.durability = CDB_DURABILITY_FULL;
     cfg.accel_min_bytes = 1; /* small test collections still reach the accelerator (spec 18.4) */
     memset(&h, 0, sizeof h);
@@ -523,6 +526,72 @@ static void test_engine_matches_cpu(void)
     engine_case(CDB_VEC_BINARY, CDB_VEC_HAMMING);
 }
 
+/* Spec 18.4: a neighbour-graph refresh through the device leaves exactly
+ * the graph the CPU leaves. Quarter-valued vectors tie constantly, the
+ * hard case for certifying. Two collections, the same vectors and slices;
+ * every list and its distances must agree to the bit. */
+static void refresh_case(cdb_vector_elem elem, unsigned measure)
+{
+    enum { N = 900, GK = 8 }; /* 1 KB pages hold 8 neighbours */
+    cdb_vec_config c;
+    cdb_vec_hit ha[GK], hb[GK];
+    uint64_t a, b, e;
+    size_t left_a = 1, left_b = 1, na, nb, j;
+    unsigned i;
+    rng = 5150u + (uint32_t)elem * 3u + measure;
+    open_db();
+    memset(&c, 0, sizeof c);
+    c.elem = elem;
+    c.dims = DIMS;
+    c.measure = measure;
+    c.model = "m";
+    c.model_len = 1;
+    c.model_version = "1";
+    c.model_version_len = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_create(&db, "a", 1, &c, &a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_create(&db, "b", 1, &c, &b));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    for (i = 0; i < N; i++) {
+        vec v = make_vec(elem);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_insert(&db, a, v.enc, v.n, 0, 0, &e));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_insert(&db, b, v.enc, v.n, 0, 0, &e));
+        if (i % 300 == 299) {
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+        }
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_create_graph(&db, a, GK));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_create_graph(&db, b, GK));
+    while (left_a || left_b) {
+        db.env.accel = dev_ops;
+        db.env.accel_ctx = dev_ctx;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_refresh(&db, a, 200, &left_a));
+        db.env.accel = NULL;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_refresh(&db, b, 200, &left_b));
+    }
+    db.env.accel = dev_ops;
+    for (e = 1; e <= N; e++) {
+        int fa, fb;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_neighbours(&db, a, e, ha, GK, &na, &fa));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_neighbours(&db, b, e, hb, GK, &nb, &fb));
+        TEST_ASSERT_EQUAL_size_t(nb, na);
+        for (j = 0; j < na; j++) {
+            TEST_ASSERT_EQUAL_UINT64(hb[j].entry, ha[j].entry);
+            TEST_ASSERT_TRUE(memcmp(&ha[j].distance, &hb[j].distance, sizeof ha[j].distance) == 0);
+        }
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+static void test_refresh_matches_cpu(void)
+{
+    refresh_case(CDB_VEC_F32, CDB_VEC_COSINE);
+    refresh_case(CDB_VEC_F32, CDB_VEC_EUCLIDEAN);
+    refresh_case(CDB_VEC_I8, CDB_VEC_DOT);
+    refresh_case(CDB_VEC_BINARY, CDB_VEC_HAMMING);
+}
+
 /* Every test on the device env holds now. */
 static void run_device_tests(void)
 {
@@ -534,4 +603,5 @@ static void run_device_tests(void)
     RUN_TEST(test_i8);
     RUN_TEST(test_binary);
     RUN_TEST(test_engine_matches_cpu);
+    RUN_TEST(test_refresh_matches_cpu);
 }

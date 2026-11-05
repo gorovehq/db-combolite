@@ -767,6 +767,119 @@ static void test_crash_sweep(void)
  * accelerated yet (spec 18.4, a later layer), so this suite shows only
  * that the accelerator, installed, changes nothing, its crash sweep
  * included. Says so rather than passing quietly. */
+/* Spec 18.4: a refresh on the accelerator leaves exactly the graph the CPU
+ * leaves. Two collections get the same vectors and the same changes, in
+ * small refresh slices (so later batches offer to lists already there);
+ * one is refreshed through the fake accelerator, whose noise sends some
+ * shortlists back to the CPU, the other on the CPU alone. Every list, its
+ * distances to the bit, what is pending, and approximate searches (which
+ * depend on the entry points the coverage checks keep) must agree. */
+static void refresh_both(uint64_t a, uint64_t b, size_t budget)
+{
+    const cdb_accel_ops *ops = env.accel;
+    void *ctx = env.accel_ctx;
+    size_t left_a = 1, left_b = 1;
+    while (left_a || left_b) {
+        db.env.accel = ops;
+        db.env.accel_ctx = ctx;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_refresh(&db, a, budget, &left_a));
+        db.env.accel = NULL;
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_refresh(&db, b, budget, &left_b));
+        TEST_ASSERT_EQUAL_size_t(left_b, left_a);
+    }
+    db.env.accel = ops;
+    db.env.accel_ctx = ctx;
+}
+
+static void same_graph(uint64_t a, uint64_t b, uint64_t last, const vec *centers)
+{
+    cdb_vec_hit ha[K + 2], hb[K + 2];
+    size_t na, nb, j;
+    uint64_t e;
+    int t;
+    for (e = 1; e <= last; e++) {
+        int fa, fb;
+        cdb_status sa = cdb_vec_neighbours(&db, a, e, ha, K + 2, &na, &fa);
+        cdb_status sb = cdb_vec_neighbours(&db, b, e, hb, K + 2, &nb, &fb);
+        TEST_ASSERT_EQUAL_INT(sb, sa);
+        if (sa != CDB_OK)
+            continue;
+        TEST_ASSERT_EQUAL_size_t(nb, na);
+        TEST_ASSERT_EQUAL_INT(fb, fa);
+        for (j = 0; j < na; j++) {
+            TEST_ASSERT_EQUAL_UINT64(hb[j].entry, ha[j].entry);
+            TEST_ASSERT_TRUE(memcmp(&ha[j].distance, &hb[j].distance, sizeof ha[j].distance) == 0);
+        }
+    }
+    TEST_ASSERT_EQUAL_size_t(pending_left(b), pending_left(a));
+    for (t = 0; t < 100; t++) {
+        vec q = make_vec(&centers[t % 20]);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_mode(&db, a, q.enc, q.n, 0, CDB_VEC_APPROX, ha, K, &na));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_mode(&db, b, q.enc, q.n, 0, CDB_VEC_APPROX, hb, K, &nb));
+        TEST_ASSERT_EQUAL_size_t(nb, na);
+        for (j = 0; j < na; j++) {
+            TEST_ASSERT_EQUAL_UINT64(hb[j].entry, ha[j].entry);
+            TEST_ASSERT_TRUE(ha[j].distance == hb[j].distance);
+        }
+    }
+}
+
+static void test_accelerated_refresh_is_exact(void)
+{
+    static vec centers[20], vs[400];
+    static cdb_fakeaccel own;
+    uint64_t a, b, e;
+    int i;
+#ifndef CDB_PROFILE_HOST
+    TEST_IGNORE_MESSAGE("the mcu profile has no accelerator (spec 18.1)");
+#endif
+    reset_data(313u);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    if (db.env.accel == NULL) { /* not the _accel run: install the fake here */
+        cdb_fakeaccel_init(&own, &env);
+        own.noise = 0.05;
+        db.env.accel = env.accel;
+        db.env.accel_ctx = env.accel_ctx;
+    }
+    a = make_coll("a");
+    b = make_coll("b");
+    for (i = 0; i < 20; i++)
+        centers[i] = make_vec(NULL);
+    for (i = 0; i < 400; i++)
+        vs[i] = make_vec(&centers[i % 20]);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    for (i = 0; i < 300; i++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_insert(&db, a, vs[i].enc, vs[i].n, 0, 0, &e));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_insert(&db, b, vs[i].enc, vs[i].n, 0, 0, &e));
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_create_graph(&db, a, K));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_create_graph(&db, b, K));
+    refresh_both(a, b, 50);
+    same_graph(a, b, 300, centers);
+
+    /* Changes: new vectors, replacements and deletes, refreshed in small
+     * slices, so batches offer to lists already there. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    for (i = 300; i < 400; i++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_insert(&db, a, vs[i].enc, vs[i].n, 0, 0, &e));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_insert(&db, b, vs[i].enc, vs[i].n, 0, 0, &e));
+    }
+    for (i = 0; i < 10; i++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_replace(&db, a, (uint64_t)(i * 7 + 1), vs[399 - i].enc, vs[399 - i].n));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_replace(&db, b, (uint64_t)(i * 7 + 1), vs[399 - i].enc, vs[399 - i].n));
+    }
+    for (i = 0; i < 30; i++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_delete(&db, a, (uint64_t)(i * 9 + 3)));
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_delete(&db, b, (uint64_t)(i * 9 + 3)));
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    refresh_both(a, b, 40);
+    same_graph(a, b, 400, centers);
+    TEST_ASSERT_TRUE(((const cdb_fakeaccel *)db.env.accel_ctx)->nearests > 0); /* the device took part */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 static void test_accelerator_was_used(void)
 {
     if (getenv("CDB_TEST_ACCEL") == NULL)
@@ -785,6 +898,7 @@ int main(void)
     RUN_TEST(test_vec_mem_limit_falls_back);
     RUN_TEST(test_rejects_bad_use);
     RUN_TEST(test_crash_sweep);
+    RUN_TEST(test_accelerated_refresh_is_exact);
     RUN_TEST(test_accelerator_was_used);
     graph_k = K;
     return UNITY_END();

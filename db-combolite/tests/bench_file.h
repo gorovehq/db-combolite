@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "combolite/cdb_env.h"
 #include "cdb_catalog.h"
@@ -122,6 +124,68 @@ static uint64_t bench_last_id(cdb_db *db, uint64_t coll, uint8_t *buf, size_t ca
             hi = mid;
     }
     return lo;
+}
+
+static double bench_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* GutenFree Diet's verified-page cache (gf_db.h), so pages read once are
+ * not read and checked again. */
+static void bench_with_page_cache(cdb_db_config *c)
+{
+    c->pager.page_cache_size = 128u * 1024u * 1024u;
+    c->pager.page_cache = bench_take(c->pager.page_cache_size);
+}
+
+/* A refresh over real vectors (spec 18 profiling): the first n vectors of
+ * collection `name` (0: all) are copied into a new collection of the same
+ * settings in the same database, which gets a graph of k neighbours and is
+ * refreshed to the end, timed. The environment's accelerator, if any, is
+ * the one the refresh may use. */
+static void bench_refresh_file(cdb_db *db, cdb_db_config *cfg, cdb_env *env, const char *base, const char *name,
+                               uint64_t n, uint32_t k)
+{
+    static uint8_t enc[1024u * 4u + 16u];
+    static char model[CDB_VEC_MODEL_MAX], version[CDB_VEC_MODEL_MAX];
+    char dst_name[64];
+    cdb_vec_config vc;
+    uint64_t src, dst, last, id, e;
+    size_t len, left;
+    double t0, t_copy, t_refresh;
+    bench_open_file(db, cfg, env, base, bench_with_page_cache);
+    src = bench_find(db, name);
+    last = bench_last_id(db, src, enc, sizeof enc);
+    if (n == 0 || n > last)
+        n = last;
+    bench_check(cdb_vec_describe(db, src, &vc, model, version), "describe");
+    snprintf(dst_name, sizeof dst_name, "bench_refresh_%ld", (long)getpid());
+    bench_check(cdb_vec_create(db, dst_name, strlen(dst_name), &vc, &dst), "create");
+    t0 = bench_now();
+    bench_check(cdb_tx_begin(db, CDB_DURABILITY_DEFAULT), "begin");
+    for (id = 1; id <= n; id++) {
+        if (!bench_get_vec(db, src, id, enc, sizeof enc, &len))
+            continue;
+        bench_check(cdb_vec_insert(db, dst, enc, len, 0, 0, &e), "insert");
+        if (id % 200u == 0) {
+            bench_check(cdb_tx_commit(db), "commit");
+            bench_check(cdb_tx_begin(db, CDB_DURABILITY_DEFAULT), "begin");
+        }
+    }
+    bench_check(cdb_tx_commit(db), "commit");
+    t_copy = bench_now() - t0;
+    t0 = bench_now();
+    bench_check(cdb_vec_create_graph(db, dst, k), "graph");
+    bench_check(cdb_vec_refresh(db, dst, 0, &left), "refresh");
+    t_refresh = bench_now() - t0;
+    printf("%s in %s: %llu vectors, %u dims, k=%u: copy %.2f s, refresh %.2f s (%.2f ms a vector), "
+           "%llu full coverage checks\n",
+           name, base, (unsigned long long)n, (unsigned)vc.dims, (unsigned)k, t_copy, t_refresh,
+           t_refresh * 1e3 / (double)n, (unsigned long long)db->vec_full_checks);
+    bench_check(cdb_db_close(db), "close");
 }
 
 #endif
