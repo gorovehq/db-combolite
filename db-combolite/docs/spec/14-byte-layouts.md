@@ -272,6 +272,7 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
   | `07` | joined store ID (8 bytes, big-endian) | empty: a joined store that links into this catalog's domain (12.9) |
   | `08` | procedure ID + version (4 bytes, big-endian) | record reference: every version of a procedure (14.3.6) |
   | `09` | store ID + procedure ID | empty: a procedure in this catalog that depends on the store (14.3.6) |
+  | `0A` | principal ID + role ID | empty: a grant of a role in this catalog to a principal (14.3.7) |
 
 - **Record pages.** Records live in pages of type `0x0004`. Each record is written twice, and a **record reference** is the two logical page IDs, 16 bytes.
 - **Store records** use the shared value encoding (14.6), with these field IDs:
@@ -292,7 +293,7 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
 
 - **Moving a store (12.8).** While field 22 is present, field 5 names the domain the store is moving into, and the record lives in that domain's catalog. The walk cursor is a binary value whose meaning is the data model's: the structure and key the walk stopped at. Empty means start from the beginning; restarting is always correct, because a page already in the new domain is passed over by its header alone. The finish call, or the walk reaching its end, removes field 22 in the archive commit that re-encrypts the last old page.
 
-- **Object kinds** (field 1, and the kind in key `02`): 1 store · 2 link type (14.13.1) · 3 enclave · 4 joined store (14.3.4) · 5 procedure (14.3.6). Reading an object as the wrong kind finds nothing. **Data models** (field 4): 1 relational · 2 document · 3 vector · 4 time series · 5 the link store.
+- **Object kinds** (field 1, and the kind in key `02`): 1 store · 2 link type (14.13.1) · 3 enclave · 4 joined store (14.3.4) · 5 procedure (14.3.6) · 6 principal · 7 role (both 14.3.7). Reading an object as the wrong kind finds nothing. **Data models** (field 4): 1 relational · 2 document · 3 vector · 4 time series · 5 the link store.
 
 - **Writing the root slots.** The first catalog commit writes both root slots. Later commits alternate between them.
 - **Choosing a slot on open.**
@@ -384,6 +385,29 @@ A stored procedure is a catalog object of kind 5, named in key `02` like a store
 - **Dependents.** For each store in a version's dependencies, the catalog that holds the procedure has key `09` + store ID + procedure ID, for the current version only. A store move (12.8) finds the procedures to re-place through key `09` in the public catalog, the store's old domain's catalog and the catalogs of the joined stores linking into it, all of which are open during a move.
 - **Re-placing** a procedure moves its records (every version), its key `02` and its keys `08` and `09` to the catalog its placement now chooses, in the store move's archive commit. Its ID does not change. Overflow chains move with it, re-encrypted in the new domain.
 - **Dropping** a procedure sets bit 0 of field 11 on its current record; its history stays (4.11).
+
+### 14.3.7 Principals, roles and grants (12.5)
+
+- **Principals** are catalog objects of kind 6 in the public catalog, named in key `02`. Fields 1, 2, 3, 10 and 11 mean what they mean in a store record; bit 0 of field 11 marks a retired principal, which keeps its record (signatures it made stay checkable) but holds no roles.
+
+  | ID | Field |
+  |---|---|
+  | 30 | tenant ID |
+  | 31 | signature algorithm: 1 ECDSA over P-256 with SHA-256 |
+  | 32 | public key: for algorithm 1, the 33-byte compressed point |
+
+- **Roles** are catalog objects of kind 7, named in key `02`, in the catalog of the domain their scopes lie in (12.5). Fields 1, 2, 3, 10 and 11 as above; bit 0 of field 11 marks a dropped role, whose grants are removed in the same commit.
+
+  | ID | Field |
+  |---|---|
+  | 33 | permissions: an array of objects `{1: scope kind, 2: scope ID, 3: permissions}` |
+
+  - **Scope kinds:** 0 the whole database (scope ID 0; public roles only) · 1 a store · 2 a domain as a whole (an enclave or joined store: scope ID is its ID; only in that domain's own catalog) · 3 a procedure.
+  - **Permissions:** bit 0 read · bit 1 write · bit 2 execute · bit 3 admin; other bits zero.
+  - Every store and procedure a role names must be in the role's own catalog. A role naming anything else is malformed.
+- **Grants** are keys `0A` + principal ID + role ID, with an empty value, in the role's catalog. Granting a role that is already granted, or revoking one that is not, changes nothing and is not an audit event.
+- **Checking a permission** for a principal on a store or procedure takes the union of the permissions that every granted role in the public catalog and in the object's own domain gives on the object itself, on its domain as a whole, and on the whole database.
+- **Audit events** (12.5) name the principal, role and scope IDs, never key material.
 
 ## 14.4 Companion files, delta records and commit records
 

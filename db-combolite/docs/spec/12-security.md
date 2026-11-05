@@ -78,7 +78,11 @@ The library ships with a set of providers. Applications can register further pro
   - **Roles** are granted to identities.
   - **Permissions** are `read`, `write`, `execute` (procedures) and `admin`. They can be granted on the whole database, a store, an enclave or a procedure.
   - **An enclave's roles are defined inside that enclave** (Section 4.4), so its access rules don't leak.
-  - **Principals and role grants are catalog objects**, so they survive a reopen: public ones in the public catalog, an enclave's in its own catalog (14.3.5).
+  - **Principals and roles are catalog objects** (14.3.7), so they survive a reopen.
+    - A **principal** is recorded once, in the public catalog: its name, tenant and public key. Public keys are public by nature; anyone with the file can list principals, but not what they may do inside an enclave.
+    - A **role** is a named set of (scope, permissions). Principals are granted roles, so changing what a role allows changes it for every holder at once.
+    - A role, and its grants, live in the catalog of the domain its scopes lie in: public roles (which alone may cover the whole database) in the public catalog, an enclave's roles in the enclave's catalog, a joined store's in its own.
+    - **History** is kept in the audit series: creating, changing or dropping a role, granting or revoking one, and registering or retiring a principal are each events in the hash-chained audit series of the domain concerned (12.7). The catalog holds only the current state.
 - **Signing.** Revisions and audit events can be signed with the identity's key. The policy is configurable:
   - sign every revision;
   - sign audit-series events only (**the default**);
@@ -165,5 +169,4 @@ Stored procedures are catalog objects (14.3.6), with the source text, compiled f
 
 The decisions in 12.8–12.10 are confirmed; these byte-level details are still to be proposed and confirmed:
 
-- **RBAC records**: principals and role grants as catalog objects, public ones in the public catalog and an enclave's roles in its own (14.3.5): their kinds and fields.
 - **Replication slices**: the byte form of a sealed domain change in a slice, how a receiving copy holds changes it can't apply, and **nonce uniqueness across copies**: two copies sharing a domain key number their records from their own slots and sequences, so their nonces can coincide under the same key. The design must add a per-copy part to the nonce or derive per-copy subkeys.
