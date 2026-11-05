@@ -1,0 +1,112 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Sort keys from dot products (spec 18.5): for row i and query j (the
+// workgroup's y), the distance's order bits above the row. Rows and
+// queries are `words` words each. Per row, vaux holds 1 / |v| (cosine; 0
+// for a zero vector) or |v|^2 (Euclidean); per query, qaux holds 1 / |q|
+// or |q|^2. Only multiplies and adds after the product, which Vulkan
+// rounds correctly (cax_bound's float epilogue).
+//
+// LANES invocations share a row, each taking every LANES-th word, so a
+// workgroup reads consecutive memory; their sums are added in shared
+// memory. The bound holds for any order of adds, and i8 stays exact.
+layout(push_constant) uniform P {
+    uvec2 rows, q, vaux, qaux, keys;
+    uint n, words, elem, measure;
+} pc;
+
+// IEEE 754 half precision to float, exactly, as the CPU path decodes it.
+float half_to_float(uint h)
+{
+    uint e = (h >> 10) & 31u, m = h & 1023u;
+    float v;
+    if (e == 0u)
+        v = ldexp(float(m), -24);
+    else if (e == 31u)
+        v = uintBitsToFloat(m != 0u ? 0x7FC00000u : 0x7F800000u);
+    else
+        v = ldexp(float(m | 1024u), int(e) - 25);
+    return (h & 0x8000u) != 0u ? -v : v;
+}
+
+uint order_bits(float f)
+{
+    uint u = floatBitsToUint(f);
+    return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
+const uint LANES = 32u;
+const uint ROWS_PER_GROUP = 256u / LANES;
+
+shared float fsum[256];
+shared int isum[256];
+
+void main()
+{
+    U32 rows = U32(pc.rows), q = U32(pc.q);
+    F32 vaux = F32(pc.vaux), qaux = F32(pc.qaux);
+    U64 keys = U64(pc.keys);
+    uint j = gl_WorkGroupID.y, qb = j * pc.words, t = gl_LocalInvocationID.x;
+    uint lane = t % LANES, r = t / LANES;
+    float qa = qaux.v[j];
+    // The loop is the same for the whole workgroup, so its barriers are too.
+    for (uint base = gl_WorkGroupID.x * ROWS_PER_GROUP; base < pc.n; base += gl_NumWorkGroups.x * ROWS_PER_GROUP) {
+        uint i = base + r, rb = i * pc.words;
+        float s = 0.0;
+        int si = 0;
+        if (i < pc.n) {
+            if (pc.elem == F32_ELEM) {
+                for (uint w = lane; w < pc.words; w += LANES)
+                    s += uintBitsToFloat(rows.v[rb + w]) * uintBitsToFloat(q.v[qb + w]);
+            } else if (pc.elem == F16_ELEM) {
+                for (uint w = lane; w < pc.words; w += LANES) {
+                    uint a = rows.v[rb + w], b = q.v[qb + w];
+                    s += half_to_float(a & 0xFFFFu) * half_to_float(b & 0xFFFFu);
+                    s += half_to_float(a >> 16) * half_to_float(b >> 16);
+                }
+            } else if (pc.elem == BF16_ELEM) {
+                for (uint w = lane; w < pc.words; w += LANES) {
+                    uint a = rows.v[rb + w], b = q.v[qb + w];
+                    s += uintBitsToFloat(a << 16) * uintBitsToFloat(b << 16);
+                    s += uintBitsToFloat(a & 0xFFFF0000u) * uintBitsToFloat(b & 0xFFFF0000u);
+                }
+            } else { // i8: exact in an int
+                for (uint w = lane; w < pc.words; w += LANES) {
+                    int a = int(rows.v[rb + w]), b = int(q.v[qb + w]);
+                    for (int k = 0; k < 32; k += 8)
+                        si += bitfieldExtract(a, k, 8) * bitfieldExtract(b, k, 8);
+                }
+            }
+        }
+        fsum[t] = s;
+        isum[t] = si;
+        memoryBarrierShared();
+        barrier();
+        for (uint off = LANES / 2u; off > 0u; off >>= 1) {
+            if (lane < off) {
+                fsum[t] += fsum[t + off];
+                isum[t] += isum[t + off];
+            }
+            memoryBarrierShared();
+            barrier();
+        }
+        if (lane == 0u && i < pc.n) {
+            float d;
+            s = pc.elem == I8_ELEM ? float(isum[t]) : fsum[t];
+            if (pc.measure == DOT) {
+                d = -s;
+            } else if (pc.measure == COSINE) {
+                float va = vaux.v[i];
+                d = (qa == 0.0 || va == 0.0) ? 1.0 : 1.0 - s * (qa * va);
+            } else {
+                float a = qa + vaux.v[i] - 2.0 * s;
+                d = sqrt(max(a, 0.0));
+            }
+            keys.v[j * pc.n + i] = uvec2(i, order_bits(d));
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+}

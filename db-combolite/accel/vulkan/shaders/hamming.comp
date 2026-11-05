@@ -1,0 +1,26 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Hamming keys: the differing bits between row i and query j (the
+// workgroup's y), shifted above the row's entry ID, which takes id_bits
+// (at least 32), so ties order by lower ID (spec 18.10). Unused bits are
+// zero in rows and queries.
+layout(push_constant) uniform P {
+    uvec2 rows, q, ids, keys;
+    uint n, words, id_bits;
+} pc;
+
+void main()
+{
+    U32 rows = U32(pc.rows), q = U32(pc.q);
+    U64 ids = U64(pc.ids), keys = U64(pc.keys);
+    uint j = gl_WorkGroupID.y, qb = j * pc.words;
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += stride_x()) {
+        uint rb = i * pc.words, bits = 0u;
+        for (uint w = 0u; w < pc.words; w++)
+            bits += uint(bitCount(rows.v[rb + w] ^ q.v[qb + w]));
+        uvec2 id = ids.v[i];
+        keys.v[j * pc.n + i] = uvec2(id.x, id.y | (bits << (pc.id_bits - 32u)));
+    }
+}

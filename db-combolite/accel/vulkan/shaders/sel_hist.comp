@@ -1,0 +1,38 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// One radix-select pass (as cak_kernels.cu): counts, for query j (the
+// workgroup's y), the digit at `shift` of every key still a candidate,
+// that is whose bits under the mask equal the prefix.
+layout(push_constant) uniform P {
+    uvec2 keys, state, hist;
+    uint n, shift;
+} pc;
+
+shared uint h[256];
+
+void main()
+{
+    U64 keys = U64(pc.keys);
+    U32 s = U32(pc.state), hist = U32(pc.hist);
+    uint j = gl_WorkGroupID.y, b = j * 8u, t = gl_LocalInvocationID.x;
+    if (s.v[b + S_DONE] != 0u)
+        return; // the same for the whole workgroup
+    h[t] = 0u;
+    memoryBarrierShared();
+    barrier();
+    uvec2 prefix = uvec2(s.v[b + S_PREFIX], s.v[b + S_PREFIX + 1u]);
+    uvec2 mask = uvec2(s.v[b + S_MASK], s.v[b + S_MASK + 1u]);
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += stride_x()) {
+        uvec2 k = keys.v[j * pc.n + i];
+        if ((k & mask) == prefix) {
+            uint d = pc.shift >= 32u ? (k.y >> (pc.shift - 32u)) & 255u : (k.x >> pc.shift) & 255u;
+            atomicAdd(h[d], 1u);
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+    if (h[t] != 0u)
+        atomicAdd(hist.v[j * 256u + t], h[t]);
+}
