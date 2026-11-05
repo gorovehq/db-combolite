@@ -519,6 +519,16 @@ static cdb_status cursor_open(cdb_db *db, unsigned slot, struct jcursor *c, int 
 /* Publishes the archive commit the pager is reading from (spec 5.9.7),
  * then re-reads the header to be sure no commit moved past it before the
  * pin was visible. */
+/* Publishes the sequence this process's readers use (spec 5.9.7), held at
+ * or below the oldest archive an accelerator mirror reflects, so the change
+ * log it must catch up from is not trimmed meanwhile (spec 18.12). A lower
+ * pin only keeps more pages from reuse. */
+static cdb_status publish_pin(cdb_db *db, uint64_t seq)
+{
+    uint64_t floor = cdb_vec_accel_floor(db);
+    return cdb_coord_publish_pin(&db->coord, floor < seq ? floor : seq);
+}
+
 static cdb_status pin_archive(cdb_db *db)
 {
     for (;;) {
@@ -531,7 +541,7 @@ static cdb_status pin_archive(cdb_db *db)
             && (s = cdb_pager_reload(&db->pager)) != CDB_OK)
             return s;
         seq = db->pager.hs.record.committed_seq;
-        if ((s = cdb_coord_publish_pin(&db->coord, seq)) != CDB_OK)
+        if ((s = publish_pin(db, seq)) != CDB_OK)
             return s;
         if ((s = cdb_header_open(&db->archive_st, &hs)) != CDB_OK)
             return s;
@@ -1017,13 +1027,15 @@ static cdb_status rebase_pages(cdb_db *db)
 }
 
 /* rebase_pages, then each accelerator mirror catches up from its change
- * log to the archive now (spec 18.12). This runs after the new committed
- * sequence is published; if another process trims the log in between, the
- * mirror cannot catch up and is filled again instead. */
+ * log to the archive now (spec 18.12). Until it has, the published pin
+ * stays at the oldest archive a mirror reflects (publish_pin), so no baton
+ * holder trims what the catch-up reads; then the pin moves up. */
 static cdb_status rebase(cdb_db *db)
 {
     cdb_status s = rebase_pages(db);
-    return s == CDB_OK ? cdb_vec_accel_rebase(db) : s;
+    if (s == CDB_OK && (s = cdb_vec_accel_rebase(db)) == CDB_OK)
+        s = publish_pin(db, db->pager.hs.record.committed_seq);
+    return s;
 }
 
 static cdb_status maybe_rebase(cdb_db *db)

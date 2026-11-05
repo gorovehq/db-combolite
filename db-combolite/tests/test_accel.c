@@ -456,6 +456,9 @@ static void test_catch_up_across_processes(void)
     /* A sees the archive move at its next tick, rebases and catches up. */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&db));
     TEST_ASSERT_TRUE(db.accel_stats.catchups >= 1);
+    /* Caught up, the reader pin moves up to the archive A reads (it was
+     * held at the mirror's older archive until then). */
+    TEST_ASSERT_EQUAL_UINT64(db.pager.hs.record.committed_seq, db.coord.me.pinned);
     TEST_ASSERT_EQUAL_UINT64(0, db.accel_stats.stale);
     for (i = 0; i < 15; i++) {
         q = make_vec(CDB_VEC_F32);

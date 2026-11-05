@@ -3173,6 +3173,20 @@ static void accel_note(cdb_db *db, const coll *c, uint64_t entry, uint64_t kind)
     a->queue[a->queued++] = (entry & ~Q_KIND) | kind;
 }
 
+/* The oldest archive any ready mirror reflects: the reader pin this
+ * process publishes is held at or below it, so no baton holder trims a
+ * change log past what a mirror still has to catch up on (spec 18.12).
+ * UINT64_MAX when there is none. */
+uint64_t cdb_vec_accel_floor(const cdb_db *db)
+{
+    uint64_t floor = UINT64_MAX;
+    unsigned i;
+    for (i = 0; i < CDB_ACCEL_MIRRORS; i++)
+        if (db->accel[i].state == CDB_ACCEL_READY && db->accel[i].seen < floor)
+            floor = db->accel[i].seen;
+    return floor;
+}
+
 /* After this process's own reconciliation commits: every change that
  * commit holds, from any slot's journal, reached each mirror through the
  * apply, so each reflects the archive it made. */
@@ -3511,6 +3525,11 @@ static void accel_note(cdb_db *db, const coll *c, uint64_t entry, uint64_t kind)
 void cdb_vec_accel_committed(cdb_db *db)
 {
     (void)db;
+}
+uint64_t cdb_vec_accel_floor(const cdb_db *db)
+{
+    (void)db;
+    return UINT64_MAX;
 }
 static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned measure, cdb_vec_hit *hits, size_t k,
                               size_t *n, int *used)

@@ -230,6 +230,9 @@ cdb_status cdb_vec_accel_maintain(cdb_db *db);
 cdb_status cdb_vec_accel_rebase(cdb_db *db);
 /* After this process's own reconciliation has committed the archive. */
 void cdb_vec_accel_committed(cdb_db *db);
+/* The oldest archive sequence a ready mirror reflects (UINT64_MAX: none):
+ * the reader pin is held at or below it (spec 18.12). */
+uint64_t cdb_vec_accel_floor(const cdb_db *db);
 /* The store was dropped: its mirror goes. */
 void cdb_vec_accel_forget(cdb_db *db, uint64_t store);
 /* At close: every mirror is closed. */
