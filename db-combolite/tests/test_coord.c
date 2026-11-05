@@ -1122,6 +1122,53 @@ static void test_collision_on_same_entry(void)
     cdb_faultenv_on_sleep(&fe, NULL, NULL);
 }
 
+/* Another process's collision scan honours rollback records (spec 14.4.9
+ * rule 7): a change p1 rolled back does not collide with p2, a kept one
+ * does, and a write-set key is never dropped. */
+static void test_collision_skips_rolled_back(void)
+{
+    cdb_tx_mark m;
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 5, CDB_OP_REPLACE, "one", 3));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_savepoint(&p1.db, &m));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 6, CDB_OP_REPLACE, "gone", 4));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 8, CDB_OP_REPLACE, "gone", 4));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put_key(&p1.db, 1, 0, "ukey", 4));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_rollback_to(&p1.db, &m));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 7, CDB_OP_REPLACE, "seven", 5));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+
+    cdb_faultenv_advance(&fe, 10000000);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 6, CDB_OP_REPLACE, "six", 3));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 8, CDB_OP_REPLACE, "eight", 5));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 7, CDB_OP_REPLACE, "bad", 3));
+    TEST_ASSERT_EQUAL_INT(CDB_E_COLLISION, cdb_tx_commit(&p2.db));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    /* Entry 8 meets p1's dropped change first; the key must still count. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 8, CDB_OP_REPLACE, "bad", 3));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put_key(&p2.db, 1, 0, "ukey", 4));
+    TEST_ASSERT_EQUAL_INT(CDB_E_COLLISION, cdb_tx_commit(&p2.db));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p2.db));
+    TEST_ASSERT_EQUAL_STRING("one", value_of(&p2, 5));
+    TEST_ASSERT_EQUAL_STRING("six", value_of(&p2, 6));
+    TEST_ASSERT_EQUAL_STRING("seven", value_of(&p2, 7));
+    TEST_ASSERT_EQUAL_STRING("eight", value_of(&p2, 8));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+}
+
 /* Write-set key records make two inserts of the same unique key collide
  * even though they write different entries (spec 5.9.4, 14.4.7 rule 3). */
 static void test_collision_on_unique_key(void)
@@ -1328,6 +1375,78 @@ static void test_rebase_preserves_write_keys(void)
         off = next;
     }
     TEST_ASSERT_TRUE(found_write_key);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+}
+
+/* Counts p's journal records of a kind; entry_id when entry is not 0. */
+static unsigned journal_count(struct proc *p, uint8_t kind, uint64_t entry)
+{
+    cdb_record r;
+    uint64_t next, off = CDB_JOURNAL_HEADER_SIZE;
+    unsigned n = 0;
+    while (off < p->db.journal.end) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_journal_read(&p->db.journal, off, p->db.cfg.record_buf,
+                                                       p->db.cfg.record_buf_size, &r, &next));
+        if (r.kind == kind && (entry == 0 || r.entry_id == entry))
+            n++;
+        off = next;
+    }
+    return n;
+}
+
+/* The rebase copy of a transaction with a rollback (spec 14.4.7 rule 2,
+ * 14.4.9): the dropped record and the rollback record stay behind, the
+ * commit's rollbacks flag is cleared, and the adopted changes are the kept
+ * ones only. */
+static void test_rebase_drops_rolled_back(void)
+{
+    cdb_tx_mark m;
+    cdb_record r;
+    uint64_t next, off;
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 15, CDB_OP_REPLACE, "keep", 4));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_savepoint(&p2.db, &m));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 16, CDB_OP_REPLACE, "drop", 4));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_rollback_to(&p2.db, &m));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 17, CDB_OP_REPLACE, "after", 5));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_UINT(1u, journal_count(&p2, CDB_RECORD_ROLLBACK, 0));
+    TEST_ASSERT_EQUAL_UINT(1u, journal_count(&p2, CDB_RECORD_DATA, 16));
+
+    /* p2 crashes while p1 stays alive without reconciling. */
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
+    cdb_storage_close(&p2.db.overlay_st);
+    cdb_storage_close(&p2.db.journal_st);
+    cdb_storage_close(&p2.db.archive_st);
+    cdb_storage_close(&p2.db.coord.st);
+    p2.db.coord.joined = 0;
+
+    /* A newcomer claims dead slot 1 and rebases its journal. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_UINT(1, p2.db.coord.me.slot);
+    TEST_ASSERT_EQUAL_UINT(0u, journal_count(&p2, CDB_RECORD_ROLLBACK, 0));
+    TEST_ASSERT_EQUAL_UINT(0u, journal_count(&p2, CDB_RECORD_DATA, 16));
+    TEST_ASSERT_EQUAL_UINT(1u, journal_count(&p2, CDB_RECORD_DATA, 15));
+    TEST_ASSERT_EQUAL_UINT(1u, journal_count(&p2, CDB_RECORD_DATA, 17));
+    for (off = CDB_JOURNAL_HEADER_SIZE; off < p2.db.journal.end; off = next) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_journal_read(&p2.db.journal, off, p2.db.cfg.record_buf,
+                                                       p2.db.cfg.record_buf_size, &r, &next));
+        if (r.kind == CDB_RECORD_COMMIT)
+            TEST_ASSERT_FALSE(r.flags & CDB_RECORD_FLAG_ROLLBACKS);
+    }
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p2.db));
+    TEST_ASSERT_EQUAL_STRING("keep", value_of(&p2, 15));
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p2, 16));
+    TEST_ASSERT_EQUAL_STRING("after", value_of(&p2, 17));
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
@@ -1950,9 +2069,11 @@ int main(void)
     RUN_TEST(test_id_blocks_across_processes);
     RUN_TEST(test_collision_on_same_entry);
     RUN_TEST(test_collision_on_unique_key);
+    RUN_TEST(test_collision_skips_rolled_back);
     RUN_TEST(test_collision_with_prepared);
     RUN_TEST(test_collision_with_prepared_commit);
     RUN_TEST(test_rebase_preserves_write_keys);
+    RUN_TEST(test_rebase_drops_rolled_back);
     RUN_TEST(test_table_multi_process_e2e);
     RUN_TEST(test_idle_process_loses_slot);
     RUN_TEST(test_recovery_merges_slots_by_stamp);

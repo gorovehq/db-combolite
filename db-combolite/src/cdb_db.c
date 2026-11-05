@@ -2045,7 +2045,11 @@ static cdb_status check_slot_collisions(cdb_db *db, unsigned slot, uint64_t my_s
 
     for (;;) {
         uint64_t off, cur_tx = 0, prep_stamp = 0;
-        int cur_overlap = 0, cur_prepared = 0;
+        int cur_overlap = 0, cur_prepared = 0, key_overlap = 0;
+        /* A rollback drops the data records from ordinal p on (spec 14.4.9
+         * rule 2), so the transaction overlaps while its first overlapping
+         * data record is below every later rollback's p. */
+        uint32_t cur_ord = 0, first_ov = UINT32_MAX;
 
         if ((s = env_exists(db, path, &exists)) != CDB_OK || !exists)
             return s;
@@ -2071,18 +2075,38 @@ static cdb_status check_slot_collisions(cdb_db *db, unsigned slot, uint64_t my_s
                 continue;
             counter = r.tx_id & TX_COUNTER_MASK;
             if (r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_WRITE_KEY) {
+                int hit = 0;
                 if (r.tx_id != cur_tx) {
                     cur_tx = r.tx_id;
                     cur_overlap = 0;
                     cur_prepared = 0;
                     prep_stamp = 0;
+                    key_overlap = 0;
+                    cur_ord = 0;
+                    first_ov = UINT32_MAX;
                 }
-                if (counter > mark && !cur_overlap && ws_from_record(&r, &it)) {
-                    if ((s = own_has_item(db, own, nown, more_at, own_end, &it, &cur_overlap)) != CDB_OK) {
+                /* Write-set keys are never dropped (rule 7), so one is
+                 * still looked at after a data record overlapped. */
+                if (counter > mark && !key_overlap && (r.kind == CDB_RECORD_WRITE_KEY || first_ov == UINT32_MAX)
+                    && ws_from_record(&r, &it)) {
+                    if ((s = own_has_item(db, own, nown, more_at, own_end, &it, &hit)) != CDB_OK) {
                         cdb_storage_close(&db->rj_st);
                         return s;
                     }
+                    if (hit && r.kind == CDB_RECORD_DATA)
+                        first_ov = cur_ord;
+                    else if (hit)
+                        key_overlap = 1;
+                    cur_overlap = key_overlap || first_ov != UINT32_MAX;
                 }
+                if (r.kind == CDB_RECORD_DATA)
+                    cur_ord++;
+            } else if (r.kind == CDB_RECORD_ROLLBACK && r.tx_id == cur_tx
+                       && r.payload_len == CDB_ROLLBACK_PAYLOAD_SIZE) {
+                uint32_t p = cdb_load_u32(r.payload, db->pager.order);
+                if (first_ov != UINT32_MAX && first_ov >= p)
+                    first_ov = UINT32_MAX;
+                cur_overlap = key_overlap || first_ov != UINT32_MAX;
             } else if (r.kind == CDB_RECORD_PREPARE && r.tx_id == cur_tx
                        && r.payload_len == CDB_PREPARE_PAYLOAD_SIZE) {
                 if (counter > mark) {
