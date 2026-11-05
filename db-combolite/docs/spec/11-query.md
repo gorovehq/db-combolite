@@ -353,8 +353,12 @@ To allow batch workflows and data ingestion scripts to recover from individual c
    - `SAVEPOINT <name>;` (emits bytecode opcode `CDB_BC_SAVEPOINT`)
    - `ROLLBACK TO <name>;` (emits bytecode opcode `CDB_BC_ROLLBACK_TO`)
    - `RELEASE <name>;`
-2. **Staged Delta Unwinding**: Rolling back to a savepoint rewinds the uncommitted transaction staging buffer and transaction index entries back to the savepoint's offset. Reconciled pages and archive commits are untouched.
-3. **Error Status Trapping**: In stored procedure bytecode, mutation opcodes (`CALL_MUTATION`) write their integer `cdb_status` return code into a destination register. A procedure can check if `$status != 0` and execute a `ROLLBACK TO` block or log error telemetry rather than terminating execution.
+
+   A savepoint needs an open transaction: outside one, every mutation commits on its own and there is nothing to undo, so `SAVEPOINT` fails with `CDB_E_STATE`. At most `CDB_PROC_MAX_SAVEPOINTS` (8) are set at once; one more fails with `CDB_E_OUT_OF_BUDGET`. Setting a savepoint whose name is already set moves it to the current point. `ROLLBACK TO` keeps the savepoint and forgets every later one; `RELEASE` forgets the savepoint and every later one and keeps their changes.
+2. **Staged Delta Unwinding**: Rolling back to a savepoint undoes every change the transaction made since it. The journal gets a rollback record (14.4.9), and the transaction's staging (its view of its own changes) is rewound to the savepoint. Reconciled pages and archive commits are untouched. Registers are not restored, so a status checked before the rollback survives it. A transaction can hold at most 32 separate dropped ranges (14.4.9); a rollback past that fails with `CDB_E_OUT_OF_BUDGET` and changes nothing.
+3. **Error Status Trapping**: In stored procedure bytecode, mutation opcodes (`CALL_MUTATION`, `CALL_MUTATION_EX`) write their result into a destination register: on success the result (an insert's new entry ID, otherwise `CDB_OK`), on a failure the negative `cdb_status`. A procedure can check for a negative status and execute a `ROLLBACK TO` block or log error telemetry rather than terminating execution.
+   - **Which failures continue.** Logical failures: `CDB_E_NOT_FOUND`, `CDB_E_EXISTS`, `CDB_E_SCHEMA`, `CDB_E_OVERFLOW`, `CDB_E_INVALID_ARG`, `CDB_E_MALFORMED`, `CDB_E_NOT_CANONICAL` and `CDB_E_DEPTH`. Every other status (I/O, corruption, security, budget, busy, collision, a failed database) ends the procedure with that status.
+   - **A failed mutation leaves nothing.** Inside a transaction, the engine sets an internal savepoint before each mutation and rolls back to it when the mutation fails logically, so a mutation either makes all its changes or none. Outside a transaction, the mutation's own transaction is aborted.
 
 #### 11.12.4 Event Triggers & Safety Constraints
 
