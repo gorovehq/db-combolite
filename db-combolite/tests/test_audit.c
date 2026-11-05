@@ -176,8 +176,8 @@ static void test_audit_tamper_detection(void)
     /* Deliberately tamper with the audit index root page bytes */
     TEST_ASSERT_TRUE(db.pager.catroot.audit_root != 0);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db.pager, db.pager.catroot.audit_root, pg, &ph));
-    hdr_sz = cdb_page_header_size(db.pager.fmt);
-    payload_cap = db.pager.page_size - hdr_sz - cdb_page_trailer_size(db.pager.fmt);
+    hdr_sz = cdb_page_payload_offset(db.pager.fmt);
+    payload_cap = cdb_page_capacity(db.pager.fmt, db.pager.page_size);
 
     /* Flip bits in the entry region at the end of the node */
     pg[hdr_sz + payload_cap - 20] ^= 0xFF;

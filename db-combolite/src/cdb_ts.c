@@ -1185,15 +1185,15 @@ static cdb_status blk_read(cdb_db *db, const ts_store *t, const blk *b, const ui
     cdb_status s;
     if (cdb_nib_is(b->lid)) {
         /* A small block lives in a nibblet (spec 16.5). */
-        *pl = tbuf(db, B_READ) + cdb_page_header_size(db->pager.fmt);
-        return cdb_nib_get(db, b->lid, tbuf(db, B_READ) + cdb_page_header_size(db->pager.fmt), capacity(db), len);
+        *pl = tbuf(db, B_READ) + cdb_page_payload_offset(db->pager.fmt);
+        return cdb_nib_get(db, b->lid, tbuf(db, B_READ) + cdb_page_payload_offset(db->pager.fmt), capacity(db), len);
     }
     s = cdb_pager_read(&db->pager, b->lid, tbuf(db, B_READ), &h);
     if (s != CDB_OK)
         return s == CDB_E_NOT_FOUND ? CDB_E_CORRUPT : s;
     if (h.type != CDB_PAGE_TYPE_TS_BLOCK || h.store_id != t->slot.store_id)
         return CDB_E_CORRUPT;
-    *pl = tbuf(db, B_READ) + cdb_page_header_size(db->pager.fmt);
+    *pl = tbuf(db, B_READ) + cdb_page_payload_offset(db->pager.fmt);
     *len = h.payload_len;
     return CDB_OK;
 }

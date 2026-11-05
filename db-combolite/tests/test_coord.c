@@ -593,7 +593,7 @@ static cdb_status kv_apply(void *ctx, cdb_pager *p, const cdb_delta *d)
         s = cdb_pager_read(p, d->entry_id, cur, &t);
         if (s == CDB_OK) {
             len = t.payload_len;
-            memcpy(val, cur + cdb_page_header_size(p->fmt), len);
+            memcpy(val, cur + cdb_page_payload_offset(p->fmt), len);
         } else if (s != CDB_E_NOT_FOUND) {
             return s;
         }
@@ -617,7 +617,7 @@ static const char *value_of(struct proc *p, uint64_t e)
     if (s == CDB_E_NOT_FOUND)
         return out;
     TEST_ASSERT_EQUAL_INT(CDB_OK, s);
-    memcpy(out, buf + cdb_page_header_size(p->db.pager.fmt), h.payload_len);
+    memcpy(out, buf + cdb_page_payload_offset(p->db.pager.fmt), h.payload_len);
     out[h.payload_len] = '\0';
     return out;
 }
@@ -1010,7 +1010,7 @@ static void test_crashed_process_recovered(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&p2.db.pager, 3, buf, &h));
     TEST_ASSERT_EQUAL_UINT(5, h.payload_len);
-    TEST_ASSERT_EQUAL_MEMORY("three", buf + cdb_page_header_size(p2.db.pager.fmt), 5);
+    TEST_ASSERT_EQUAL_MEMORY("three", buf + cdb_page_payload_offset(p2.db.pager.fmt), 5);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
 }
 

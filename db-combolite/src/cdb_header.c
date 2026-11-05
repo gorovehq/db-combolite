@@ -210,6 +210,8 @@ cdb_status cdb_header_check_features(const cdb_header *h, int *read_only)
     *read_only = 0;
     if (h->incompat_flags & ~CDB_FEATURES_INCOMPAT_KNOWN)
         return CDB_E_UNSUPPORTED;
+    if ((h->incompat_flags & CDB_FEATURES_INCOMPAT_REQUIRED) != CDB_FEATURES_INCOMPAT_REQUIRED)
+        return CDB_E_UNSUPPORTED; /* written before the store ID slot (spec 14.2.7) */
     if (h->rocompat_flags & ~CDB_FEATURES_ROCOMPAT_KNOWN)
         *read_only = 1;
     return CDB_OK;
@@ -238,6 +240,7 @@ cdb_status cdb_header_create(const cdb_storage *st, const cdb_header *h, cdb_hea
     cdb_status s;
 
     rec.epoch = (uint8_t)CDB_HEADER_EPOCH;
+    rec.incompat_flags |= CDB_FEATURES_INCOMPAT_REQUIRED;
     rec.committed_seq = 1;
     rec.ring_size = (uint16_t)CDB_HEADER_SLOTS;
     rec.role = CDB_ROLE_COMMITTED;
@@ -365,6 +368,7 @@ cdb_status cdb_header_commit(const cdb_storage *st, cdb_header_state *hs, const 
 
     memcpy(rec.db_id, hs->record.db_id, sizeof rec.db_id);
     rec.order = hs->record.order;
+    rec.incompat_flags |= hs->record.incompat_flags & CDB_FEATURES_INCOMPAT_REQUIRED; /* never dropped */
     rec.committed_seq = hs->record.committed_seq + 1;
     rec.role = CDB_ROLE_COMMITTED;
     if ((s = write_next(st, hs, &rec)) != CDB_OK)

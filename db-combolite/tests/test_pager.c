@@ -86,7 +86,7 @@ static void expect_text(cdb_pager *p, uint64_t lid, const char *text)
     cdb_page_header h;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(p, lid, page, &h));
     TEST_ASSERT_EQUAL_UINT32(strlen(text), h.payload_len);
-    TEST_ASSERT_EQUAL_MEMORY(text, page + cdb_page_header_size(p->fmt), strlen(text));
+    TEST_ASSERT_EQUAL_MEMORY(text, page + cdb_page_payload_offset(p->fmt), strlen(text));
 }
 
 static void create(cdb_pager *p)
@@ -986,7 +986,7 @@ static void test_page_cache_enclave_security(void)
     /* Authorized read: succeeds and populates cache */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&p, lid, page, &h));
     TEST_ASSERT_EQUAL_UINT32(19, h.payload_len);
-    TEST_ASSERT_EQUAL_MEMORY("secret_enclave_data", page + cdb_page_header_size(p.fmt), 19);
+    TEST_ASSERT_EQUAL_MEMORY("secret_enclave_data", page + cdb_page_payload_offset(p.fmt), 19);
 
     /* Revoke enclave access / lock enclave */
     mock_enclave_allowed = 0;
@@ -995,7 +995,7 @@ static void test_page_cache_enclave_security(void)
     memset(page, 0, sizeof page);
     TEST_ASSERT_EQUAL_INT(CDB_E_SECURITY, cdb_pager_read(&p, lid, page, &h));
     /* Verify zero plaintext was leaked into caller's buffer */
-    TEST_ASSERT_EQUAL_UINT8(0, page[cdb_page_header_size(p.fmt)]);
+    TEST_ASSERT_EQUAL_UINT8(0, page[cdb_page_payload_offset(p.fmt)]);
 
     /* Wipe enclave domain 42 from cache */
     cdb_pager_cache_wipe_domain(&p, 42);
@@ -1003,7 +1003,7 @@ static void test_page_cache_enclave_security(void)
     /* Re-allow enclave access */
     mock_enclave_allowed = 1;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&p, lid, page, &h));
-    TEST_ASSERT_EQUAL_MEMORY("secret_enclave_data", page + cdb_page_header_size(p.fmt), 19);
+    TEST_ASSERT_EQUAL_MEMORY("secret_enclave_data", page + cdb_page_payload_offset(p.fmt), 19);
 }
 
 int main(void)

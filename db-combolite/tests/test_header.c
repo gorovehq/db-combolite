@@ -173,6 +173,9 @@ static void test_feature_classes(void)
 {
     cdb_header h = sample_header(CDB_ORDER_LITTLE);
     int ro;
+    /* A file without the store ID slot is refused (spec 14.2.7). */
+    TEST_ASSERT_EQUAL_INT(CDB_E_UNSUPPORTED, cdb_header_check_features(&h, &ro));
+    h.incompat_flags = CDB_FEATURE_IN_STORE_SLOT;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_header_check_features(&h, &ro));
     TEST_ASSERT_FALSE(ro);
     h.compat_flags = 0x1;
@@ -181,7 +184,7 @@ static void test_feature_classes(void)
     h.rocompat_flags = 0x2;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_header_check_features(&h, &ro));
     TEST_ASSERT_TRUE(ro);
-    h.incompat_flags = 0x4;
+    h.incompat_flags |= 0x4;
     TEST_ASSERT_EQUAL_INT(CDB_E_UNSUPPORTED, cdb_header_check_features(&h, &ro));
 }
 
@@ -255,6 +258,7 @@ static void test_unknown_incompat_refuses(void)
     cdb_header_state hs;
     h.incompat_flags = UINT64_C(1) << 63;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_header_create(&st, &h, &hs));
+    TEST_ASSERT_TRUE(hs.record.incompat_flags & CDB_FEATURE_IN_STORE_SLOT); /* always set on create */
     TEST_ASSERT_EQUAL_INT(CDB_E_UNSUPPORTED, cdb_header_open(&st, &hs));
 }
 

@@ -221,7 +221,7 @@ static void test_enclave_create_and_roundtrip(void)
         cdb_page_header ph;
         TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db.pager, 1, page, &ph));
         TEST_ASSERT_EQUAL_INT(15, ph.payload_len);
-        TEST_ASSERT_EQUAL_MEMORY("enclave_payload", page + cdb_page_header_size(db.pager.fmt), 15);
+        TEST_ASSERT_EQUAL_MEMORY("enclave_payload", page + cdb_page_payload_offset(db.pager.fmt), 15);
     }
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
@@ -243,7 +243,7 @@ static void test_enclave_create_and_roundtrip(void)
         cdb_page_header ph;
         TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db.pager, 1, page, &ph));
         TEST_ASSERT_EQUAL_INT(15, ph.payload_len);
-        TEST_ASSERT_EQUAL_MEMORY("enclave_payload", page + cdb_page_header_size(db.pager.fmt), 15);
+        TEST_ASSERT_EQUAL_MEMORY("enclave_payload", page + cdb_page_payload_offset(db.pager.fmt), 15);
     }
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
@@ -272,7 +272,7 @@ static void test_master_key_rotation(void)
         cdb_page_header ph;
         TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db.pager, 1, page, &ph));
         TEST_ASSERT_EQUAL_INT(15, ph.payload_len);
-        TEST_ASSERT_EQUAL_MEMORY("persistent_data", page + cdb_page_header_size(db.pager.fmt), 15);
+        TEST_ASSERT_EQUAL_MEMORY("persistent_data", page + cdb_page_payload_offset(db.pager.fmt), 15);
     }
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
@@ -306,7 +306,7 @@ static void test_enclave_key_rotation(void)
         cdb_page_header ph;
         TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db.pager, 2, page, &ph));
         TEST_ASSERT_EQUAL_INT(10, ph.payload_len);
-        TEST_ASSERT_EQUAL_MEMORY("v2_payload", page + cdb_page_header_size(db.pager.fmt), 10);
+        TEST_ASSERT_EQUAL_MEMORY("v2_payload", page + cdb_page_payload_offset(db.pager.fmt), 10);
     }
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));

@@ -190,7 +190,7 @@ cdb_status cdb_pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header *tm
                            const void *payload, size_t len);
 
 /* Reads and verifies logical page lid into page (page_size bytes). The
- * payload starts at page + cdb_page_header_size(p->fmt).
+ * payload starts at page + cdb_page_payload_offset(p->fmt).
  * CDB_E_NOT_FOUND when lid has no live page, CDB_E_CORRUPT when the page
  * fails its checksum. */
 cdb_status cdb_pager_read(cdb_pager *p, uint64_t lid, uint8_t *page, cdb_page_header *h);

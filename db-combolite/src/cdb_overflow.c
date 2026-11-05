@@ -126,7 +126,7 @@ static cdb_status chain_page(cdb_pager *p, uint64_t lid, uint64_t store, size_t 
     if (h.type != CDB_PAGE_TYPE_OVERFLOW || !(h.flags & CDB_PAGE_FLAG_OVERFLOW) || h.store_id != store
         || h.payload_len != p->addr_width + part)
         return CDB_E_CORRUPT;
-    pl = page + cdb_page_header_size(p->fmt);
+    pl = page + cdb_page_payload_offset(p->fmt);
     *next = load_lid(p, pl);
     if (last ? *next != 0 : *next == 0)
         return CDB_E_CORRUPT;
@@ -239,7 +239,7 @@ cdb_status cdb_overflow_nib_moved(cdb_db *db, uint64_t store, const uint8_t *oke
             return s == CDB_E_NOT_FOUND ? CDB_E_NOT_FOUND : s;
         if (h.type != CDB_PAGE_TYPE_OVERFLOW || !(h.flags & CDB_PAGE_FLAG_OVERFLOW) || h.store_id != store)
             return CDB_E_NOT_FOUND;
-        pl = pbuf + cdb_page_header_size(db->pager.fmt);
+        pl = pbuf + cdb_page_payload_offset(db->pager.fmt);
         if (h.payload_len < db->pager.addr_width)
             return CDB_E_CORRUPT;
         if (load_lid(&db->pager, pl) != old_addr)

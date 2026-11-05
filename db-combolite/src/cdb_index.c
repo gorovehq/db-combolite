@@ -241,7 +241,7 @@ static cdb_status read_node(cdb_index *ix, uint64_t lid, uint8_t *page, node_vie
         return s == CDB_E_NOT_FOUND ? CDB_E_CORRUPT : s;
     if (h.type != CDB_PAGE_TYPE_INDEX_NODE)
         return CDB_E_CORRUPT;
-    return view_node(ix, page + cdb_page_header_size(ix->pager->fmt), v);
+    return view_node(ix, page + cdb_page_payload_offset(ix->pager->fmt), v);
 }
 
 /* Loads node lid into the work entries, with full keys. Interior children,
@@ -924,7 +924,7 @@ cdb_status cdb_index_open(cdb_index *ix, cdb_pager *p, uint64_t root, const cdb_
         return s;
     if (h.type != CDB_PAGE_TYPE_INDEX_NODE)
         return CDB_E_CORRUPT;
-    if ((s = view_node(ix, w_page(ix) + cdb_page_header_size(p->fmt), &v)) != CDB_OK)
+    if ((s = view_node(ix, w_page(ix) + cdb_page_payload_offset(p->fmt), &v)) != CDB_OK)
         return s;
     ix->flags = (uint8_t)v.flags;
     ix->store_id = h.store_id;

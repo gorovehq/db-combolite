@@ -66,11 +66,11 @@ static uint64_t load_addr(const cdb_pager *p, const uint8_t *at)
     return p->addr_width == 8 ? cdb_load_u64(at, p->order) : cdb_load_u32(at, p->order);
 }
 
-/* Byte offset of the payload inside a page: the payload starts right after
- * the common page header, whose size depends on the page format. */
+/* Byte offset of the payload inside a page: the payload starts after the
+ * common page header and the store ID slot (spec 14.2.7). */
 static size_t payload_off(const cdb_pager *p)
 {
-    return cdb_page_header_size(p->fmt);
+    return cdb_page_payload_offset(p->fmt);
 }
 
 /* Size of one anchor-map leaf entry: the physical address, then page size
@@ -229,15 +229,9 @@ static cdb_status pager_seal_page(cdb_pager *p, uint8_t *buf, cdb_page_header *h
     return s;
 }
 
-static uint64_t load_domain_id(const uint8_t *p, unsigned w, cdb_byte_order o)
-{
-    if (w == 8)
-        return cdb_load_u64(p, o);
-    if (w == 4)
-        return cdb_load_u32(p, o);
-    return cdb_load_u16(p, o);
-}
-
+/* Verifies the page in buf and decrypts it when it is encrypted. The
+ * header, read without verifying it first, names the domain whose key opens
+ * the page. */
 static cdb_status pager_open_page(cdb_pager *p, uint8_t *buf, cdb_page_header *h)
 {
     const uint8_t *key = NULL;
@@ -245,37 +239,18 @@ static cdb_status pager_open_page(cdb_pager *p, uint8_t *buf, cdb_page_header *h
     unsigned aead_alg = CDB_AEAD_NONE;
     cdb_status s;
 
-    /* First attempt to open unencrypted */
-    s = cdb_page_open(buf, p->page_size, p->fmt, p->order, p->checksum_alg, h);
-    if (s != CDB_OK) {
-        /* Peek header to determine domain_id and flags without CRC check */
-        if (buf[0] != 0xC0u || buf[1] != 0xDBu)
-            return CDB_E_CORRUPT;
-        h->flags = buf[5];
-        if (p->fmt == CDB_PAGE_FMT_COMPACT) {
-            h->domain_id = load_domain_id(buf + 24, 2, p->order);
-            h->key_version = cdb_load_u16(buf + 16, p->order);
-        } else {
-            unsigned w = p->fmt == CDB_PAGE_FMT_FULL64 ? 8u : 4u;
-            h->domain_id = load_domain_id(buf + 24 + 2 * w, w, p->order);
-            h->key_version = cdb_load_u32(buf + 8, p->order);
-        }
-    }
-
+    if ((s = cdb_page_peek(buf, p->page_size, p->fmt, p->order, h)) != CDB_OK)
+        return s;
     if (h->domain_id > 0 && p->aead_alg != CDB_AEAD_NONE) {
-        if (p->domain_key_fn != NULL &&
-            p->domain_key_fn(p->domain_key_ctx, h->domain_id, h->key_version, key_buf) == CDB_OK) {
-            key = key_buf;
-            aead_alg = p->aead_alg;
-        } else {
+        if (p->domain_key_fn == NULL
+            || p->domain_key_fn(p->domain_key_ctx, h->domain_id, h->key_version, key_buf) != CDB_OK)
             return CDB_E_SECURITY;
-        }
+        key = key_buf;
+        aead_alg = p->aead_alg;
     } else if (h->flags & CDB_PAGE_FLAG_TAMPER_EVIDENT) {
         if (!p->has_integrity_key)
             return CDB_E_SECURITY;
         key = p->integrity_key;
-    } else if (s == CDB_OK) {
-        return CDB_OK;
     }
 
     s = cdb_page_open_crypto(buf, p->page_size, p->fmt, p->order, p->checksum_alg,
