@@ -17,7 +17,7 @@ This section was written after a first implementation (the CRDT helpers and `cdb
 ### 19.1 Copies and the replication group
 
 - **A copy** is a database file that takes part in replication. Copies of one database form its **replication group**.
-- **Creating a replica.** A new copy is made from an existing one by a dedicated call, never by copying the file alone. The call gives the new copy its own **copy number**.
+- **Creating a replica.** A new copy is made from an existing one by a dedicated call, never by copying the file alone. The call gives the new copy its own **copy number** and its own database ID; the group shares a **group ID** (14.21.1).
 - **Copying the file is not a replica.** A plain copy of the file that goes on being written beside the original is a fork, not a member of the group: it has the original's copy number, so the IDs it allocates (19.2) can collide with the original's. Its encryption is safe either way, because every session writes under its own salt (12.1).
 - **Copy numbers** are 16 bits. The first copy holds all of them. A copy creating a replica hands it **half of its remaining copy numbers**, so numbers are never handed out twice and no copy needs to ask another.
 - **Group size.** A per-database limit on the number of copies in the group, set when the database is created (default 32). A replica beyond it is refused. The version vector (19.4) is bounded by it, so it fits in fixed memory and in one page.
@@ -36,9 +36,9 @@ Every ID a replicated object or entry takes is unique across the group: **its to
 
 ### 19.4 Clocks and version vectors
 
-- **Hybrid logical clock.** Every replicated change carries a hybrid-logical-clock time: physical time, a logical counter and the copy number. Times are totally ordered, and a copy's clock moves past every time it receives.
+- **Hybrid logical clock.** Every replicated change carries a hybrid-logical-clock time: physical time, a logical counter and the copy number. Times are totally ordered. A copy's clock moves past every time it receives, up to the drift bound (below), and **every write is stamped later than what it overwrites**: a write to a path takes a time after both the copy's clock and the path's current clock time (19.5), so a local change always supersedes the value it replaces, even one stamped by a fast clock.
 - **Version vector.** Each copy keeps, per origin copy, the latest change it has applied from that origin. A slice for a receiver holds the changes above the receiver's vector.
-- **Persistence.** The copy number, the clock and the vector are stored in the database, and the vector advances only when the transaction that applied the changes commits. A reopened copy remembers what it has seen.
+- **Persistence.** The copy number, the clock and the vector are stored in the database, and the vector advances only when the transaction that applied the changes commits: each such transaction journals its clock and vector advances with its commit, and reconciliation folds them into the copy's group record (14.21.1). A reopened copy remembers what it has seen.
 - **Clock readings.** Copies are not continuously connected, so they exchange no heartbeats. Instead, every sync handshake carries the sender's wall-clock reading and the clock offsets it has measured for other copies. The receiver records, for each copy, its estimated offset from the local clock with an error bound (the transit time can't be known), in a built-in **replication-clock time series**, and relays the estimates in its own handshakes. Every copy thus knows the estimated drift of the whole group, and governance can show which copy was off, by how much, and when.
 - **Clocks are never adjusted** from these readings: the library sets no system clock, and changing clock times would change who won past conflicts.
 - **Drift bound.** A configured bound limits how far ahead of the local clock a received change may be stamped. A change beyond it is still applied, since every copy must treat it alike to converge, but it is recorded as an audit event naming the copy and its offset, and the local hybrid clock moves at most to the local time plus the bound because of it. A fast copy still wins its own conflicts, visibly.
@@ -65,7 +65,7 @@ A replicated delete leaves a tombstone, so that an old change arriving late can'
 ### 19.7 Slices
 
 - **Logical changes.** A slice carries changes in merge form, independent of the journal's layout: set or remove a path, delete an entry, add or remove a link, a time-series point, replace a vector, and the catalog objects and schema versions replicated stores need (14.21.5). Export derives them from committed transactions.
-- **Signed by the sender.** Every message is signed with the sending copy's principal key (12.5). A receiver refuses messages from unknown or retired principals, and messages whose signature fails, so slices are tamper-evident and every change is attributable. Keeping public changes confidential in transit is the transport's job (TLS, for example).
+- **Signed by the sender.** Every message is signed with the sending copy's principal key (12.5). The private key stays in the application's keystore, found through a key reference in the copy's group record (12.3); it is never in the file. Messages carry a per-sender sequence number, so a replayed message changes nothing (14.21.4). A receiver refuses messages from unknown or retired principals, and messages whose signature fails, so slices are tamper-evident and every change is attributable. Keeping public changes confidential in transit is the transport's job (TLS, for example).
 
 ### 19.8 Encryption
 

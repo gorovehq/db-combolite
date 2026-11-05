@@ -41,13 +41,19 @@ After a crash, numbering resumes at the persisted high-water mark. A sequence nu
 ### 12.2 Key hierarchy
 
 - **Envelope encryption.** Enclave keys are stored in the external keystore (Section 1.4) **encrypted under the master key**. A stolen keystore is useless without the master key.
-- **Separate subkeys for each purpose.** From each enclave key, the library derives a separate subkey for each job:
-  - encrypting pages;
-  - computing keyed content hashes (Section 6.3);
-  - protecting the enclave's indexes;
-  - sealing references to its entries in joined stores (12.9): one subkey derives the synthetic nonce, another encrypts.
+- **Separate subkeys for each purpose.** From each domain key (an enclave's or a joined store's), and from each of its key versions, the library derives a separate subkey for each job with HKDF-SHA-256, the job's label as the info:
 
-  A weakness in one use of a key therefore can't affect another use.
+  | Subkey | Label | Session salt (12.1) | Used for |
+  |---|---|---|---|
+  | page | `cdb page` | yes | encrypting pages and delta records (counter nonces, 14.2.5) |
+  | hash | `cdb hash` | no | keyed content hashes (Section 6.3) |
+  | index | `cdb index` | no | protecting the domain's indexes, and the tags of its entries in joined stores (12.9) |
+  | seal | `cdb seal` | no | encrypting sealed references in joined stores (12.9) |
+  | seal nonce | `cdb seal nonce` | no | deriving those references' synthetic nonces |
+  | replication | `cdb repl` | no | encrypting sealed changes in replication slices (14.21.5) |
+  | replication nonce | `cdb repl nonce` | no | deriving those changes' synthetic nonces |
+
+  Only the page subkey uses a counter nonce, so only it takes the session salt; every copy and session computes the others alike. Distinct labels keep every use apart: a weakness in one use of a key can't affect another use.
 - **Joined stores** (Section 4.9) have keys of their own, handled exactly like enclave keys.
 
 ### 12.3 Key provider references
@@ -148,7 +154,7 @@ An **encryption domain** is either the public domain (ID 0), an enclave, or a jo
 - **Links between domains.** A link whose two ends are in different domains is stored in a joined store. A link type whose ends may be in different domains names the joined store its links go into.
 - **Opaque pointers.** Inside a joined store, an end that lies in an enclave is an **opaque pointer** with two parts (14.13.2):
   - **a tag**: the keyed hash (HMAC-SHA-256, all 32 bytes) of the joined store's ID and the entry reference under that enclave's index subkey (12.2), used in the index key, so that equal references match and a pair can be looked up, and the same entry can't be matched across two joined stores;
-  - **the sealed reference**: the entry reference encrypted under the enclave's sealing subkey, so that only holders of the enclave key can follow it. Its nonce is **synthetic**: a keyed hash of the joined store's ID and the reference, under a second sealing subkey. It is never stored, needs no random source (12.1), and is the same only when everything it protects is the same.
+  - **the sealed reference**: the entry reference encrypted under the enclave's seal subkey, so that only holders of the enclave key can follow it. Its nonce is **synthetic**: a keyed hash of the joined store's ID and the reference, under the enclave's seal nonce subkey. It is never stored, needs no random source (12.1), and is the same only when everything it protects is the same.
 
   A joined store therefore reveals neither the names nor the structure of the enclaves it points into. An end in the public domain is stored as is.
 - **Link types that cross domains** live in the joined store's catalog. A link type names the joined store its links go into and the **member domains** whose entries its links may join; a link with an end in any other domain is refused.
