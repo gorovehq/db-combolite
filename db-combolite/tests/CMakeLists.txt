@@ -9,7 +9,8 @@ endif()
 # Test-only support code: kept out of the production library.
 add_library(combolite_testing STATIC
   ${PROJECT_SOURCE_DIR}/src/cdb_faultdev.c
-  ${PROJECT_SOURCE_DIR}/src/cdb_faultenv.c)
+  ${PROJECT_SOURCE_DIR}/src/cdb_faultenv.c
+  ${PROJECT_SOURCE_DIR}/src/cdb_fakeaccel.c)
 target_include_directories(combolite_testing PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(combolite_testing PUBLIC combolite)
 target_compile_options(combolite_testing PRIVATE ${CDB_WARNINGS})
@@ -45,6 +46,7 @@ cdb_add_test(test_link)
 cdb_add_test(test_schema)
 cdb_add_test(test_fts)
 cdb_add_test(test_vec)
+cdb_add_test(test_accel)
 cdb_add_test(test_graph)
 cdb_add_test(test_tsbits)
 cdb_add_test(test_tsblock)
@@ -91,4 +93,12 @@ cdb_add_test(test_idblocks)
 foreach(name test_link test_fts test_vec test_ts test_table test_rowgroup)
   add_test(NAME ${name}_cap1 COMMAND ${name})
   set_tests_properties(${name}_cap1 PROPERTIES ENVIRONMENT CDB_TEST_MAX_OPEN=1)
+endforeach()
+
+# The vector suites again with the fake accelerator installed (spec 18.11):
+# they must give exactly the same results; the graph suite's crash sweep
+# runs with it too.
+foreach(name test_vec test_graph)
+  add_test(NAME ${name}_accel COMMAND ${name})
+  set_tests_properties(${name}_accel PROPERTIES ENVIRONMENT CDB_TEST_ACCEL=1)
 endforeach()

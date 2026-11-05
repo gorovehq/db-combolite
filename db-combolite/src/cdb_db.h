@@ -164,7 +164,43 @@ typedef struct cdb_db_config {
      * vec_work; 0 means CDB_VEC_MEM_DEFAULT (spec 17.4). At the limit a
      * refresh is slower, never an error (spec 17.3). */
     size_t vec_mem;
+    /* Host profile: most device memory the accelerator's mirrors may use
+     * together, counted as their vectors' bytes; 0 leaves it to the
+     * accelerator (spec 18.8). */
+    uint64_t accel_mem;
 } cdb_db_config;
+
+/* Mirrors of vector collections on the environment's accelerator (spec
+ * 18.6-18.8), kept apart from the open-store slots so that closing a
+ * collection's slot does not drop its mirror. */
+#define CDB_ACCEL_MIRRORS 16u      /* collections mirrored at once */
+#define CDB_ACCEL_QUEUE 4096u      /* changes held for a mirror between uses */
+
+enum { CDB_ACCEL_FREE = 0, CDB_ACCEL_WANTED, CDB_ACCEL_READY };
+
+typedef struct cdb_accel_entry {
+    uint64_t store;
+    int state;                  /* CDB_ACCEL_*: WANTED is filled at reconciliation or tick */
+    cdb_accel_mirror *m;        /* READY only */
+    uint64_t seen;              /* reflects the archive at this committed sequence, plus what was applied since */
+    uint64_t vectors;           /* in the mirror */
+    uint64_t bytes;             /* its vectors' bytes, counted against accel_mem */
+    uint64_t last_use;
+    size_t vec_bytes;
+    uint64_t *queue;            /* changed entries not sent yet; top bit set: deleted */
+    size_t queued;
+} cdb_accel_entry;
+
+/* What the accelerator path did, for tests and diagnostics. */
+typedef struct cdb_accel_stats {
+    uint64_t fills;             /* mirrors filled from the vector blocks */
+    uint64_t certified;         /* searches answered from a certified shortlist */
+    uint64_t widened;           /* shortlists asked for again, twice as long */
+    uint64_t cpu;               /* searches that went to the CPU path: no mirror yet, declined, or too wide */
+    uint64_t catchups;          /* mirrors caught up from a change log at a rebase */
+    uint64_t stale;             /* mirrors dropped to be filled again */
+    uint64_t evicted;           /* mirrors dropped to make room */
+} cdb_accel_stats;
 
 /* An open document pool (cdb_doc.h). */
 struct cdb_doc_pool {
@@ -363,6 +399,11 @@ typedef struct cdb_db {
     /* Graph refreshes whose list of entries to check overflowed, so every
      * entry was checked (spec 14.12.4): a diagnostic for tests. */
     uint64_t vec_full_checks;
+    /* The accelerator's mirrors (spec 18). */
+    cdb_accel_entry accel[CDB_ACCEL_MIRRORS];
+    uint64_t accel_bytes;       /* the mirrors' bytes together */
+    uint64_t accel_clock;       /* counts mirror uses, for least recently used */
+    cdb_accel_stats accel_stats;
     /* Security, encryption & RBAC (spec 12). */
     uint8_t master_key[32];
     uint8_t integrity_key[32];

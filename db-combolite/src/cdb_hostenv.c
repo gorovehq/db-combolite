@@ -402,4 +402,6 @@ void cdb_hostenv_init(cdb_hostenv *he, cdb_env *out)
     memset(he, 0, sizeof *he);
     out->ops = &hostenv_ops;
     out->ctx = he;
+    out->accel = NULL; /* an accelerator library sets its own (spec 18.7) */
+    out->accel_ctx = NULL;
 }
