@@ -201,6 +201,7 @@ AES-GCM and ChaCha20-Poly1305 both take a 12-byte nonce:
   | `0x0008` | time-series block (14.11.1) |
   | `0x0009` | nibblet page: small records of any store (14.18) |
   | `0x000A` | enclave root: the roots of an enclave's or joined store's own catalog (14.3.5) |
+  | `0x000B` | held log: a domain's committed changes waiting for its key (14.4.10) |
   | `0x7F00` | reserved for tests |
 
   Further page types are assigned IDs when they are built.
@@ -313,6 +314,7 @@ The enclave directory is the public half of every enclave and joined store (12.8
   | 18 | current key version: the version new writes use; it is in field 17 |
   | 19 | enclave root: an array of two logical page IDs, the primary and the mirror enclave root page (below) |
   | 20 | rotation: an object `{1: last rotated, 2: interval, 3: overdue response}` |
+  | 21 | held log: the logical page ID of the held log's head page (14.4.10) |
 
 - **Key versions.** Each key reference (12.3) addresses that version's key, wrapped under the master key, in the external keystore. Rotating the key appends a version and makes it current. A version is removed from field 17 once compaction has re-encrypted the last page and the last held record (12.8) that used it. A page or record whose key version is not in field 17 is corrupt.
 - **Enclave root pages.** The two pages named in field 19 are in the domain's own encryption domain, encrypted under its current page subkey, and hold the roots of the domain's own catalog (14.3.5). The primary and the mirror are written alike, as the public catalog's body is (3.5); their logical IDs never change.
@@ -494,6 +496,38 @@ Rolling back to a savepoint drops the data records an open transaction has journ
 5. **Commit.** A transaction with at least one rollback record sets flag `0x10` on its commit record. A reader that finds the flag reads the transaction's records once to collect the dropped ranges before it applies any. A reader that does not find it does not look for rollback records. The commit's delta count leaves dropped records out. A transaction whose data records were all dropped ends with an abort record, not a commit record.
 6. **Readers.** Everything that takes a committed transaction's changes skips dropped records: the apply at commit, replay after a crash, rotation (14.4.7 rule 2) and replication export. An open transaction's own reads of its journal (its view of its own changes) skip them too.
 7. **Collisions.** Write-set key records (kind 4) are never dropped, and another process's collision scan (5.9.4) does not look for rollback records. Dropped changes can therefore cause a needless collision, never a missed one.
+
+### 14.4.10 Held log (12.8)
+
+A domain's held log keeps the committed changes of that domain that a process could not apply because it lacked the key. It lives in the archive, so the database stays one file at rest, and it is written without the key: it holds the records' ciphertext unchanged.
+
+1. **Pages.** The log is a chain of logical pages of type `0x000B`. They are public pages (domain ID 0, store ID 0) holding another domain's ciphertext. The head page is allocated when the domain is created; its logical ID is in the directory record's field 21 (14.3.4) and never changes. Payload, in the file's byte order:
+
+   | Size | Field |
+   |---|---|
+   | address width | Next page's logical ID, 0 for the last page |
+   | 4 | Bytes used in this page after this field |
+   | n | Log bytes |
+
+   The log is the concatenation of the pages' log bytes. An entry can continue onto the next page.
+2. **Entry.** One per held part of a transaction, in merge order (14.4.7 rule 5):
+
+   | Size | Field |
+   |---|---|
+   | 4 | Length of the rest of the entry |
+   | 8 | Transaction ID (14.4.3) |
+   | 8 | Commit stamp (14.4.4), the merge order key |
+   | 8 | Global commit number the transaction was given at reconciliation (14.1.8) |
+   | 4 | Track ID of the records: slot (2 bytes) and companion type (2 bytes), as in the nonce (14.2.5) |
+   | 4 | Record count |
+   | n | The records, each a complete delta record (14.4.2) copied byte for byte |
+
+   Only the domain's records that the transaction keeps are copied: its data changes and neuron-weight updates, in journal order. Write-set keys, rollback records and the data records a rollback dropped (14.4.9) are left out.
+3. **Nonces.** A held record keeps its header, sequence number and ciphertext, so it is decrypted with the nonce built from the entry's track ID and the record's own sequence number. Copying it changes nothing that the nonce or the associated data covers, and delta sequence numbers are reserved durably (12.1), so no other record ever takes that nonce.
+4. **Holding** happens in the archive commit that applies the transaction's other domains and advances its slot's mark (5.9.2). The entry is appended to the log, and new pages are linked, in that same commit, so a crash leaves either both or neither.
+5. **Draining** happens in a reconciliation by a process that holds the domain's key. It applies the entries in log order, frees every page but the head, and empties the head, all in one archive commit; then it applies the domain's new changes.
+6. **Reading.** A process with the domain open reads the log's entries in order, after the archive and before the journals, when it builds its view of the domain.
+7. **Key versions.** A held record names the key version that encrypted it. That version stays in the directory record's field 17 until the record is drained (14.3.4).
 
 ## 14.5 Coordinator slot
 
