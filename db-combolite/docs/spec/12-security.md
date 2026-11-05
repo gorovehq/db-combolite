@@ -23,6 +23,14 @@ The algorithm is chosen per file and recorded in a header flag, in the same way 
 
 No random number generator is needed for nonces.
 
+**Per-session salts make forks safe.** A copy of a database file that goes on being written beside the original (a cloned database, a restored backup, a snapshot) counts its sequence numbers up from the same point, so on its own it would repeat nonces under the same keys. To prevent this:
+
+- each time a database is opened for writing, the library draws a **random 128-bit session salt**, once;
+- page and record subkeys are derived from the domain key **and the session salt** (12.2), so two forks of one file encrypt under different subkeys and their nonces may repeat harmlessly;
+- each page and record names the salt it was encrypted under, by a small index into a **salt table** kept in the file. A salt is removed from the table once no page or record uses it, as an old key version is (12.4).
+
+The random source is needed once per session, never per nonce. A replica (Section 19) needs nothing more: it writes under its own session salts like any copy.
+
 **Sequence numbers are reserved durably (review R1).** Before any sequence number in a range *[n, n+B)* is used, the high-water mark *n+B* is persisted:
 
 - page sequences: in the working header copy;
@@ -169,4 +177,5 @@ Stored procedures are catalog objects (14.3.6), with the source text, compiled f
 
 The decisions in 12.8–12.10 are confirmed; these byte-level details are still to be proposed and confirmed:
 
-- **Replication slices**: the byte form of a sealed domain change in a slice (with Section 19's wire format). Nonce uniqueness across copies is settled by per-copy subkeys (19.7).
+- **Replication slices**: the byte form of a sealed domain change in a slice (with Section 19's wire format).
+- **Session salts** (12.1): the salt table's place and layout, the width and position of the salt index in page headers (14.2) and delta record headers (14.4.2), how the salt enters subkey derivation, pruning, and what a platform without a random source does.

@@ -17,8 +17,8 @@ This section was written after a first implementation (the CRDT helpers and `cdb
 ### 19.1 Copies and the replication group
 
 - **A copy** is a database file that takes part in replication. Copies of one database form its **replication group**.
-- **Creating a replica.** A new copy is made from an existing one by a dedicated call, never by copying the file alone. The call gives the new copy its own **copy number** and its own encryption subkeys (19.7).
-- **Copying the file is not a replica.** A copy of the file that goes on being written, beside the original, reuses nonces under the same keys (12.1). Restoring a backup and writing to only one of the two is safe; writing to both is not. The library can't detect a plain file copy, so this rule is documented, not enforced.
+- **Creating a replica.** A new copy is made from an existing one by a dedicated call, never by copying the file alone. The call gives the new copy its own **copy number**.
+- **Copying the file is not a replica.** A plain copy of the file that goes on being written beside the original is a fork, not a member of the group: it has the original's copy number, so the IDs it allocates (19.2) can collide with the original's. Its encryption is safe either way, because every session writes under its own salt (12.1).
 - **Copy numbers** are 16 bits. The first copy holds all of them. A copy creating a replica hands it **half of its remaining copy numbers**, so numbers are never handed out twice and no copy needs to ask another.
 - **Group size.** A per-database limit on the number of copies in the group, set when the database is created (default 32). A replica beyond it is refused. The version vector (19.4) is bounded by it, so it fits in fixed memory and in one page.
 - **Retiring a copy** removes it from the group, so that tombstones it has not seen can be purged (19.6).
@@ -58,7 +58,7 @@ A replicated delete leaves a tombstone, so that an old change arriving late can'
 
 ### 19.7 Encryption
 
-- **Per-copy subkeys.** Each copy derives its page and record subkeys from the domain key **and its copy number** (12.2). Two copies sharing an enclave key therefore encrypt under different subkeys, and their nonces may repeat harmlessly. The nonce layout (14.2.5) does not change.
+- **Nonces across copies.** Every session that writes a copy draws its own salt, and subkeys are derived with it (12.1). Two copies sharing an enclave key therefore encrypt under different subkeys, and their nonces may repeat harmlessly. The nonce layout (14.2.5) does not change, and replicas need no subkeys of their own.
 - **Sealed for the receiver.** A domain's changes are exported only while the domain is open on the sending copy, sealed in the slice under the domain's key, never in plaintext (12.8). The receiving copy needs the same domain key to apply them; until it has it, it holds them in the domain's held log (14.4.10).
 
 ## Open questions (do not specify until answered)
@@ -68,5 +68,4 @@ A replicated delete leaves a tombstone, so that an old change arriving late can'
 - **Copy and group records**: the copy number range a copy owns, the group limit, members and their last reported vectors, retired copies.
 - **Conflict list**: its layout and the calls that list and resolve conflicts.
 - **Wire format**: the handshake and the slice, with sealed domain changes; versioning of the wire format.
-- **Subkey derivation**: how the copy number enters the derivation (12.2), and what the first copy uses.
 - **Migration**: what becomes of databases written by the first implementation, and of IDs allocated before a database joins a group.
