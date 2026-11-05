@@ -37,6 +37,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | M22 | Text query language (CMBQL): db-combolite's own human-readable language (CMBQL), formal EBNF grammar and lexer, literal dot escaping vs 0x1F nested path resolution, procedural variable scoping and materialization, compiling into the M21 structured core (spec 11.1, 11.10) | done |
 | M23 | Cross-store atomic transactions and collision handling, triggers and trigger safety, scheduled and maintenance-window procedure runs, intra-transaction cursor isolation, procedure error trapping and savepoints (spec 11.3, 11.6, 11.9) | done |
 | M24 | Security, authenticated encryption (AES-256-GCM, ChaCha20-Poly1305), envelope key wrapping, subkey derivations, key rotation, tamper-evident governance mode, identities and RBAC authorization (spec 12, 14) | done |
+| M25 | Compute acceleration (spec 18), in layers. **1:** the accelerator hook in `cdb_env`, mirrors (filled on the worker pool a chunk at a time, kept in step through batched apply notes, caught up from the vector change log at a rebase, evicted under `accel_mem`), certified exact search, the fake accelerator. **2:** CUDA backend (cuBLAS distances, our own top-K). **3:** Vulkan backend (our own shaders, checked-in SPIR-V). **4:** bulk search, graph refresh acceleration (after profiling), the demo | layer 1 done |
 
 ## Commands
 
@@ -137,6 +138,8 @@ These were agreed with the user:
       - The fault environment's allocator frees everything at reboot, as a crash would. `cdb_faultenv_live_allocs()` counts what is live.
       - ctest runs the multi-store suites a second time as `<suite>_cap1`, with `CDB_TEST_MAX_OPEN=1`. A test that needs several stores of one model in one transaction calls `need_open(n)`.
 - `src/cdb_faultenv.*`: several fault devices on one shared crash clock, plus directory entries that are lost on crash unless their directory was synced. Test-only.
+- `src/cdb_fakeaccel.*`: a fake accelerator (spec 18.11) for the `cdb_env` accelerator hook: the CPU's distances plus noise up to the bound it reports, and calls scriptable to decline or fail. Test-only, like the fault devices. ctest reruns the vector and graph suites with it as `<suite>_accel` (`CDB_TEST_ACCEL=1`); they must give exactly the CPU's results.
+- **Locking.** Every public data call holds the database's re-entrant lock (`cdb_db_lock`) for its whole run, so worker-pool tasks (graph refresh, mirror refills) never overlap an application call. A new public call takes it too: wrap an unchanged static body. The lock is a no-op without thread hooks.
 - `src/cdb_faultdev.*`: an in-memory device that simulates power loss: unsynced writes are dropped, kept in part or torn. It is built only into the `combolite_testing` library, never into the production library.
   - **Crash modes:** drop every unsynced write, keep an in-order prefix of them, tear a write partway, or reorder (only the latest write survives, the way a real disk can land writes out of order).
   - **Crash sweeps.** A test counts a workload's mutating operations, then crashes at each one in every mode, calls `cdb_faultdev_reboot()`, and checks what recovery sees. Every new write sequence needs a sweep, and the reorder mode is what catches a missing barrier.
@@ -176,6 +179,7 @@ The confirmed meanings of these terms are in `docs/spec/06-keys-links.md`:
    - **mbedTLS**, for cryptography, behind a crypto interface of our own. Never hand-roll cryptography.
    - **ICU**, for language-aware collation on hosts that are not microcontrollers (spec 14.8.6).
    - **xz (liblzma)**, for LZMA2 compression of column chunks (spec 9.12). It is vendored in `third-party/xz` from a pinned release whose signature has been checked, never 5.6.0 or 5.6.1 (CVE-2024-3094), and its allocations go through the environment's allocator.
+   - **CUDA** (the runtime and **cuBLAS**) and **Vulkan** (the loader and headers; `glslc` to generate the checked-in SPIR-V), for the optional accelerator library `combolite_accel` only (spec 18.5). They are system installs, never vendored, and never reach the core: the core sees only the `cdb_env` accelerator hook. Each goes in `ATTRIBUTIONS.md` when first used.
 
 ### Role in the larger effort
 
