@@ -117,6 +117,8 @@ An **encryption domain** is either the public domain (ID 0), an enclave, or a jo
 - **Each enclave has its own link store** for links whose ends are both inside it. A link between domains goes in a joined store (12.9).
 - **Wrapped keys stay in the keystore.** A key reference (12.3) points at the enclave's key **wrapped under the master key** in the external keystore. The library fetches the wrapped key and unwraps it with the master key; the archive holds only references, never key material (Section 1.4).
 - **What stays readable.** Page headers and delta record headers of an enclave or joined store are authenticated but not encrypted, and they carry **only the domain ID**. The store ID and entry ID of an encrypted page or record are kept inside its encrypted payload, and the readable fields hold 0. An outsider with the file can learn which domain wrote how much and when, but not which store or entry changed, nor any name, schema, content or key.
+- **Collisions with hidden IDs.** When a process scans another process's journal for clashing writes (5.9.4), it skips the encrypted records of every domain its own transaction did not write: they cannot overlap its write set. It decrypts the records of the domains it did write, whose keys it holds because it wrote there, and compares their store and entry IDs. No process needs another tenant's key, and no write clashes needlessly.
+- **Replication.** Replication between copies of a database (built ahead of its spec section; the replicated flag is in 14.4.2) exports a domain's changes only while the domain is open, and are sealed in the slice under the domain's key, never sent in plaintext. The receiving copy must hold the same domain key to import them; until it does, it holds them, as recovery holds records (below).
 - **Recovery with a closed enclave.** Recovery replays every transaction it can. A committed transaction's records for an enclave whose key isn't available are **held** until that enclave is opened, and are applied then, in commit order. The journal that holds them is kept until they are applied.
 - **Accelerator mirrors.** A vector collection in an enclave is mirrored on an accelerator (Section 18) only while its enclave is open. Closing the enclave evicts the mirror and zeroes its device memory, as the decrypted page cache is wiped (12.6).
 
@@ -145,7 +147,8 @@ The decisions in 12.8–12.10 are confirmed; these byte-level details are still 
 
 - **RBAC records**: principals and role grants as catalog objects, public ones in the public catalog and an enclave's roles in its own (14.3.5): their kinds and fields.
 - **Hidden IDs**: where the store ID and entry ID sit inside an encrypted page payload and an encrypted delta record (Sections 13, 14.2, 14.4.2).
-- **Held records**: how recovery records the transactions it holds, how holding interacts with journal rotation (14.4.7) and with other processes (Section 5.9), and the crash cases.
+- **Held records**: how recovery and replication import record the transactions they hold, how holding interacts with journal rotation (14.4.7: a rotated record gets a new sequence number and so a new nonce, which needs the domain's key) and with other processes (Section 5.9), and the crash cases.
+- **Replication slices**: the byte form of a sealed domain change in a slice.
 - **Moving a store**: the store record's target-domain field, and how compaction finds and re-encrypts the pages still in the old domain.
 - **Joined stores**: the index layout of their links and the byte form of an opaque pointer.
 - **Procedure records**: their object kind in the catalog (14.3.3) and their fields.
