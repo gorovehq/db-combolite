@@ -131,7 +131,8 @@ The fields are defined in Section 13. 8-byte fields are aligned to 8-byte bounda
 | 32 | 8 | Owning store ID |
 | 40 | 8 | Encryption domain ID |
 | 48 | 2 | Extent position |
-| 50 | 6 | Reserved, zero |
+| 50 | 2 | Session salt index (14.2.8); 0 on a page that is not encrypted |
+| 52 | 4 | Reserved, zero |
 
 ### 14.2.2 Full header, 32-bit file (40 bytes)
 
@@ -143,7 +144,7 @@ Bytes 0–23 are the same as in 14.2.1. The rest of the header is:
 | 28 | 4 | Owning store ID |
 | 32 | 4 | Encryption domain ID |
 | 36 | 2 | Extent position |
-| 38 | 2 | Reserved, zero |
+| 38 | 2 | Session salt index (14.2.8) |
 
 ### 14.2.3 Compact header (28 bytes)
 
@@ -161,7 +162,7 @@ Bytes 0–23 are the same as in 14.2.1. The rest of the header is:
 | 20 | 2 | Logical page ID |
 | 22 | 2 | Owning store ID |
 | 24 | 2 | Encryption domain ID |
-| 26 | 2 | Reserved, zero |
+| 26 | 2 | Session salt index (14.2.8) |
 
 ### 14.2.4 Trailer
 
@@ -222,6 +223,14 @@ Every page's payload starts with a **store ID slot**, in every domain, so that a
 - **Checks.** A reader that expects a page of a known store checks the slot, after decryption on an encrypted page.
 - **Files written before the slot** are not supported and are not migrated: the format is not yet stable (pre-1.0), and such a database is rebuilt from its source data. Files with the slot carry incompatible feature flag 0 (14.1.10): a library that knows the slot refuses a file without the flag, and an older library refuses a file with it, each with a clear status instead of misreading pages.
 
+### 14.2.8 Session salts (12.1)
+
+- **Drawing.** Opening a database for writing draws a 16-byte salt from the environment's random hook (`cdb_env.random`), once, before the first encrypted write. Without the hook, an encrypted database opens read-only; a database with no encryption is unaffected.
+- **Salt table.** An ordered index (14.8) whose root is at catalog root slot offset 104 (14.3.2): key, the salt index (2 bytes, big-endian, 1–65,535); value, the salt (16 bytes). A session takes the lowest free index when it draws its salt, and the table entry is committed with the session's first encrypted write.
+- **Use.** An encrypted page or delta record names its salt in the salt index field of its header (14.2.1–14.2.3, 14.4.2). The index is part of the header, so it is authenticated as associated data. Index 0 means no salt and is used only by pages and records that are not encrypted.
+- **Derivation.** Every subkey that encrypts pages or records is derived with HKDF-SHA-256 from the domain key, with the session salt as the HKDF salt and the purpose (12.2) as the info. Subkeys that never produce a nonce from a counter (content hashes, index tags, the reference-sealing subkeys of 12.9, and the replication subkey of 14.21.5) are derived without a session salt, so that every copy and session computes the same values.
+- **Pruning.** A salt leaves the table when a complete scrub pass (3.5) finds no page, no held record (14.4.10) and no live journal record that uses it. When all 65,535 indexes are taken, a session that needs a salt refuses encrypted writes with `CDB_E_OUT_OF_BUDGET` until a scrub pass frees one.
+
 ## 14.3 Catalog root slot (location 0)
 
 ### 14.3.1 Placement
@@ -253,7 +262,9 @@ Logical IDs in this structure are always 8 bytes, even in 32-bit files, so the s
 | 80 | 8 | Public audit series root | Section 10.7 |
 | 88 | 8 | Next object ID | the store, enclave and procedure ID counter; IDs are never reused (Section 4.12) |
 | 96 | 8 | Public nibblet free-space root | the free-space index of public nibblet pages (14.18.3); 0 until the first nibblet |
-| 104 | 380 | Reserved | zero |
+| 104 | 8 | Session salt table root | 14.2.8; 0 until the first encrypted write |
+| 112 | 8 | Replication group record | object ID of the copy's group record (14.21.1); 0 when the database does not replicate |
+| 120 | 364 | Reserved | zero |
 | 484 | 8 | End magic | `0A 54 41 43 42 44 43 89` (the start magic reversed) |
 | 492 | 16 | Tamper-evident tag | |
 | 508 | 4 | CRC32C | covers bytes 0–507 |
@@ -291,12 +302,13 @@ Each store's entry-ID counter is held in that store's catalog entry, not in the 
   | 13 | document pools: revisions index root; link store: reverse index root (optional) | 14 | document pools: next entry ID (optional) |
   | 15 | document pools: full-text settings, an object (14.14.1; optional) | 16 | settings, an object: vector collections (14.12.3), time-series stores (14.11.1) |
   | 22 | moving (optional): an object `{1: the domain being moved out of, 2: walk cursor}`; absent when no move is under way (12.8) | | |
+  | 23 | replicated store (optional): clock index root, conflict list root, next conflict number (14.21.2) | | |
 
   Optional fields that are absent read as zero.
 
 - **Moving a store (12.8).** While field 22 is present, field 5 names the domain the store is moving into, and the record lives in that domain's catalog. The walk cursor is a binary value whose meaning is the data model's: the structure and key the walk stopped at. Empty means start from the beginning; restarting is always correct, because a page already in the new domain is passed over by its header alone. The finish call, or the walk reaching its end, removes field 22 in the archive commit that re-encrypts the last old page.
 
-- **Object kinds** (field 1, and the kind in key `02`): 1 store · 2 link type (14.13.1) · 3 enclave · 4 joined store (14.3.4) · 5 procedure (14.3.6) · 6 principal · 7 role (both 14.3.7). Reading an object as the wrong kind finds nothing. **Data models** (field 4): 1 relational · 2 document · 3 vector · 4 time series · 5 the link store.
+- **Object kinds** (field 1, and the kind in key `02`): 1 store · 2 link type (14.13.1) · 3 enclave · 4 joined store (14.3.4) · 5 procedure (14.3.6) · 6 principal · 7 role (both 14.3.7) · 8 replication group record (14.21.1). Reading an object as the wrong kind finds nothing. **Data models** (field 4): 1 relational · 2 document · 3 vector · 4 time series · 5 the link store.
 
 - **Writing the root slots.** The first catalog commit writes both root slots. Later commits alternate between them.
 - **Choosing a slot on open.**
@@ -446,7 +458,8 @@ A delta record is a 48-byte header, followed by the payload, followed by the tra
 | 24 | 8 | Target store ID |
 | 32 | 8 | Target entry ID, or 0 if there is none |
 | 40 | 4 | Key version |
-| 44 | 4 | Reserved, zero |
+| 44 | 2 | Session salt index (14.2.8); 0 on a record that is not encrypted |
+| 46 | 2 | Reserved, zero |
 | 48 | n | Payload |
 | 48+n | 16 | Trailer: the AEAD tag, or a checksum padded with zeros |
 
@@ -1594,3 +1607,89 @@ Every instruction starts with a 1-byte opcode:
 ## Open questions (do not specify until answered)
 
 None at present.
+
+## 14.21 Replication (Section 19)
+
+Multi-byte fields in this section are big-endian, in every file and on the wire, so that copies of any byte order exchange the same bytes.
+
+### 14.21.1 Group record
+
+Each copy keeps one **group record**, a public catalog object of kind 8 (14.3.3) with no name, found through catalog root slot offset 112. It is the copy's own state and is never replicated. Fields 1, 2 and 10 as in a store record, then:
+
+| ID | Field |
+|---|---|
+| 34 | copy number (0–65,535) |
+| 35 | copy numbers this copy may still hand out: an object `{1: lowest, 2: highest}`, empty when none are left |
+| 36 | group limit (19.1) |
+| 37 | hybrid clock: an object `{1: physical, ns since the Unix epoch, 2: logical}` |
+| 38 | version vector: an array of objects `{1: copy number, 2: physical, 3: logical}`, one per origin, at most the group limit |
+| 39 | member vectors root: an ordered index keyed by member copy number (2) then origin copy number (2), valued physical (8) · logical (4): each member's vector as it last reported it, for purging tombstones (19.6) |
+| 40 | retired copies: an array of copy numbers |
+| 41 | principal: the ID of the principal (14.3.7) whose key signs this copy's slices |
+| 42 | drift bound in ns (19.4); 0 means the default |
+
+- **The first copy** is copy 0 and may hand out 1–65,535. A database that never replicated has allocated its IDs with 0 in their top 16 bits (19.2), so they are already copy 0's.
+- **Creating a replica** hands the new copy the upper half of the creator's remaining range: the new copy takes the lowest number of that half as its own and may hand out the rest. Both group records change in the call; the new copy's file is written from the creator's state.
+- **The clock** is persisted with every commit that ticks it, as part of the commit's catalog change.
+
+### 14.21.2 Replicated stores
+
+A replicated store's record has field 23 (14.3.3): an object `{1: clock index root, 2: conflict list root, 3: next conflict number}`. Marking a store replicated later writes a clock entry for every live path of every entry, at the clock time of the marking.
+
+- **Clock index.** An ordered index. Key: entry ID (8), then the path, one field ID (8) per level; an empty path stands for the whole entry. Value: physical (8) · logical (4) · copy number (2) · flags (1, bit 0 tombstone).
+- **Conflict list** (19.5). An ordered index keyed by conflict number (8). Value, an object: `{1: index number, 2: the key's bytes, 3: entry that kept the key, 4: entry set aside, 5: winner's clock time, 6: set-aside entry's clock time}`. Resolving a conflict removes its key.
+
+### 14.21.3 Replication-clock series
+
+A time-series store of the engine's own, `$replclock`, holds one series per copy number. Each point, at the time of the handshake that brought it: `{1: estimated offset of that copy's clock from this copy's, ns (signed), 2: error bound, ns, 3: copy number that measured it}`. A copy measures a sender's offset as the sender's wall-clock reading minus its own clock at receipt; the error bound is the round trip when the transport reports one, else the configured drift bound.
+
+### 14.21.4 Wire messages
+
+Every message starts with:
+
+| Size | Field |
+|---|---|
+| 4 | Magic: `43 44 42 52` (`CDBR`) |
+| 1 | Wire version: 1 |
+| 1 | Message type: 1 handshake · 2 slice |
+| 16 | Database ID (14.1): the group's, shared by every copy |
+| 2 | Sender's copy number |
+| 8 | Sender's principal ID |
+| 8 | Sender's wall clock at sending, ns since the Unix epoch |
+
+and ends with the sender's signature: a 2-byte length, then an ECDSA P-256 signature over SHA-256 of every byte before the length (ASN.1 DER). A receiver refuses a message whose principal is unknown or retired, whose signature does not verify, or whose database ID is not its own.
+
+- **Handshake** body: the sender's version vector (2-byte count, then per origin: copy number 2 · physical 8 · logical 4), then the offsets it knows (2-byte count, then: copy number 2 · offset 8 (signed) · error bound 8 · measured at 8).
+- **Slice** body: a 4-byte change count, then the changes in each origin's clock order.
+
+### 14.21.5 Changes
+
+Each change:
+
+| Size | Field |
+|---|---|
+| 2 | Origin copy number |
+| 8 | Clock time: physical |
+| 4 | Clock time: logical |
+| 2 | Ordinal: the change's position among its origin's changes with the same clock time |
+| 1 | Kind (below) |
+| 8 | Domain ID: 0 public, else the enclave or joined store |
+| 4 | Body length |
+| n | Body: in plain bytes when the domain ID is 0, else sealed |
+
+Change kinds and bodies (references are store ID 8 · entry ID 8; paths are a 1-byte level count, then one field ID (8) per level; values use the shared encoding, 14.6):
+
+| Kind | Change | Body |
+|---|---|---|
+| 1 | set a path | reference · path · value |
+| 2 | remove a path | reference · path |
+| 3 | delete an entry | reference |
+| 4 | add or reinforce a link | link type (8) · source end · target end · weight (4) · time (8); ends as in 14.13.1, or 14.13.2 in a joined store |
+| 5 | remove a link | link type · source end · target end |
+| 6 | a time-series point | store (8) · series (8) · timestamp (8) · values (an object) |
+| 7 | replace a vector | reference · vector value |
+| 8 | a catalog object a replicated store needs (19.3) | the object's record, as stored (14.3) |
+| 9 | a schema version | store (8) · version (4) · the schema record |
+
+- **Sealed bodies.** The body is encrypted with the file's AEAD algorithm under the domain's replication subkey, derived from the domain key without a session salt (14.2.8), so every copy that holds the domain key can open it. The associated data is the change's header (the bytes before the body). The nonce is the first 12 bytes of HMAC-SHA-256, under the domain's replication nonce subkey, of the header and the plaintext body: it repeats only for an identical change, even between forks that share a copy number. The sealed body is the ciphertext followed by the 16-byte tag.
+- **Holding.** A copy without the domain key holds the change, sealed as received, in the domain's held log (14.4.10), as a held entry whose records are the sealed changes.

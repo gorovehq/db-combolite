@@ -29,7 +29,7 @@ No random number generator is needed for nonces.
 - page and record subkeys are derived from the domain key **and the session salt** (12.2), so two forks of one file encrypt under different subkeys and their nonces may repeat harmlessly;
 - each page and record names the salt it was encrypted under, by a small index into a **salt table** kept in the file. A salt is removed from the table once no page or record uses it, as an old key version is (12.4).
 
-The random source is needed once per session, never per nonce. A replica (Section 19) needs nothing more: it writes under its own session salts like any copy.
+The random source is needed once per session, never per nonce. Without one, an encrypted database opens read-only; a platform that encrypts must supply entropy through the environment's random hook. A replica (Section 19) needs nothing more: it writes under its own session salts like any copy. Layout: 14.2.8.
 
 **Sequence numbers are reserved durably (review R1).** Before any sequence number in a range *[n, n+B)* is used, the high-water mark *n+B* is persisted:
 
@@ -175,7 +175,5 @@ Stored procedures are catalog objects (14.3.6), with the source text, compiled f
 
 ## Open questions (do not specify until answered)
 
-The decisions in 12.8–12.10 are confirmed; these byte-level details are still to be proposed and confirmed:
+None at present. The byte layouts for 12.1 and 12.8–12.10 are in Section 14 (14.2.7, 14.2.8, 14.3.4–14.3.7, 14.4.10, 14.13.2, 14.21.5).
 
-- **Replication slices**: the byte form of a sealed domain change in a slice (with Section 19's wire format).
-- **Session salts** (12.1): the salt table's place and layout, the width and position of the salt index in page headers (14.2) and delta record headers (14.4.2), how the salt enters subkey derivation, pruning, and what a platform without a random source does.

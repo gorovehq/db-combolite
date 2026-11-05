@@ -17,14 +17,14 @@ This is a clean-room specification for a portable, serverless, multi-model embed
 | 9 | [Relational](09-relational.md) | 2, 4, 6, 8 | — |
 | 10 | [Time series](10-time-series.md) | 2, 4, 5, 9 | — |
 | 11 | [Query layer and stored procedures](11-query.md) | 3–10 | — |
-| 12 | [Security](12-security.md) | 1, 2, 4, 5, 6 | the replication slice's sealed changes (with Section 19); session salt layout (12.1) |
+| 12 | [Security](12-security.md) | 1, 2, 4, 5, 6 | — |
 | 13 | [Common page header](13-page-header.md) | 1, 2, 12 | — |
 | 14 | [Byte layouts](14-byte-layouts.md) | all | — |
 | 15 | [Compression](15-compression.md) | 1, 2, 9, 12, 13, 14 | the performance budget for page and journal compression (set after M18's benchmarks) |
 | 16 | [Small records (nibblets)](16-nibblets.md) | 2, 3, 8, 9, 12, 14 | — |
 | 17 | [Build profiles](17-build-profiles.md) | 4, 5, 11, 14 | to measure with the host benchmark: query_mem and vec_mem defaults, host limit values |
 | 18 | [Compute acceleration](18-compute-acceleration.md) | 5, 6, 7, 14, 17 | to measure: first shortlist sizes by element type; profiling a graph refresh |
-| 19 | [Replication between copies](19-replication.md) | 4, 5, 6, 8, 9, 10, 12, 14 | per-field clocks, copy and group records, conflict list, wire format, migration (19, open questions) |
+| 19 | [Replication between copies](19-replication.md) | 4, 5, 6, 8, 9, 10, 12, 14 | — (byte layouts in 14.21 to review with the implementation plan) |
 
 ## Reviews
 

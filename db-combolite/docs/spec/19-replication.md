@@ -62,16 +62,16 @@ All copies end up identical, whatever order the syncs happen in. Each data model
 
 A replicated delete leaves a tombstone, so that an old change arriving late can't undo it. A copy purges a tombstone once **every member copy's version vector**, as last reported to it, covers the delete. A copy that stays offline keeps tombstones alive everywhere until it syncs or is retired (19.1).
 
-### 19.7 Encryption
+### 19.7 Slices
+
+- **Logical changes.** A slice carries changes in merge form, independent of the journal's layout: set or remove a path, delete an entry, add or remove a link, a time-series point, replace a vector, and the catalog objects and schema versions replicated stores need (14.21.5). Export derives them from committed transactions.
+- **Signed by the sender.** Every message is signed with the sending copy's principal key (12.5). A receiver refuses messages from unknown or retired principals, and messages whose signature fails, so slices are tamper-evident and every change is attributable. Keeping public changes confidential in transit is the transport's job (TLS, for example).
+
+### 19.8 Encryption
 
 - **Nonces across copies.** Every session that writes a copy draws its own salt, and subkeys are derived with it (12.1). Two copies sharing an enclave key therefore encrypt under different subkeys, and their nonces may repeat harmlessly. The nonce layout (14.2.5) does not change, and replicas need no subkeys of their own.
 - **Sealed for the receiver.** A domain's changes are exported only while the domain is open on the sending copy, sealed in the slice under the domain's key, never in plaintext (12.8). The receiving copy needs the same domain key to apply them; until it has it, it holds them in the domain's held log (14.4.10).
 
 ## Open questions (do not specify until answered)
 
-- **Clock index layout**: its key (entry ID and path encoding) and value (clock time, tombstone flag), and when its tombstones are purged (19.6).
-- **Copy and group records**: the copy number range a copy owns, the group limit, members and their last reported vectors, retired copies.
-- **Conflict list**: its layout and the calls that list and resolve conflicts.
-- **Wire format**: the handshake (with clock readings and relayed offsets) and the slice, with sealed domain changes; versioning of the wire format.
-- **Replication-clock series**: its layout, the offset estimate and error bound, and the drift bound's default.
-- **Joining later**: what becomes of IDs allocated before a database joins a group (top 16 bits 0, 19.2).
+None at present. The byte layouts are in 14.21; they are proposals until reviewed with the implementation plan.
