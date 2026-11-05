@@ -24,6 +24,7 @@ This is a clean-room specification for a portable, serverless, multi-model embed
 | 16 | [Small records (nibblets)](16-nibblets.md) | 2, 3, 8, 9, 12, 14 | — |
 | 17 | [Build profiles](17-build-profiles.md) | 4, 5, 11, 14 | to measure with the host benchmark: query_mem and vec_mem defaults, host limit values |
 | 18 | [Compute acceleration](18-compute-acceleration.md) | 5, 6, 7, 14, 17 | to measure: first shortlist sizes by element type; profiling a graph refresh |
+| 19 | [Replication between copies](19-replication.md) | 4, 5, 6, 8, 9, 10, 12, 14 | to be redesigned: epochs, key versions across copies, one clock, held changes, trust and IDs (19, open questions); 14.21 withdrawn |
 
 ## Reviews
 
