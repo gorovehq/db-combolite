@@ -268,24 +268,56 @@ static cdb_status new_journal(cdb_db *db, const char *path, uint64_t unsealed_se
     return cdb_storage_sync(&db->journal_st);
 }
 
+/* The slot of the open enclave whose ID is domain, or -1. */
+static int enclave_index(const cdb_db *db, uint64_t domain)
+{
+    unsigned i;
+    for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++)
+        if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == domain)
+            return (int)i;
+    return -1;
+}
+
+/* The encryption domain of store_id: an open enclave's own ID, or the
+ * domain its catalog record names; 0 for the public domain. */
+static uint64_t store_domain(cdb_db *db, uint64_t store_id)
+{
+    cdb_store_info sinfo;
+    if (enclave_index(db, store_id) >= 0)
+        return store_id;
+    if (db->has_catalog && cdb_catalog_get_store(&db->catalog, store_id, &sinfo) == CDB_OK)
+        return sinfo.domain_id;
+    return 0;
+}
+
+/* The page subkey of an open domain, and its key version; NULL when the
+ * domain is not open. */
+static const uint8_t *domain_page_key(cdb_db *db, uint64_t domain, uint32_t *version)
+{
+    int i = enclave_index(db, domain);
+    if (i < 0)
+        return NULL;
+    if (version != NULL)
+        *version = db->enclaves[i].key_version;
+    return db->enclaves[i].page_key;
+}
+
 static cdb_status cdb_db_domain_key_cb(void *ctx, uint64_t domain_id, uint32_t key_version, uint8_t key_out[32])
 {
     cdb_db *db = (cdb_db *)ctx;
-    unsigned i;
+    const uint8_t *key;
     (void)key_version;
 
     if (db == NULL || key_out == NULL)
         return CDB_E_INVALID_ARG;
-
-    for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
-        if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == domain_id) {
-            memcpy(key_out, db->enclaves[i].page_key, 32);
-            return CDB_OK;
-        }
-    }
-    return CDB_E_SECURITY;
+    if ((key = domain_page_key(db, domain_id, NULL)) == NULL)
+        return CDB_E_SECURITY;
+    memcpy(key_out, key, 32);
+    return CDB_OK;
 }
 
+/* Reads one record, decrypting it under its domain's key when it is
+ * encrypted: the header's store field names the domain (spec 14.4.2). */
 static cdb_status read_record(cdb_db *db, cdb_journal *j, uint64_t offset,
                               uint8_t *buf, size_t buf_size, cdb_record *r, uint64_t *next)
 {
@@ -297,26 +329,7 @@ static cdb_status read_record(cdb_db *db, cdb_journal *j, uint64_t offset,
     if (buf[0] != 0xC0u || buf[1] != 0xDEu)
         return CDB_E_CORRUPT;
     if (buf[3] & CDB_RECORD_FLAG_ENCRYPTED) {
-        uint64_t store_id = cdb_load_u64(buf + 24, j->order);
-        const uint8_t *key = NULL;
-        unsigned i;
-        for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
-            if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == store_id) {
-                key = db->enclaves[i].page_key;
-                break;
-            }
-        }
-        if (key == NULL && db->has_catalog) {
-            cdb_store_info sinfo;
-            if (cdb_catalog_get_store(&db->catalog, store_id, &sinfo) == CDB_OK && sinfo.domain_id > 0) {
-                for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
-                    if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == sinfo.domain_id) {
-                        key = db->enclaves[i].page_key;
-                        break;
-                    }
-                }
-            }
-        }
+        const uint8_t *key = domain_page_key(db, cdb_load_u64(buf + 24, j->order), NULL);
         if (key == NULL)
             return CDB_E_SECURITY;
         return cdb_journal_read_crypto(j, offset, buf, buf_size, r, next, db->aead_alg, key);
@@ -1100,14 +1113,7 @@ static cdb_status rebase_pages(cdb_db *db)
                 if ((r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_WRITE_KEY || r.kind == CDB_RECORD_COMMIT)
                     && r.tx_id == c.tx_id) {
                     if (r.flags & CDB_RECORD_FLAG_ENCRYPTED) {
-                        const uint8_t *enc_key = NULL;
-                        unsigned k;
-                        for (k = 0; k < sizeof(db->enclaves) / sizeof(db->enclaves[0]); k++) {
-                            if (db->enclaves[k].in_use && db->enclaves[k].enclave_id == r.store_id) {
-                                enc_key = db->enclaves[k].page_key;
-                                break;
-                            }
-                        }
+                        const uint8_t *enc_key = domain_page_key(db, r.domain_id, NULL);
                         if (enc_key != NULL && db->aead_alg != CDB_AEAD_NONE) {
                             s = cdb_journal_append_crypto(&db->journal, &r, db->cfg.record_buf, db->cfg.record_buf_size,
                                                           db->aead_alg, enc_key);
@@ -1744,7 +1750,6 @@ static cdb_status tx_put_in(cdb_db *db, uint64_t store_id, uint64_t entry_id, ui
     uint8_t *payload = db->cfg.record_buf + CDB_RECORD_HEADER_SIZE;
     cdb_record r;
     const uint8_t *enc_key = NULL;
-    unsigned i;
     cdb_status s;
 
     if (usable(db) != CDB_OK || !db->in_tx)
@@ -1769,27 +1774,9 @@ static cdb_status tx_put_in(cdb_db *db, uint64_t store_id, uint64_t entry_id, ui
     if (db->in_crdt_import)
         r.flags |= (uint8_t)CDB_RECORD_FLAG_REPLICATED;
 
-    for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
-        if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == store_id) {
-            enc_key = db->enclaves[i].page_key;
-            r.key_version = db->enclaves[i].key_version;
-            break;
-        }
-    }
-    if (enc_key == NULL && db->has_catalog) {
-        cdb_store_info sinfo;
-        if (cdb_catalog_get_store(&db->catalog, store_id, &sinfo) == CDB_OK && sinfo.domain_id > 0) {
-            for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
-                if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == sinfo.domain_id) {
-                    enc_key = db->enclaves[i].page_key;
-                    r.key_version = db->enclaves[i].key_version;
-                    break;
-                }
-            }
-            if (enc_key == NULL)
-                return CDB_E_SECURITY;
-        }
-    }
+    r.domain_id = store_domain(db, store_id);
+    if (r.domain_id != 0 && (enc_key = domain_page_key(db, r.domain_id, &r.key_version)) == NULL)
+        return CDB_E_SECURITY;
 
     if (enc_key != NULL && db->aead_alg != CDB_AEAD_NONE) {
         r.flags |= CDB_RECORD_FLAG_ENCRYPTED;
@@ -3471,21 +3458,8 @@ static cdb_status db_trigger_unregister_in(cdb_db *db, const char *name, size_t 
 
 static const uint8_t *get_enclave_hash_key(cdb_db *db, uint64_t store_id)
 {
-    unsigned i;
-    for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
-        if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == store_id)
-            return db->enclaves[i].hash_key;
-    }
-    if (db->has_catalog) {
-        cdb_store_info sinfo;
-        if (cdb_catalog_get_store(&db->catalog, store_id, &sinfo) == CDB_OK && sinfo.domain_id > 0) {
-            for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
-                if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == sinfo.domain_id)
-                    return db->enclaves[i].hash_key;
-            }
-        }
-    }
-    return NULL;
+    int i = enclave_index(db, store_domain(db, store_id));
+    return i < 0 ? NULL : db->enclaves[i].hash_key;
 }
 
 static cdb_status db_blob_write_begin_in(cdb_db *db, uint64_t store_id, uint8_t *scratch, cdb_blob_writer *w);

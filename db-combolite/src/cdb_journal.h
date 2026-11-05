@@ -65,7 +65,13 @@ typedef struct cdb_journal_header {
 
 /* One delta record (spec 14.4.2). On append the caller fills every field
  * except seq; on read every field is filled and payload points into the
- * caller's buffer. */
+ * caller's buffer.
+ *
+ * An encrypted record hides its target: its header's store field holds
+ * domain_id and its entry field 0, and the real store and entry IDs lead
+ * the encrypted plaintext as two varints. Append and read do this, so
+ * store_id and entry_id are always the real ones here, and payload and
+ * payload_len never include the varints. */
 typedef struct cdb_record {
     uint8_t kind;          /* CDB_RECORD_* */
     uint8_t flags;         /* encrypted, compressed (none used yet) */
@@ -73,6 +79,7 @@ typedef struct cdb_record {
     uint64_t tx_id;        /* owning transaction (spec 14.4.3) */
     uint64_t store_id;     /* target store */
     uint64_t entry_id;     /* target entry, or 0 */
+    uint64_t domain_id;    /* encryption domain of an encrypted record; 0 otherwise */
     uint32_t key_version;
     const uint8_t *payload;
     uint32_t payload_len;
