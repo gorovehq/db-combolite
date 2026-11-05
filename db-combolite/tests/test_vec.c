@@ -7,6 +7,7 @@
 #include "combolite/cdb_value.h"
 #include "cdb_doc.h"
 #include "cdb_endian.h"
+#include "cdb_fakeaccel.h"
 #include "cdb_faultenv.h"
 #include "cdb_page.h"
 #include "cdb_vec.h"
@@ -22,6 +23,8 @@ static uint8_t env_arena[CDB_FAULTENV_MAX_FILES * 3u * FCAP];
 static cdb_fault_record env_records[CDB_FAULTENV_MAX_FILES * 4096u];
 static cdb_faultenv fe;
 static cdb_env env;
+static cdb_fakeaccel fake;
+static uint64_t accel_used; /* nearest calls the fake answered, over the whole run */
 
 static uint8_t arena[NODES * 2u * PAGE + 2u * PAGE];
 static cdb_pager_node nodes[NODES];
@@ -43,6 +46,11 @@ static void init_env(void)
     c.records = env_records;
     c.records_per_file = 4096;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_faultenv_init(&fe, &c, &env));
+    if (getenv("CDB_TEST_ACCEL") != NULL) { /* the accelerator runs (tests/CMakeLists.txt, spec 18.11) */
+        accel_used += fake.nearests;
+        cdb_fakeaccel_init(&fake, &env);
+        fake.noise = 0.05;
+    }
 }
 
 void setUp(void)
@@ -1150,6 +1158,17 @@ static void test_crash_sweep(void)
     }
 }
 
+/* In the accelerator run, the suite must have reached the accelerator,
+ * or matching the CPU proves nothing. */
+static void test_accelerator_was_used(void)
+{
+    if (getenv("CDB_TEST_ACCEL") == NULL)
+        TEST_IGNORE_MESSAGE("not the accelerator run");
+#ifdef CDB_PROFILE_HOST
+    TEST_ASSERT_TRUE(accel_used + fake.nearests > 0);
+#endif
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1163,5 +1182,6 @@ int main(void)
     RUN_TEST(test_change_log_and_cursors);
     RUN_TEST(test_track_changes_on_old_collection);
     RUN_TEST(test_crash_sweep);
+    RUN_TEST(test_accelerator_was_used);
     return UNITY_END();
 }

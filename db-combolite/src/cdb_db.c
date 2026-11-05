@@ -519,6 +519,16 @@ static cdb_status cursor_open(cdb_db *db, unsigned slot, struct jcursor *c, int 
 /* Publishes the archive commit the pager is reading from (spec 5.9.7),
  * then re-reads the header to be sure no commit moved past it before the
  * pin was visible. */
+/* Publishes the sequence this process's readers use (spec 5.9.7), held at
+ * or below the oldest archive an accelerator mirror reflects, so the change
+ * log it must catch up from is not trimmed meanwhile (spec 18.12). A lower
+ * pin only keeps more pages from reuse. */
+static cdb_status publish_pin(cdb_db *db, uint64_t seq)
+{
+    uint64_t floor = cdb_vec_accel_floor(db);
+    return cdb_coord_publish_pin(&db->coord, floor < seq ? floor : seq);
+}
+
 static cdb_status pin_archive(cdb_db *db)
 {
     for (;;) {
@@ -531,7 +541,7 @@ static cdb_status pin_archive(cdb_db *db)
             && (s = cdb_pager_reload(&db->pager)) != CDB_OK)
             return s;
         seq = db->pager.hs.record.committed_seq;
-        if ((s = cdb_coord_publish_pin(&db->coord, seq)) != CDB_OK)
+        if ((s = publish_pin(db, seq)) != CDB_OK)
             return s;
         if ((s = cdb_header_open(&db->archive_st, &hs)) != CDB_OK)
             return s;
@@ -742,6 +752,7 @@ static cdb_status merge_journals(cdb_db *db, int keep_in_use)
         set_journal_slot(db, keep_in_use, db->applied);
         if ((s = fence_and_pins(db)) != CDB_OK || (s = cdb_pager_commit(&db->pager)) != CDB_OK)
             return s;
+        cdb_vec_accel_committed(db); /* the mirrors had all of it (spec 18.6) */
         for (i = 0; i < n; i++)
             if (cur[i].slot == db->coord.me.slot && cur[i].top > db->my_mark)
                 db->my_mark = cur[i].top;
@@ -906,7 +917,7 @@ static cdb_status rotate_journal(cdb_db *db);
  * re-applies its own committed transactions above its mark onto a fresh
  * overlay while rotating its journal to the new committed sequence (spec
  * 5.9.1, 14.4.7 rule 2). */
-static cdb_status rebase(cdb_db *db)
+static cdb_status rebase_pages(cdb_db *db)
 {
     cdb_header_state hs;
     cdb_status s;
@@ -1013,6 +1024,18 @@ static cdb_status rebase(cdb_db *db)
         return s;
     db->unsynced = 0;
     return env_sync_dir(db, db->workdir);
+}
+
+/* rebase_pages, then each accelerator mirror catches up from its change
+ * log to the archive now (spec 18.12). Until it has, the published pin
+ * stays at the oldest archive a mirror reflects (publish_pin), so no baton
+ * holder trims what the catch-up reads; then the pin moves up. */
+static cdb_status rebase(cdb_db *db)
+{
+    cdb_status s = rebase_pages(db);
+    if (s == CDB_OK && (s = cdb_vec_accel_rebase(db)) == CDB_OK)
+        s = publish_pin(db, db->pager.hs.record.committed_seq);
+    return s;
 }
 
 static cdb_status maybe_rebase(cdb_db *db)
@@ -1396,6 +1419,8 @@ cdb_status cdb_db_tick(cdb_db *db)
     s = usable(db);
     if (s == CDB_OK)
         s = heartbeat(db);
+    if (s == CDB_OK && !db->in_tx)
+        s = cdb_vec_accel_maintain(db); /* fills wanted mirrors (spec 18.6) */
     db_unlock(db);
     return s;
 }
@@ -2306,6 +2331,7 @@ static cdb_status reconcile_hold(cdb_db *db, int closing)
             set_journal_slot(db, keep_in_use, db->applied);
             if ((s = fence_and_pins(db)) != CDB_OK || (s = cdb_pager_commit(&db->pager)) != CDB_OK)
                 return on_baton_err(db, s);
+            cdb_vec_accel_committed(db); /* the mirrors had all of it (spec 18.6) */
             own_mark_committed(db);
             if (!closing && (s = prune_held_blocks(db)) != CDB_OK)
                 return s;
@@ -2461,6 +2487,7 @@ static cdb_status db_drop_store_in(cdb_db *db, uint64_t id)
         slot->in_use = 0;
     if ((slot = cdb_slots_find(&db->table_slots, id)) != NULL)
         slot->in_use = 0;
+    cdb_vec_accel_forget(db, id); /* its mirror, if any (spec 18) */
     {
         unsigned i = 0;
         while (i < db->nid_ranges) {
@@ -2651,6 +2678,8 @@ cdb_status cdb_db_close(cdb_db *db)
     cdb_status s;
 
     db_lock(db);
+    /* First, so the closing reconciliation fills no mirror (spec 18). */
+    cdb_vec_accel_close(db);
     if (db->failed) {
         db_unlock(db);
         cleanup_concurrency(db);

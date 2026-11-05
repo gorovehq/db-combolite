@@ -159,6 +159,8 @@ class cdb_env(Structure):
     _fields_ = [
         ("ops", POINTER(cdb_env_ops)),
         ("ctx", c_void_p),
+        ("accel", c_void_p),       # optional accelerator (spec 18.7); the studio sets none
+        ("accel_ctx", c_void_p),
     ]
 
 
@@ -391,6 +393,7 @@ class cdb_db_config(Structure):
         ("identity", c_void_p),
         ("query_mem", c_size_t),   # host profile: a query's memory budget (spec 17.4); 0 = default
         ("vec_mem", c_size_t),     # host profile: a graph refresh's memory budget (spec 17.4); 0 = default
+        ("accel_mem", c_uint64),   # host profile: device memory for accelerator mirrors (spec 18.8); 0 = its own
     ]
 
 

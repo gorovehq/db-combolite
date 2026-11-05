@@ -83,11 +83,47 @@ typedef struct cdb_env_ops {
     cdb_status (*thread_join)(void *ctx, cdb_thread *t);
 } cdb_env_ops;
 
-/* An environment handle: an operation table plus its state. Copied by
- * value; ctx must outlive every copy. */
+/* ------------------------------------------------- accelerator (spec 18) */
+
+/* A collection's vectors held on the device: the accelerator's own. */
+typedef struct cdb_accel_mirror cdb_accel_mirror;
+
+/* An optional compute accelerator, such as a GPU, for vector arithmetic
+ * (spec 18.7). It keeps mirrors, device copies of collections, and answers
+ * nearest-neighbour requests over them; the engine rescores every answer
+ * on the CPU and checks it is complete (18.3, 18.10), so results match a
+ * build without one. Any call may decline with a non-OK status; the engine
+ * then uses the CPU path or treats the mirror as stale, never failing its
+ * own caller. Calls on different mirrors may overlap; one mirror is never
+ * called from two threads at once. Vectors are passed in their stored
+ * form: vec_bytes each, elements in `order`. */
+typedef struct cdb_accel_ops {
+    /* A mirror for one collection, sized for `expect` vectors. elem is a
+     * cdb_vector_elem and measure a CDB_VEC_* distance (cdb_vec.h). */
+    cdb_status (*mirror_open)(void *ctx, uint64_t store, unsigned elem, uint32_t dims, unsigned measure,
+                              cdb_byte_order order, uint64_t expect, cdb_accel_mirror **out);
+    /* Inserts or replaces n vectors: ids[i] is the i-th of vecs. */
+    cdb_status (*mirror_put)(void *ctx, cdb_accel_mirror *m, const uint64_t *ids, const void *vecs,
+                             size_t vec_bytes, size_t n);
+    cdb_status (*mirror_del)(void *ctx, cdb_accel_mirror *m, const uint64_t *ids, size_t n);
+    void (*mirror_close)(void *ctx, cdb_accel_mirror *m);
+    /* For each of nq queries (vec_bytes each, as stored), up to `want`
+     * candidates nearest first, into ids and dists (nq * want each); counts[i]
+     * is how many. bounds[i] bounds how far any distance for query i may be
+     * from the CPU's (spec 18.10); 0 only for distances computed exactly,
+     * whose ties must then be ordered by lower entry ID. */
+    cdb_status (*nearest)(void *ctx, cdb_accel_mirror *m, const void *queries, size_t nq, size_t want,
+                          uint64_t *ids, float *dists, size_t *counts, double *bounds);
+} cdb_accel_ops;
+
+/* An environment handle: an operation table plus its state, and an
+ * optional accelerator with its own state (spec 18.7; NULL: none). Copied
+ * by value; ctx and accel_ctx must outlive every copy. */
 typedef struct cdb_env {
     const cdb_env_ops *ops;
     void *ctx;
+    const cdb_accel_ops *accel;
+    void *accel_ctx;
 } cdb_env;
 
 /* ------------------------------------------------------- host (POSIX) */
