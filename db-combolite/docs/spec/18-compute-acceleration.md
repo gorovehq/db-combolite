@@ -20,6 +20,7 @@ Embedding, which turns text into vectors, is not engine work. An application com
 - **Optional.** An engine without an accelerator, or whose accelerator declines a request, uses the CPU path. Neither case is ever an error. This matches the exception for neighbour-graph maintenance in 17.3.
 - **Outside the core.** The core gains only an optional hook in the environment (`cdb_env`), as it did for threads (M20). The GPU code lives in a separate optional library, `combolite_accel`, never in `src/`. An application links it and passes its hook in the environment. The core never calls a GPU API itself, and the rule against heap allocation in the core is unchanged.
 - **Build.** The accelerator library is built for **CUDA**, **Vulkan**, both or neither, chosen at build time. With both, the hook uses whichever device it finds at run time.
+- **Software devices.** A device that runs on the CPU, such as Mesa's llvmpipe for Vulkan, is not used by default, since the engine's own CPU path is usually faster. An application may allow one with an open flag. Tests use them that way, but a run that finds no hardware device still reports skipped (18.11).
 
 ### 18.2 A resident mirror and top-K requests
 
