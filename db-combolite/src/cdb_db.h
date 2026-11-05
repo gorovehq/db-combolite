@@ -155,7 +155,72 @@ typedef struct cdb_db_config {
     cdb_rotation_policy rotation_policy;
     cdb_signing_policy signing_policy;
     const cdb_identity *identity;
+    /* Host profile: most memory one query may grow to through the
+     * environment's allocator; 0 means CDB_QUERY_MEM_DEFAULT (spec 17.4).
+     * The mcu profile never grows. Last, so bindings that mirror the
+     * fields before it keep their offsets. */
+    size_t query_mem;
+    /* Host profile: most memory a neighbour-graph refresh may grow to past
+     * vec_work; 0 means CDB_VEC_MEM_DEFAULT (spec 17.4). At the limit a
+     * refresh is slower, never an error (spec 17.3). */
+    size_t vec_mem;
+    /* Host profile: most device memory the accelerator's mirrors may use
+     * together, counted as their vectors' bytes; 0 leaves it to the
+     * accelerator (spec 18.8). */
+    uint64_t accel_mem;
+    /* Host profile: the least vector bytes a request must read for the
+     * accelerator to take it (queries x the collection's vectors' bytes);
+     * smaller requests, and collections never searched with that much,
+     * stay on the CPU, which answers them sooner than a device call.
+     * 0 means CDB_ACCEL_MIN_BYTES_DEFAULT; 1 sends everything (spec 18.4). */
+    uint64_t accel_min_bytes;
 } cdb_db_config;
+
+/* Mirrors of vector collections on the environment's accelerator (spec
+ * 18.6-18.8), kept apart from the open-store slots so that closing a
+ * collection's slot does not drop its mirror. */
+#define CDB_ACCEL_MIRRORS 16u      /* collections mirrored at once */
+#define CDB_ACCEL_QUEUE 4096u      /* changes held for a mirror between uses */
+
+/* WANTED: to be filled (on the worker pool where there are threads, else at
+ * reconciliation or tick); FILLING: being filled, a chunk at a time;
+ * DECLINED: the accelerator would not mirror it, the CPU serves it. */
+enum { CDB_ACCEL_FREE = 0, CDB_ACCEL_WANTED, CDB_ACCEL_READY, CDB_ACCEL_FILLING, CDB_ACCEL_DECLINED };
+
+/* A fill queued on the worker pool, for entry `index` as it was at `token`. */
+typedef struct cdb_accel_task {
+    struct cdb_db *db;
+    unsigned index;
+    uint64_t token;
+} cdb_accel_task;
+
+typedef struct cdb_accel_entry {
+    uint64_t store;
+    int state;                  /* CDB_ACCEL_* */
+    uint64_t token;             /* changes whenever the entry is dropped, so a queued fill can tell */
+    int task_queued;            /* a fill task for it is on the worker pool */
+    uint64_t fill_from;         /* FILLING: the next entry ID to read */
+    cdb_accel_mirror *m;        /* READY only */
+    uint64_t seen;              /* reflects the archive at this committed sequence, plus what was applied since */
+    uint64_t vectors;           /* in the mirror */
+    uint64_t bytes;             /* its vectors' bytes, counted against accel_mem */
+    uint64_t last_use;
+    size_t vec_bytes;
+    uint64_t *queue;            /* changed entries not sent yet; top bit set: deleted */
+    size_t queued;
+} cdb_accel_entry;
+
+/* What the accelerator path did, for tests and diagnostics. */
+typedef struct cdb_accel_stats {
+    uint64_t fills;             /* mirrors filled from the vector blocks */
+    uint64_t certified;         /* searches answered from a certified shortlist */
+    uint64_t widened;           /* shortlists asked for again, twice as long */
+    uint64_t cpu;               /* searches that went to the CPU path: no mirror yet, declined, or too wide */
+    uint64_t catchups;          /* mirrors caught up from a change log at a rebase */
+    uint64_t stale;             /* mirrors dropped to be filled again */
+    uint64_t evicted;           /* mirrors dropped to make room */
+    uint64_t small;             /* requests below accel_min_bytes, left to the CPU */
+} cdb_accel_stats;
 
 /* An open document pool (cdb_doc.h). */
 struct cdb_doc_pool {
@@ -196,6 +261,8 @@ struct cdb_vec_coll {
     cdb_index graph;         /* entry -> neighbour record; 0 -> live count */
     cdb_index reverse;       /* (neighbour, entry): entry lists neighbour; (0, entry): an entry point */
     cdb_index pending;       /* entries whose list needs work */
+    int changes_on;          /* it keeps a change log (spec 14.12.5, 18.12) */
+    cdb_index changes;       /* (sequence, entry) -> kind; (0, 0) trimmed-through; (0, n) cursor n */
 };
 
 /* An open time-series store (cdb_ts.h). */
@@ -258,6 +325,10 @@ struct cdb_table_store {
 
 /* Caller memory for n open stores of each kind, without an allocator. */
 size_t cdb_db_slot_mem_size(unsigned n);
+/* The sizes of cdb_db and cdb_db_config, for bindings that mirror them to
+ * check their copies against this build */
+size_t cdb_db_struct_size(void);
+size_t cdb_db_config_size(void);
 
 /* An open database. All fields are internal to the engine. */
 typedef struct cdb_db {
@@ -345,6 +416,15 @@ typedef struct cdb_db {
     int hb_running;           /* 1 if hb_thread is running and must be joined */
     /* Background worker threads (spec 5.9.6, M20). */
     cdb_worker_pool workers;
+    /* Graph refreshes whose list of entries to check overflowed, so every
+     * entry was checked (spec 14.12.4): a diagnostic for tests. */
+    uint64_t vec_full_checks;
+    /* The accelerator's mirrors (spec 18). */
+    cdb_accel_entry accel[CDB_ACCEL_MIRRORS];
+    cdb_accel_task accel_tasks[CDB_ACCEL_MIRRORS];
+    uint64_t accel_bytes;       /* the mirrors' bytes together */
+    uint64_t accel_clock;       /* counts mirror uses, for least recently used */
+    cdb_accel_stats accel_stats;
     /* Security, encryption & RBAC (spec 12). */
     uint8_t master_key[32];
     uint8_t integrity_key[32];
@@ -391,6 +471,11 @@ typedef struct cdb_db {
     /* Event triggers (spec 11.6). */
     cdb_trigger_registry triggers;
 } cdb_db;
+
+/* The catalog and pager inside a database, for bindings that call the
+ * catalog and index functions directly (no fixed offsets to keep in step) */
+cdb_catalog *cdb_db_catalog(cdb_db *db);
+cdb_pager *cdb_db_pager(cdb_db *db);
 
 /* Re-entrant synchronization locks across threads (spec 5.9.6, M20). */
 void cdb_db_lock(cdb_db *db);

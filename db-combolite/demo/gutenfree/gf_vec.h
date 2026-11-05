@@ -5,8 +5,8 @@
  *                 neighbour graph (k = 16) for approximate search
  *   passage_bits  the same vectors as 384 sign bits (48 bytes), Hamming
  *   book_vec      the mean of a book's passage vectors, source = its
- *                 catalog row
- *   similar_to    links between book_vec entries (N:M, recorded), to each
+ *                 library row
+ *   similar_to    links between library rows (N:M, recorded), to each
  *                 book's nearest books, weight = cosine similarity */
 #ifndef GF_VEC_H
 #define GF_VEC_H
@@ -62,6 +62,23 @@ cdb_status gf_vec_embed_book(gf_db *g, const gf_catalog *c, const gf_books *b, c
 /* Links every book vector to its GF_SIMILAR nearest; adds only links that
  * are missing. *added counts them. */
 cdb_status gf_vec_link_similar(gf_db *g, const gf_vec *v, uint64_t *added);
+
+/* Refreshes the passage neighbour graph until nothing is pending, in about
+ * GF_GRAPH_STEPS slices of at least GF_GRAPH_SLICE entries, calling
+ * progress after each with how many are done and still pending and the
+ * milliseconds so far. Each slice commits, so an interrupted refresh keeps
+ * what it did. */
+#define GF_GRAPH_SLICE 256u
+#define GF_GRAPH_STEPS 16u
+typedef void (*gf_graph_progress_fn)(size_t done, size_t pending, double ms, void *ctx);
+cdb_status gf_vec_refresh_graph(gf_db *g, const gf_vec *v, gf_graph_progress_fn progress, void *ctx,
+                                size_t *remaining);
+
+/* For measuring a whole graph build (run it on a copy of the database):
+ * copies every passage vector into a new collection, graph_bench, with a
+ * neighbour graph, so all of them are pending. *bench is its store ID,
+ * *copied how many were copied. CDB_E_EXISTS if graph_bench exists. */
+cdb_status gf_vec_bench_copy(gf_db *g, const gf_vec *v, uint64_t *bench, uint64_t *copied);
 
 /* Encodes a vector value: f32, or with bits set, its sign bits. */
 size_t gf_vec_encode(const float *f, int bits, uint8_t *out, size_t cap);

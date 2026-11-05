@@ -21,6 +21,19 @@ else()
 endif()
 option(CDB_SANITIZE "Build with AddressSanitizer and UBSan" ${CDB_SANITIZE_DEFAULT})
 
+# Build profile (spec 17): host sizes a process's limits for a host and
+# grows working memory through the environment's allocator; mcu keeps
+# everything in caller memory. Both read and write the same files.
+set(CDB_PROFILE host CACHE STRING "Build profile: host or mcu (spec 17)")
+set_property(CACHE CDB_PROFILE PROPERTY STRINGS host mcu)
+if(NOT CDB_PROFILE STREQUAL "host" AND NOT CDB_PROFILE STREQUAL "mcu")
+  message(FATAL_ERROR "CDB_PROFILE must be host or mcu, not '${CDB_PROFILE}'")
+endif()
+# Host optimisation (17.6): -O3 and link-time optimisation in optimised
+# builds; -march=native only on request, for builds that never leave this
+# machine.
+option(CDB_NATIVE "Optimise for this machine's CPU (-march=native); never for distributed builds" OFF)
+
 # LZMA2 compression through the vendored liblzma (spec 15.7,
 # third-party/xz/VENDORED.md). Without it, compression defaults are off and
 # files that use compression are refused.
@@ -124,6 +137,51 @@ endif()
 if(CDB_SANITIZE)
   target_compile_options(combolite PUBLIC ${CDB_SANITIZER_FLAGS})
   target_link_options(combolite PUBLIC ${CDB_SANITIZER_FLAGS})
+endif()
+if(CDB_PROFILE STREQUAL "mcu")
+  target_compile_definitions(combolite PUBLIC CDB_PROFILE_MCU=1)
+  target_compile_options(combolite PRIVATE $<$<NOT:$<CONFIG:Debug>>:-Os>)
+else()
+  target_compile_options(combolite PRIVATE $<$<NOT:$<CONFIG:Debug>>:-O3>)
+  if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT CDB_IPO_OK OUTPUT CDB_IPO_MSG LANGUAGES C)
+    if(CDB_IPO_OK)
+      set_property(TARGET combolite PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+    endif()
+  endif()
+  if(CDB_NATIVE)
+    target_compile_options(combolite PRIVATE -march=native)
+  endif()
+endif()
+message(STATUS "CDB_PROFILE=${CDB_PROFILE}")
+
+# The optional accelerator library, combolite_accel (spec 18.1, 18.5):
+# never part of the core, host profile only, with a CUDA backend, a Vulkan
+# one, or both. CUDA is enabled here, at the top, because the tests link
+# its kernels too.
+option(CDB_ACCEL_CUDA "Build the CUDA accelerator (needs the CUDA toolkit with cuBLAS)" OFF)
+option(CDB_ACCEL_VULKAN "Build the Vulkan accelerator (needs the Vulkan loader and headers)" OFF)
+if((CDB_ACCEL_CUDA OR CDB_ACCEL_VULKAN) AND NOT CDB_PROFILE STREQUAL "host")
+  message(FATAL_ERROR "The accelerator exists only in the host profile (spec 18.1)")
+endif()
+if(CDB_ACCEL_CUDA)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+  endif()
+  # NVIDIA's packages install outside PATH; CUDACXX or CMAKE_CUDA_COMPILER
+  # still choose another.
+  if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX} AND EXISTS /usr/local/cuda/bin/nvcc)
+    set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
+  endif()
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+endif()
+if(CDB_ACCEL_VULKAN)
+  find_package(Vulkan REQUIRED)
+endif()
+if(CDB_ACCEL_CUDA OR CDB_ACCEL_VULKAN)
+  add_subdirectory(accel)
 endif()
 
 if(CDB_BUILD_TESTS)

@@ -7,6 +7,10 @@
  *   gutenfree ingest-books [books-dir] [base]
  *                                           store the books gf_fetch.py fetched
  *                                           (listed in books-dir/manifest.tsv)
+ *   gutenfree ingest-text [books-dir] [base]
+ *                                           give library books stored before
+ *                                           book_text existed their whole
+ *                                           text there
  *   gutenfree merge-csv [pg_catalog.csv] [base]
  *                                           add genres, subjects and dates
  *                                           (ingest-index does it too when
@@ -21,6 +25,14 @@
  *   gutenfree embed [model.gguf] [base]     embed every stored passage (the
  *                                           model from gf_model.py), link
  *                                           similar books, refresh the graph
+ *   gutenfree graph [base]                  refresh the passages' graph only
+ *   gutenfree link-similar [base]           link similar books only (one
+ *                                           bulk search)
+ *   gutenfree bench-graph [base]            time a whole graph build (on a
+ *                                           copy of the database)
+ *
+ * With an accelerator in the build (CDB_ACCEL_CUDA, CDB_ACCEL_VULKAN),
+ * GUTENFREE_ACCEL=off goes without it and =software allows llvmpipe.
  *
  * base is the database path without extension: the last argument, else
  * $GUTENFREE_DB, else data/gutenfree (giving data/gutenfree.cdbarch);
@@ -88,8 +100,8 @@ static void draw(const char *base, const gf_db *g, double open_ms, const char *n
     }
     if (note != NULL)
         mvprintw(5 + (int)NITEMS, 4, "%s", note);
-    gf_status(" %s.cdbarch | page %u B | buffers %.1f MB | opened in %.1f ms | build: %s ", base, GF_PAGE,
-              (double)g->bytes / (1024.0 * 1024.0), open_ms, GF_BUILD_LABEL);
+    gf_status(" %s.cdbarch | page %u B | buffers %.1f MB | opened in %.1f ms | build: %s | accel: %s ", base,
+              GF_PAGE, (double)g->bytes / (1024.0 * 1024.0), open_ms, GF_BUILD_LABEL, g->accel_name);
     refresh();
 }
 
@@ -112,6 +124,7 @@ static cdb_status merge_csv(gf_db *g, const gf_catalog *c, const char *path)
     printf("  %llu records: %llu rows updated, %llu new rows, %llu refused; %.0f ms, %u commits, worst %.1f ms\n",
            (unsigned long long)st.entries, (unsigned long long)st.updated, (unsigned long long)st.inserted,
            (unsigned long long)st.refused, st.ms, st.batches, st.worst_batch_ms);
+    printf("  %llu GUTINDEX titles with '?' for letters replaced by the CSV's\n", (unsigned long long)st.retitled);
     if (st.ms > 0)
         gf_metric("catalog.merge_rows_per_s", (double)st.entries / (st.ms / 1000.0));
     gf_metrics_flush(g);
@@ -149,6 +162,9 @@ static int ingest_cli(gf_db *g, const char *gutindex, unsigned batch)
     printf("  entries %llu, inserted %llu, already present %llu, refused %llu\n",
            (unsigned long long)st.entries, (unsigned long long)st.inserted,
            (unsigned long long)st.duplicates, (unsigned long long)st.refused);
+    if (st.refused > 0)
+        printf("  first refused: ebook %lld, %s\n", (long long)st.first_refused_ebook,
+               cdb_status_str(st.first_refused));
     printf("  %.0f ms in all: %.0f ms parsing, %.0f ms in the engine; %u commits, worst %.1f ms\n", st.ms,
            st.parse_ms, st.ms - st.parse_ms, st.batches, st.worst_batch_ms);
     if (s == CDB_OK && access(GF_DEFAULT_PGCSV, R_OK) == 0)
@@ -157,6 +173,51 @@ static int ingest_cli(gf_db *g, const char *gutindex, unsigned batch)
     if (gf_catalog_count(g, &c, &rows) == CDB_OK)
         printf("  table now holds %llu rows (counted in %.1f ms)\n", (unsigned long long)rows, gf_now_ms() - t0);
     return s == CDB_OK ? 0 : 1;
+}
+
+/* Gives each book in the library its book_text row, from dir/<ebook>.txt:
+ * for books stored before the table existed. */
+static int ingest_text_cli(gf_db *g, const char *dir)
+{
+    static uint64_t rows[4096];
+    gf_catalog c;
+    gf_books b;
+    cdb_table_cursor cur;
+    size_t n = 0, i;
+    unsigned done = 0, had = 0, failed = 0;
+    uint64_t bytes = 0;
+    double t0 = gf_now_ms();
+    cdb_status s;
+
+    if ((s = gf_catalog_open(g, &c)) != CDB_OK || (s = gf_books_open(g, &b)) != CDB_OK) {
+        fprintf(stderr, "gutenfree: open stores: %s\n", cdb_status_str(s));
+        return 1;
+    }
+    memset(&cur, 0, sizeof cur);
+    gf_catalog_shelf(g, &c, &cur, rows, sizeof rows / sizeof rows[0], &n);
+    for (i = 0; i < n; i++) {
+        static gf_book bk;
+        gf_book_stats st;
+        if (gf_catalog_read(g, &c, rows[i], &bk) != CDB_OK)
+            continue;
+        s = gf_books_add_text_file(g, &c, &b, bk.ebook, dir, &st);
+        if (s == CDB_E_EXISTS) {
+            had++;
+            continue;
+        }
+        if (s != CDB_OK) {
+            printf("  #%lld: %s: %s\n", (long long)bk.ebook, st.step, cdb_status_str(s));
+            failed++;
+            continue;
+        }
+        done++;
+        bytes += st.bytes;
+        printf("  #%lld: %llu bytes of text in book_text, %.1f ms\n", (long long)bk.ebook,
+               (unsigned long long)st.bytes, st.ms);
+    }
+    printf("book_text: %u added, %u had it, %u failed; %llu bytes, %.0f ms\n", done, had, failed,
+           (unsigned long long)bytes, gf_now_ms() - t0);
+    return failed == 0 ? 0 : 1;
 }
 
 /* Stores every book listed in dir/manifest.tsv that has no passages yet. */
@@ -212,6 +273,31 @@ static int ingest_books_cli(gf_db *g, const char *dir)
 }
 
 /* Embeds every book with passages but no vectors, then links and refreshes. */
+/* One line per slice of the graph refresh: how far, how fast, how long to go. */
+static void graph_progress(size_t done, size_t pending, double ms, void *ctx)
+{
+    double rate = ms > 0 ? (double)done / (ms / 1000.0) : 0;
+    (void)ctx;
+    printf("  graph: %6zu refreshed, %6zu pending | %6.1f entries/s | %5.0f s so far, about %.0f s to go\n", done,
+           pending, rate, ms / 1000.0, rate > 0 ? (double)pending / rate : 0.0);
+    fflush(stdout);
+}
+
+static cdb_status refresh_graph(gf_db *g, const gf_vec *v)
+{
+    size_t remaining = 0;
+    double t0 = gf_now_ms();
+    cdb_status s;
+
+    printf("neighbour graph: refreshing (each entry's %u nearest, exact) ...\n", GF_VEC_K);
+    s = gf_vec_refresh_graph(g, v, graph_progress, NULL, &remaining);
+    printf("neighbour graph: %s, refreshed in %.0f ms, %zu pending\n", cdb_status_str(s), gf_now_ms() - t0,
+           remaining);
+    gf_metric("vec.graph_refresh_ms", gf_now_ms() - t0);
+    gf_metrics_flush(g);
+    return s;
+}
+
 static int embed_cli(gf_db *g, const char *model)
 {
     static uint64_t rows[4096];
@@ -220,7 +306,7 @@ static int embed_cli(gf_db *g, const char *model)
     gf_vec v;
     gf_embed *e;
     cdb_table_cursor cur;
-    size_t n = 0, i, remaining = 0;
+    size_t n = 0, i;
     uint64_t links = 0, total = 0;
     double t0;
     cdb_status s;
@@ -263,14 +349,74 @@ static int embed_cli(gf_db *g, const char *model)
     s = gf_vec_link_similar(g, &v, &links);
     printf("similar_to: %s, %llu links added in %.1f ms\n", cdb_status_str(s), (unsigned long long)links,
            gf_now_ms() - t0);
-    t0 = gf_now_ms();
     if (s == CDB_OK)
-        s = cdb_vec_refresh(&g->db, v.passages, 0, &remaining);
-    printf("neighbour graph: %s, refreshed in %.0f ms, %zu pending\n", cdb_status_str(s), gf_now_ms() - t0,
-           remaining);
-    gf_metric("vec.graph_refresh_ms", gf_now_ms() - t0);
-    gf_metrics_flush(g);
+        s = refresh_graph(g, &v);
     printf("embedded %llu passages this run\n", (unsigned long long)total);
+    return s == CDB_OK ? 0 : 1;
+}
+
+/* Refreshes the passages' neighbour graph only: what embed ends with. */
+static int graph_cli(gf_db *g)
+{
+    gf_vec v;
+    cdb_status s = gf_vec_open(g, &v);
+
+    if (s != CDB_OK) {
+        fprintf(stderr, "gutenfree: open stores: %s\n", cdb_status_str(s));
+        return 1;
+    }
+    return refresh_graph(g, &v) == CDB_OK ? 0 : 1;
+}
+
+/* Links similar books only: what embed does before its graph refresh. One
+ * bulk search over every book vector (spec 18.4), on the accelerator when
+ * there is one; prints how the searches went. */
+static int similar_cli(gf_db *g)
+{
+    gf_vec v;
+    uint64_t links = 0;
+    cdb_accel_stats before;
+    double t0;
+    cdb_status s = gf_vec_open(g, &v);
+
+    if (s != CDB_OK) {
+        fprintf(stderr, "gutenfree: open stores: %s\n", cdb_status_str(s));
+        return 1;
+    }
+    before = g->db.accel_stats;
+    t0 = gf_now_ms();
+    s = gf_vec_link_similar(g, &v, &links);
+    printf("similar_to: %s, %llu links added in %.1f ms (%llu searches on the accelerator, %llu on the CPU)\n",
+           cdb_status_str(s), (unsigned long long)links, gf_now_ms() - t0,
+           (unsigned long long)(g->db.accel_stats.certified - before.certified),
+           (unsigned long long)(g->db.accel_stats.cpu + g->db.accel_stats.small - before.cpu - before.small));
+    return s == CDB_OK ? 0 : 1;
+}
+
+/* Times a whole graph build: every passage vector copied into graph_bench,
+ * then its graph refreshed as embed does. Run it on a copy of the
+ * database; it refuses when graph_bench exists. */
+static int bench_graph_cli(gf_db *g)
+{
+    gf_vec v, bv;
+    uint64_t copied = 0;
+    double t0;
+    cdb_status s = gf_vec_open(g, &v);
+
+    if (s != CDB_OK) {
+        fprintf(stderr, "gutenfree: open stores: %s\n", cdb_status_str(s));
+        return 1;
+    }
+    t0 = gf_now_ms();
+    bv = v;
+    if ((s = gf_vec_bench_copy(g, &v, &bv.passages, &copied)) != CDB_OK) {
+        fprintf(stderr, "gutenfree: graph_bench: %s (use a fresh copy of the database)\n", cdb_status_str(s));
+        return 1;
+    }
+    printf("graph_bench: %llu vectors copied in %.0f ms (vec_work %zu bytes, vec_mem %zu, 0: default)\n",
+           (unsigned long long)copied, gf_now_ms() - t0, g->db.cfg.vec_work_size, g->db.cfg.vec_mem);
+    s = refresh_graph(g, &bv); /* bv: the passages' handles, with graph_bench in place of passage_vec */
+    printf("graph_bench: refreshes that checked every entry: %llu\n", (unsigned long long)g->db.vec_full_checks);
     return s == CDB_OK ? 0 : 1;
 }
 
@@ -380,12 +526,19 @@ int main(int argc, char **argv)
     static gf_app app;
     int cli = argc > 1 && strcmp(argv[1], "ingest-index") == 0;
     int cli_books = argc > 1 && strcmp(argv[1], "ingest-books") == 0;
+    int cli_text = argc > 1 && strcmp(argv[1], "ingest-text") == 0;
     int cli_embed = argc > 1 && strcmp(argv[1], "embed") == 0;
+    int cli_graph = argc > 1 && strcmp(argv[1], "graph") == 0;
+    int cli_bench = argc > 1 && strcmp(argv[1], "bench-graph") == 0;
+    int cli_similar = argc > 1 && strcmp(argv[1], "link-similar") == 0;
     int cli_metrics = argc > 1 && strcmp(argv[1], "metrics") == 0;
     int cli_probe = argc > 1 && strcmp(argv[1], "probe") == 0;
     int cli_merge = argc > 1 && strcmp(argv[1], "merge-csv") == 0;
     int cli_filter = argc > 1 && strcmp(argv[1], "filter") == 0;
-    int a = cli_filter ? argc : cli || cli_books || cli_embed || cli_metrics || cli_probe || cli_merge ? 2 : 1;
+    int a = cli_filter ? argc : cli || cli_books || cli_text || cli_embed || cli_graph || cli_bench || cli_similar || cli_metrics || cli_probe
+                                        || cli_merge
+                                ? 2
+                                : 1;
     const char *pgcsv = GF_DEFAULT_PGCSV;
     double seconds = 10;
     unsigned batch = GF_INGEST_BATCH;
@@ -402,7 +555,7 @@ int main(int argc, char **argv)
     }
     if (cli && a < argc)
         gutindex = argv[a++];
-    if (cli_books && a < argc)
+    if ((cli_books || cli_text) && a < argc)
         books = argv[a++];
     if (cli_embed && a < argc)
         model = argv[a++];
@@ -412,7 +565,8 @@ int main(int argc, char **argv)
         pgcsv = argv[a++];
     if (argc > 1 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
         printf("gutenfree [base] | ingest-index [--batch N] [gutindex] [base] | merge-csv [csv] [base]\n"
-               "          | ingest-books [dir] [base] | embed [model.gguf] [base] | filter key=value ...\n"
+               "          | ingest-books [dir] [base] | ingest-text [dir] [base] | embed [model.gguf] [base]\n"
+               "          | graph [base] | bench-graph [copy-of-base] | filter key=value ...\n"
                "          | probe [seconds] [base] | metrics [base]\n"
                "base: database path without extension (default %s, or $GUTENFREE_DB).\n"
                "Run from demo/gutenfree/; see README.md there.\n", GF_DEFAULT_BASE);
@@ -449,9 +603,15 @@ int main(int argc, char **argv)
         rc = merge_cli(&g, pgcsv);
     } else if (cli_filter) {
         rc = filter_cli(&g, argc, argv, 2);
-    } else if (cli || cli_books || cli_embed) {
-        printf("build: %s\nopen: %.1f ms\n", GF_BUILD_LABEL, open_ms);
-        rc = cli ? ingest_cli(&g, gutindex, batch) : cli_books ? ingest_books_cli(&g, books) : embed_cli(&g, model);
+    } else if (cli || cli_books || cli_text || cli_embed || cli_graph || cli_bench || cli_similar) {
+        printf("build: %s\naccelerator: %s\nopen: %.1f ms\n", GF_BUILD_LABEL, g.accel_name, open_ms);
+        rc = cli ? ingest_cli(&g, gutindex, batch)
+             : cli_books ? ingest_books_cli(&g, books)
+             : cli_text ? ingest_text_cli(&g, books)
+             : cli_graph ? graph_cli(&g)
+             : cli_bench ? bench_graph_cli(&g)
+             : cli_similar ? similar_cli(&g)
+             : embed_cli(&g, model);
     } else {
         app.g = &g;
         gf_jobs_set_app(&app);

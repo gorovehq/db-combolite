@@ -39,6 +39,12 @@ else()
 endif()
 target_compile_definitions(gutenfree PRIVATE GF_BUILD_LABEL="${GF_BUILD_LABEL}")
 target_link_libraries(gutenfree PRIVATE combolite llama ${CURSES_LIBRARIES})
+# The accelerator (spec 18), when this build has a backend: vector search
+# and graph refreshes on the GPU (gf_db.c; GUTENFREE_ACCEL turns it off).
+if(TARGET combolite_accel)
+  target_link_libraries(gutenfree PRIVATE combolite_accel)
+  target_compile_definitions(gutenfree PRIVATE GF_ACCEL=1)
+endif()
 # The binary goes next to its scripts and data/, so it runs as ./gutenfree
 # from demo/gutenfree/ (the last build made wins; git ignores it).
 set_target_properties(gutenfree PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

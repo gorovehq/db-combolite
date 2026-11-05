@@ -138,6 +138,22 @@ cdb_status cdb_vec_search(cdb_db *db, uint64_t store, const void *query, size_t 
 cdb_status cdb_vec_search_mode(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
                                unsigned mode, cdb_vec_hit *hits, size_t k, size_t *n);
 
+/* Bulk search (spec 18.4): nq searches in one call, such as building
+ * similar_to links or retrieving memories for several prompts. Query i is
+ * queries[i], lens[i] bytes, as for cdb_vec_search_mode; its hits go to
+ * hits[i * k ...] and counts[i] says how many. Each query's result is
+ * exactly what cdb_vec_search_mode gives it. With an accelerator holding
+ * the collection, the exact searches go to the device in batches; without
+ * one, they run on the CPU one by one. Every query is checked before any
+ * is searched: one that is not a vector of the collection is
+ * CDB_E_INVALID_ARG, with nothing searched. The database's lock is let go
+ * between batches of 64 queries, so other calls run meanwhile; a later
+ * batch may see commits made in between, as separate searches would.
+ * Requests that read fewer than cdb_db_config.accel_min_bytes stay on
+ * the CPU. */
+cdb_status cdb_vec_search_bulk(cdb_db *db, uint64_t store, const void *const *queries, const size_t *lens, size_t nq,
+                               unsigned measure, unsigned mode, cdb_vec_hit *hits, size_t k, size_t *counts);
+
 /* Adds a neighbour graph with k neighbours per entry (0: 16) and queues
  * every vector; commits immediately. CDB_E_EXISTS if there is one,
  * CDB_E_OVERFLOW if a record of k neighbours does not fit an index value. */
@@ -167,6 +183,81 @@ cdb_status cdb_vec_refresh_async(cdb_db *db, cdb_vec_refresh_task *task, uint64_
  * incomplete). CDB_E_NOT_FOUND for an entry that does not exist. */
 cdb_status cdb_vec_neighbours(cdb_db *db, uint64_t store, uint64_t entry, cdb_vec_hit *hits, size_t max,
                               size_t *n, int *fresh);
+
+/* ---- Change log and named change cursors (spec 14.12.5, 18.12) ----
+ *
+ * Every collection created now keeps a change log: which entries each
+ * archive commit inserted, replaced or deleted, keyed by that commit's
+ * sequence. Reconciliation trims it below the readers' floor and the lowest
+ * named cursor, so an application that wants the changes since it last
+ * looked, across sessions, holds them with a named cursor. */
+
+#define CDB_VEC_CURSOR_NAME_MAX 64u
+
+/* One changed entry: the sequence of the archive commit that changed it,
+ * and whether it is live now (0: deleted since). An entry changed under
+ * several sequences is listed once for each. */
+typedef struct cdb_vec_change {
+    uint64_t seq;
+    uint64_t entry;
+    int live;
+} cdb_vec_change;
+
+/* Adds a change log to a collection created before logs existed; it holds
+ * every change from now on. Commits immediately. CDB_E_EXISTS if it has
+ * one. */
+cdb_status cdb_vec_track_changes(cdb_db *db, uint64_t store);
+
+/* The collection's change stamp, the sequence of its newest change (or its
+ * trimmed-through sequence when no change is kept), and *oldest, the
+ * sequence the log holds every change after. CDB_E_STATE without a log. */
+cdb_status cdb_vec_change_stamp(cdb_db *db, uint64_t store, uint64_t *stamp, uint64_t *oldest);
+
+/* Lists the changes after (*seq, *entry), in that order, at most max of
+ * them; *n says how many. Start with *seq the sequence to read after and
+ * *entry UINT64_MAX; both are advanced past what is returned, so call
+ * again until *n is 0. CDB_E_STATE without a log, or when the log no
+ * longer reaches back to *seq (it was trimmed: read the collection whole
+ * instead). Not inside a transaction. */
+cdb_status cdb_vec_changes(cdb_db *db, uint64_t store, uint64_t *seq, uint64_t *entry, cdb_vec_change *out,
+                           size_t max, size_t *n);
+
+/* Opens the named cursor, creating it at the change stamp if it does not
+ * exist; *seq is the sequence it has read up to. Commits immediately when
+ * it creates. Names are 1 to CDB_VEC_CURSOR_NAME_MAX bytes. CDB_E_STATE
+ * without a log. */
+cdb_status cdb_vec_cursor_open(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t *seq);
+
+/* Advances the named cursor to seq, in the open transaction: one ordinary
+ * commit, no reconciliation (spec 14.12.5). A lower seq changes nothing.
+ * CDB_E_NOT_FOUND if there is no such cursor. */
+cdb_status cdb_vec_cursor_advance(cdb_db *db, uint64_t store, const char *name, size_t len, uint64_t seq);
+
+/* Drops the named cursor, so it no longer holds the log. Commits
+ * immediately. CDB_E_NOT_FOUND if there is no such cursor. */
+cdb_status cdb_vec_cursor_drop(cdb_db *db, uint64_t store, const char *name, size_t len);
+
+/* ---- Accelerator mirrors (spec 18), host profile; no-ops on mcu ---- */
+
+/* Fills the mirrors searches have asked for; run at reconciliation and at
+ * each cdb_db_tick. */
+cdb_status cdb_vec_accel_maintain(cdb_db *db);
+/* At the end of a rebase: catches each mirror up from its change log. */
+cdb_status cdb_vec_accel_rebase(cdb_db *db);
+/* After this process's own reconciliation has committed the archive. */
+void cdb_vec_accel_committed(cdb_db *db);
+/* The oldest archive sequence a ready mirror reflects (UINT64_MAX: none):
+ * the reader pin is held at or below it (spec 18.12). */
+uint64_t cdb_vec_accel_floor(const cdb_db *db);
+/* The store was dropped: its mirror goes. */
+void cdb_vec_accel_forget(cdb_db *db, uint64_t store);
+/* At close: every mirror is closed. */
+void cdb_vec_accel_close(cdb_db *db);
+/* The distance the CPU path computes between a query and a stored vector,
+ * both in their stored form: for an accelerator, or a test, to compare
+ * its own against. */
+double cdb_vec_cpu_distance(unsigned elem, uint32_t dims, unsigned measure, const uint8_t *q, const uint8_t *v,
+                            cdb_byte_order o);
 
 /* Bytes of vec_work a collection with this shape and k needs. */
 size_t cdb_vec_work_size(cdb_vector_elem elem, uint32_t dims, uint32_t k);

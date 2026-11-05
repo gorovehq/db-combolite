@@ -13,6 +13,9 @@
 #define GF_PAGE_LOG2 12u
 #define GF_PAGE (1u << GF_PAGE_LOG2)
 #define GF_NODES 1024u                 /* pager cache: 8 MB of 4 KB pages */
+/* Verified data pages kept in memory (cdb_pager_config.page_cache): the
+ * vector blocks and graph indexes a refresh or search reads over and over */
+#define GF_PAGE_CACHE (128u * 1024u * 1024u)
 /* Largest document body. Each byte costs about 41 bytes of engine buffers
  * (8 MB: about 330 MB), mostly full-text token slots. Books are stored as
  * passages far smaller than this, so a book of any size fits. */
@@ -32,9 +35,15 @@ typedef struct gf_db {
     size_t bytes;             /* their total, for the diagnostics screen */
     int failed;               /* an allocation failed */
     int open;
+    void *accel;              /* the accelerator, a cdb_accel (spec 18), or NULL */
+    char accel_name[160];     /* which, or why none, for the screens */
 } gf_db;
 
-/* Opens <base>.cdbarch, creating it if it does not exist. */
+/* Opens <base>.cdbarch, creating it if it does not exist. In a build with
+ * combolite_accel, it first opens the accelerator the machine has (CUDA,
+ * then Vulkan) for vector search and graph refreshes: GUTENFREE_ACCEL=off
+ * goes without one, GUTENFREE_ACCEL=software also allows a device that
+ * runs on the CPU (llvmpipe). */
 cdb_status gf_db_open(gf_db *g, const char *base);
 
 /* Closes the database (one file at rest) and frees the buffers. */

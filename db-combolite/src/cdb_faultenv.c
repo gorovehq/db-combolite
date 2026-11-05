@@ -393,6 +393,8 @@ cdb_status cdb_faultenv_init(cdb_faultenv *fe, const cdb_faultenv_config *cfg, c
     fe->rng = 0x9E3779B97F4A7C15ull;
     out->ops = &faultenv_ops;
     out->ctx = fe;
+    out->accel = NULL;
+    out->accel_ctx = NULL;
     return CDB_OK;
 }
 

@@ -191,8 +191,21 @@ int cdb_ts_is_open(cdb_db *db, uint64_t store)
 
 /* A catalog change: the four indexes are created for the ID the store will
  * get, then the store record naming them, all in one commit. */
+static cdb_status ts_create_in(cdb_db *db, const char *name, size_t len, unsigned late_mode, int64_t lateness,
+                               uint64_t *store);
+
 cdb_status cdb_ts_create(cdb_db *db, const char *name, size_t len, unsigned late_mode, int64_t lateness,
                          uint64_t *store)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = ts_create_in(db, name, len, late_mode, lateness, store);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status ts_create_in(cdb_db *db, const char *name, size_t len, unsigned late_mode, int64_t lateness,
+                               uint64_t *store)
 {
     uint8_t settings[CDB_CATALOG_SETTINGS_MAX];
     size_t slen;
@@ -725,8 +738,21 @@ static int64_t default_window(unsigned precision)
     return w;
 }
 
+static cdb_status ts_series_in(cdb_db *db, uint64_t store, const char *name, size_t len, const cdb_ts_tag *tags,
+                               size_t ntags, const cdb_ts_def *def, uint64_t *series, int *created);
+
 cdb_status cdb_ts_series(cdb_db *db, uint64_t store, const char *name, size_t len, const cdb_ts_tag *tags,
                          size_t ntags, const cdb_ts_def *def, uint64_t *series, int *created)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = ts_series_in(db, store, name, len, tags, ntags, def, series, created);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status ts_series_in(cdb_db *db, uint64_t store, const char *name, size_t len, const cdb_ts_tag *tags,
+                               size_t ntags, const cdb_ts_def *def, uint64_t *series, int *created)
 {
     uint8_t key[KEY_MAX], payload[16 + CDB_TS_MAX_FIELDS * 9u + KEY_MAX];
     size_t klen;
@@ -762,7 +788,18 @@ cdb_status cdb_ts_series(cdb_db *db, uint64_t store, const char *name, size_t le
     return CDB_OK;
 }
 
+static cdb_status ts_describe_in(cdb_db *db, uint64_t store, uint64_t series, cdb_ts_def *def);
+
 cdb_status cdb_ts_describe(cdb_db *db, uint64_t store, uint64_t series, cdb_ts_def *def)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = ts_describe_in(db, store, series, def);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status ts_describe_in(cdb_db *db, uint64_t store, uint64_t series, cdb_ts_def *def)
 {
     ts_store *t;
     srec r;
@@ -800,7 +837,18 @@ static int64_t ticks_to_ns(int64_t ticks, unsigned precision)
     return ticks;
 }
 
+static cdb_status ts_append_in(cdb_db *db, uint64_t store, uint64_t series, const cdb_ts_in *points, size_t n);
+
 cdb_status cdb_ts_append(cdb_db *db, uint64_t store, uint64_t series, const cdb_ts_in *points, size_t n)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = ts_append_in(db, store, series, points, n);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status ts_append_in(cdb_db *db, uint64_t store, uint64_t series, const cdb_ts_in *points, size_t n)
 {
     uint8_t *p;
     size_t at = 0, i, room;
@@ -873,7 +921,18 @@ static size_t k_retention(uint8_t out[9], uint64_t series)
 }
 
 /* Only checks the series exists; the apply does the removal. */
+static cdb_status ts_drop_before_in(cdb_db *db, uint64_t store, uint64_t series, int64_t ts);
+
 cdb_status cdb_ts_drop_before(cdb_db *db, uint64_t store, uint64_t series, int64_t ts)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = ts_drop_before_in(db, store, series, ts);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status ts_drop_before_in(cdb_db *db, uint64_t store, uint64_t series, int64_t ts)
 {
     uint8_t p[8];
     ts_store *t;
@@ -895,7 +954,18 @@ cdb_status cdb_ts_drop_before(cdb_db *db, uint64_t store, uint64_t series, int64
     return CDB_OK;
 }
 
+static cdb_status ts_set_retention_in(cdb_db *db, uint64_t store, uint64_t series, int64_t max_age_ticks);
+
 cdb_status cdb_ts_set_retention(cdb_db *db, uint64_t store, uint64_t series, int64_t max_age_ticks)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = ts_set_retention_in(db, store, series, max_age_ticks);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status ts_set_retention_in(cdb_db *db, uint64_t store, uint64_t series, int64_t max_age_ticks)
 {
     ts_store *t;
     srec r;
@@ -930,7 +1000,18 @@ cdb_status cdb_ts_set_retention(cdb_db *db, uint64_t store, uint64_t series, int
     return CDB_OK;
 }
 
+static cdb_status ts_get_retention_in(cdb_db *db, uint64_t store, uint64_t series, int64_t *max_age_ticks);
+
 cdb_status cdb_ts_get_retention(cdb_db *db, uint64_t store, uint64_t series, int64_t *max_age_ticks)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = ts_get_retention_in(db, store, series, max_age_ticks);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status ts_get_retention_in(cdb_db *db, uint64_t store, uint64_t series, int64_t *max_age_ticks)
 {
     ts_store *t;
     srec r;
@@ -961,7 +1042,18 @@ cdb_status cdb_ts_get_retention(cdb_db *db, uint64_t store, uint64_t series, int
     return CDB_OK;
 }
 
+static cdb_status ts_apply_retention_in(cdb_db *db, uint64_t store, uint64_t series, int64_t now_ts, int64_t *dropped_before);
+
 cdb_status cdb_ts_apply_retention(cdb_db *db, uint64_t store, uint64_t series, int64_t now_ts, int64_t *dropped_before)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = ts_apply_retention_in(db, store, series, now_ts, dropped_before);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status ts_apply_retention_in(cdb_db *db, uint64_t store, uint64_t series, int64_t now_ts, int64_t *dropped_before)
 {
     int64_t retention = 0;
     int64_t cutoff;
@@ -1593,8 +1685,21 @@ static cdb_status write_row(const srec *r, const cdb_ts_point *p, cdb_byte_order
     return w.error;
 }
 
+static cdb_status ts_range_in(cdb_db *db, uint64_t store, uint64_t series, int64_t from, int64_t to, uint8_t *buf,
+                              size_t cap, cdb_ts_row *rows, size_t max, size_t *n, int64_t *next);
+
 cdb_status cdb_ts_range(cdb_db *db, uint64_t store, uint64_t series, int64_t from, int64_t to, uint8_t *buf,
                         size_t cap, cdb_ts_row *rows, size_t max, size_t *n, int64_t *next)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = ts_range_in(db, store, series, from, to, buf, cap, rows, max, n, next);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status ts_range_in(cdb_db *db, uint64_t store, uint64_t series, int64_t from, int64_t to, uint8_t *buf,
+                              size_t cap, cdb_ts_row *rows, size_t max, size_t *n, int64_t *next)
 {
     ts_store *t;
     srec r;
@@ -1656,7 +1761,18 @@ cdb_status cdb_ts_range(cdb_db *db, uint64_t store, uint64_t series, int64_t fro
     }
 }
 
+static cdb_status ts_live_in_tx_in(cdb_db *db, uint64_t store, uint64_t series, int *live);
+
 cdb_status cdb_ts_live_in_tx(cdb_db *db, uint64_t store, uint64_t series, int *live)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = ts_live_in_tx_in(db, store, series, live);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status ts_live_in_tx_in(cdb_db *db, uint64_t store, uint64_t series, int *live)
 {
     cdb_store_info info;
     ts_store *t;
@@ -1680,7 +1796,18 @@ cdb_status cdb_ts_live_in_tx(cdb_db *db, uint64_t store, uint64_t series, int *l
     return CDB_OK;
 }
 
+static cdb_status ts_point_live_in_tx_in(cdb_db *db, uint64_t store, uint64_t series, int64_t ts, int *live);
+
 cdb_status cdb_ts_point_live_in_tx(cdb_db *db, uint64_t store, uint64_t series, int64_t ts, int *live)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = ts_point_live_in_tx_in(db, store, series, ts, live);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status ts_point_live_in_tx_in(cdb_db *db, uint64_t store, uint64_t series, int64_t ts, int *live)
 {
     cdb_store_info info;
     ts_store *t;
@@ -1912,8 +2039,21 @@ static cdb_status flush_downsample_bucket(cdb_db *db, const cdb_ts_downsample_sp
     return cdb_ts_append(db, spec->dst_store, spec->dst_series, &pin, 1);
 }
 
+static cdb_status ts_downsample_run_in(cdb_db *db, const cdb_ts_downsample_spec *spec,
+                                       int64_t from_ts, int64_t to_ts, size_t *points_generated);
+
 cdb_status cdb_ts_downsample_run(cdb_db *db, const cdb_ts_downsample_spec *spec,
                                  int64_t from_ts, int64_t to_ts, size_t *points_generated)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = ts_downsample_run_in(db, spec, from_ts, to_ts, points_generated);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status ts_downsample_run_in(cdb_db *db, const cdb_ts_downsample_spec *spec,
+                                       int64_t from_ts, int64_t to_ts, size_t *points_generated)
 {
     cdb_ts_def src_def, dst_def;
     agg_state aggs[CDB_TS_MAX_FIELDS];

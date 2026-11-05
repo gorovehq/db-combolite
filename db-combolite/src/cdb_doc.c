@@ -923,9 +923,24 @@ static cdb_status materialize(cdb_db *db, struct cdb_doc_pool *pool, uint64_t en
     return CDB_OK;
 }
 
+static cdb_status doc_get_in(cdb_db *db, uint64_t store, uint64_t entry, uint64_t rev,
+                             void *body, size_t cap, size_t *body_len,
+                             char *summary, size_t summary_cap, size_t *summary_len, cdb_doc_info *info);
+
 cdb_status cdb_doc_get(cdb_db *db, uint64_t store, uint64_t entry, uint64_t rev,
                        void *body, size_t cap, size_t *body_len,
                        char *summary, size_t summary_cap, size_t *summary_len, cdb_doc_info *info)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_get_in(db, store, entry, rev, body, cap, body_len, summary, summary_cap, summary_len, info);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_get_in(cdb_db *db, uint64_t store, uint64_t entry, uint64_t rev,
+                             void *body, size_t cap, size_t *body_len,
+                             char *summary, size_t summary_cap, size_t *summary_len, cdb_doc_info *info)
 {
     struct cdb_doc_pool *pool;
     materialized m;
@@ -1366,7 +1381,18 @@ cdb_status cdb_doc_apply(void *ctx, cdb_pager *pager, const cdb_delta *d)
 
 /* The head revision of a document, for other models that refer to it.
  * CDB_E_INVALID_ARG: the store is not a document pool. */
+static cdb_status doc_head_in(cdb_db *db, uint64_t store, uint64_t entry, uint64_t *rev, int *live);
+
 cdb_status cdb_doc_head(cdb_db *db, uint64_t store, uint64_t entry, uint64_t *rev, int *live)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_head_in(db, store, entry, rev, live);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_head_in(cdb_db *db, uint64_t store, uint64_t entry, uint64_t *rev, int *live)
 {
     struct cdb_doc_pool *pool;
     head_rec h;
@@ -1388,7 +1414,18 @@ cdb_status cdb_doc_head(cdb_db *db, uint64_t store, uint64_t entry, uint64_t *re
 /* A catalog change: reconciles first (cdb_db_catalog_begin), builds the
  * index, records its settings and roots in the store record (which
  * commits), then rotates the journal (cdb_db_catalog_end). */
+static cdb_status doc_create_full_text_in(cdb_db *db, uint64_t store, const cdb_fts_config *cfg);
+
 cdb_status cdb_doc_create_full_text(cdb_db *db, uint64_t store, const cdb_fts_config *cfg)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_create_full_text_in(db, store, cfg);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_create_full_text_in(cdb_db *db, uint64_t store, const cdb_fts_config *cfg)
 {
     struct cdb_doc_pool *pool;
     uint8_t settings[CDB_CATALOG_FULL_TEXT_MAX];
@@ -1447,8 +1484,21 @@ cdb_status cdb_doc_create_full_text(cdb_db *db, uint64_t store, const cdb_fts_co
     return cdb_db_catalog_end(db, s);
 }
 
+static cdb_status doc_search_in(cdb_db *db, uint64_t store, const char *query, size_t len, int mode,
+                                cdb_fts_hit *hits, size_t max, size_t *n);
+
 cdb_status cdb_doc_search(cdb_db *db, uint64_t store, const char *query, size_t len, int mode,
                           cdb_fts_hit *hits, size_t max, size_t *n)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_search_in(db, store, query, len, mode, hits, max, n);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_search_in(cdb_db *db, uint64_t store, const char *query, size_t len, int mode,
+                                cdb_fts_hit *hits, size_t max, size_t *n)
 {
     struct cdb_doc_pool *pool;
     cdb_status s;
@@ -1496,7 +1546,18 @@ static cdb_status schema_validate(cdb_db *db, const uint8_t *doc, size_t len)
 
 /* Checks the schema is well formed before storing it, so a bad schema can
  * never become current. */
+static cdb_status doc_set_schema_in(cdb_db *db, uint64_t store, const void *schema, size_t len, uint32_t *version);
+
 cdb_status cdb_doc_set_schema(cdb_db *db, uint64_t store, const void *schema, size_t len, uint32_t *version)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_set_schema_in(db, store, schema, len, version);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_set_schema_in(cdb_db *db, uint64_t store, const void *schema, size_t len, uint32_t *version)
 {
     struct cdb_doc_pool *pool;
     int trivial;
@@ -1513,8 +1574,21 @@ cdb_status cdb_doc_set_schema(cdb_db *db, uint64_t store, const void *schema, si
     return CDB_OK;
 }
 
+static cdb_status doc_get_schema_in(cdb_db *db, uint64_t store, uint32_t version, void *schema, size_t cap,
+                                    size_t *len, uint32_t *current);
+
 cdb_status cdb_doc_get_schema(cdb_db *db, uint64_t store, uint32_t version, void *schema, size_t cap,
                               size_t *len, uint32_t *current)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_get_schema_in(db, store, version, schema, cap, len, current);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_get_schema_in(cdb_db *db, uint64_t store, uint32_t version, void *schema, size_t cap,
+                                    size_t *len, uint32_t *current)
 {
     struct cdb_doc_pool *pool;
     cdb_status s;
@@ -1890,8 +1964,21 @@ static cdb_status put_body(cdb_db *db, struct cdb_doc_pool *pool, int guarded, u
 /* The entry ID is taken from the pool's counter, which advances only after
  * the change is journaled. An aborted insert still uses up its ID; IDs are
  * never reused. */
+static cdb_status doc_insert_in(cdb_db *db, uint64_t store, const char *summary, size_t summary_len,
+                                const void *body, size_t body_len, uint64_t *entry);
+
 cdb_status cdb_doc_insert(cdb_db *db, uint64_t store, const char *summary, size_t summary_len,
                           const void *body, size_t body_len, uint64_t *entry)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_insert_in(db, store, summary, summary_len, body, body_len, entry);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_insert_in(cdb_db *db, uint64_t store, const char *summary, size_t summary_len,
+                                const void *body, size_t body_len, uint64_t *entry)
 {
     struct cdb_doc_pool *pool;
     uint64_t id;
@@ -1906,8 +1993,21 @@ cdb_status cdb_doc_insert(cdb_db *db, uint64_t store, const char *summary, size_
     return CDB_OK;
 }
 
+static cdb_status doc_replace_in(cdb_db *db, uint64_t store, uint64_t entry, const char *summary,
+                                 size_t summary_len, const void *body, size_t body_len);
+
 cdb_status cdb_doc_replace(cdb_db *db, uint64_t store, uint64_t entry, const char *summary,
                            size_t summary_len, const void *body, size_t body_len)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_replace_in(db, store, entry, summary, summary_len, body, body_len);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_replace_in(cdb_db *db, uint64_t store, uint64_t entry, const char *summary,
+                                 size_t summary_len, const void *body, size_t body_len)
 {
     struct cdb_doc_pool *pool;
     int guarded;
@@ -1922,7 +2022,18 @@ cdb_status cdb_doc_replace(cdb_db *db, uint64_t store, uint64_t entry, const cha
 /* A patch is checked twice for size: the patch itself must fit as a delta
  * revision's body, and the patched document must fit as a later checkpoint.
  * The schema check runs on the patched document. */
+static cdb_status doc_patch_in(cdb_db *db, uint64_t store, uint64_t entry, const void *patch, size_t patch_len);
+
 cdb_status cdb_doc_patch(cdb_db *db, uint64_t store, uint64_t entry, const void *patch, size_t patch_len)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_patch_in(db, store, entry, patch, patch_len);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_patch_in(cdb_db *db, uint64_t store, uint64_t entry, const void *patch, size_t patch_len)
 {
     struct cdb_doc_pool *pool;
     staged st;
@@ -1957,7 +2068,18 @@ cdb_status cdb_doc_patch(cdb_db *db, uint64_t store, uint64_t entry, const void 
 
 /* Delete only needs liveness, not the document's contents. Link rules are
  * checked here, before journaling, so the apply never has to refuse. */
+static cdb_status doc_delete_in(cdb_db *db, uint64_t store, uint64_t entry);
+
 cdb_status cdb_doc_delete(cdb_db *db, uint64_t store, uint64_t entry)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_delete_in(db, store, entry);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_delete_in(cdb_db *db, uint64_t store, uint64_t entry)
 {
     struct cdb_doc_pool *pool;
     staged st;
@@ -1982,7 +2104,18 @@ cdb_status cdb_doc_delete(cdb_db *db, uint64_t store, uint64_t entry)
     return CDB_OK;
 }
 
+static cdb_status doc_live_in_tx_in(cdb_db *db, uint64_t store, uint64_t entry, int *live);
+
 cdb_status cdb_doc_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *live)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_live_in_tx_in(db, store, entry, live);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_live_in_tx_in(cdb_db *db, uint64_t store, uint64_t entry, int *live)
 {
     struct cdb_doc_pool *pool;
     staged st;
@@ -2000,8 +2133,21 @@ cdb_status cdb_doc_live_in_tx(cdb_db *db, uint64_t store, uint64_t entry, int *l
     return CDB_OK;
 }
 
+static cdb_status doc_get_in_tx_in(cdb_db *db, uint64_t store, uint64_t entry, size_t staged_off, void *body,
+                                   size_t cap, size_t *len, int *live, uint32_t *schema);
+
 cdb_status cdb_doc_get_in_tx(cdb_db *db, uint64_t store, uint64_t entry, size_t staged_off, void *body,
                              size_t cap, size_t *len, int *live, uint32_t *schema)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_get_in_tx_in(db, store, entry, staged_off, body, cap, len, live, schema);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_get_in_tx_in(cdb_db *db, uint64_t store, uint64_t entry, size_t staged_off, void *body,
+                                   size_t cap, size_t *len, int *live, uint32_t *schema)
 {
     struct cdb_doc_pool *pool;
     staged st;
@@ -2051,7 +2197,18 @@ cdb_status cdb_doc_get_in_tx(cdb_db *db, uint64_t store, uint64_t entry, size_t 
     return CDB_OK;
 }
 
+static cdb_status doc_next_live_in(cdb_db *db, uint64_t store, uint64_t after, uint64_t *entry, int *done);
+
 cdb_status cdb_doc_next_live(cdb_db *db, uint64_t store, uint64_t after, uint64_t *entry, int *done)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_next_live_in(db, store, after, entry, done);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_next_live_in(cdb_db *db, uint64_t store, uint64_t after, uint64_t *entry, int *done)
 {
     struct cdb_doc_pool *pool;
     cdb_index_cursor c;
@@ -2170,7 +2327,18 @@ cdb_status cdb_doc_overflow_tail_moved(cdb_db *db, uint64_t store, const uint8_t
     return cdb_pager_write(&db->pager, rev_addr, &h, pl, h.payload_len);
 }
 
+static cdb_status doc_set_keep_in(cdb_db *db, uint64_t store, uint32_t keep);
+
 cdb_status cdb_doc_set_keep(cdb_db *db, uint64_t store, uint32_t keep)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = doc_set_keep_in(db, store, keep);
+    cdb_db_unlock(db);
+    return r;
+}
+
+static cdb_status doc_set_keep_in(cdb_db *db, uint64_t store, uint32_t keep)
 {
     struct cdb_doc_pool *pool;
     cdb_status s = doc_pool(db, store, &pool);

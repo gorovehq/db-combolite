@@ -119,7 +119,8 @@ void cdb_eval_ctx_set_vector(cdb_eval_ctx *ctx, const cdb_value *vec);
 /* Sets execution step budget limit. */
 void cdb_eval_ctx_set_budget(cdb_eval_ctx *ctx, uint64_t step_limit);
 
-/* Sets custom field resolver hook. */
+/* Sets custom field resolver hook. It is consulted first; a path it does not
+ * find falls through to the pseudo-fields and the bound record. */
 void cdb_eval_ctx_set_custom_resolver(cdb_eval_ctx *ctx, cdb_field_resolver_fn fn, void *user_data);
 
 /* Resolves a field path (may contain 0x1F unit separators for nested objects).

@@ -1,6 +1,13 @@
-/* GutenFree Diet: the card catalog, a row-oriented table built from
- * GUTINDEX.ALL (spec 9). One row per ebook, keyed by its number, with an
- * index on a short sort title for browsing. */
+/* GutenFree Diet: the card catalog and the library (spec 9).
+ *
+ *   catalog   every ebook Project Gutenberg lists (GUTINDEX.ALL merged with
+ *             pg_catalog.csv), keyed by its number: reference data only
+ *   library   one row per book whose text is stored, keyed by the same
+ *             number: passages, words, the first and last passage keys, and
+ *             when it was ingested and embedded
+ *
+ * Links (spec 6) join them: in_catalog (library row -> catalog row, 1:1) and
+ * has_passage (library row -> passage, 1:N, in reading order). */
 #ifndef GF_CATALOG_H
 #define GF_CATALOG_H
 
@@ -22,7 +29,7 @@ enum {
 /* Bibliographic columns from pg_catalog.csv, added by a second schema change
  * (all strings; null until gf_catalog_merge_csv has run). */
 enum {
-    GF_BIB_TYPE,        /* Text, Sound, ... */
+    GF_BIB_TYPE,        /* media_type: Text, Sound, ... */
     GF_BIB_ISSUED,      /* YYYY-MM-DD */
     GF_BIB_AUTHORS,     /* "Surname, Given, dates; ..." */
     GF_BIB_SUBJECTS,    /* "; "-separated */
@@ -34,27 +41,41 @@ enum {
 };
 
 /* Indexes, by number (a table numbers them in creation order; 0 is the
- * primary key). Together they are the engine's limit of 8 per table. */
+ * primary key). The engine allows 8 per table. */
 #define GF_CATALOG_PK_INDEX 0u      /* ebook */
 #define GF_CATALOG_SORT_INDEX 1u    /* sort_title */
-#define GF_CATALOG_SHELF_INDEX 2u   /* passages: the books with text */
-#define GF_CATALOG_GENRE_INDEX 3u   /* genre, sort_title */
-#define GF_CATALOG_AUTHOR_INDEX 4u  /* author_sort, sort_title */
-#define GF_CATALOG_ISSUED_INDEX 5u  /* issued, sort_title */
-#define GF_CATALOG_LANG_INDEX 6u    /* language, sort_title */
-#define GF_CATALOG_LOCC_INDEX 7u    /* locc, sort_title */
+#define GF_CATALOG_GENRE_INDEX 2u   /* genre, sort_title */
+#define GF_CATALOG_AUTHOR_INDEX 3u  /* author_sort, sort_title */
+#define GF_CATALOG_ISSUED_INDEX 4u  /* issued, sort_title */
+#define GF_CATALOG_LANG_INDEX 5u    /* language, sort_title */
+#define GF_CATALOG_LOCC_INDEX 6u    /* locc, sort_title */
+
+/* Library columns. */
+enum {
+    GF_LIB_EBOOK,       /* int, primary key: the catalog's ebook number */
+    GF_LIB_TITLE,       /* string, not null */
+    GF_LIB_AUTHOR,      /* string */
+    GF_LIB_LANGUAGE,    /* string */
+    GF_LIB_PASSAGES,    /* int: how many passages */
+    GF_LIB_WORDS,       /* int: words in the stored text */
+    GF_LIB_FIRST,       /* string: the first passage's key, "1342/0000" */
+    GF_LIB_LAST,        /* string: the last passage's key */
+    GF_LIB_INGESTED,    /* string: when the text was stored, UTC ISO 8601 */
+    GF_LIB_EMBEDDED,    /* string: when its vectors were stored; null until then */
+    GF_LIB_MODEL,       /* string: embed_model, the embedding model */
+    GF_NLIB
+};
 #define GF_SORT_MAX 96u
 #define GF_LOCC_MAX 64u
 
-/* first_passage and passages (ints) are added by a schema change after the
- * table exists, as a real application would grow: rows written before it
- * read them as null (spec 9.8). */
 typedef struct gf_catalog {
     uint64_t store;
     uint64_t field[GF_NCOLS];
-    uint64_t first_field;     /* first_passage: entry ID of the first passage */
-    uint64_t passages_field;  /* passages: how many */
     uint64_t bib[GF_NBIB];
+    uint64_t lib_store;       /* the library table */
+    uint64_t lib[GF_NLIB];
+    uint64_t in_catalog;      /* link type: library row -> catalog row */
+    uint64_t has_passage;     /* link type: library row -> passage */
 } gf_catalog;
 
 typedef struct gf_book {
@@ -64,8 +85,15 @@ typedef struct gf_book {
     char subtitle[512];
     char language[64];
     char credits[768];
-    uint64_t first_passage;   /* 0 with passages 0: no text stored */
+    /* From the library, when the book's text is stored */
+    uint64_t lib_row;         /* 0: not in the library */
+    uint64_t first_passage;   /* the first passage's entry, by has_passage */
     uint64_t passages;
+    uint64_t words;
+    char first_key[48];       /* "1342/0000" */
+    char last_key[48];
+    char ingested[32];
+    char embedded[32];        /* empty until embedded */
     char type[16];
     char issued[16];
     char authors[512];
@@ -95,7 +123,10 @@ typedef struct gf_ingest_stats {
     uint64_t inserted;
     uint64_t duplicates;   /* already in the table */
     uint64_t updated;      /* merge: rows given bibliographic data */
+    uint64_t retitled;     /* merge: GUTINDEX titles with '?' for letters, replaced */
     uint64_t refused;      /* rejected by the table's checks */
+    cdb_status first_refused;      /* why the first one was */
+    int64_t first_refused_ebook;
     unsigned batches;      /* commits */
     unsigned batch_rows;   /* rows per commit */
     double ms;             /* whole ingest */
@@ -106,7 +137,8 @@ typedef struct gf_ingest_stats {
 
 typedef void (*gf_progress_fn)(const gf_ingest_stats *st, void *ctx);
 
-/* Opens the "books" table, creating it and its sort index the first time. */
+/* Opens the catalog and library tables and their link types, creating them
+ * the first time. */
 cdb_status gf_catalog_open(gf_db *g, gf_catalog *c);
 
 /* Adds every entry of a GUTINDEX.ALL file that is not in the table yet,
@@ -124,10 +156,18 @@ cdb_status gf_catalog_read(gf_db *g, const gf_catalog *c, uint64_t entry, gf_boo
 /* Finds a row by ebook number. */
 cdb_status gf_catalog_find(gf_db *g, const gf_catalog *c, int64_t ebook, uint64_t *entry, int *found);
 
-/* Inside a transaction: records where a book's passages are. */
-cdb_status gf_catalog_set_passages(gf_db *g, const gf_catalog *c, uint64_t entry, uint64_t first, uint64_t count);
+/* Inside a transaction: adds the library row for catalog row `row` and its
+ * in_catalog link. b holds the catalog fields; passages, words and the
+ * first and last keys are given. */
+cdb_status gf_library_add(gf_db *g, const gf_catalog *c, uint64_t row, const gf_book *b, uint64_t passages,
+                          uint64_t words, const char *first_key, const char *last_key, uint64_t *lib_row);
+/* Inside a transaction: records that a library row's vectors are stored. */
+cdb_status gf_library_set_embedded(gf_db *g, const gf_catalog *c, uint64_t lib_row, const char *model);
+/* UTC now as ISO 8601, "2026-11-03T22:41:07Z". */
+void gf_iso_now(char *out, size_t cap);
 
-/* The books with passages, through the shelf index; zero cur to start. */
+/* The catalog rows of the books in the library, in library order; zero cur
+ * to start. */
 cdb_status gf_catalog_shelf(gf_db *g, const gf_catalog *c, cdb_table_cursor *cur, uint64_t *entries, size_t max,
                             size_t *n);
 
