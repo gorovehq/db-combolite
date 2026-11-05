@@ -735,6 +735,12 @@
       <!-- Section 7 -->
       <section id="security-governance">
         <h2>7. Security, Cryptography & Tamper Governance</h2>
+        <div class="alert important" style="margin-bottom: 1.5rem;">
+          <div class="alert-title">Enclaves do not encrypt your stores yet</div>
+          <p>
+            A store (document pool, table, vector collection, time series or links) can't be placed in an enclave yet, so its data is written <strong>unencrypted</strong>, whatever enclaves exist. Enclaves are also not saved: after a reopen the database no longer knows them. Don't rely on enclaves to keep data confidential until the enclave work described in spec sections 12.8&ndash;12.10 is built. The format below describes how encryption is meant to work; what is missing is placing stores in an enclave. The audit hash chain is not affected.
+          </p>
+        </div>
         <p>
           Enterprise security and multi-tenancy are built into the physical disk format:
         </p>

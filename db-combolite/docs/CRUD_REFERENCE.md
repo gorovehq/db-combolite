@@ -64,6 +64,8 @@ ROLLBACK;
 
 Combolite provides confidential storage domains protected with hardware/AES-256-GCM authenticated encryption and zero-downtime key rotation.
 
+> **Not yet effective.** A store (document pool, table, vector collection, time series or links) can't be placed in an enclave yet, so its data is written **unencrypted**, whatever enclaves exist. Enclaves are also not saved: after a reopen the database no longer knows them. Don't rely on enclaves to keep data confidential until the enclave work in spec sections 12.8–12.10 is built.
+
 | Operation | C99 Function | Declarative SQL | Functional Flux |
 | :--- | :--- | :--- | :--- |
 | **Create Enclave** | `cdb_db_create_enclave(db, id, uri)` | `CREATE ENCLAVE 1 KEY "vault://keys/1";` | `create_enclave(id: 1, key: "vault://keys/1");` |
