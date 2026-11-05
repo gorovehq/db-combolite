@@ -1940,6 +1940,8 @@ static cdb_status source_rev(cdb_db *db, uint64_t store, uint64_t entry, uint64_
 static void accel_note(cdb_db *db, const coll *c, uint64_t entry, uint64_t kind);
 static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned measure, cdb_vec_hit *hits, size_t k,
                               size_t *n, int *used);
+static cdb_status accel_exact_many(cdb_db *db, coll *c, const uint8_t *const *qs, size_t nq, unsigned measure,
+                                   cdb_vec_hit *hits, size_t k, size_t *counts, uint8_t *done);
 
 /* -------------------------------------------------------- change log */
 
@@ -2631,6 +2633,27 @@ static cdb_status search_approx(cdb_db *db, coll *c, const uint8_t *q, unsigned 
     return CDB_OK;
 }
 
+/* Whether a search of c under measure takes the approximate path: the
+ * caller's mode, else the operator's, else the automatic rule:
+ * approximate only with a graph, under the base measure, and with at
+ * least vec_exact_below live vectors. */
+static cdb_status search_path(cdb_db *db, coll *c, unsigned measure, unsigned mode, int *approx)
+{
+    *approx = 0;
+    if (mode == CDB_VEC_AUTO)
+        mode = db->cfg.vec_mode;
+    if (c->graph_on && mode == CDB_VEC_APPROX) {
+        *approx = 1;
+    } else if (c->graph_on && mode == CDB_VEC_AUTO && measure == c->measure) {
+        uint64_t live;
+        cdb_status s;
+        if ((s = meta_get(c, &live)) != CDB_OK)
+            return s;
+        *approx = live >= (db->cfg.vec_exact_below ? db->cfg.vec_exact_below : DEFAULT_EXACT_BELOW);
+    }
+    return CDB_OK;
+}
+
 /* Validates the query, picks the path (see cdb_vec.h), searches, then
  * fills in each hit's source state. Searches see committed vectors only. */
 static cdb_status vec_search_mode_in(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
@@ -2665,19 +2688,8 @@ static cdb_status vec_search_mode_in(cdb_db *db, uint64_t store, const void *que
         return s;
     if (k == 0)
         return CDB_OK;
-    /* The caller's mode, else the operator's, else the automatic rule:
-     * approximate only with a graph, under the base measure, and with at
-     * least vec_exact_below live vectors. */
-    if (mode == CDB_VEC_AUTO)
-        mode = db->cfg.vec_mode;
-    if (c->graph_on && mode == CDB_VEC_APPROX) {
-        approx = 1;
-    } else if (c->graph_on && mode == CDB_VEC_AUTO && measure == c->measure) {
-        uint64_t live;
-        if ((s = meta_get(c, &live)) != CDB_OK)
-            return s;
-        approx = live >= (db->cfg.vec_exact_below ? db->cfg.vec_exact_below : DEFAULT_EXACT_BELOW);
-    }
+    if ((s = search_path(db, c, measure, mode, &approx)) != CDB_OK)
+        return s;
     if (approx) {
         s = search_approx(db, c, q, measure, hits, k, n);
     } else {
@@ -2693,6 +2705,76 @@ cdb_status cdb_vec_search(cdb_db *db, uint64_t store, const void *query, size_t 
                           cdb_vec_hit *hits, size_t k, size_t *n)
 {
     return cdb_vec_search_mode(db, store, query, len, measure, CDB_VEC_AUTO, hits, k, n);
+}
+
+/* Every query is checked before any is searched. On the exact path, with
+ * an accelerator holding the collection and the environment's allocator
+ * for the batch, the queries' first shortlists go to the device together
+ * (accel_exact_many); each query it does not answer, and every query on
+ * the approximate path, is searched alone, exactly as vec_search_mode_in
+ * would. */
+static cdb_status vec_search_bulk_in(cdb_db *db, uint64_t store, const void *const *queries, const size_t *lens,
+                                     size_t nq, unsigned measure, unsigned mode, cdb_vec_hit *hits, size_t k,
+                                     size_t *counts)
+{
+    const uint8_t **qs = NULL;
+    uint8_t *done = NULL;
+    coll *c;
+    size_t i;
+    int approx;
+    cdb_status s;
+
+    for (i = 0; i < nq; i++)
+        counts[i] = 0;
+    if ((s = coll_get(db, store, &c)) != CDB_OK)
+        return s;
+    if (measure == CDB_VEC_BASE)
+        measure = c->measure;
+    if (!measure_fits(c->elem, measure) || (hits == NULL && k && nq) || mode > CDB_VEC_APPROX
+        || (nq && (queries == NULL || lens == NULL)))
+        return CDB_E_INVALID_ARG;
+    for (i = 0; i < nq; i++) {
+        const uint8_t *q;
+        if ((s = vector_of(db, c, (const uint8_t *)queries[i], lens[i], 1, &q)) != CDB_OK)
+            return s;
+    }
+    if (k == 0 || nq == 0)
+        return CDB_OK;
+    if ((s = search_path(db, c, measure, mode, &approx)) != CDB_OK)
+        return s;
+    if (!approx && db->env.accel != NULL && db->env.ops->alloc != NULL) {
+        qs = (const uint8_t **)db->env.ops->alloc(db->env.ctx, nq * sizeof *qs);
+        done = (uint8_t *)db->env.ops->alloc(db->env.ctx, nq);
+        if (qs != NULL && done != NULL) {
+            for (i = 0; i < nq && s == CDB_OK; i++) {
+                done[i] = 0;
+                s = vector_of(db, c, (const uint8_t *)queries[i], lens[i], 0, &qs[i]);
+            }
+            if (s == CDB_OK)
+                s = accel_exact_many(db, c, qs, nq, measure, hits, k, counts, done);
+            for (i = 0; i < nq && s == CDB_OK; i++)
+                if (done[i])
+                    s = source_states(db, c, hits + i * k, counts[i]);
+        }
+    }
+    for (i = 0; i < nq && s == CDB_OK; i++)
+        if (done == NULL || qs == NULL || !done[i])
+            s = vec_search_mode_in(db, store, queries[i], lens[i], measure, mode, hits + i * k, k, &counts[i]);
+    if (qs != NULL)
+        db->env.ops->free(db->env.ctx, (void *)qs);
+    if (done != NULL)
+        db->env.ops->free(db->env.ctx, done);
+    return s;
+}
+
+cdb_status cdb_vec_search_bulk(cdb_db *db, uint64_t store, const void *const *queries, const size_t *lens, size_t nq,
+                               unsigned measure, unsigned mode, cdb_vec_hit *hits, size_t k, size_t *counts)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = vec_search_bulk_in(db, store, queries, lens, nq, measure, mode, hits, k, counts);
+    cdb_db_unlock(db);
+    return r;
 }
 
 /* -------------------------------------------------------- graph upkeep */
@@ -3703,57 +3785,99 @@ void cdb_vec_accel_close(cdb_db *db)
             accel_drop(db, &db->accel[i]);
 }
 
+/* The mirror an exact search of c under measure may use, current (its
+ * queued changes sent), and the first shortlist's size for k (spec
+ * 18.10): NULL when the CPU path must answer (counted), which also asks
+ * for a mirror the collection lacks. */
+static cdb_accel_entry *accel_ready(cdb_db *db, coll *c, unsigned measure, size_t k, size_t *want, cdb_status *s)
+{
+    cdb_accel_entry *a;
+    size_t cap;
+    *s = CDB_OK;
+    if (!accel_on(db))
+        return NULL;
+    if ((a = accel_find(db, c->slot.store_id)) == NULL) {
+        accel_want(db, c);
+        db->accel_stats.cpu++;
+        return NULL;
+    }
+    a->last_use = ++db->accel_clock;
+    if (a->state != CDB_ACCEL_READY || measure != c->measure) {
+        db->accel_stats.cpu++;
+        return NULL;
+    }
+    if ((*s = accel_send(db, c, a)) != CDB_OK)
+        return NULL;
+    if (a->state != CDB_ACCEL_READY) {
+        db->accel_stats.cpu++;
+        return NULL;
+    }
+    *want = 2u * k > k + 8u ? 2u * k : k + 8u;
+    cap = (size_t)(a->vectors / 8u);
+    if (*want >= a->vectors) {
+        *want = (size_t)a->vectors; /* the whole collection: exact by construction */
+    } else if (*want > cap) {
+        db->accel_stats.cpu++; /* too small to gain from a shortlist */
+        return NULL;
+    }
+    return a;
+}
+
+/* Rescores a shortlist of `count` candidates on the CPU as search_exact
+ * would (spec 18.3) into hits, and says whether it is certified complete
+ * (18.10): it held every vector, or nothing left out could be among the k
+ * nearest. */
+static cdb_status accel_rescore(cdb_db *db, coll *c, const cdb_accel_entry *a, const uint8_t *q, double qn,
+                                unsigned measure, const uint64_t *ids, const float *dists, size_t count, size_t want,
+                                double bound, cdb_vec_hit *hits, size_t k, size_t *n, int *ok)
+{
+    cdb_byte_order o = db->pager.order;
+    cdb_status s = CDB_OK;
+    size_t j;
+    *n = 0;
+    *ok = 0;
+    for (j = 0; j < count && s == CDB_OK; j++) {
+        uint8_t *tmp = vbuf(db, V_BUILD);
+        double vn;
+        int found;
+        if ((s = fetch_vector(db, c, ids[j], tmp, &vn, &found)) == CDB_OK && found)
+            add_hit(hits, k, n, ids[j], distance(c, measure, q, qn, tmp, measure == CDB_VEC_COSINE ? vn : -1.0, o));
+    }
+    if (s != CDB_OK)
+        return s;
+    *ok = count < want || want == a->vectors
+          || (*n == k
+              && (bound == 0.0 ? (double)dists[count - 1] >= hits[k - 1].distance
+                               : (double)dists[count - 1] - bound > hits[k - 1].distance));
+    if (!*ok)
+        *n = 0;
+    return CDB_OK;
+}
+
 /* The exact path on the accelerator (spec 18.3, 18.10): a shortlist from
- * the mirror, every candidate rescored on the CPU as search_exact would,
- * and the result certified complete, widening the shortlist while it stays
- * under an eighth of the collection. *used is 0 when the CPU path must
- * answer instead; *n is then 0. */
+ * the mirror, every candidate rescored on the CPU, and the result
+ * certified complete, widening the shortlist while it stays under an
+ * eighth of the collection. *used is 0 when the CPU path must answer
+ * instead; *n is then 0. */
 static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned measure, cdb_vec_hit *hits, size_t k,
                               size_t *n, int *used)
 {
-    cdb_byte_order o = db->pager.order;
     const cdb_accel_ops *ax = db->env.accel;
-    double qn = measure == CDB_VEC_COSINE ? norm_of(c, q, o) : 0.0;
-    uint64_t *ids;
-    float *dists;
-    size_t want, cap;
+    double qn = measure == CDB_VEC_COSINE ? norm_of(c, q, db->pager.order) : 0.0;
+    size_t want = 0;
     cdb_accel_entry *a;
     cdb_status s;
 
     *used = 0;
     *n = 0;
-    if (!accel_on(db))
-        return CDB_OK;
-    if ((a = accel_find(db, c->slot.store_id)) == NULL) {
-        accel_want(db, c);
-        db->accel_stats.cpu++;
-        return CDB_OK;
-    }
-    a->last_use = ++db->accel_clock;
-    if (a->state != CDB_ACCEL_READY || measure != c->measure) {
-        db->accel_stats.cpu++;
-        return CDB_OK;
-    }
-    if ((s = accel_send(db, c, a)) != CDB_OK)
+    if ((a = accel_ready(db, c, measure, k, &want, &s)) == NULL)
         return s;
-    if (a->state != CDB_ACCEL_READY) {
-        db->accel_stats.cpu++;
-        return CDB_OK;
-    }
-    want = 2u * k > k + 8u ? 2u * k : k + 8u;
-    cap = (size_t)(a->vectors / 8u);
-    if (want >= a->vectors)
-        want = (size_t)a->vectors; /* the whole collection: exact by construction */
-    else if (want > cap) {
-        db->accel_stats.cpu++; /* too small to gain from a shortlist */
-        return CDB_OK;
-    }
     for (;;) {
-        size_t count = 0, j;
+        size_t count = 0;
         double bound = 0.0;
-        int ok;
-        ids = (uint64_t *)db->env.ops->alloc(db->env.ctx, (want ? want : 1u) * sizeof *ids);
-        dists = (float *)db->env.ops->alloc(db->env.ctx, (want ? want : 1u) * sizeof *dists);
+        uint64_t *ids = (uint64_t *)db->env.ops->alloc(db->env.ctx, (want ? want : 1u) * sizeof *ids);
+        float *dists = (float *)db->env.ops->alloc(db->env.ctx, (want ? want : 1u) * sizeof *dists);
+        int ok = 0;
         if (ids == NULL || dists == NULL
             || ax->nearest(db->env.accel_ctx, a->m, q, 1, want, ids, dists, &count, &bound) != CDB_OK
             || count > want) {
@@ -3764,22 +3888,7 @@ static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned me
             db->accel_stats.cpu++; /* declined: the CPU path (spec 18.7) */
             return CDB_OK;
         }
-        *n = 0;
-        for (j = 0; j < count && s == CDB_OK; j++) {
-            uint8_t *tmp = vbuf(db, V_BUILD);
-            double vn;
-            int found;
-            if ((s = fetch_vector(db, c, ids[j], tmp, &vn, &found)) == CDB_OK && found)
-                add_hit(hits, k, n, ids[j],
-                        distance(c, measure, q, qn, tmp, measure == CDB_VEC_COSINE ? vn : -1.0, o));
-        }
-        /* Complete when the shortlist held every vector, or when nothing
-         * left out could be among the k nearest. */
-        ok = s == CDB_OK
-             && (count < want || want == a->vectors
-                 || (*n == k
-                     && (bound == 0.0 ? (double)dists[count - 1] >= hits[k - 1].distance
-                                      : (double)dists[count - 1] - bound > hits[k - 1].distance)));
+        s = accel_rescore(db, c, a, q, qn, measure, ids, dists, count, want, bound, hits, k, n, &ok);
         db->env.ops->free(db->env.ctx, ids);
         db->env.ops->free(db->env.ctx, dists);
         if (s != CDB_OK)
@@ -3789,14 +3898,81 @@ static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned me
             db->accel_stats.certified++;
             return CDB_OK;
         }
-        *n = 0;
-        if (want * 2u > cap) {
+        if (want * 2u > (size_t)(a->vectors / 8u)) {
             db->accel_stats.cpu++; /* wider would cost more than the CPU path */
             return CDB_OK;
         }
         want *= 2u;
         db->accel_stats.widened++;
     }
+}
+
+#define BULK_BATCH 64u /* queries per nearest request in a bulk search */
+
+/* Exact searches of many queries on the accelerator (spec 18.4): their
+ * first shortlists in requests of BULK_BATCH, each rescored and certified
+ * as accel_exact does. done[i] is set for each query answered; the others
+ * (declined, or not certified) are left to the single-query path, which
+ * widens them or uses the CPU. */
+static cdb_status accel_exact_many(cdb_db *db, coll *c, const uint8_t *const *qs, size_t nq, unsigned measure,
+                                   cdb_vec_hit *hits, size_t k, size_t *counts, uint8_t *done)
+{
+    const cdb_accel_ops *ax = db->env.accel;
+    size_t want = 0, b0, vb = c->vec_bytes;
+    cdb_accel_entry *a;
+    uint8_t *qbuf;
+    uint64_t *ids;
+    float *dists;
+    size_t *cnt;
+    double *bounds;
+    uint64_t cpu0 = db->accel_stats.cpu;
+    cdb_status s;
+
+    if (nq < 2u)
+        return CDB_OK;
+    if ((a = accel_ready(db, c, measure, k, &want, &s)) == NULL) {
+        db->accel_stats.cpu = cpu0; /* each query's own path counts it */
+        return s;
+    }
+    qbuf = (uint8_t *)db->env.ops->alloc(db->env.ctx, BULK_BATCH * vb);
+    ids = (uint64_t *)db->env.ops->alloc(db->env.ctx, BULK_BATCH * (want ? want : 1u) * sizeof *ids);
+    dists = (float *)db->env.ops->alloc(db->env.ctx, BULK_BATCH * (want ? want : 1u) * sizeof *dists);
+    cnt = (size_t *)db->env.ops->alloc(db->env.ctx, BULK_BATCH * sizeof *cnt);
+    bounds = (double *)db->env.ops->alloc(db->env.ctx, BULK_BATCH * sizeof *bounds);
+    s = CDB_OK;
+    if (qbuf != NULL && ids != NULL && dists != NULL && cnt != NULL && bounds != NULL)
+        for (b0 = 0; b0 < nq && s == CDB_OK; b0 += BULK_BATCH) {
+            size_t bn = nq - b0 < BULK_BATCH ? nq - b0 : BULK_BATCH, i;
+            for (i = 0; i < bn; i++)
+                memcpy(qbuf + i * vb, qs[b0 + i], vb);
+            if ((s = accel_send(db, c, a)) != CDB_OK || a->state != CDB_ACCEL_READY
+                || ax->nearest(db->env.accel_ctx, a->m, qbuf, bn, want, ids, dists, cnt, bounds) != CDB_OK)
+                break; /* declined: these and the rest go one at a time */
+            for (i = 0; i < bn && s == CDB_OK; i++) {
+                size_t qi = b0 + i;
+                double qn = measure == CDB_VEC_COSINE ? norm_of(c, qs[qi], db->pager.order) : 0.0;
+                int ok = 0;
+                if (cnt[i] > want)
+                    continue;
+                s = accel_rescore(db, c, a, qs[qi], qn, measure, ids + i * want, dists + i * want, cnt[i], want,
+                                  bounds[i], hits + qi * k, k, &counts[qi], &ok);
+                if (s == CDB_OK && ok) {
+                    done[qi] = 1;
+                    db->accel_stats.certified++;
+                }
+            }
+        }
+    if (qbuf != NULL)
+        db->env.ops->free(db->env.ctx, qbuf);
+    if (ids != NULL)
+        db->env.ops->free(db->env.ctx, ids);
+    if (dists != NULL)
+        db->env.ops->free(db->env.ctx, dists);
+    if (cnt != NULL)
+        db->env.ops->free(db->env.ctx, cnt);
+    if (bounds != NULL)
+        db->env.ops->free(db->env.ctx, bounds);
+    return s;
 }
 
 #else /* mcu: no accelerator (spec 18.1) */
@@ -3820,6 +3996,12 @@ static cdb_status accel_exact(cdb_db *db, coll *c, const uint8_t *q, unsigned me
     (void)db, (void)c, (void)q, (void)measure, (void)hits, (void)k;
     *n = 0;
     *used = 0;
+    return CDB_OK;
+}
+static cdb_status accel_exact_many(cdb_db *db, coll *c, const uint8_t *const *qs, size_t nq, unsigned measure,
+                                   cdb_vec_hit *hits, size_t k, size_t *counts, uint8_t *done)
+{
+    (void)db, (void)c, (void)qs, (void)nq, (void)measure, (void)hits, (void)k, (void)counts, (void)done;
     return CDB_OK;
 }
 cdb_status cdb_vec_accel_maintain(cdb_db *db)

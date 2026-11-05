@@ -488,6 +488,32 @@ static void test_approximate_recall(void)
         TEST_MESSAGE(msg);
     }
     TEST_ASSERT_TRUE_MESSAGE(found * 100u >= wanted * 90u, "recall below 90%");
+    /* Spec 18.4: a bulk search gives each query what a single search gives
+     * it, on the walk (automatic here) and on the exact path. */
+    {
+        static vec qv[30];
+        static const void *qp[30];
+        static size_t ql[30], counts[30];
+        static cdb_vec_hit got[30 * 10];
+        unsigned mode;
+        for (t = 0; t < 30; t++) {
+            qv[t] = make_vec(&centers[(t * 7) % 60]);
+            qp[t] = qv[t].enc;
+            ql[t] = qv[t].n;
+        }
+        for (mode = CDB_VEC_AUTO; mode <= CDB_VEC_EXACT; mode++) {
+            TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_bulk(&db, coll, qp, ql, 30, 0, mode, got, 10, counts));
+            for (t = 0; t < 30; t++) {
+                size_t a;
+                TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_mode(&db, coll, qp[t], ql[t], 0, mode, ex, 10, &ne));
+                TEST_ASSERT_EQUAL_size_t(ne, counts[t]);
+                for (a = 0; a < ne; a++) {
+                    TEST_ASSERT_EQUAL_UINT64(ex[a].entry, got[t * 10 + a].entry);
+                    TEST_ASSERT_TRUE(ex[a].distance == got[t * 10 + a].distance);
+                }
+            }
+        }
+    }
 
     /* A pending vector identical to the query is found first. */
     {

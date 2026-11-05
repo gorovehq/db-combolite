@@ -1169,6 +1169,53 @@ static void test_accelerator_was_used(void)
 #endif
 }
 
+/* Spec 18.4: a bulk search gives each query exactly what a single search
+ * gives it, ties and order included (in the _accel run, through the fake
+ * accelerator's batches). */
+static void test_bulk_search(void)
+{
+    enum { NQ = 80, KB = 7 };
+    static vec qv[NQ];
+    static const void *qp[NQ];
+    static size_t ql[NQ], counts[NQ];
+    static cdb_vec_hit got[NQ * KB];
+    cdb_vec_hit want[KB];
+    uint64_t coll;
+    size_t i, j, nw;
+    rng = 4242u;
+    setUp();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
+    coll = make_coll("c", CDB_VEC_F32, CDB_VEC_COSINE);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_DEFAULT));
+    for (i = 0; i < 300; i++) {
+        vec v = make_vec(CDB_VEC_F32, 0);
+        insert(coll, &v, 0, 0);
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    for (i = 0; i < NQ; i++) {
+        qv[i] = make_vec(CDB_VEC_F32, 0);
+        qp[i] = qv[i].enc;
+        ql[i] = qv[i].n;
+    }
+    /* A first search asks for a mirror (with an accelerator); a tick fills it. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search(&db, coll, qp[0], ql[0], CDB_VEC_BASE, want, KB, &nw));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_bulk(&db, coll, qp, ql, NQ, CDB_VEC_BASE, CDB_VEC_AUTO, got, KB,
+                                                      counts));
+    for (i = 0; i < NQ; i++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search(&db, coll, qp[i], ql[i], CDB_VEC_BASE, want, KB, &nw));
+        TEST_ASSERT_EQUAL_size_t(nw, counts[i]);
+        for (j = 0; j < nw; j++) {
+            TEST_ASSERT_EQUAL_UINT64(want[j].entry, got[i * KB + j].entry);
+            TEST_ASSERT_TRUE(want[j].distance == got[i * KB + j].distance);
+        }
+    }
+    /* Nothing to search: no hits, no error. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_bulk(&db, coll, qp, ql, 0, CDB_VEC_BASE, CDB_VEC_AUTO, got, KB,
+                                                      counts));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1182,6 +1229,7 @@ int main(void)
     RUN_TEST(test_change_log_and_cursors);
     RUN_TEST(test_track_changes_on_old_collection);
     RUN_TEST(test_crash_sweep);
+    RUN_TEST(test_bulk_search);
     RUN_TEST(test_accelerator_was_used);
     return UNITY_END();
 }

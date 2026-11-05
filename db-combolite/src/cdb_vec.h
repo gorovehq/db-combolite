@@ -138,6 +138,18 @@ cdb_status cdb_vec_search(cdb_db *db, uint64_t store, const void *query, size_t 
 cdb_status cdb_vec_search_mode(cdb_db *db, uint64_t store, const void *query, size_t len, unsigned measure,
                                unsigned mode, cdb_vec_hit *hits, size_t k, size_t *n);
 
+/* Bulk search (spec 18.4): nq searches in one call, such as building
+ * similar_to links or retrieving memories for several prompts. Query i is
+ * queries[i], lens[i] bytes, as for cdb_vec_search_mode; its hits go to
+ * hits[i * k ...] and counts[i] says how many. Each query's result is
+ * exactly what cdb_vec_search_mode gives it. With an accelerator holding
+ * the collection, the exact searches go to the device in batches; without
+ * one, they run on the CPU one by one. Every query is checked before any
+ * is searched: one that is not a vector of the collection is
+ * CDB_E_INVALID_ARG, with nothing searched. */
+cdb_status cdb_vec_search_bulk(cdb_db *db, uint64_t store, const void *const *queries, const size_t *lens, size_t nq,
+                               unsigned measure, unsigned mode, cdb_vec_hit *hits, size_t k, size_t *counts);
+
 /* Adds a neighbour graph with k neighbours per entry (0: 16) and queues
  * every vector; commits immediately. CDB_E_EXISTS if there is one,
  * CDB_E_OVERFLOW if a record of k neighbours does not fit an index value. */

@@ -471,6 +471,67 @@ static void test_catch_up_across_processes(void)
     cdb_faultenv_on_sleep(&fe, NULL, NULL);
 }
 
+/* Spec 18.4: a bulk search gives each query exactly the single search's
+ * answer, in one device request per 64 queries; queries a shortlist does
+ * not certify (noise) go one at a time and still match. */
+static void bulk_case(double noise)
+{
+    enum { NQ = 150 };
+    static vec qv[NQ];
+    static const void *qp[NQ];
+    static size_t ql[NQ], counts[NQ];
+    static cdb_vec_hit got[NQ * K];
+    cdb_vec_hit want[K];
+    const cdb_accel_ops *ax;
+    uint64_t coll, nearests;
+    size_t i, j, nw;
+    setUp();
+    rng = 41u;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&pa));
+    fake.noise = noise;
+    coll = make_coll(&db, "c", CDB_VEC_F32, CDB_VEC_EUCLIDEAN);
+    fill(&db, coll, CDB_VEC_F32, 800);
+    mirror(&db, coll, CDB_VEC_F32);
+    for (i = 0; i < NQ; i++) {
+        qv[i] = make_vec(CDB_VEC_F32);
+        qp[i] = qv[i].enc;
+        ql[i] = qv[i].n;
+    }
+    nearests = fake.nearests;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search_bulk(&db, coll, qp, ql, NQ, CDB_VEC_BASE, CDB_VEC_AUTO, got, K,
+                                                      counts));
+    if (noise == 0.0)
+        TEST_ASSERT_EQUAL_UINT64(nearests + (NQ + 63u) / 64u, fake.nearests); /* batched, nothing redone */
+    ax = db.env.accel;
+    db.env.accel = NULL;
+    for (i = 0; i < NQ; i++) {
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_vec_search(&db, coll, qp[i], ql[i], CDB_VEC_BASE, want, K, &nw));
+        TEST_ASSERT_EQUAL_size_t(nw, counts[i]);
+        for (j = 0; j < nw; j++) {
+            TEST_ASSERT_EQUAL_UINT64(want[j].entry, got[i * K + j].entry);
+            TEST_ASSERT_TRUE(want[j].distance == got[i * K + j].distance);
+            TEST_ASSERT_EQUAL_INT(want[j].source_state, got[i * K + j].source_state);
+        }
+    }
+    db.env.accel = ax;
+    /* One query that is not a vector: nothing is searched. */
+    qp[5] = "x";
+    ql[5] = 1;
+    nearests = fake.nearests;
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_vec_search_bulk(&db, coll, qp, ql, NQ, CDB_VEC_BASE, CDB_VEC_AUTO,
+                                                                 got, K, counts));
+    TEST_ASSERT_EQUAL_UINT64(nearests, fake.nearests);
+    TEST_ASSERT_EQUAL_size_t(0, counts[0]);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+static void test_bulk_search(void)
+{
+    bulk_case(0.0);
+    bulk_case(0.3);
+    TEST_ASSERT_TRUE(db.accel_stats.widened + db.accel_stats.cpu > 0); /* some went one at a time */
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -484,5 +545,6 @@ int main(void)
     RUN_TEST(test_declines_and_failures);
     RUN_TEST(test_budget_and_eviction);
     RUN_TEST(test_catch_up_across_processes);
+    RUN_TEST(test_bulk_search);
     return UNITY_END();
 }
