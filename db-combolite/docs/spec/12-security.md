@@ -178,5 +178,4 @@ Stored procedures are catalog objects (14.3.6), with the source text, compiled f
 The decisions in 12.8–12.10 are confirmed; these byte-level details are still to be proposed and confirmed:
 
 - **Replication slices**: the byte form of a sealed domain change in a slice (with Section 19's wire format).
-- **Files written before the store ID slot** (14.2.7): how a database whose pages have no slot is migrated (a rewrite at open, a one-off tool, or a format version that keeps both layouts readable).
 - **Session salts** (12.1): the salt table's place and layout, the width and position of the salt index in page headers (14.2) and delta record headers (14.4.2), how the salt enters subkey derivation, pruning, and what a platform without a random source does.

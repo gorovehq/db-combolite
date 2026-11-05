@@ -108,6 +108,7 @@ The bits of the three feature-flag fields (offsets 80, 88 and 96) that are assig
 | Class | Bit | Feature | Set when |
 |---|---|---|---|
 | read-only compatible | 0 | vector change logs (14.12.5) | the first change log in the file is created |
+| incompatible | 0 | store ID slot (14.2.7) | always, when the file is created; a library refuses a file without it |
 
 ## 14.2 Page header and trailer
 
@@ -219,7 +220,7 @@ Every page's payload starts with a **store ID slot**, in every domain, so that a
 - **Lengths.** The header's payload length counts the slot. Page types size themselves from the payload room after it, which is the same in every domain.
 - **Order of operations.** The slot is written outside compression: the plaintext is the slot followed by the page type's payload, compressed when the page is compressed (Section 15), and on an encrypted page the whole plaintext is then encrypted.
 - **Checks.** A reader that expects a page of a known store checks the slot, after decryption on an encrypted page.
-- **Files written before the slot** have page layouts without it; how they are migrated is an open item (12, open questions).
+- **Files written before the slot** are not supported and are not migrated: the format is not yet stable (pre-1.0), and such a database is rebuilt from its source data. Files with the slot carry incompatible feature flag 0 (14.1.10): a library that knows the slot refuses a file without the flag, and an older library refuses a file with it, each with a clear status instead of misreading pages.
 
 ## 14.3 Catalog root slot (location 0)
 

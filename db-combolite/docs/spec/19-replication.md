@@ -10,7 +10,7 @@ A database is a single file on one host, and processes on that host share it thr
 
 Replication adds no server, daemon or broker, and no copy ever opens another copy's file. The library produces and consumes **slices** of changes; how a slice travels (a file, a socket, a sync service) is the application's business. Scope stays as in the hard constraints: one database is never accessed from more than one host.
 
-This section was written after a first implementation (the CRDT helpers and `cdb_db_crdt_export_slice` / `cdb_db_crdt_import_slice`), which replays changes in arrival order and keeps its state in memory. That implementation is to be reworked to match.
+This section was written after a first implementation (the CRDT helpers and `cdb_db_crdt_export_slice` / `cdb_db_crdt_import_slice`), which replays changes in arrival order and keeps its state in memory. That implementation is to be reworked to match. Its state was never persisted, so no file holds anything to migrate.
 
 ## Confirmed decisions
 
@@ -47,7 +47,10 @@ Every ID a replicated object or entry takes is unique across the group: **its to
 
 All copies end up identical, whatever order the syncs happen in. Each data model merges by its own rule, with clock times deciding between writes:
 
-- **Documents and table rows** merge **field by field**: each field keeps the write with the later clock time.
+- **Documents and table rows** merge **path by path**: every leaf path of a document (a sequence of field IDs into nested objects), and every column of a row, keeps the write with the later clock time. Concurrent edits to different keys of one nested object both survive. Arrays are leaves: an array is replaced whole by the later write.
+  - Writing an object at a path writes each leaf under it at the write's clock time, and removes, at that time, the leaves under the path that the new object lacks.
+  - Removing a field or path leaves a tombstone for it at the remove's clock time, so an older write arriving later can't bring it back.
+- **Clock index.** Each replicated store keeps the clock times in an ordered index of its own, keyed by entry and path, holding each path's latest clock time and whether it is a tombstone. Revisions are unchanged and local stores pay nothing. The index holds only the latest clocks; revision history keeps the values, not their past clocks.
 - **Deletes** compare with writes like any write: a delete newer than every write to the entry removes it; a write newer than the delete revives the entry, with only the fields written after the delete.
 - **Unique keys and primary keys.** When two copies insert rows with the same unique key, the row with the earlier clock time keeps the key. The other row is kept, with its key set aside, in a **per-store conflict list**, and a conflict event goes to the audit series (12.7). Nothing is lost silently; the application resolves listed conflicts.
 - **Links** merge as an **add-wins observed-remove set**: a link added on one copy and removed concurrently on another stays. Weight and time take the later write.
@@ -66,10 +69,9 @@ A replicated delete leaves a tombstone, so that an old change arriving late can'
 
 ## Open questions (do not specify until answered)
 
-- **Field granularity**: whether "field by field" means top-level fields only, with nested objects merged whole, or every path.
-- **Per-field clocks**: where each replicated document and row keeps its fields' clock times, and their cost.
+- **Clock index layout**: its key (entry ID and path encoding) and value (clock time, tombstone flag), and when its tombstones are purged (19.6).
 - **Copy and group records**: the copy number range a copy owns, the group limit, members and their last reported vectors, retired copies.
 - **Conflict list**: its layout and the calls that list and resolve conflicts.
 - **Wire format**: the handshake (with clock readings and relayed offsets) and the slice, with sealed domain changes; versioning of the wire format.
 - **Replication-clock series**: its layout, the offset estimate and error bound, and the drift bound's default.
-- **Migration**: what becomes of databases written by the first implementation, and of IDs allocated before a database joins a group.
+- **Joining later**: what becomes of IDs allocated before a database joins a group (top 16 bits 0, 19.2).
