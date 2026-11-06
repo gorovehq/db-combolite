@@ -30,8 +30,8 @@ The coordinator is not a separate process or daemon. It runs on the caller's sta
 - The first coordinator to start becomes the **primary** and sets the `PRIMARY_COORD` bit. `PRIMARY_COORD` is claimed through the append → settle → choose protocol (5.5), so two coordinators starting at the same moment still produce exactly one primary.
 - Every coordinator that starts later is **subordinate** to the primary. If a subordinate tries to claim primary, the claim is rejected.
 - The primary is the **clock source** that every coordinator synchronizes to.
-- Coordinators exchange heartbeats. If the primary's heartbeat stops, the subordinates **elect a new primary from among themselves by priority value**.
-- **Stale primary bit.** A process may open the database and find `PRIMARY_COORD` set while no primary is running, for example because the primary crashed when no subordinates existed. In that case the opener checks the primary's heartbeat. If the heartbeat is dead, the opener takes over as primary.
+- If the primary dies, the subordinates **elect a new primary from among themselves by priority value**, through append → settle → choose (5.5). The primary is dead when its slot's lock is free (5.8); in the fallback without the lock hook, when its heartbeat is older than the dead timeout. A primary that is only slow stays primary: subordinates compute its time from their own monotonic clock and the last offset it published (14.5.3), so commit stamps keep moving while it stalls.
+- **Stale primary bit.** A process may open the database and find `PRIMARY_COORD` set while no primary is running, for example because the primary crashed when no subordinates existed. In that case the opener checks the primary's slot: when its lock is free (in the fallback, when its heartbeat is dead), the opener takes over as primary.
 
 ## 5.3 The baton
 
