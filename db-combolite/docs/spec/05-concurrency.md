@@ -87,13 +87,19 @@ These are defined in Section 11.3. In brief:
 - Its **delta tracks** follow the same rule: each process owns its own tracks and is their only writer (Section 1.3). At reconciliation, the baton holder merges every process's tracks in commit order, using commit timestamps from the primary's clock.
 - The primary reads every slot and puts the requests in order. Subordinates read the slots when they need to detect that the primary has failed, or to elect a new primary.
 
-No two processes ever write to the same bytes. As a result, coordination doesn't depend on atomic appends, on OS file locks or on any other filesystem convention.
+No two processes ever write to the same bytes, so the correctness of the data never depends on atomic appends, on OS file locks or on any other filesystem convention. A lock only answers whether a slot's owner is alive (5.8).
 
-## 5.8 Heartbeats
+## 5.8 Liveness and heartbeats
 
-- Each coordinator writes its heartbeat and its crash notices to **its own slot** (5.7).
-- The **heartbeat interval can be configured**. Each device class in the table in Section 2.8 has a default interval.
-- **On microcontrollers**, where usually only one process runs, heartbeats stay **in memory** and are never written to flash. This avoids flash wear.
+Status: **confirmed by the project owner on 2026-11-05.** It replaces liveness by heartbeat timeout, after the demo's parallel writers showed a live process judged dead: a long engine call held the lock its heartbeat needed, another process merged and discarded its journal, and its later commits went to a file nobody would read. Being slow is not being dead.
+
+- **Alive means holding the slot lock.** For its whole session, a coordinator holds an exclusive OS lock on its own slot file (5.7). A slot is alive exactly while its lock is held. Another process tests a slot with an attempt to take its lock that does not wait, and releases the lock at once when it gets it, unless it is taking the slot over (5.9.5). A death is seen as soon as the OS releases the lock, and a live process is never judged dead, however long it stalls.
+- **The lock hook.** The environment provides the lock through an optional hook (`cdb_env`). The lock belongs to the open file, not to the process: the OS releases it when the process ends, however it ends, and closing other handles to the same file does not release it. That is how `flock` behaves on POSIX systems and `LockFileEx` on Windows; POSIX record locks (`fcntl`) do not qualify, because closing any handle to a file releases all of a process's locks on it. Locks are reliable only on a local filesystem, which the single-host scope already requires (hard constraint 1); network filesystems are not supported.
+- **Mixed processes.** A coordinator records in its slot's flags whether it uses lock liveness (14.5.2). Others judge a slot with the flag by its lock alone, and a slot without it by the heartbeat rules of the fallback below.
+- **Fallback without the hook.** In an environment without the lock hook, liveness comes from heartbeats as before: a coordinator whose heartbeat is older than the dead timeout is dead (5.9.6), and the lease margin applies (5.9.8). Microcontrollers, where usually only one process runs, keep their heartbeats **in memory** and never write them to flash, which avoids flash wear.
+- **Heartbeats and status.** Every coordinator, with the lock or without it, keeps writing heartbeats to **its own slot** (5.7). A heartbeat carries the primary's clock for commit stamps (14.5.3), crash notices, and the coordinator's **status**: the operation it is busy with, when it started, and its estimate of when it will finish (for the baton holder, its progress *x / x-total*, 5.9.8). The status is written when it changes, and at least once per heartbeat interval while the coordinator is busy. The **heartbeat interval can be configured**; each device class in the table in Section 2.8 has a default.
+- **The responder.** Where the environment has thread hooks, a background thread of the coordinator writes its heartbeats and status. It never takes the database's lock, only a small lock of the coordinator's own, so no engine call, however long, can delay it. Without thread hooks, heartbeats are cooperative: library calls and `cdb_coord_tick()` write them (5.9.6).
+- **Stalls are waited out, not timed out.** A process that waits on another live coordinator (for the baton, or for a transaction that coordinator has prepared, 5.9.4) reads that coordinator's status. When the estimate shows the wait outlasting the call's cap, or the wait reaches the cap, the call returns `CDB_E_BUSY` instead of waiting further. The coordinator waited on is never treated as dead. Closing a session and asking for reconciliation don't wait for the baton at all; 5.9.1 and 5.9.8 say how.
 
 ## 5.9 How processes share one archive (M19)
 
@@ -146,12 +152,12 @@ This implements the default policy of 11.3, where the later write is rejected. C
 
 ### 5.9.6 Liveness and concurrency (spec 5.9.6, M20)
 
-- **When heartbeats are written.** Every library call writes a heartbeat if one is due, at most once per heartbeat interval. `cdb_coord_tick()` lets an idle application keep its coordinator alive.
-- **Dead coordinators.** A coordinator whose heartbeat is older than the dead timeout is dead. *Provisional:* interval 1 s, timeout 3 intervals, settle interval 2 ms.
-- **Coming back.** A process that has been idle past the timeout finds this out on its next call. It rejoins: if its slot is still free it takes it back, otherwise it takes another slot. It does so as a subordinate, then rebases.
+- **When heartbeats are written.** The responder writes them (5.8). Without thread hooks, every library call writes a heartbeat if one is due, at most once per heartbeat interval, and `cdb_coord_tick()` lets an idle application keep its coordinator's heartbeat current.
+- **Dead coordinators.** Liveness is 5.8: a slot is dead when its lock can be taken. In the fallback without the lock hook, a coordinator whose heartbeat is older than the dead timeout is dead. *Provisional:* interval 1 s, fallback dead timeout 3 intervals, settle interval 2 ms.
+- **Coming back (fallback only).** With the lock, an idle process never loses its slot. Without it, a process that has been idle past the dead timeout finds this out on its next call. It rejoins: if its slot is still free it takes it back, otherwise it takes another slot. It does so as a subordinate, then rebases.
 - **Background threads and synchronization (M20).**
   - **Environment hooks:** `cdb_env` provides opaque handles and function pointers for recursive mutexes (`cdb_mutex`), monotonic condition variables (`cdb_cond`), and threads (`cdb_thread`). POSIX environments implement these with `pthreads` (`PTHREAD_MUTEX_RECURSIVE`, `CLOCK_MONOTONIC`).
-  - **Autonomous heartbeat thread:** When concurrency hooks are present, `cdb_db_open` starts a dedicated background thread inside `cdb_db` that pulses slot heartbeats at half the heartbeat interval. Idle processes without application polling loops remain alive indefinitely. Public database operations acquire re-entrant mutex locks.
+  - **The responder thread:** When concurrency hooks are present, `cdb_db_open` starts the coordinator's responder (5.8), which writes heartbeats and status at half the heartbeat interval and whenever the status changes. It takes only the coordinator's own lock, never the database's. Public database operations acquire the database's re-entrant mutex.
   - **Worker thread pool:** A caller-configured pool of background worker threads (`cdb_worker_pool`, `cdb_db_config.worker_threads`) backed by a fixed ring-buffer queue offloads heavy maintenance tasks (such as `cdb_vec_refresh_async`) without heap allocation in the core engine.
   - **Single-threaded fallback:** When thread hooks in `cdb_env` are `NULL` (single-threaded environments or microcontrollers), or when `worker_threads` is 0, heartbeats remain cooperative, and submitted worker tasks execute immediately and synchronously on the caller thread with identical semantics.
 
