@@ -54,6 +54,7 @@
 #include "gf_jobs.h"
 #include "gf_metrics.h"
 #include "gf_bench.h"
+#include "gf_pipeline.h"
 #include "gf_probe.h"
 #include "gf_queries.h"
 #include "gf_ui.h"
@@ -300,42 +301,6 @@ static cdb_status refresh_graph(gf_db *g, const gf_vec *v)
     return s;
 }
 
-/* Vector search, two query sets: stored passages (which find their own
- * precomputed neighbours, so flatter the graph) and fresh text (what a
- * reader types, embedded as the semantic-search screen does). Timings go
- * into the stage's ops; quality is printed here. e may be NULL: no fresh set. */
-static cdb_status search_check(gf_db *g, const gf_vec *v, gf_embed *e, unsigned stored)
-{
-    static float q[256][GF_EMBED_DIMS];
-    static uint32_t rng = 12345u;
-    static char text[600];
-    gf_vec_check ck;
-    unsigned n = 0, i;
-    cdb_status s;
-
-    if (stored > 256)
-        stored = 256;
-    if ((s = gf_vec_stored_queries(g, v, stored, &rng, q, &n)) != CDB_OK)
-        return s;
-    s = gf_vec_check_search(g, v, (const float (*)[GF_EMBED_DIMS])q, n, "stored", &ck);
-    printf("search check, %u stored passages as queries: graph finds %.2f of the exact top 10 (worst %.0f), "
-           "1-bit %.2f (worst %.0f)\n", ck.queries, ck.recall, ck.recall_min, ck.bits_agree, ck.bits_min);
-    if (s != CDB_OK || e == NULL)
-        return s;
-    for (i = 0; i < gf_nqueries && i < 256; i++) {
-        int rc;
-        snprintf(text, sizeof text, "%s%s", GF_EMBED_QUERY_PREFIX, gf_queries[i]);
-        GF_TIME("embed.query", rc = gf_embed_text(e, text, strlen(text), q[i], NULL));
-        if (rc != 0)
-            return CDB_E_STATE;
-    }
-    s = gf_vec_check_search(g, v, (const float (*)[GF_EMBED_DIMS])q, i, "fresh", &ck);
-    printf("search check, %u fresh queries: graph finds %.2f of the exact top 10 (worst %.0f: \"%s\"), "
-           "1-bit %.2f (worst %.0f)\n", ck.queries, ck.recall, ck.recall_min, gf_queries[ck.worst_query],
-           ck.bits_agree, ck.bits_min);
-    return s;
-}
-
 static int embed_cli(gf_db *g, const char *model)
 {
     static uint64_t rows[4096];
@@ -392,7 +357,7 @@ static int embed_cli(gf_db *g, const char *model)
         s = refresh_graph(g, &v);
     printf("embedded %llu passages this run\n", (unsigned long long)total);
     if (s == CDB_OK)
-        s = search_check(g, &v, e, 200);
+        s = gf_search_checks(g, &v, e, 200, NULL, 0);
     gf_embed_close(e);
     return s == CDB_OK ? 0 : 1;
 }
@@ -598,8 +563,10 @@ int main(int argc, char **argv)
     int cli_probe = argc > 1 && strcmp(argv[1], "probe") == 0;
     int cli_merge = argc > 1 && strcmp(argv[1], "merge-csv") == 0;
     int cli_filter = argc > 1 && strcmp(argv[1], "filter") == 0;
+    int cli_pipe = argc > 1 && strcmp(argv[1], "pipeline") == 0;
+    int cli_worker = argc > 1 && strcmp(argv[1], "pipeline-worker") == 0;
     int a = cli_filter || cli_metrics ? argc : cli || cli_books || cli_text || cli_embed || cli_graph || cli_bench || cli_similar || cli_probe
-                                        || cli_merge
+                                        || cli_merge || cli_pipe || cli_worker
                                 ? 2
                                 : 1;
     const char *pgcsv = GF_DEFAULT_PGCSV;
@@ -608,6 +575,8 @@ int main(int argc, char **argv)
     const char *gutindex = GF_DEFAULT_GUTINDEX, *base = GF_DEFAULT_BASE, *books = GF_DEFAULT_BOOKS;
     const char *model = GF_EMBED_DEFAULT_MODEL;
     const char *note = NULL;
+    unsigned pipe_count = 100, worker_index = 0;
+    const char *worker_ops = NULL;
     double t0, open_ms;
     cdb_status s;
     int quit = 0, rc = 0;
@@ -626,11 +595,21 @@ int main(int argc, char **argv)
         seconds = strtod(argv[a++], NULL);
     if (cli_merge && a < argc)
         pgcsv = argv[a++];
+    if (cli_pipe && a < argc && argv[a][0] >= '0' && argv[a][0] <= '9')
+        pipe_count = (unsigned)strtoul(argv[a++], NULL, 10);
+    if (cli_worker && a + 3 < argc) { /* index, ops file, books dir, model (from gf_pipeline_cli) */
+        worker_index = (unsigned)strtoul(argv[a], NULL, 10);
+        worker_ops = argv[a + 1];
+        books = argv[a + 2];
+        model = argv[a + 3];
+        a += 4;
+    }
     if (argc > 1 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
         printf("gutenfree [base] | ingest-index [--batch N] [gutindex] [base] | merge-csv [csv] [base]\n"
                "          | ingest-books [dir] [base] | ingest-text [dir] [base] | embed [model.gguf] [base]\n"
                "          | graph [base] | bench-graph [copy-of-base] | filter key=value ...\n"
                "          | probe [seconds] [base] | metrics [op ...]\n"
+               "          | pipeline [N] [base]   N new books, fetched and written by $GUTENFREE_WORKERS processes\n"
                "metrics and filter take the database from $GUTENFREE_DB or the default.\n"
                "base: database path without extension (default %s, or $GUTENFREE_DB).\n"
                "Run from demo/gutenfree/; see README.md there.\n", GF_DEFAULT_BASE);
@@ -661,14 +640,17 @@ int main(int argc, char **argv)
 
     if (cli_metrics) {
         rc = metrics_cli(&g, argc, argv, 2);
-    } else if (cli_probe || cli_merge || cli_filter || cli || cli_books || cli_text || cli_embed || cli_graph
+    } else if (cli_worker) {
+        rc = worker_ops != NULL ? gf_pipeline_worker(&g, worker_index, worker_ops, books, model) : 2;
+    } else if (cli_pipe || cli_probe || cli_merge || cli_filter || cli || cli_books || cli_text || cli_embed || cli_graph
                || cli_bench || cli_similar) {
         /* Every command is one measured stage: each engine operation it
          * makes is timed, and the report ends the output. */
         gf_stage stage;
         printf("build: %s\naccelerator: %s\nopen: %.1f ms\n", GF_BUILD_LABEL, g.accel_name, open_ms);
         gf_stage_begin(&g, &stage, argv[1]);
-        rc = cli_probe ? probe_cli(&g, seconds)
+        rc = cli_pipe ? gf_pipeline_cli(&g, base, pipe_count, books, model)
+             : cli_probe ? probe_cli(&g, seconds)
              : cli_merge ? merge_cli(&g, pgcsv)
              : cli_filter ? filter_cli(&g, argc, argv, 2)
              : cli ? ingest_cli(&g, gutindex, batch)

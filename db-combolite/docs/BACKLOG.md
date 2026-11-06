@@ -119,6 +119,12 @@ Features and follow-ups that were agreed and deferred. Each one becomes a milest
 - **A time-series store can't list its series.** `cdb_ts_series` finds a series by name, but nothing enumerates them, so a reader (the demo's `metrics`) must know every name in advance.
 - **1-bit vectors never reach the accelerator at this size.** The demo's 16,033 x 48-byte collection (770 KB) is under `accel_min_bytes` (1 MB), so every Hamming search runs on the CPU, about 5.3 ms at p50. That is by design, but the threshold was set for f32 rows; a Hamming kernel would make sign-bit search the cheap first pass it is meant to be.
 
+- **Parallel writers leave a database that won't open** (demo `pipeline`, 2026-11-05: 4 writer processes, 12 new books, RelWithDebInfo). Afterwards `cdb_db_open` fails with `CDB_E_CORRUPT` on every attempt, also with a fresh working directory. The archive itself is sound: the header, the anchor map, both free-space chains (7,097 extents) and all 103,066 live pages verify through `cdb_pager_open` and `cdb_pager_read`. The failing return comes after the coordinator's baton take in `open_db` and was not yet pinned down; the coordinator slot decode failures seen on the way are the per-half ones `read_file` skips. Repro: `demo/gutenfree/data/repro/pipeline-4w-unopenable.cdbarch` (git-ignored, on the development machine), with the working directory the run left (`pipeline-4w-leftover.cdbwork`). Highest priority of the demo's findings: it is data loss as far as a user can tell.
+- **Concurrent writers of different books collide on almost every transaction.** In the same run, 29 store attempts ended in `CDB_E_COLLISION` and 7 of 12 books failed after 3 retries, although each worker writes its own book (its library row, passages, links, text). Either a key every book transaction writes (a catalog counter, a link-type or index entry) or collision detection coarser than the entries written. Parallel ingestion is impractical until this is found.
+- **A writer can't close while others are live.** Three of the four workers ended with `close failed: busy`, leaving their coordinator slots behind.
+- **One store attempt returned `CDB_E_STATE`** under the same load; not yet reproduced alone.
+- **Contention costs under 4 writers:** `link.add_has_passage` p50 509 us (about 30 us for a link alone), book commits p99 1.75 s, one passage read 2.1 s.
+
 ## Done
 
 Entries closed with nothing left open, one line each. Git history keeps their full text.

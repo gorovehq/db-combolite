@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "gf_metrics.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -113,10 +114,14 @@ cdb_status gf_metrics_open(gf_db *g)
     return cdb_ts_create(&g->db, "metrics", 7, CDB_TS_LATE_ACCEPT, 0, &M.store);
 }
 
+static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
+
 void gf_metric(const char *name, double value)
 {
+    pthread_mutex_lock(&queue_lock);
     if (M.nq == GF_METRICS_QUEUE) {
         M.dropped++;
+        pthread_mutex_unlock(&queue_lock);
         return;
     }
     snprintf(M.q[M.nq].name, sizeof M.q[M.nq].name, "%s", name);
@@ -124,6 +129,7 @@ void gf_metric(const char *name, double value)
     M.q[M.nq].ts = now_us();
     M.q[M.nq].v = value;
     M.nq++;
+    pthread_mutex_unlock(&queue_lock);
 }
 
 static cdb_status series_id(gf_db *g, const char *name, int create, uint64_t *id)
@@ -161,10 +167,18 @@ cdb_status gf_metrics_flush(gf_db *g)
     unsigned i, done = 0;
     double t0 = gf_now_ms();
 
-    if (M.nq == 0 || M.store == 0)
+    /* The queue is held for the whole write: gf_metric from another
+     * thread waits rather than appending to a queue being emptied. */
+    pthread_mutex_lock(&queue_lock);
+    if (M.nq == 0 || M.store == 0) {
+        pthread_mutex_unlock(&queue_lock);
         return CDB_OK;
-    if ((s = cdb_tx_begin(&g->db, CDB_DURABILITY_DEFAULT)) != CDB_OK)
+    }
+    if ((s = cdb_tx_begin(&g->db, CDB_DURABILITY_DEFAULT)) != CDB_OK) {
+        snprintf(M.error, sizeof M.error, "begin: %s", cdb_status_str(s));
+        pthread_mutex_unlock(&queue_lock);
         return s;
+    }
     /* One append per series, of its points in order. */
     while (s == CDB_OK && done < M.nq) {
         const char *name = NULL;
@@ -212,14 +226,17 @@ cdb_status gf_metrics_flush(gf_db *g)
         }
     }
     M.nq = 0;
+    pthread_mutex_unlock(&queue_lock);
     if (s != CDB_OK) {
         cdb_tx_abort(&g->db);
         M.nseries = 0; /* series created in the aborted transaction are gone */
         return s;
     }
     M.error[0] = '\0';
-    if ((s = cdb_tx_commit(&g->db)) != CDB_OK)
+    if ((s = cdb_tx_commit(&g->db)) != CDB_OK) {
+        snprintf(M.error, sizeof M.error, "commit: %s", cdb_status_str(s));
         return s;
+    }
     gf_metric("ts.flush_ms", gf_now_ms() - t0); /* written with the next flush */
     return CDB_OK;
 }

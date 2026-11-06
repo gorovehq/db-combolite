@@ -94,8 +94,12 @@ The database is `data/gutenfree.cdbarch`. Set `GUTENFREE_DB=/some/path` (no exte
 ./gutenfree graph                                                   # refresh the passages' neighbour graph
 ./gutenfree link-similar                                            # link similar books (one bulk search)
 ./gutenfree bench-graph data/copy                                   # time a whole graph build, on a copy of the database
+GUTENFREE_WORKERS=4 ./gutenfree pipeline 100                        # 100 new books: parallel downloads, 4 writer processes, GPU embedding
+python3 gf_fetch.py --rename-existing                               # give books saved under <number>.txt their title names
 ./gutenfree --help
 ```
+
+**The pipeline** is the stress test. It fetches books the database has never seen (8 downloads at once, no pause, backing off on 429 and 503) and hands each to one of `GUTENFREE_WORKERS` writer processes the moment it lands. Each writer has its own database handle, so the engine sees that many writers at once; each stores its book, embeds it on the GPU and commits the vectors. One book in ten is held out as unseen search queries. Engine refusals are retried three times and counted per status. Books are saved as `<Title>.txt` in characters no shell needs escaped; `manifest.tsv` maps numbers to files.
 
 **Measurements.** Every command above, and the ingest and embed commands, ends with a report: each engine operation it made, timed one call at a time (count, min, p50, p95, p99, max, calls per second), the archive commits and file growth, and the accelerator's share of the searches. The summaries are stored, so `metrics` shows them later. `embed` ends with a search check: 200 stored passages and 50 fresh phrases (`gf_queries.c`, embedded as semantic search does) each searched exactly, through the neighbour graph and through the 1-bit vectors, with how many of the exact top 10 the other two find. Stored passages find their own precomputed neighbours, so the fresh queries are the honest score. Timings are only meaningful in a RelWithDebInfo or Release build; the report names the build.
 

@@ -225,7 +225,7 @@ static size_t copy_line(char *dst, size_t cap, const char *src, size_t n)
  * GF_PASSAGE_MAX bytes, or a piece of one paragraph that is longer, cut at
  * a line end or space and at a character boundary. Returns its length
  * (0 at the end) and sets *start. */
-static size_t next_passage(const char *text, size_t len, size_t *pos, size_t *start)
+size_t gf_books_next_passage(const char *text, size_t len, size_t *pos, size_t *start)
 {
     size_t p = *pos, end, cut = 0;
 
@@ -332,7 +332,7 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
 
     /* The library row comes first, so the passages can be linked to it:
      * count them before writing any */
-    while ((n = next_passage(text, len, &pos, &start)) > 0)
+    while ((n = gf_books_next_passage(text, len, &pos, &start)) > 0)
         count++;
     if (count == 0)
         return CDB_OK;
@@ -349,7 +349,7 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
     }
     heading[0] = '\0';
     pos = 0;
-    while (s == CDB_OK && (n = next_passage(text, len, &pos, &start)) > 0) {
+    while (s == CDB_OK && (n = gf_books_next_passage(text, len, &pos, &start)) > 0) {
         const char *t = text + start, *h1, *hl;
         size_t h1len, hllen, at, hlen;
         pfield v[GF_NP];
@@ -421,7 +421,33 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
     return s;
 }
 
-/* dir/<ebook>.txt, read whole into a malloc'd, terminated buffer */
+/* The file of ebook in dir: the name its manifest line gives (gf_fetch.py
+ * names books by title, "number<TAB>url<TAB>bytes<TAB>file"), else the
+ * older <ebook>.txt. */
+void gf_books_path(const char *dir, int64_t ebook, char *path, size_t cap)
+{
+    char line[2048];
+    FILE *mf;
+
+    snprintf(path, cap, "%s/%lld.txt", dir, (long long)ebook);
+    snprintf(line, sizeof line, "%s/manifest.tsv", dir);
+    if ((mf = fopen(line, "r")) == NULL)
+        return;
+    while (fgets(line, sizeof line, mf) != NULL) {
+        char *f1, *f2, *f3, *nl;
+        if (strtoll(line, NULL, 10) != ebook || (f1 = strchr(line, '\t')) == NULL
+            || (f2 = strchr(f1 + 1, '\t')) == NULL || (f3 = strchr(f2 + 1, '\t')) == NULL)
+            continue;
+        if ((nl = strpbrk(f3 + 1, "\r\n")) != NULL)
+            *nl = '\0';
+        if (f3[1] != '\0')
+            snprintf(path, cap, "%s/%s", dir, f3 + 1);
+    }
+    fclose(mf);
+}
+
+/* The file of ebook in dir (gf_books_path), read whole into a malloc'd,
+ * terminated buffer. */
 static cdb_status read_book_file(const char *dir, int64_t ebook, char **text, size_t *len)
 {
     char path[1024];
@@ -429,7 +455,7 @@ static cdb_status read_book_file(const char *dir, int64_t ebook, char **text, si
     long size;
 
     *text = NULL;
-    snprintf(path, sizeof path, "%s/%lld.txt", dir, (long long)ebook);
+    gf_books_path(dir, ebook, path, sizeof path);
     if ((f = fopen(path, "rb")) == NULL)
         return CDB_E_IO;
     if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 0) {

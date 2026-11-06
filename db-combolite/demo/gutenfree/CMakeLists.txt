@@ -23,7 +23,7 @@ set(LLAMA_BUILD_COMMIT 01fc3aa)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third-party/llama.cpp
                  ${CMAKE_CURRENT_BINARY_DIR}/llama.cpp EXCLUDE_FROM_ALL)
 
-add_executable(gutenfree gf_main.c gf_bench.c gf_queries.c gf_db.c gf_catalog.c gf_books.c gf_metrics.c gf_embed.c gf_vec.c gf_probe.c gf_jobs.c gf_ui.c)
+add_executable(gutenfree gf_main.c gf_bench.c gf_queries.c gf_db.c gf_catalog.c gf_books.c gf_metrics.c gf_embed.c gf_vec.c gf_probe.c gf_pipeline.c gf_jobs.c gf_ui.c)
 target_include_directories(gutenfree PRIVATE
   ${PROJECT_SOURCE_DIR}/src
   ${CURSES_INCLUDE_DIRS})

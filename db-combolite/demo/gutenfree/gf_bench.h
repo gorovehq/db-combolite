@@ -53,7 +53,10 @@ double gf_us_since(double t0);
 /* An expression that times call (a cdb_status) into the op called name and
  * gives its status, for use inside conditions. The comma operator takes
  * the start time before the call; the start is one static, so the call
- * must not itself contain a GF_T. */
+ * must not itself contain a GF_T, and every GF_T runs under the pipeline's
+ * engine lock (gf_pipeline.c), never from two threads at once. GF_TIME
+ * keeps its start in a local and works anywhere. Recording an op is
+ * thread-safe. */
 void gf_mark(void);
 cdb_status gf_lap(const char *name, cdb_status s);
 #define GF_T(name, call) (gf_mark(), gf_lap((name), (call)))
@@ -72,6 +75,12 @@ void gf_stage_begin(gf_db *g, gf_stage *st, const char *name);
 /* Prints the ops with samples and the change in the engine's counters,
  * and stores each op's summary as metric points. */
 void gf_stage_end(gf_db *g, gf_stage *st, FILE *out);
+
+/* Writes every op with samples to f, and adds the ops in f into this
+ * process's ops of the same names: how worker processes hand their
+ * measurements to the pipeline, which reports them as one. */
+int gf_bench_dump(FILE *f);
+int gf_bench_merge(FILE *f);
 
 /* The conditions a measurement was taken under: build type, sanitizers,
  * accelerator. */
