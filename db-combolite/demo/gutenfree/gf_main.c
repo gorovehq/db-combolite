@@ -53,7 +53,9 @@
 #include "gf_embed.h"
 #include "gf_jobs.h"
 #include "gf_metrics.h"
+#include "gf_bench.h"
 #include "gf_probe.h"
+#include "gf_queries.h"
 #include "gf_ui.h"
 #include "gf_vec.h"
 #include "cdb_vec.h"
@@ -298,6 +300,42 @@ static cdb_status refresh_graph(gf_db *g, const gf_vec *v)
     return s;
 }
 
+/* Vector search, two query sets: stored passages (which find their own
+ * precomputed neighbours, so flatter the graph) and fresh text (what a
+ * reader types, embedded as the semantic-search screen does). Timings go
+ * into the stage's ops; quality is printed here. e may be NULL: no fresh set. */
+static cdb_status search_check(gf_db *g, const gf_vec *v, gf_embed *e, unsigned stored)
+{
+    static float q[256][GF_EMBED_DIMS];
+    static uint32_t rng = 12345u;
+    static char text[600];
+    gf_vec_check ck;
+    unsigned n = 0, i;
+    cdb_status s;
+
+    if (stored > 256)
+        stored = 256;
+    if ((s = gf_vec_stored_queries(g, v, stored, &rng, q, &n)) != CDB_OK)
+        return s;
+    s = gf_vec_check_search(g, v, (const float (*)[GF_EMBED_DIMS])q, n, "stored", &ck);
+    printf("search check, %u stored passages as queries: graph finds %.2f of the exact top 10 (worst %.0f), "
+           "1-bit %.2f (worst %.0f)\n", ck.queries, ck.recall, ck.recall_min, ck.bits_agree, ck.bits_min);
+    if (s != CDB_OK || e == NULL)
+        return s;
+    for (i = 0; i < gf_nqueries && i < 256; i++) {
+        int rc;
+        snprintf(text, sizeof text, "%s%s", GF_EMBED_QUERY_PREFIX, gf_queries[i]);
+        GF_TIME("embed.query", rc = gf_embed_text(e, text, strlen(text), q[i], NULL));
+        if (rc != 0)
+            return CDB_E_STATE;
+    }
+    s = gf_vec_check_search(g, v, (const float (*)[GF_EMBED_DIMS])q, i, "fresh", &ck);
+    printf("search check, %u fresh queries: graph finds %.2f of the exact top 10 (worst %.0f: \"%s\"), "
+           "1-bit %.2f (worst %.0f)\n", ck.queries, ck.recall, ck.recall_min, gf_queries[ck.worst_query],
+           ck.bits_agree, ck.bits_min);
+    return s;
+}
+
 static int embed_cli(gf_db *g, const char *model)
 {
     static uint64_t rows[4096];
@@ -341,9 +379,10 @@ static int embed_cli(gf_db *g, const char *model)
         gf_metric("vec.commit_us_per_vector", st.commit_ms * 1000.0 / (double)(2 * st.passages + 1));
         gf_metrics_flush(g);
     }
-    gf_embed_close(e);
-    if (s != CDB_OK && s != CDB_E_EXISTS)
+    if (s != CDB_OK && s != CDB_E_EXISTS) {
+        gf_embed_close(e);
         return 1;
+    }
 
     t0 = gf_now_ms();
     s = gf_vec_link_similar(g, &v, &links);
@@ -352,6 +391,9 @@ static int embed_cli(gf_db *g, const char *model)
     if (s == CDB_OK)
         s = refresh_graph(g, &v);
     printf("embedded %llu passages this run\n", (unsigned long long)total);
+    if (s == CDB_OK)
+        s = search_check(g, &v, e, 200);
+    gf_embed_close(e);
     return s == CDB_OK ? 0 : 1;
 }
 
@@ -430,7 +472,8 @@ static int probe_cli(gf_db *g, double seconds)
     cdb_status s;
 
     app.g = g;
-    if ((s = gf_catalog_open(g, &app.cat)) != CDB_OK || (s = gf_books_open(g, &app.books)) != CDB_OK) {
+    if ((s = gf_catalog_open(g, &app.cat)) != CDB_OK || (s = gf_books_open(g, &app.books)) != CDB_OK
+        || (s = gf_vec_open(g, &app.vec)) != CDB_OK) {
         fprintf(stderr, "gutenfree: open stores: %s\n", cdb_status_str(s));
         return 1;
     }
@@ -503,20 +546,40 @@ static int filter_cli(gf_db *g, int argc, char **argv, int a)
 }
 
 /* Prints what each measure's series holds. */
-static int metrics_cli(gf_db *g)
+/* Every point of the demo's measures, or of the series named on the
+ * command line (an op's <op>.p50_us, .p99_us, .mean_us, one point per run
+ * of a command). The time-series store can't list its series (BACKLOG),
+ * so other series must be named. */
+static void summary_line(gf_db *g, const char *name, const char *unit)
 {
-    static double v[64];
-    unsigned m;
-    for (m = 0; m < gf_nmeasures; m++) {
-        size_t n = 0;
-        uint64_t points = 0;
-        double ms = 0;
-        cdb_status s = gf_metrics_recent(g, gf_measures[m].name, v, 64, &n, &points, &ms);
-        printf("  %-26s %s: %llu points", gf_measures[m].name, cdb_status_str(s), (unsigned long long)points);
-        if (n > 0)
-            printf(", last %.3f %s", v[n - 1], gf_measures[m].unit);
-        printf(" (read %.2f ms)\n", ms);
+    gf_metric_summary m;
+    cdb_status s = gf_metrics_summary(g, name, &m);
+    if (s != CDB_OK || m.count == 0) {
+        printf("  %-34s %s, no points\n", name, cdb_status_str(s));
+        return;
     }
+    printf("  %-34s %8llu %12.3f %12.3f %12.3f %12.3f  %s\n", name, (unsigned long long)m.count, m.min,
+           m.sum / (double)m.count, m.max, m.last, unit);
+}
+
+static int metrics_cli(gf_db *g, int argc, char **argv, int first)
+{
+    unsigned m;
+    int i;
+    printf("  %-34s %8s %12s %12s %12s %12s\n", "series", "points", "min", "mean", "max", "last");
+    if (first < argc) {
+        for (i = first; i < argc; i++) {
+            char name[64];
+            static const char *const parts[] = { "p50_us", "p99_us", "mean_us" };
+            for (m = 0; m < 3; m++) {
+                snprintf(name, sizeof name, "%s.%s", argv[i], parts[m]);
+                summary_line(g, name, "us");
+            }
+        }
+        return 0;
+    }
+    for (m = 0; m < gf_nmeasures; m++)
+        summary_line(g, gf_measures[m].name, gf_measures[m].unit);
     return 0;
 }
 
@@ -535,7 +598,7 @@ int main(int argc, char **argv)
     int cli_probe = argc > 1 && strcmp(argv[1], "probe") == 0;
     int cli_merge = argc > 1 && strcmp(argv[1], "merge-csv") == 0;
     int cli_filter = argc > 1 && strcmp(argv[1], "filter") == 0;
-    int a = cli_filter ? argc : cli || cli_books || cli_text || cli_embed || cli_graph || cli_bench || cli_similar || cli_metrics || cli_probe
+    int a = cli_filter || cli_metrics ? argc : cli || cli_books || cli_text || cli_embed || cli_graph || cli_bench || cli_similar || cli_probe
                                         || cli_merge
                                 ? 2
                                 : 1;
@@ -567,7 +630,8 @@ int main(int argc, char **argv)
         printf("gutenfree [base] | ingest-index [--batch N] [gutindex] [base] | merge-csv [csv] [base]\n"
                "          | ingest-books [dir] [base] | ingest-text [dir] [base] | embed [model.gguf] [base]\n"
                "          | graph [base] | bench-graph [copy-of-base] | filter key=value ...\n"
-               "          | probe [seconds] [base] | metrics [base]\n"
+               "          | probe [seconds] [base] | metrics [op ...]\n"
+               "metrics and filter take the database from $GUTENFREE_DB or the default.\n"
                "base: database path without extension (default %s, or $GUTENFREE_DB).\n"
                "Run from demo/gutenfree/; see README.md there.\n", GF_DEFAULT_BASE);
         return 0;
@@ -596,22 +660,25 @@ int main(int argc, char **argv)
         fprintf(stderr, "gutenfree: metrics flush: %s\n", gf_metrics_error());
 
     if (cli_metrics) {
-        rc = metrics_cli(&g);
-    } else if (cli_probe) {
-        rc = probe_cli(&g, seconds);
-    } else if (cli_merge) {
-        rc = merge_cli(&g, pgcsv);
-    } else if (cli_filter) {
-        rc = filter_cli(&g, argc, argv, 2);
-    } else if (cli || cli_books || cli_text || cli_embed || cli_graph || cli_bench || cli_similar) {
+        rc = metrics_cli(&g, argc, argv, 2);
+    } else if (cli_probe || cli_merge || cli_filter || cli || cli_books || cli_text || cli_embed || cli_graph
+               || cli_bench || cli_similar) {
+        /* Every command is one measured stage: each engine operation it
+         * makes is timed, and the report ends the output. */
+        gf_stage stage;
         printf("build: %s\naccelerator: %s\nopen: %.1f ms\n", GF_BUILD_LABEL, g.accel_name, open_ms);
-        rc = cli ? ingest_cli(&g, gutindex, batch)
+        gf_stage_begin(&g, &stage, argv[1]);
+        rc = cli_probe ? probe_cli(&g, seconds)
+             : cli_merge ? merge_cli(&g, pgcsv)
+             : cli_filter ? filter_cli(&g, argc, argv, 2)
+             : cli ? ingest_cli(&g, gutindex, batch)
              : cli_books ? ingest_books_cli(&g, books)
              : cli_text ? ingest_text_cli(&g, books)
              : cli_graph ? graph_cli(&g)
              : cli_bench ? bench_graph_cli(&g)
              : cli_similar ? similar_cli(&g)
              : embed_cli(&g, model);
+        gf_stage_end(&g, &stage, stdout);
     } else {
         app.g = &g;
         gf_jobs_set_app(&app);

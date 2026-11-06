@@ -9,7 +9,7 @@
 #include "cdb_ts.h"
 
 #define F_VALUE 1u
-#define MAX_SERIES 64u
+#define MAX_SERIES 256u
 #define APPEND_CHUNK 32u
 
 /* Thresholds are first guesses for a workstation: spec 2.8's device-class
@@ -70,15 +70,18 @@ int gf_measure_band(const gf_measure *m, double v)
     return v <= m->exceptional ? 2 : v <= m->satisfactory ? 1 : 0;
 }
 
+#define NAME_MAX_LEN 48u /* names are copied: callers may build them on the stack */
+
 typedef struct point {
-    const char *name;  /* static strings only */
+    char name[NAME_MAX_LEN];
+    int sent;          /* written by the flush under way */
     int64_t ts;
     double v;
 } point;
 
 static struct {
     uint64_t store;
-    struct { const char *name; uint64_t id; } series[MAX_SERIES];
+    struct { char name[NAME_MAX_LEN]; uint64_t id; } series[MAX_SERIES];
     unsigned nseries;
     point q[GF_METRICS_QUEUE];
     unsigned nq;
@@ -116,7 +119,8 @@ void gf_metric(const char *name, double value)
         M.dropped++;
         return;
     }
-    M.q[M.nq].name = name;
+    snprintf(M.q[M.nq].name, sizeof M.q[M.nq].name, "%s", name);
+    M.q[M.nq].sent = 0;
     M.q[M.nq].ts = now_us();
     M.q[M.nq].v = value;
     M.nq++;
@@ -140,7 +144,7 @@ static cdb_status series_id(gf_db *g, const char *name, int create, uint64_t *id
     def.fields[0].type = CDB_TYPE_F64;
     s = cdb_ts_series(&g->db, M.store, name, strlen(name), NULL, 0, create ? &def : NULL, id, &created);
     if (s == CDB_OK && M.nseries < MAX_SERIES) {
-        M.series[M.nseries].name = name;
+        snprintf(M.series[M.nseries].name, sizeof M.series[M.nseries].name, "%s", name);
         M.series[M.nseries].id = *id;
         M.nseries++;
     }
@@ -168,7 +172,7 @@ cdb_status gf_metrics_flush(gf_db *g)
         uint64_t id;
         for (i = 0; i < M.nq; i++) {
             cdb_value_writer w;
-            if (M.q[i].name == NULL || (name != NULL && strcmp(M.q[i].name, name) != 0))
+            if (M.q[i].sent || (name != NULL && strcmp(M.q[i].name, name) != 0))
                 continue;
             name = M.q[i].name;
             cdb_value_writer_init(&w, vals[n], sizeof vals[n], GF_ORDER, CDB_DECIMAL_COMPACT);
@@ -186,7 +190,7 @@ cdb_status gf_metrics_flush(gf_db *g)
             in[n].values = vals[n];
             in[n].len = cdb_value_writer_len(&w);
             n++;
-            M.q[i].name = NULL;
+            M.q[i].sent = 1;
             done++;
         }
         if (s != CDB_OK)
@@ -220,22 +224,18 @@ cdb_status gf_metrics_flush(gf_db *g)
     return CDB_OK;
 }
 
-cdb_status gf_metrics_recent(gf_db *g, const char *name, double *out, size_t max, size_t *n, uint64_t *points,
-                             double *read_ms)
+/* Calls fn for every point of a series, oldest first. */
+static cdb_status walk(gf_db *g, const char *name, void (*fn)(double v, void *ctx), void *ctx)
 {
     static uint8_t buf[64 * 1024];
     static cdb_ts_row rows[1024];
     int64_t from = 0, next, to = INT64_MAX;
     uint64_t id;
-    size_t got, i, keep = 0, head = 0;
-    double t0 = gf_now_ms();
+    size_t got, i;
     cdb_status s = series_id(g, name, 0, &id);
 
-    *n = 0;
-    *points = 0;
     if (s == CDB_E_NOT_FOUND)
         return CDB_OK;
-    /* Every point, keeping the last max in a ring. */
     while (s == CDB_OK && from < to) {
         if ((s = cdb_ts_range(&g->db, M.store, id, from, to, buf, sizeof buf, rows, 1024, &got, &next)) != CDB_OK)
             break;
@@ -245,28 +245,71 @@ cdb_status gf_metrics_recent(gf_db *g, const char *name, double *out, size_t max
             if (cdb_value_read(buf + rows[i].off, rows[i].len, GF_ORDER, &obj) != CDB_OK
                 || cdb_value_object_get(&obj, GF_ORDER, F_VALUE, &v, &found) != CDB_OK || !found)
                 continue;
-            out[(head + keep) % max] = v.as.f64;
-            if (keep < max)
-                keep++;
-            else
-                head = (head + 1) % max;
-            (*points)++;
+            fn(v.as.f64, ctx);
         }
         if (got == 0 || next <= from)
             break;
         from = next;
     }
+    return s;
+}
+
+typedef struct recent_ctx {
+    double *out;
+    size_t max, keep, head;
+    uint64_t points;
+} recent_ctx;
+
+static void keep_recent(double v, void *ctx)
+{
+    recent_ctx *r = (recent_ctx *)ctx;
+    r->out[(r->head + r->keep) % r->max] = v;
+    if (r->keep < r->max)
+        r->keep++;
+    else
+        r->head = (r->head + 1) % r->max;
+    r->points++;
+}
+
+cdb_status gf_metrics_recent(gf_db *g, const char *name, double *out, size_t max, size_t *n, uint64_t *points,
+                             double *read_ms)
+{
+    recent_ctx r = { out, max, 0, 0, 0 };
+    double t0 = gf_now_ms();
+    cdb_status s = walk(g, name, keep_recent, &r);
+    size_t i;
+
     /* Unroll the ring, oldest first. */
-    if (head != 0) {
+    if (r.head != 0) {
         double tmp[512];
-        for (i = 0; i < keep && i < 512; i++)
-            tmp[i] = out[(head + i) % max];
-        memcpy(out, tmp, keep * sizeof *out);
+        for (i = 0; i < r.keep && i < 512; i++)
+            tmp[i] = out[(r.head + i) % max];
+        memcpy(out, tmp, r.keep * sizeof *out);
     }
-    *n = keep;
+    *n = r.keep;
+    *points = r.points;
     *read_ms = gf_now_ms() - t0;
     return s;
 }
+
+static void add_summary(double v, void *ctx)
+{
+    gf_metric_summary *m = (gf_metric_summary *)ctx;
+    if (m->count == 0 || v < m->min)
+        m->min = v;
+    if (m->count == 0 || v > m->max)
+        m->max = v;
+    m->sum += v;
+    m->last = v;
+    m->count++;
+}
+
+cdb_status gf_metrics_summary(gf_db *g, const char *name, gf_metric_summary *out)
+{
+    memset(out, 0, sizeof *out);
+    return walk(g, name, add_summary, out);
+}
+
 
 uint64_t gf_metrics_written(void) { return M.written; }
 uint64_t gf_metrics_dropped(void) { return M.dropped; }

@@ -43,6 +43,13 @@ cdb_status gf_metrics_flush(gf_db *g);
 cdb_status gf_metrics_recent(gf_db *g, const char *name, double *out, size_t max, size_t *n, uint64_t *points,
                              double *read_ms);
 
+/* Every point of a series: how many, the smallest, largest, sum and last. */
+typedef struct gf_metric_summary {
+    uint64_t count;
+    double min, max, sum, last;
+} gf_metric_summary;
+cdb_status gf_metrics_summary(gf_db *g, const char *name, gf_metric_summary *out);
+
 /* The last flush failure ("" when the last flush worked). */
 const char *gf_metrics_error(void);
 

@@ -88,13 +88,16 @@ The database is `data/gutenfree.cdbarch`. Set `GUTENFREE_DB=/some/path` (no exte
 
 ```sh
 ./gutenfree filter genre="science fiction" type=Text author=verne   # the catalog filter, from the shell
-./gutenfree probe 15                                                # 15 s of probe load
-./gutenfree metrics                                                 # what every gauge holds
+./gutenfree probe 15                                                # 15 s of probe load: lookups, reads, scans, text and vector search
+./gutenfree metrics                                                 # every point of each gauge: count, min, mean, max, last
+./gutenfree metrics vec.search_graph.fresh fts.search               # an operation's p50, p99 and mean across runs
 ./gutenfree graph                                                   # refresh the passages' neighbour graph
 ./gutenfree link-similar                                            # link similar books (one bulk search)
 ./gutenfree bench-graph data/copy                                   # time a whole graph build, on a copy of the database
 ./gutenfree --help
 ```
+
+**Measurements.** Every command above, and the ingest and embed commands, ends with a report: each engine operation it made, timed one call at a time (count, min, p50, p95, p99, max, calls per second), the archive commits and file growth, and the accelerator's share of the searches. The summaries are stored, so `metrics` shows them later. `embed` ends with a search check: 200 stored passages and 50 fresh phrases (`gf_queries.c`, embedded as semantic search does) each searched exactly, through the neighbour graph and through the 1-bit vectors, with how many of the exact top 10 the other two find. Stored passages find their own precomputed neighbours, so the fresh queries are the honest score. Timings are only meaningful in a RelWithDebInfo or Release build; the report names the build.
 
 ## Licences and sources
 

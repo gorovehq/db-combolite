@@ -11,6 +11,7 @@
 #include <time.h>
 
 #include "cdb_link.h"
+#include "gf_bench.h"
 
 static const char *const col_names[GF_NCOLS] = {
     "ebook", "title", "author", "subtitle", "language", "credits", "sort_title",
@@ -233,10 +234,10 @@ cdb_status gf_library_add(gf_db *g, const gf_catalog *c, uint64_t row, const gf_
     v[n].id = c->lib[GF_LIB_INGESTED], v[n].s = now, n++;
     if ((s = encode_cols(v, n, buf, sizeof buf, &len)) != CDB_OK)
         return s;
-    if ((s = cdb_table_insert(&g->db, c->lib_store, buf, len, lib_row)) != CDB_OK)
+    if ((s = GF_T("table.insert_library", cdb_table_insert(&g->db, c->lib_store, buf, len, lib_row))) != CDB_OK)
         return s;
-    return cdb_link_add(&g->db, c->in_catalog, cdb_ref_entry(c->lib_store, *lib_row), cdb_ref_entry(c->store, row),
-                        1.0f, 0);
+    return GF_T("link.add_in_catalog", cdb_link_add(&g->db, c->in_catalog, cdb_ref_entry(c->lib_store, *lib_row), cdb_ref_entry(c->store, row),
+                        1.0f, 0));
 }
 
 cdb_status gf_library_set_embedded(gf_db *g, const gf_catalog *c, uint64_t lib_row, const char *model)
@@ -252,7 +253,7 @@ cdb_status gf_library_set_embedded(gf_db *g, const gf_catalog *c, uint64_t lib_r
     v[1].id = c->lib[GF_LIB_MODEL], v[1].s = model;
     if ((s = encode_cols(v, 2, buf, sizeof buf, &len)) != CDB_OK)
         return s;
-    return cdb_table_update(&g->db, c->lib_store, lib_row, buf, len);
+    return GF_T("table.update_library", cdb_table_update(&g->db, c->lib_store, lib_row, buf, len));
 }
 
 cdb_status gf_catalog_shelf(gf_db *g, const gf_catalog *c, cdb_table_cursor *cur, uint64_t *entries, size_t max,
@@ -534,7 +535,7 @@ typedef struct ingest {
 
 static cdb_status commit_batch(ingest *in, int reopen)
 {
-    cdb_status s = cdb_tx_commit(&in->g->db);
+    cdb_status s = GF_T("tx.commit_catalog_batch", cdb_tx_commit(&in->g->db));
     double t;
     if (s != CDB_OK)
         return s;
@@ -572,7 +573,7 @@ static cdb_status flush_entry(ingest *in, gentry *en)
         in->st->refused++;
         return CDB_OK;
     }
-    s = cdb_table_insert(&in->g->db, in->c->store, in->row, len, &row_entry);
+    s = GF_T("table.insert_catalog", cdb_table_insert(&in->g->db, in->c->store, in->row, len, &row_entry));
     if (s == CDB_E_EXISTS)
         in->st->duplicates++;
     else if (s == CDB_E_SCHEMA || s == CDB_E_OVERFLOW) {
@@ -693,7 +694,7 @@ cdb_status gf_catalog_read(gf_db *g, const gf_catalog *c, uint64_t entry, gf_boo
     size_t len;
     cdb_value obj, v;
     int found;
-    cdb_status s = cdb_table_get(&g->db, c->store, entry, buf, sizeof buf, &len);
+    cdb_status s = GF_T("table.get_catalog", cdb_table_get(&g->db, c->store, entry, buf, sizeof buf, &len));
 
     memset(b, 0, sizeof *b);
     if (s != CDB_OK)
@@ -740,7 +741,7 @@ static cdb_status read_library(gf_db *g, const gf_catalog *c, gf_book *b)
         b->lib_row = 0;
         return s;
     }
-    if ((s = cdb_table_get(&g->db, c->lib_store, b->lib_row, buf, sizeof buf, &len)) != CDB_OK
+    if ((s = GF_T("table.get_library", cdb_table_get(&g->db, c->lib_store, b->lib_row, buf, sizeof buf, &len))) != CDB_OK
         || (s = cdb_value_read(buf, len, GF_ORDER, &obj)) != CDB_OK)
         return s;
     if (cdb_value_object_get(&obj, GF_ORDER, c->lib[GF_LIB_PASSAGES], &v, &found) == CDB_OK && found
@@ -1019,9 +1020,9 @@ cdb_status gf_catalog_merge_csv(gf_db *g, const gf_catalog *c, const char *path,
             continue;
         }
         if (found)
-            s = cdb_table_update(&g->db, c->store, entry, row, cdb_value_writer_len(&w));
+            s = GF_T("table.update_catalog", cdb_table_update(&g->db, c->store, entry, row, cdb_value_writer_len(&w)));
         else
-            s = cdb_table_insert(&g->db, c->store, row, cdb_value_writer_len(&w), &entry);
+            s = GF_T("table.insert_catalog", cdb_table_insert(&g->db, c->store, row, cdb_value_writer_len(&w), &entry));
         if (s == CDB_E_SCHEMA || s == CDB_E_OVERFLOW || s == CDB_E_EXISTS) {
             st->refused++;
             s = CDB_OK;

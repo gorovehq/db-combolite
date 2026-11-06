@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "gf_books.h"
+#include "gf_bench.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -293,9 +294,9 @@ static cdb_status store_text(gf_db *g, const gf_catalog *c, const gf_books *b, u
     v[1].id = b->tcol[GF_T_TITLE], v[1].s = book->title, v[1].n = title_len;
     v[2].id = b->tcol[GF_T_BODY], v[2].s = text, v[2].n = len;
     if ((s = encode_fields(v, GF_NT, row, cap, &n)) == CDB_OK
-        && (s = cdb_table_insert(&g->db, b->text_table, row, n, &entry)) == CDB_OK)
-        s = cdb_link_add(&g->db, b->full_text, cdb_ref_entry(c->lib_store, lib_row),
-                         cdb_ref_entry(b->text_table, entry), 1.0f, 0);
+        && (s = GF_T("table.insert_text", cdb_table_insert(&g->db, b->text_table, row, n, &entry))) == CDB_OK)
+        s = GF_T("link.add_full_text", cdb_link_add(&g->db, b->full_text, cdb_ref_entry(c->lib_store, lib_row),
+                         cdb_ref_entry(b->text_table, entry), 1.0f, 0));
     free(row);
     return s;
 }
@@ -385,20 +386,20 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
         if ((s = encode_fields(v, k, body, sizeof body, &w)) != CDB_OK)
             break;
         st->step = "document insert";
-        if ((s = cdb_doc_insert(&g->db, b->pool, summary, strlen(summary), body, w, &entry)) != CDB_OK)
+        if ((s = GF_T("doc.insert_passage", cdb_doc_insert(&g->db, b->pool, summary, strlen(summary), body, w, &entry))) != CDB_OK)
             break;
         if (seq > 0 && entry != prev + 1) {
             s = CDB_E_STATE; /* the reader relies on consecutive entry IDs */
             break;
         }
         st->step = "link has_passage";
-        if ((s = cdb_link_add(&g->db, c->has_passage, cdb_ref_entry(c->lib_store, lib_row),
-                              cdb_ref_entry(b->pool, entry), 1.0f, 0)) != CDB_OK)
+        if ((s = GF_T("link.add_has_passage", cdb_link_add(&g->db, c->has_passage, cdb_ref_entry(c->lib_store, lib_row),
+                              cdb_ref_entry(b->pool, entry), 1.0f, 0))) != CDB_OK)
             break;
         if (seq > 0) {
             st->step = "link next_passage";
-            if ((s = cdb_link_add(&g->db, b->next_passage, cdb_ref_entry(b->pool, prev), cdb_ref_entry(b->pool, entry),
-                                  1.0f, 0)) != CDB_OK)
+            if ((s = GF_T("link.add_next", cdb_link_add(&g->db, b->next_passage, cdb_ref_entry(b->pool, prev), cdb_ref_entry(b->pool, entry),
+                                  1.0f, 0))) != CDB_OK)
                 break;
         }
         /* The next passage falls under the last heading this one has */
@@ -413,7 +414,7 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
     }
     st->step = "commit";
     tc = gf_now_ms();
-    s = cdb_tx_commit(&g->db);
+    s = GF_T("tx.commit_book", cdb_tx_commit(&g->db));
     st->commit_ms = gf_now_ms() - tc;
     st->passages = seq;
     st->ms = gf_now_ms() - t0;
