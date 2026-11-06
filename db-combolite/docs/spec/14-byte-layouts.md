@@ -614,10 +614,26 @@ A domain's held log keeps the committed changes of that domain that a process co
 
 - **Host files:** each coordinator slot is the file `coord/<slot>`, the slot number in decimal. With the lock hook (5.8), its owner holds an exclusive lock on the whole file for its session.
 - **Working-directory lock (5.9.5):** `coord/lock`, an empty file whose content is never read; joiners lock it shared, and a process removing the working directory locks it exclusively.
+- **Primary file (5.2):** `coord/primary`. Its exclusive lock makes its holder the primary; only the holder writes it, with the primary's slot and the number of slots, in one 512-byte record:
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | 8 | Magic: `89 43 44 42 50 52 49 0A` (`\x89CDBPRI\n`) |
+  | 8 | 1 | Byte-order flag |
+  | 9 | 1 | Epoch: 1 |
+  | 10 | 2 | The primary's slot |
+  | 12 | 2 | Number of slots, 1–65,534 |
+  | 14 | 2 | Reserved, zero |
+  | 16 | 16 | Database ID |
+  | 32 | 16 | The primary's session identity |
+  | 48 | 460 | Reserved, zero |
+  | 508 | 4 | CRC32C over bytes 0–507 |
+
+  A joiner that finds the file locked but its record torn or missing waits the settle interval and reads it again.
 - **Lobby files (5.9.5, fallback only):** `coord/join.<session>`, the session identity as 32 lowercase hex digits. One 512-byte half in the layout below: request kind 4, the wanted slot at offset 10 and the wanted priority at offset 14. Times are µs of the primary's clock, as in the slot.
 - **Raw flash:** each slot is a region.
 - **Two halves.** Every slot has two 512-byte halves, A and B. Writes alternate between them. The valid half with the higher heartbeat counter wins. A torn heartbeat write therefore never makes a live coordinator look dead.
-- **Maximum number of coordinators.** It can be configured. The default comes from the device-class table (Section 2.8): about 1–2 on microcontrollers and 64 on desktop and server hosts. On raw flash, the coordinator region is sized for this maximum.
+- **Maximum number of coordinators.** The primary decides it from its configuration and publishes it in `coord/primary`; it stays fixed while the database is in use (5.2). The default comes from the device-class table (Section 2.8): about 1–2 on microcontrollers and 64 on desktop and server hosts; the format allows up to 65,534. On raw flash, the coordinator region is sized for this maximum.
 
 ### 14.5.2 Field layout (each half)
 
