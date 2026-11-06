@@ -201,6 +201,17 @@ typedef struct cdb_coord {
 cdb_status cdb_coord_join(cdb_coord *c, const cdb_env *env, const char *dir, const uint8_t db_id[16],
                           cdb_byte_order order, const cdb_coord_config *cfg);
 
+/* Decides whether this process can adopt the journal of slot s, a dead or
+ * closed slot whose record says its journal is in use (spec 5.9.5): nonzero
+ * yes. NULL: every journal can be adopted. */
+typedef int (*cdb_coord_adoptable_fn)(void *arg, unsigned s);
+
+/* cdb_coord_join, but with the lock hook a slot whose journal this process
+ * cannot adopt is passed over for the next one. */
+cdb_status cdb_coord_join_with(cdb_coord *c, const cdb_env *env, const char *dir, const uint8_t db_id[16],
+                               cdb_byte_order order, const cdb_coord_config *cfg, cdb_coord_adoptable_fn adoptable,
+                               void *arg);
+
 /* Writes a heartbeat if one is due (force: now), refreshes what is known
  * about the others, and elects a new primary if the old one died.
  * CDB_E_BUSY if another coordinator has taken this one's slot, which in the

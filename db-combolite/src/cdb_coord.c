@@ -608,21 +608,33 @@ static cdb_status lock_dir_shared(cdb_coord *c, const char *parent)
     }
 }
 
-/* With the lock hook: the lowest slot whose lock this coordinator gets is
- * its own; the system settles any race between joiners (spec 5.9.5). */
-static cdb_status join_by_lock(cdb_coord *c)
+/* With the lock hook: the lowest slot whose lock this coordinator gets, and
+ * whose journal it can adopt, is its own; the system settles any race
+ * between joiners (spec 5.9.5). */
+static cdb_status join_by_lock(cdb_coord *c, cdb_coord_adoptable_fn adoptable, void *arg)
 {
     char path[CDB_COORD_PATH];
     unsigned slot, p, i;
     cdb_status s;
 
     for (slot = 0; slot < c->cfg.max_coords; slot++) {
+        cdb_coord_rec old;
+        int valid;
         slot_path(c, slot, path);
         s = c->env.ops->lock_open(c->env.ctx, path, 1, &c->slot_lock);
-        if (s == CDB_OK)
-            break;
-        if (s != CDB_E_BUSY)
+        if (s == CDB_E_BUSY)
+            continue;
+        if (s != CDB_OK)
             return s;
+        if (adoptable == NULL)
+            break;
+        if ((s = read_file(c, path, 2, &old, &valid)) != CDB_OK) {
+            unlock(c, &c->slot_lock);
+            return s;
+        }
+        if (!valid || !(old.flags & CDB_COORD_JOURNAL) || adoptable(arg, slot))
+            break;
+        unlock(c, &c->slot_lock); /* its journal waits for one that can */
     }
     if (slot == c->cfg.max_coords)
         return CDB_E_BUSY;
@@ -707,6 +719,13 @@ static void make_session(cdb_coord *c)
 cdb_status cdb_coord_join(cdb_coord *c, const cdb_env *env, const char *dir, const uint8_t db_id[16],
                           cdb_byte_order order, const cdb_coord_config *cfg)
 {
+    return cdb_coord_join_with(c, env, dir, db_id, order, cfg, NULL, NULL);
+}
+
+cdb_status cdb_coord_join_with(cdb_coord *c, const cdb_env *env, const char *dir, const uint8_t db_id[16],
+                               cdb_byte_order order, const cdb_coord_config *cfg, cdb_coord_adoptable_fn adoptable,
+                               void *arg)
+{
     char lobby[CDB_COORD_PATH], parent[CDB_COORD_PATH];
     uint64_t lost_slots = 0;
     uint8_t lost_prio[PRIORITY_LIMIT + 1u];
@@ -759,7 +778,7 @@ cdb_status cdb_coord_join(cdb_coord *c, const cdb_env *env, const char *dir, con
         return s;
     }
     if (c->use_locks) {
-        s = join_by_lock(c);
+        s = join_by_lock(c, adoptable, arg);
         unlock(c, &c->dir_lock); /* the slot's lock now keeps the directory */
         if (s != CDB_OK)
             return s;

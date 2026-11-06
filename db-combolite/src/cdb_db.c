@@ -528,7 +528,12 @@ static cdb_status pager_reload(cdb_db *db)
 }
 
 /* Reads one record, decrypting it under its domain's key when it is
- * encrypted: the header's store field names the domain (spec 14.4.2). */
+ * encrypted: the header's store field names the domain (spec 14.4.2).
+ * A record that cannot be decrypted is an error, never the journal's end:
+ * CDB_E_SECURITY, with *next set past it, when its domain is not open; and
+ * CDB_E_SECURITY when its tag fails although another record follows it, so
+ * it cannot be a torn tail (the wrong key). A failing last record is the
+ * torn tail, CDB_E_CORRUPT, as for plain records. */
 static cdb_status read_record(cdb_db *db, cdb_journal *j, uint64_t offset,
                               uint8_t *buf, size_t buf_size, cdb_record *r, uint64_t *next)
 {
@@ -540,12 +545,19 @@ static cdb_status read_record(cdb_db *db, cdb_journal *j, uint64_t offset,
     if (buf[0] != 0xC0u || buf[1] != 0xDEu)
         return CDB_E_CORRUPT;
     if (buf[3] & CDB_RECORD_FLAG_ENCRYPTED) {
-        uint8_t key[32];
+        uint64_t after = offset + CDB_RECORD_HEADER_SIZE + (uint64_t)cdb_load_u32(buf + 4, j->order)
+                         + CDB_RECORD_TRAILER_SIZE;
+        uint8_t key[32], mark[2];
         /* Under the salt of the session that wrote the journal (14.2.8). */
-        if ((s = domain_page_key_for(db, cdb_load_u64(buf + 24, j->order), j->hdr.salt, key)) != CDB_OK)
+        if ((s = domain_page_key_for(db, cdb_load_u64(buf + 24, j->order), j->hdr.salt, key)) != CDB_OK) {
+            *next = after;
             return s;
+        }
         s = cdb_journal_read_crypto(j, offset, buf, buf_size, r, next, db->aead_alg, key);
         cdb_crypto_wipe(key, sizeof key);
+        if (s == CDB_E_CORRUPT && cdb_storage_read(&j->st, after, mark, sizeof mark) == CDB_OK
+            && mark[0] == 0xC0u && mark[1] == 0xDEu)
+            return CDB_E_SECURITY;
         return s;
     }
     return cdb_journal_read(j, offset, buf, buf_size, r, next);
@@ -727,6 +739,31 @@ static cdb_status open_journal(cdb_db *db, unsigned slot)
     return s;
 }
 
+/* Whether this process can adopt slot's journal (spec 5.9.5, 14.4.7 rule 9):
+ * no record in it belongs to a domain this process has not opened, since
+ * rotation must re-encrypt every record under this session's salt. At open
+ * no enclave is open yet, so any encrypted record rules the slot out; its
+ * journal waits for the baton holder or for a process that can. Records
+ * already merged count too: the marks cannot be read before the catalog. */
+static int journal_adoptable(void *arg, unsigned slot)
+{
+    cdb_db *db = (cdb_db *)arg;
+    uint64_t off = CDB_JOURNAL_HEADER_SIZE;
+    cdb_status s;
+    if (open_journal(db, slot) != CDB_OK)
+        return 1; /* none, or set aside as damaged at adoption */
+    for (;;) {
+        cdb_record r;
+        uint64_t next;
+        s = read_record(db, &db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
+        if (s != CDB_OK)
+            break;
+        off = next;
+    }
+    cdb_storage_close(&db->rj_st);
+    return s != CDB_E_SECURITY;
+}
+
 /* One slot's journal while recovery or reconciliation merges them (spec
  * 5.9.1, 14.4.7 rule 5). */
 struct jcursor {
@@ -741,6 +778,8 @@ struct jcursor {
     int have;           /* there is a next transaction to apply: */
     uint64_t stamp, counter, tx_id, start, commit_at;
     int rollbacks;      /* its commit record says it holds rollback records (14.4.9) */
+    int deferred;       /* stopped at a record this process cannot decrypt: the rest
+                           waits, pending, for a process that can (spec 5.9.5) */
 };
 
 /* The merge order (spec 5.9.2): stamp, then slot, then counter. */
@@ -774,8 +813,18 @@ static cdb_status scan_next(cdb_db *db, struct jcursor *c)
     for (;;) {
         cdb_record r;
         uint64_t next;
-        if (read_record(db, &db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next) != CDB_OK)
+        if ((s = read_record(db, &db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next)) != CDB_OK) {
+            /* Not the end: what follows waits for a process with the key,
+             * from the start of the transaction it belongs to. */
+            if (s == CDB_E_SECURITY) {
+                c->deferred = 1;
+                c->have = 0;
+                c->off = cur != 0 ? start : off;
+                cdb_storage_close(&db->rj_st);
+                return CDB_OK;
+            }
             break;
+        }
         if ((r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_WRITE_KEY) && r.tx_id != cur) {
             cur = r.tx_id;
             start = off;
@@ -1078,8 +1127,11 @@ static cdb_status merge_journals(cdb_db *db, int keep_in_use)
     /* Fold whatever was replayed into the archive, with the marks that
      * say so, before discarding dead slots' journals. */
     for (i = 0; i < n; i++) {
-        if (cur[i].dead_hwm > cur[i].top)
+        if (cur[i].deferred) {
+            keep_in_use = 1; /* a journal still holds changes (14.4.7 rule 7) */
+        } else if (cur[i].dead_hwm > cur[i].top) {
             cur[i].top = cur[i].dead_hwm;
+        }
         marks_moved |= cur[i].top > cur[i].mark;
     }
     if (db->last_tx > db->my_mark)
@@ -1118,6 +1170,8 @@ static cdb_status merge_journals(cdb_db *db, int keep_in_use)
     for (i = 0; i < n; i++) {
         char path[CDB_DB_PATH_MAX], opath[CDB_DB_PATH_MAX];
         unsigned sl = cur[i].slot;
+        if (cur[i].deferred)
+            continue; /* still pending: its files stay */
         if (sl == db->coord.me.slot) {
             if (recovering && cur[i].has_journal) {
                 journal_paths(db, sl, path, NULL);
@@ -1298,8 +1352,14 @@ static cdb_status rebase_pages(cdb_db *db)
     if (db->last_tx <= db->my_mark) {
         if (db->journal_st.ops != NULL)
             return rotate_journal(db);
-        if ((s = new_journal(db, db->journal_path, db->pager.hs.record.committed_seq)) != CDB_OK)
+        /* A journal adopted with a dead or closed slot, fully merged: an
+         * empty one under this session's salt replaces it whole, so none of
+         * its old records can follow the new header (14.4.7 rule 9). */
+        if ((s = new_journal(db, db->journal_tmp, db->pager.hs.record.committed_seq)) != CDB_OK)
             return s;
+        if ((s = db->env.ops->rename(db->env.ctx, db->journal_tmp, db->journal_path)) != CDB_OK)
+            return s;
+        db->unsynced = 0;
         return env_sync_dir(db, db->workdir);
     }
 
@@ -1380,6 +1440,8 @@ static cdb_status rebase_pages(cdb_db *db)
         }
         if (s != CDB_OK)
             return s;
+        if (c.deferred)
+            return CDB_E_SECURITY; /* the copy would leave records out: the old journal stays */
     }
     if ((s = cdb_storage_sync(&db->journal_st)) != CDB_OK)
         return s;
@@ -1574,8 +1636,8 @@ static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg
         return s;
     if ((s = env_sync_dir(db, db->parent)) != CDB_OK)
         return s;
-    if ((s = cdb_coord_join(&db->coord, &db->env, db->coorddir, db->pager.hs.record.db_id, db->pager.order,
-                            &cfg->coord)) != CDB_OK)
+    if ((s = cdb_coord_join_with(&db->coord, &db->env, db->coorddir, db->pager.hs.record.db_id, db->pager.order,
+                                 &cfg->coord, journal_adoptable, db)) != CDB_OK)
         return s;
     journal_paths(db, db->coord.me.slot, db->journal_path, db->journal_tmp);
     overlay_path_of(db, db->coord.me.slot, db->overlay_path);
@@ -1630,6 +1692,8 @@ static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg
             while (c.have)
                 if ((s = scan_next(db, &c)) != CDB_OK)
                     return s;
+            if (c.deferred)
+                return CDB_E_SECURITY; /* journal_adoptable passed it over: it changed since */
             if (c.top > db->last_tx)
                 db->last_tx = c.top;
         }
@@ -2314,7 +2378,16 @@ static cdb_status check_slot_collisions(cdb_db *db, unsigned slot, uint64_t my_s
             cdb_record r;
             struct ws_item it;
             uint64_t next, counter;
-            if (read_record(db, &db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next) != CDB_OK)
+            cdb_status rs = read_record(db, &db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next);
+            if (rs == CDB_E_SECURITY && enclave_index(db, cdb_load_u64(db->cfg.record_buf + 24, db->rj.order)) < 0) {
+                off = next; /* a domain this process cannot write: no collision with it */
+                continue;
+            }
+            if (rs == CDB_E_SECURITY) {
+                cdb_storage_close(&db->rj_st);
+                return rs;
+            }
+            if (rs != CDB_OK)
                 break;
             off = next;
             if ((r.tx_id >> 48) != slot)
@@ -4064,8 +4137,11 @@ static cdb_status crdt_walk(cdb_db *db, uint64_t since, uint8_t *out, size_t *ou
     while (off < db->journal.end) {
         cdb_record r;
         uint64_t next, counter;
-        if (read_record(db, &db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next) != CDB_OK)
+        if ((s = read_record(db, &db->journal, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next)) != CDB_OK) {
+            if (s == CDB_E_SECURITY)
+                return s;
             break;
+        }
         counter = r.tx_id & TX_COUNTER_MASK;
         if ((r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_WRITE_KEY) && r.tx_id != cur) {
             cur = r.tx_id;

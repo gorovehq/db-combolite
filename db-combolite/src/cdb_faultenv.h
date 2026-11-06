@@ -15,7 +15,7 @@
 #include "combolite/cdb_env.h"
 #include "cdb_faultdev.h"
 
-#define CDB_FAULTENV_MAX_FILES 10
+#define CDB_FAULTENV_MAX_FILES 16  /* three processes' journals, overlays and slots, coord/lock, a rotation */
 #define CDB_FAULTENV_MAX_DIRS 4
 #define CDB_FAULTENV_NAME 160
 #define CDB_FAULTENV_MAX_ALLOCS 256

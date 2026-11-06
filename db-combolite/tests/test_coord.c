@@ -979,6 +979,94 @@ static void test_two_processes_encrypted_merge(void)
     keyed_procs = 0;
 }
 
+/* A newcomer cannot rotate encrypted records of an enclave it has not
+ * opened, so it passes over a crashed slot whose journal holds some and
+ * takes the next slot (spec 5.9.5, 14.4.7 rule 9). The journal stays
+ * pending, whole, until the baton holder, which has the enclave open,
+ * merges it: the encrypted transaction and the plain one after it. */
+static void test_take_over_encrypted_slot(void)
+{
+    keyed_procs = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_enclave(&p1.db, ENCLAVE, "custom://enc"));
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&p2.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, ENCLAVE, 5, CDB_OP_REPLACE, "secret", 6));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
+    crash_proc(&p2);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_UINT(2, p2.db.coord.me.slot);
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/main.1.cdb"));
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/coord/1"));
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("secret", value_of(&p1, 5));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&p1.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_STRING("secret", value_of(&p1, 5));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    keyed_procs = 0;
+}
+
+/* A merger without an enclave's key leaves the rest of a journal that holds
+ * the enclave's records pending, from the first such transaction on; it
+ * neither drops nor removes it, and the database stays in use, so a process
+ * with the key merges it later (spec 5.9.5, 14.4.7 rule 7). */
+static void test_merge_defers_undecryptable(void)
+{
+    keyed_procs = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_enclave(&p1.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1)); /* p1 never opens the enclave */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&p2.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 1, CDB_OP_PATCH, "a", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, ENCLAVE, 5, CDB_OP_REPLACE, "secret", 6));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
+    crash_proc(&p2);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("a", value_of(&p1, 1)); /* before the encrypted one */
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 2));  /* after it: pending */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/main.1.cdb"));
+
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1)); /* alone: recovery defers it again */
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&p1.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("secret", value_of(&p1, 5));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+    keyed_procs = 0;
+}
+
 /* A transaction that was open while another process reconciled into the
  * archive is rejected: its view is older than the archive (spec 5.9.4). The
  * rejected process is rebased at once, so its retry builds on the new
@@ -2414,6 +2502,8 @@ int main(void)
     RUN_TEST(test_reader_pin_blocks_reuse);
     RUN_TEST(test_live_peer_merges_crashed_peer);
     RUN_TEST(test_take_over_dead_slot_while_peer_live);
+    RUN_TEST(test_take_over_encrypted_slot);
+    RUN_TEST(test_merge_defers_undecryptable);
     RUN_TEST(test_missing_peer_journal_refused);
     RUN_TEST(test_crashed_process_recovered);
     RUN_TEST(test_id_block_claims);
