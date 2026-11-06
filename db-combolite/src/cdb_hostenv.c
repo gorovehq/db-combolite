@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -389,12 +390,58 @@ static cdb_status he_thread_join(void *ctx, cdb_thread *t)
     return rc == 0 ? CDB_OK : CDB_E_IO;
 }
 
+/* flock, not fcntl record locks: a flock lock belongs to the open file
+ * description, so closing another descriptor of the same file leaves it
+ * held (spec 5.8). */
+struct cdb_lock {
+    int fd;
+};
+
+static cdb_status he_lock_open(void *ctx, const char *path, int exclusive, cdb_lock **out)
+{
+    cdb_lock *l;
+    int fd, rc;
+    (void)ctx;
+    if (path == NULL || out == NULL)
+        return CDB_E_INVALID_ARG;
+    do {
+        fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0)
+        return errno_status();
+    do {
+        rc = flock(fd, (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB);
+    } while (rc != 0 && errno == EINTR);
+    if (rc != 0) {
+        cdb_status s = errno == EWOULDBLOCK ? CDB_E_BUSY : CDB_E_IO;
+        close(fd);
+        return s;
+    }
+    if ((l = (cdb_lock *)malloc(sizeof *l)) == NULL) {
+        close(fd);
+        return CDB_E_BUFFER_TOO_SMALL;
+    }
+    l->fd = fd;
+    *out = l;
+    return CDB_OK;
+}
+
+static void he_lock_close(void *ctx, cdb_lock *l)
+{
+    (void)ctx;
+    if (l == NULL)
+        return;
+    close(l->fd); /* releases the lock */
+    free(l);
+}
+
 static const cdb_env_ops hostenv_ops = {
     he_open, he_remove, he_rename, he_mkdir, he_rmdir, he_exists, he_sync_dir, he_now, he_alloc, he_free,
     he_list, he_mono, he_random, he_sleep,
     he_mutex_create, he_mutex_lock, he_mutex_unlock, he_mutex_destroy,
     he_cond_create, he_cond_signal, he_cond_broadcast, he_cond_wait, he_cond_destroy,
-    he_thread_create, he_thread_join
+    he_thread_create, he_thread_join,
+    he_lock_open, he_lock_close
 };
 
 void cdb_hostenv_init(cdb_hostenv *he, cdb_env *out)

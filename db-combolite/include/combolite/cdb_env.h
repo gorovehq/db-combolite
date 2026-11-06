@@ -17,6 +17,8 @@
 typedef struct cdb_mutex cdb_mutex;
 typedef struct cdb_cond cdb_cond;
 typedef struct cdb_thread cdb_thread;
+/* Opaque handle for a file lock (spec 5.8). */
+typedef struct cdb_lock cdb_lock;
 
 /* The operations an environment provides. ctx is the environment's own
  * state, passed back on every call. Paths are zero-terminated strings using
@@ -81,6 +83,17 @@ typedef struct cdb_env_ops {
     /* Spawns a thread running fn(arg). The thread must be joined with thread_join. */
     cdb_status (*thread_create)(void *ctx, cdb_thread **out, void (*fn)(void *arg), void *arg);
     cdb_status (*thread_join)(void *ctx, cdb_thread *t);
+    /* The file lock hook (spec 5.8), optional as a pair: NULL hooks mean
+     * liveness falls back to heartbeats. lock_open takes a shared or
+     * exclusive lock on the whole file at path, creating the file when it
+     * does not exist, through a handle of its own that lives until
+     * lock_close; reads and writes of the file use their own handles. It
+     * never waits: CDB_E_BUSY when another holder prevents the lock. The
+     * lock belongs to the handle: two handles conflict even within one
+     * process, closing other handles to the file leaves it held, and the
+     * system releases it when the process ends, however it ends. */
+    cdb_status (*lock_open)(void *ctx, const char *path, int exclusive, cdb_lock **out);
+    void (*lock_close)(void *ctx, cdb_lock *l);
 } cdb_env_ops;
 
 /* ------------------------------------------------- accelerator (spec 18) */

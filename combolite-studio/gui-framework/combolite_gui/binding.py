@@ -152,6 +152,8 @@ class cdb_env_ops(Structure):
         ("cond_destroy", c_void_p),
         ("thread_create", c_void_p),
         ("thread_join", c_void_p),
+        ("lock_open", c_void_p),   # the file lock hook (spec 5.8)
+        ("lock_close", c_void_p),
     ]
 
 

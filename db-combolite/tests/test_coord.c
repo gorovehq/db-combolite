@@ -2080,6 +2080,7 @@ static void test_host_hooks(void)
     unsigned n = 0;
     cdb_coord c;
     cdb_storage st;
+    cdb_lock *l1, *l2, *l3;
 
     cdb_hostenv_init(&he, &h);
     snprintf(dir, sizeof dir, "%s/coord_%ld", CDB_TEST_TMPDIR, (long)getpid());
@@ -2089,6 +2090,23 @@ static void test_host_hooks(void)
     cdb_storage_close(&st);
     TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->list(h.ctx, dir, count_name, &n));
     TEST_ASSERT_EQUAL_UINT(1, n);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->remove(h.ctx, path));
+
+    /* The lock hook (spec 5.8): flock semantics, so two handles conflict
+     * within one process, and closing another descriptor of the file leaves
+     * the lock held. */
+    snprintf(path, sizeof path, "%s/l", dir);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->lock_open(h.ctx, path, 1, &l1));
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, h.ops->lock_open(h.ctx, path, 0, &l2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->open(h.ctx, path, 0, &st));
+    cdb_storage_close(&st);
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, h.ops->lock_open(h.ctx, path, 1, &l2));
+    h.ops->lock_close(h.ctx, l1);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->lock_open(h.ctx, path, 0, &l1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->lock_open(h.ctx, path, 0, &l2));
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, h.ops->lock_open(h.ctx, path, 1, &l3));
+    h.ops->lock_close(h.ctx, l1);
+    h.ops->lock_close(h.ctx, l2);
     TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->remove(h.ctx, path));
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->mono(h.ctx, &t0));

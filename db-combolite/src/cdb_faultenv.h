@@ -19,14 +19,26 @@
 #define CDB_FAULTENV_MAX_DIRS 4
 #define CDB_FAULTENV_NAME 160
 #define CDB_FAULTENV_MAX_ALLOCS 256
+#define CDB_FAULTENV_MAX_LOCKS 16
 
 typedef struct cdb_faultenv_file {
     char name[CDB_FAULTENV_NAME];
     char durable_name[CDB_FAULTENV_NAME];
     int exists;
     int durable_exists;
+    uint64_t gen;      /* which file this is: new at each create, kept by renames */
     cdb_faultdev dev;
 } cdb_faultenv_file;
+
+/* A lock held through the lock hook (spec 5.8). It belongs to the file it
+ * was taken on, not to the path: a rename keeps it, and a file created
+ * later at the same path is a different file. */
+struct cdb_lock {
+    int used;
+    int exclusive;
+    int file;          /* index into files */
+    uint64_t gen;
+};
 
 typedef struct cdb_faultenv_dir {
     char name[CDB_FAULTENV_NAME];
@@ -56,6 +68,8 @@ typedef struct cdb_faultenv {
     int no_alloc;     /* the allocator refuses: on after init is off */
     void *allocs[CDB_FAULTENV_MAX_ALLOCS]; /* live blocks */
     unsigned live;    /* how many */
+    uint64_t next_gen;
+    cdb_lock locks[CDB_FAULTENV_MAX_LOCKS];
 } cdb_faultenv;
 
 /* Sets the environment's clock: on, and the time it reports (ns since the
@@ -81,6 +95,16 @@ void cdb_faultenv_set_alloc(cdb_faultenv *fe, int on);
 unsigned cdb_faultenv_live_allocs(const cdb_faultenv *fe);
 
 cdb_status cdb_faultenv_init(cdb_faultenv *fe, const cdb_faultenv_config *cfg, cdb_env *out);
+
+/* Locks held now. Every process in a test shares this environment, so a
+ * test ends one process's life by closing its lock handles (lock_close), as
+ * the system would; a reboot releases them all, and handles from before it
+ * are abandoned, never closed. */
+unsigned cdb_faultenv_held_locks(const cdb_faultenv *fe);
+
+/* Rebinds *env to the same environment without the lock hook, for the
+ * heartbeat fallback (spec 5.8). */
+void cdb_faultenv_without_locks(cdb_env *env);
 
 /* Arms a crash at mutating operation number op, counted from now, across
  * every file and directory operation. */
