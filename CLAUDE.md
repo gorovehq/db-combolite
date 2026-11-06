@@ -23,8 +23,8 @@ ctest --test-dir build --output-on-failure   # run every test
 ctest --test-dir build -R test_value         # run one test executable
 ./build/tests/test_value                     # run one executable directly (Unity output)
 cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release   # optimised build, sanitizers off
-cmake --preset noxz                          # mcu-profile test build (spec 17): Debug, xz off, in build-noxz/
-cmake -S . -B build-cuda -DCDB_ACCEL_CUDA=ON -DCDB_ACCEL_VULKAN=ON # combolite_accel with both backends, their device tests and bench_accel
+cmake --preset noxz                          # mcu-profile test build (spec 17): Debug, xz off, in build-noxz/ (paused until after 1.0)
+cmake -S . -B build-cuda -DCDB_ACCEL_CUDA=ON -DCDB_ACCEL_VULKAN=ON # the build to test in: host tests plus combolite_accel with both backends, their device tests and bench_accel
 python3 tools/gen_spirv.py                   # after editing accel/vulkan/shaders: rewrites the checked-in SPIR-V (needs glslc)
 ```
 
@@ -57,7 +57,7 @@ These were agreed with the user:
 - **C99 only.** `CMAKE_C_EXTENSIONS` is off.
 - **Warnings are errors.** The flags include `-Wconversion`, `-Wsign-conversion` and `-Wvla`, so write explicit casts and never use VLAs.
 - **No heap allocation in the core.** Memory comes from the caller: buffers, and the environment's optional `alloc`/`free` hooks (`cdb_env.h`), which only the host environment backs with malloc. Anything that grows must also work from caller memory alone, so microcontroller builds can use static pools. Readers return views into caller-owned buffers.
-- **Build profiles (spec 17).** `CDB_PROFILE=host` (the default) or `mcu`, in `src/cdb_profile.h`. Both read and write the same files; only a process's limits differ. On host, query working memory grows through the environment's `alloc` hooks up to `cdb_db_config.query_mem`, so size host limits for speed. On mcu, everything stays in caller memory. A profile limit that is reached is `CDB_E_OUT_OF_BUDGET` in both. Run the suite in `build` (host) and `build-noxz` (mcu). For a change to vector, accelerator, `cdb_env` or locking code, also run it in `build-cuda`, configured with `-DCDB_ACCEL_CUDA=ON -DCDB_ACCEL_VULKAN=ON`. Neither default build compiles `combolite_accel` or runs the real devices.
+- **Build profiles (spec 17).** `CDB_PROFILE=host` (the default) or `mcu`, in `src/cdb_profile.h`. Both read and write the same files; only a process's limits differ. On host, query working memory grows through the environment's `alloc` hooks up to `cdb_db_config.query_mem`, so size host limits for speed. On mcu, everything stays in caller memory. A profile limit that is reached is `CDB_E_OUT_OF_BUDGET` in both. **Until after 1.0, test in `build-cuda` only** (host profile, Debug with sanitizers, configured with `-DCDB_ACCEL_CUDA=ON -DCDB_ACCEL_VULKAN=ON`): it runs every host test plus the accelerator's, so the CPU-only `build` is not run separately, to save time and tokens. Microcontroller work and the `build-noxz` (mcu) suite are paused until after 1.0: the mcu profile's code stays and must keep compiling in principle, but its suite is not run.
 - **Bindings mirror structs.** The studio's `binding.py` mirrors `cdb_db_config`, `cdb_exec_row` and others, and checks their sizes at load (`cdb_db_config_size`, `cdb_exec_row_size`, ...). Add new config fields at the end, and update `binding.py` with any struct change.
 - **Fallible functions return `cdb_status`**, defined in `include/combolite/cdb_common.h`. The value writer's errors are sticky.
 - **Explicit byte order.** Every multi-byte on-disk field goes through `src/cdb_endian.h`, using the file's declared byte order. Never cast raw bytes to integers.
@@ -76,7 +76,7 @@ Plus four rules moved up from the code layout, because most changes need them:
 These drive every design decision; the full text is in `docs/dev/project.md`.
 
 1. **Serverless, portable and embeddable.** A library; one file at rest; no daemon. Processes coordinate only through the files, each through its in-process coordinator. Single host only.
-2. **Microcontrollers are a long-term goal.** No MCU targets or HAL yet, but no format decision that would block a constrained implementation.
+2. **Microcontrollers are a long-term goal.** No MCU targets or HAL yet, but no format decision that would block a constrained implementation. Microcontroller work is paused until after 1.0.
 3. **Scales up to production.** Crash safety, integrity checks, concurrent readers.
 4. **Not a server RDBMS competitor.** Turn down features that only make sense for one.
 5. **Clean room.** Never vendor, port, wrap or copy another engine's code, and stay format-incompatible with them. Use only the approved dependencies in `docs/dev/project.md`, and never hand-roll cryptography.

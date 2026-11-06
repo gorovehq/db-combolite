@@ -38,9 +38,11 @@ The engine's optional accelerator (spec 18) can run vector searches and neighbou
 
 ```sh
 cmake -S . -B build-demo-accel -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCDB_BUILD_DEMO=ON -DCDB_BUILD_TESTS=OFF \
-      -DCDB_ACCEL_CUDA=ON -DCDB_ACCEL_VULKAN=ON
+      -DCDB_ACCEL_CUDA=ON -DCDB_ACCEL_VULKAN=ON -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
 cmake --build build-demo-accel -j --target gutenfree
 ```
+
+- **Embeddings on the GPU too:** the engine's accelerator covers vector searches and graph refreshes only; the embedding model runs in llama.cpp, which uses the GPU only when built with `-DGGML_CUDA=ON` (or `-DGGML_VULKAN=ON`). Without it, `embed` runs on the CPU. Set `CMAKE_CUDA_ARCHITECTURES` to your GPU's (89 is an RTX 40-series); leaving it out builds llama.cpp's kernels for every architecture, which takes much longer. `nvcc` must be on `PATH` (`/usr/local/cuda/bin`).
 
 - **Which device:** the demo uses CUDA when there is an NVIDIA GPU, otherwise the best Vulkan GPU. The main screen, the diagnostics screen and every command show which one, and the diagnostics screen counts the searches it took.
 - **Results:** they are the same with or without it; only the time changes.
