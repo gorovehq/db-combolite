@@ -23,15 +23,17 @@
 /* "\x89CDBCRD\n" (spec 14.5.2). */
 static const uint8_t coord_magic[8] = { 0x89, 0x43, 0x44, 0x42, 0x43, 0x52, 0x44, 0x0A };
 
-#define COORD_EPOCH 1u
+#define COORD_EPOCH 2u                /* lock liveness and status (spec 14.5.2) */
 #define DEFAULT_BEAT_NS 1000000000    /* spec 5.9.6, provisional */
 #define DEFAULT_DEAD_AFTER 3u
 #define DEFAULT_SETTLE_NS 2000000
 #define WALL_STALE_FACTOR 10          /* a heartbeat this many dead timeouts old on the wall
                                          clock is dead without watching; generous, so a wall
                                          clock jumping forward cannot kill a live process */
-#define KNOWN_FLAGS (CDB_COORD_ALIVE | CDB_COORD_BATON_PENDING | CDB_COORD_JOURNAL)
+#define KNOWN_FLAGS (CDB_COORD_ALIVE | CDB_COORD_BATON_PENDING | CDB_COORD_JOURNAL | CDB_COORD_LOCKED \
+                     | CDB_COORD_CLOSED)
 #define LOBBY_PREFIX "join."
+#define DIR_LOCK "lock"
 #define PRIORITY_LIMIT (2u * CDB_COORD_MAX) /* priority values tried at join */
 #define BATON_UNIT_NS 1000u           /* service window per declared unit of work (spec 5.9.8),
                                          provisional */
@@ -58,7 +60,9 @@ void cdb_coord_encode(const cdb_coord_rec *r, cdb_byte_order order, uint8_t *h)
     cdb_store_u64(h + 72, r->seq_hwm, order);
     cdb_store_u64(h + 80, r->tx_hwm, order);
     h[88] = r->req_kind;
+    h[89] = r->status_op;
     cdb_store_u16(h + 90, r->heat, order);
+    cdb_store_u32(h + 92, r->estimate_ms, order);
     cdb_store_u64(h + 96, r->req_time, order);
     cdb_store_u64(h + 104, r->x_total, order);
     cdb_store_u64(h + 112, r->cts, order);
@@ -71,6 +75,7 @@ void cdb_coord_encode(const cdb_coord_rec *r, cdb_byte_order order, uint8_t *h)
         cdb_store_u64(h + 160 + 16u * i, r->blocks[i].store, order);
         cdb_store_u64(h + 168 + 16u * i, r->blocks[i].first, order);
     }
+    cdb_store_u64(h + 496, r->status_start, order);
     cdb_store_u32(h + 508, cdb_crc32c(h, 508), order);
 }
 
@@ -105,7 +110,9 @@ cdb_status cdb_coord_decode(const uint8_t *h, cdb_byte_order order, cdb_coord_re
     r->seq_hwm = cdb_load_u64(h + 72, order);
     r->tx_hwm = cdb_load_u64(h + 80, order);
     r->req_kind = h[88];
+    r->status_op = h[89];
     r->heat = cdb_load_u16(h + 90, order);
+    r->estimate_ms = cdb_load_u32(h + 92, order);
     r->req_time = cdb_load_u64(h + 96, order);
     r->x_total = cdb_load_u64(h + 104, order);
     r->cts = cdb_load_u64(h + 112, order);
@@ -114,11 +121,11 @@ cdb_status cdb_coord_decode(const uint8_t *h, cdb_byte_order order, cdb_coord_re
     r->clock = cdb_load_u64(h + 136, order);
     r->pinned = cdb_load_u64(h + 144, order);
     r->nblocks = h[152];
-    if (r->role > CDB_COORD_PRIMARY || (r->flags & ~KNOWN_FLAGS) || r->req_kind > CDB_COORD_REQ_ID_BLOCK
+    r->status_start = cdb_load_u64(h + 496, order);
+    if (r->role > CDB_COORD_PRIMARY || (r->flags & ~KNOWN_FLAGS) || r->req_kind > CDB_COORD_REQ_RECONCILE
         || r->nblocks > CDB_COORD_MAX_BLOCKS)
         return CDB_E_MALFORMED;
-    if (!zero(h, 89, 90) || !zero(h, 92, 96) || !zero(h, 153, 160)
-        || !zero(h, 160 + 16u * r->nblocks, 508))
+    if (!zero(h, 153, 160) || !zero(h, 160 + 16u * r->nblocks, 496) || !zero(h, 504, 508))
         return CDB_E_MALFORMED;
     for (i = 0; i < r->nblocks; i++) {
         r->blocks[i].store = cdb_load_u64(h + 160 + 16u * i, order);
@@ -301,11 +308,35 @@ static int on_name(void *arg, const char *name)
     return 0;
 }
 
+/* Whether slot s's owner holds its lock (spec 5.8): an attempt that does
+ * not wait, released at once when it succeeds. A slot this coordinator holds
+ * itself (cdb_coord_hold_all) has no other owner. */
+static cdb_status lock_held(cdb_coord *c, unsigned s, const char *path, int *held)
+{
+    cdb_lock *l;
+    cdb_status st;
+    if (c->held[s] != NULL) {
+        *held = 0;
+        return CDB_OK;
+    }
+    st = c->env.ops->lock_open(c->env.ctx, path, 1, &l);
+    if (st == CDB_E_BUSY) {
+        *held = 1;
+        return CDB_OK;
+    }
+    if (st != CDB_OK)
+        return st;
+    c->env.ops->lock_close(c->env.ctx, l);
+    *held = 0;
+    return CDB_OK;
+}
+
 /* Reads every slot and lobby file and updates what is known about the
- * others: which are alive, which holds the primary role. A coordinator is
- * alive while its counter has moved within the dead timeout, as measured
- * here; without a monotonic clock nothing can be measured and every other
- * coordinator counts as dead. */
+ * others: which are alive, which holds the primary role. A slot that says
+ * it uses lock liveness is alive while its lock is held (spec 5.8). Any
+ * other is alive while its counter has moved within the dead timeout, as
+ * measured here; without a monotonic clock nothing can be measured and it
+ * counts as dead. */
 static cdb_status scan(cdb_coord *c)
 {
     struct names n;
@@ -348,11 +379,24 @@ static cdb_status scan(cdb_coord *c)
             p->seen = p->live = 0;
             continue;
         }
-        if (!p->seen || memcmp(p->b.session, r.session, 16) != 0) {
+        if (c->use_locks && (r.flags & CDB_COORD_LOCKED)) {
+            int held;
+            if ((st = lock_held(c, s, path, &held)) != CDB_OK)
+                return st;
+            if (!p->seen || memcmp(p->b.session, r.session, 16) != 0 || p->b.cts != r.cts
+                || p->b.issued != r.issued || p->b.x != r.x)
+                p->moved_at = now;
+            p->seen = p->confirmed = p->by_lock = 1;
+            p->beat = r.beat;
+            p->changed_at = now;
+            brief_of(&r, &p->b);
+            p->live = held;
+        } else if (!p->seen || p->by_lock || memcmp(p->b.session, r.session, 16) != 0) {
             /* First sight: alive until watched for the dead timeout, unless
              * the wall clock already shows it long dead. */
             p->seen = 1;
             p->confirmed = 0;
+            p->by_lock = 0;
             p->beat = r.beat;
             p->changed_at = wall_stale(c, r.beat_time) ? now - dead_ns(c) : now;
             p->moved_at = now;
@@ -365,8 +409,10 @@ static cdb_status scan(cdb_coord *c)
             if (p->b.cts != r.cts || p->b.issued != r.issued || p->b.x != r.x)
                 p->moved_at = now;
         }
-        brief_of(&r, &p->b);
-        p->live = c->have_mono && now - p->changed_at < dead_ns(c);
+        if (!p->by_lock) {
+            brief_of(&r, &p->b);
+            p->live = c->have_mono && now - p->changed_at < dead_ns(c);
+        }
         if (p->live) {
             c->live_others++;
             if (r.pinned != 0 && (c->min_pin == 0 || r.pinned < c->min_pin))
@@ -480,7 +526,8 @@ static cdb_status elect(cdb_coord *c)
 
 /* Becomes the owner of slot s, carrying over the counters, held blocks and
  * journal flag of a dead previous owner (spec 5.9.2, 5.9.5): both halves are
- * rewritten so nothing of the old session can win the half comparison. */
+ * rewritten so nothing of the old session can win the half comparison. With
+ * the lock hook, the caller already holds the slot's lock; lobby is NULL. */
 static cdb_status take_slot(cdb_coord *c, unsigned s, uint16_t priority, const char *lobby)
 {
     cdb_coord_rec old;
@@ -493,7 +540,7 @@ static cdb_status take_slot(cdb_coord *c, unsigned s, uint16_t priority, const c
     c->me.slot = (uint16_t)s;
     c->me.priority = priority;
     c->me.role = CDB_COORD_SUB;
-    c->me.flags = CDB_COORD_ALIVE;
+    c->me.flags = (uint8_t)(CDB_COORD_ALIVE | (c->use_locks ? CDB_COORD_LOCKED : 0u));
     c->me.req_kind = CDB_COORD_REQ_NONE;
     c->me.req_time = 0;
     if (valid) {
@@ -516,8 +563,81 @@ static cdb_status take_slot(cdb_coord *c, unsigned s, uint16_t priority, const c
     c->joined = 1;
     /* The lobby file goes before the directory sync, so a crash never
      * leaves it durable behind a durable slot file. */
-    (void)c->env.ops->remove(c->env.ctx, lobby);
+    if (lobby != NULL)
+        (void)c->env.ops->remove(c->env.ctx, lobby);
     return c->env.ops->sync_dir(c->env.ctx, c->dir);
+}
+
+static void dir_lock_path(const cdb_coord *c, char *out)
+{
+    snprintf(out, CDB_COORD_PATH, "%s/" DIR_LOCK, c->dir);
+}
+
+static void unlock(cdb_coord *c, cdb_lock **l)
+{
+    if (*l != NULL) {
+        c->env.ops->lock_close(c->env.ctx, *l);
+        *l = NULL;
+    }
+}
+
+/* Takes coord/lock shared, so no process removes the working directory while
+ * this one joins (spec 5.9.5). A process removing it holds the lock
+ * exclusively for a moment, and may have removed the folder: this waits it
+ * out, recreating the folder, for at most the dead timeout. */
+static cdb_status lock_dir_shared(cdb_coord *c, const char *parent)
+{
+    char path[CDB_COORD_PATH];
+    int64_t start = mono_now(c);
+    cdb_status s;
+    dir_lock_path(c, path);
+    for (;;) {
+        s = c->env.ops->lock_open(c->env.ctx, path, 0, &c->dir_lock);
+        if (s == CDB_OK)
+            return CDB_OK;
+        if (s != CDB_E_BUSY && s != CDB_E_NOT_FOUND)
+            return s;
+        if (!c->have_mono || mono_now(c) - start >= dead_ns(c))
+            return CDB_E_BUSY;
+        pause_for(c, c->cfg.settle_ns);
+        if (s == CDB_E_NOT_FOUND) {
+            if ((s = c->env.ops->mkdir(c->env.ctx, parent)) != CDB_OK
+                || (s = c->env.ops->mkdir(c->env.ctx, c->dir)) != CDB_OK)
+                return s;
+        }
+    }
+}
+
+/* With the lock hook: the lowest slot whose lock this coordinator gets is
+ * its own; the system settles any race between joiners (spec 5.9.5). */
+static cdb_status join_by_lock(cdb_coord *c)
+{
+    char path[CDB_COORD_PATH];
+    unsigned slot, p, i;
+    cdb_status s;
+
+    for (slot = 0; slot < c->cfg.max_coords; slot++) {
+        slot_path(c, slot, path);
+        s = c->env.ops->lock_open(c->env.ctx, path, 1, &c->slot_lock);
+        if (s == CDB_OK)
+            break;
+        if (s != CDB_E_BUSY)
+            return s;
+    }
+    if (slot == c->cfg.max_coords)
+        return CDB_E_BUSY;
+    for (p = 1; p <= PRIORITY_LIMIT; p++) {
+        int used = 0;
+        for (i = 0; i < c->cfg.max_coords && !used; i++)
+            used = i != slot && c->peers[i].live && c->peers[i].b.priority == p;
+        if (!used)
+            break;
+    }
+    if (p > PRIORITY_LIMIT || (s = take_slot(c, slot, (uint16_t)p, NULL)) != CDB_OK) {
+        unlock(c, &c->slot_lock);
+        return p > PRIORITY_LIMIT ? CDB_E_BUSY : s;
+    }
+    return CDB_OK;
 }
 
 /* Writes the lobby request for slot s and priority p, settles, and checks
@@ -615,6 +735,7 @@ cdb_status cdb_coord_join(cdb_coord *c, const cdb_env *env, const char *dir, con
     if (n < 0 || (size_t)n >= sizeof c->dir)
         return CDB_E_INVALID_ARG;
     c->have_mono = env->ops->mono != NULL && env->ops->mono(env->ctx, &probe) == CDB_OK;
+    c->use_locks = env->ops->lock_open != NULL && env->ops->lock_close != NULL;
     /* Stamps start on the wall clock where there is one (spec 14.4.4). */
     if (wall_now(c, &wall))
         c->offset = wall - mono_now(c);
@@ -628,9 +749,25 @@ cdb_status cdb_coord_join(cdb_coord *c, const cdb_env *env, const char *dir, con
         parent[slash - parent] = '\0';
         if ((s = env->ops->sync_dir(env->ctx, parent)) != CDB_OK)
             return s;
+    } else {
+        strcpy(parent, ".");
     }
-    if ((s = settle_liveness(c)) != CDB_OK)
+    if (c->use_locks && (s = lock_dir_shared(c, parent)) != CDB_OK)
         return s;
+    if ((s = settle_liveness(c)) != CDB_OK) {
+        unlock(c, &c->dir_lock);
+        return s;
+    }
+    if (c->use_locks) {
+        s = join_by_lock(c);
+        unlock(c, &c->dir_lock); /* the slot's lock now keeps the directory */
+        if (s != CDB_OK)
+            return s;
+        c->joined_at = c->last_beat = mono_now(c);
+        s = elect(c);
+        c->commit_ready = (c->live_others == 0);
+        return s;
+    }
 
     memset(lost_prio, 0, sizeof lost_prio);
     for (attempt = 0; attempt < 2u * CDB_COORD_MAX + 4u; attempt++) {
@@ -683,9 +820,9 @@ cdb_status cdb_coord_beat(cdb_coord *c, int force)
         return CDB_E_STATE;
     if (!force && c->have_mono && now - c->last_beat < c->cfg.beat_ns)
         return CDB_OK;
-    /* Silent past the dead timeout: another coordinator may have taken
-     * this slot over, or merged its journal and removed it (spec 5.9.6). */
-    if (now - c->last_beat >= dead_ns(c)) {
+    /* Silent past the dead timeout: in the fallback, another coordinator may
+     * have taken this slot over (spec 5.9.6). Its lock keeps it otherwise. */
+    if (!c->use_locks && now - c->last_beat >= dead_ns(c)) {
         cdb_coord_rec r;
         int valid;
         if ((s = read_file(c, c->path, 2, &r, &valid)) != CDB_OK)
@@ -736,15 +873,18 @@ static int64_t window_ns(const cdb_coord *c, uint64_t x_total)
     return dead_ns(c) + (int64_t)share;
 }
 
-/* Whether peer p holds the baton and has not timed out. The window runs
- * from its last change or from this coordinator's request, whichever is
- * later: a standing holder idle for an hour has not timed out until someone
- * has asked and waited (spec 5.9.8). */
+/* Whether peer p holds the baton and has not timed out. A holder judged by
+ * its lock never times out: it keeps the baton until it releases it or dies
+ * (spec 5.9.8). Otherwise the window runs from its last change or from this
+ * coordinator's request, whichever is later: a standing holder idle for an
+ * hour has not timed out until someone has asked and waited. */
 static int holds(const cdb_coord *c, const cdb_coord_peer *p, int64_t now)
 {
     int64_t since;
     if (!p->live || p->b.issued == 0)
         return 0;
+    if (p->by_lock)
+        return 1;
     since = p->moved_at > c->req_at ? p->moved_at : c->req_at;
     return now - since < window_ns(c, p->b.x_total);
 }
@@ -900,12 +1040,13 @@ cdb_status cdb_coord_baton_fence(cdb_coord *c)
     return c->max_cts > c->me.cts ? CDB_E_BUSY : CDB_OK;
 }
 
-/* The lease margin (spec 5.9.8). Silent for half the dead timeout, this
- * holder may already look dead to others: it writes a heartbeat and goes on
- * only if no other coordinator is alive to have taken over. Otherwise it
- * heartbeats when one is due, and a higher CTS seen by that scan means the
- * baton has passed on. Without a monotonic clock there are no timeouts, for
- * this coordinator or anyone. */
+/* The lease margin (spec 5.9.8, fallback). Silent for half the dead timeout,
+ * this holder may already look dead to others: it writes a heartbeat and
+ * goes on only if no other coordinator is alive to have taken over.
+ * Otherwise it heartbeats when one is due, and a higher CTS seen by that
+ * scan means the baton has passed on. With the lock hook nobody takes the
+ * baton from a live holder, so there is no margin; without a monotonic clock
+ * there are no timeouts, for this coordinator or anyone. */
 cdb_status cdb_coord_guard(cdb_coord *c)
 {
     int64_t now = mono_now(c);
@@ -914,7 +1055,7 @@ cdb_status cdb_coord_guard(cdb_coord *c)
         return CDB_E_BUSY;
     if (!c->have_mono)
         return CDB_OK;
-    if (now - c->last_beat >= dead_ns(c) / 2) {
+    if (!c->use_locks && now - c->last_beat >= dead_ns(c) / 2) {
         if ((s = cdb_coord_beat(c, 1)) != CDB_OK)
             return s;
         if (c->live_others > 0)
@@ -1123,11 +1264,70 @@ cdb_status cdb_coord_read_slot(cdb_coord *c, unsigned s, cdb_coord_rec *r, int *
     return read_file(c, path, 2, r, valid);
 }
 
+void cdb_coord_release_all(cdb_coord *c)
+{
+    unsigned s;
+    for (s = 0; s < CDB_COORD_MAX; s++)
+        unlock(c, &c->held[s]);
+    unlock(c, &c->dir_lock);
+    c->holding_all = 0;
+}
+
+cdb_status cdb_coord_hold_all(cdb_coord *c, int dir, int *all)
+{
+    char path[CDB_COORD_PATH];
+    struct names n;
+    unsigned s;
+    cdb_status st;
+
+    *all = 0;
+    if (!c->joined)
+        return CDB_E_STATE;
+    if (c->holding_all) {
+        *all = 1;
+        return CDB_OK;
+    }
+    if (!c->use_locks) {
+        if ((st = scan(c)) != CDB_OK)
+            return st;
+        *all = c->holding_all = c->live_others == 0;
+        return CDB_OK;
+    }
+    if (dir) {
+        dir_lock_path(c, path);
+        st = c->env.ops->lock_open(c->env.ctx, path, 1, &c->dir_lock);
+        if (st == CDB_E_BUSY)
+            return CDB_OK; /* a process is joining */
+        if (st != CDB_OK)
+            return st;
+    }
+    memset(&n, 0, sizeof n);
+    n.max = c->cfg.max_coords;
+    if (c->env.ops->list != NULL && (st = c->env.ops->list(c->env.ctx, c->dir, on_name, &n)) != CDB_OK) {
+        cdb_coord_release_all(c);
+        return st;
+    }
+    for (s = 0; s < c->cfg.max_coords; s++) {
+        if (s == c->me.slot || !(n.slots & ((uint64_t)1 << s)) || c->held[s] != NULL)
+            continue;
+        slot_path(c, s, path);
+        st = c->env.ops->lock_open(c->env.ctx, path, 1, &c->held[s]);
+        if (st != CDB_OK) {
+            cdb_coord_release_all(c);
+            return st == CDB_E_BUSY ? CDB_OK : st;
+        }
+    }
+    c->holding_all = 1;
+    *all = 1;
+    return scan(c); /* every other slot is now known dead */
+}
+
 cdb_status cdb_coord_remove_slot(cdb_coord *c, unsigned s)
 {
     char path[CDB_COORD_PATH];
     cdb_status st;
-    if (s >= c->cfg.max_coords || (c->joined && s == c->me.slot) || c->peers[s].live)
+    if (s >= c->cfg.max_coords || (c->joined && s == c->me.slot) || !c->holding_all
+        || (c->use_locks && c->held[s] == NULL))
         return CDB_E_STATE;
     slot_path(c, s, path);
     if ((st = c->env.ops->remove(c->env.ctx, path)) != CDB_OK && st != CDB_E_NOT_FOUND)
@@ -1135,6 +1335,8 @@ cdb_status cdb_coord_remove_slot(cdb_coord *c, unsigned s)
     return c->env.ops->sync_dir(c->env.ctx, c->dir);
 }
 
+/* The slot file goes while its lock is still held, so no joiner takes the
+ * slot and then sees its file vanish. */
 cdb_status cdb_coord_leave(cdb_coord *c)
 {
     cdb_status s;
@@ -1144,5 +1346,51 @@ cdb_status cdb_coord_leave(cdb_coord *c)
     cdb_storage_close(&c->st);
     if ((s = c->env.ops->remove(c->env.ctx, c->path)) != CDB_OK && s != CDB_E_NOT_FOUND)
         return s;
-    return c->env.ops->sync_dir(c->env.ctx, c->dir);
+    s = c->env.ops->sync_dir(c->env.ctx, c->dir);
+    unlock(c, &c->slot_lock);
+    return s;
+}
+
+cdb_status cdb_coord_close_pending(cdb_coord *c)
+{
+    cdb_status s;
+    if (!c->joined)
+        return CDB_E_STATE;
+    c->me.flags = (uint8_t)((c->me.flags & ~CDB_COORD_ALIVE) | CDB_COORD_CLOSED);
+    c->me.role = CDB_COORD_SUB;
+    c->me.req_kind = CDB_COORD_REQ_NONE;
+    c->me.req_time = 0;
+    c->me.issued = 0;
+    c->me.status_op = CDB_COORD_OP_IDLE;
+    c->me.estimate_ms = 0;
+    c->me.status_start = 0;
+    if ((s = write_half(c)) != CDB_OK || (s = cdb_storage_sync(&c->st)) != CDB_OK)
+        return s;
+    c->joined = 0;
+    cdb_storage_close(&c->st);
+    unlock(c, &c->slot_lock);
+    return CDB_OK;
+}
+
+cdb_status cdb_coord_remove_dir_lock(cdb_coord *c)
+{
+    char path[CDB_COORD_PATH];
+    cdb_status s;
+    if (c->dir_lock == NULL || !c->holding_all)
+        return CDB_E_STATE;
+    dir_lock_path(c, path);
+    if ((s = c->env.ops->remove(c->env.ctx, path)) != CDB_OK && s != CDB_E_NOT_FOUND)
+        return s;
+    return CDB_OK;
+}
+
+void cdb_coord_abandon(cdb_coord *c)
+{
+    if (c->joined)
+        cdb_storage_close(&c->st);
+    c->joined = 0;
+    if (c->use_locks) {
+        unlock(c, &c->slot_lock);
+        cdb_coord_release_all(c);
+    }
 }

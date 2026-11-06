@@ -1005,10 +1005,12 @@ static cdb_status release_held_blocks(cdb_db *db)
 }
 
 /* Merges every slot's committed transactions above its mark onto the
- * archive in (stamp, slot, counter) order, commits them with the new marks,
- * and cleans up any dead slots whose journals are now folded in (spec 5.9.1,
- * 5.9.2, 14.4.7 rules 5 and 7). keep_in_use is 0 at recovery and when the
- * last live process closes, 1 otherwise. */
+ * archive in (stamp, slot, counter) order and commits them with the new
+ * marks (spec 5.9.1, 5.9.2, 14.4.7 rules 5 and 7). Other slots' files stay:
+ * only a coordinator that holds every slot (cdb_coord_hold_all), at
+ * recovery or as the last to close, removes them once they are folded in
+ * (5.9.5). keep_in_use is 0 at recovery and when the last live process
+ * closes, 1 otherwise. */
 static cdb_status merge_journals(cdb_db *db, int keep_in_use)
 {
     struct jcursor cur[CDB_COORD_MAX];
@@ -1123,7 +1125,7 @@ static cdb_status merge_journals(cdb_db *db, int keep_in_use)
                     return s;
                 removed = 1;
             }
-        } else if (!db->coord.peers[sl].live) {
+        } else if (db->coord.holding_all) {
             if (cur[i].dead_slot && (s = cdb_coord_remove_slot(&db->coord, sl)) != CDB_OK)
                 return s;
             overlay_path_of(db, sl, opath);
@@ -1485,6 +1487,7 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
         if (db->archive_st.ops != NULL)
             cdb_storage_close(&db->archive_st);
         release_slots(db); /* recovery may have opened stores */
+        cdb_coord_release_all(&db->coord);
         (void)cdb_coord_leave(&db->coord); /* so the next opener need not wait it out */
         return s;
     }
@@ -1502,7 +1505,7 @@ cdb_status cdb_db_open(cdb_db *db, const cdb_env *env, const char *base, const c
  * overlay mode (when other processes are already live). */
 static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg, const cdb_header *create)
 {
-    int exists;
+    int exists, alone;
     cdb_status s;
 
     if ((s = set_paths(db, base)) != CDB_OK)
@@ -1583,7 +1586,11 @@ static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg
         return s;
     db->has_catalog = 1;
 
-    if (db->coord.live_others == 0) {
+    /* Recovery only when alone, holding every other slot, so no newcomer
+     * adopts a journal that recovery removes (spec 5.9.5, 14.4.7 rule 9). */
+    if ((s = cdb_coord_hold_all(&db->coord, 0, &alone)) != CDB_OK)
+        return s;
+    if (alone) {
         int granted = 0;
         if ((s = cdb_coord_baton_take(&db->coord, 0, &granted)) != CDB_OK)
             return s;
@@ -1592,6 +1599,7 @@ static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg
         cdb_pager_set_guard(&db->pager, (cdb_status (*)(void *))cdb_coord_guard, &db->coord);
         if ((s = recover(db)) != CDB_OK)
             return s;
+        cdb_coord_release_all(&db->coord);
         /* This slot's counters go on above everything it may have used before:
          * its mark in the archive, and the high-water mark a previous owner of
          * the slot reserved (spec 5.9.2). */
@@ -2801,7 +2809,7 @@ static cdb_status reconcile_hold(cdb_db *db, int closing)
             return s;
         db->unsynced = 0;
     }
-    keep_in_use = !closing || db->coord.live_others > 0;
+    keep_in_use = !closing || !db->coord.holding_all;
 
     /* Fast path: this process held the baton from the last archive commit
      * and no other slot has a journal, so its pager already holds the exact
@@ -3237,9 +3245,45 @@ static void db_wipe_crypto(cdb_db *db)
  * directory (spec 14.4.6 rule 2, 14.4.7 rule 7). A failed database is
  * refused: its journal must stay so the next open can replay it. An open
  * transaction is aborted. */
+/* Closing alongside a live process without the baton (spec 5.9.1). The
+ * private pages go with the overlay; the journal is durable already, or is
+ * made so here. With nothing left to merge, the files are removed as on any
+ * close; otherwise the journal stays and the slot is recorded as closed with
+ * its journal pending, for the baton holder to merge. */
+static cdb_status close_pending(cdb_db *db)
+{
+    int keep = db->last_tx > db->my_mark || db->coord.me.nblocks > 0;
+    cdb_status s;
+
+    if (db->unsynced > 0) {
+        if ((s = cdb_storage_sync(&db->journal_st)) != CDB_OK)
+            return s;
+        db->unsynced = 0;
+    }
+    release_slots(db);
+    if (db->have_overlay) {
+        cdb_storage_close(&db->overlay_st);
+        db->have_overlay = 0;
+        if ((s = env_remove(db, db->overlay_path)) != CDB_OK && s != CDB_E_NOT_FOUND)
+            return s;
+    }
+    if (keep) {
+        cdb_storage_close(&db->journal_st);
+        if ((s = env_sync_dir(db, db->workdir)) != CDB_OK)
+            return s;
+        return cdb_coord_close_pending(&db->coord);
+    }
+    if ((s = cdb_coord_set_journal(&db->coord, 0)) != CDB_OK)
+        return s;
+    cdb_storage_close(&db->journal_st);
+    if ((s = env_remove(db, db->journal_path)) != CDB_OK || (s = env_sync_dir(db, db->workdir)) != CDB_OK)
+        return s;
+    return cdb_coord_leave(&db->coord);
+}
+
 cdb_status cdb_db_close(cdb_db *db)
 {
-    int alone;
+    int alone, pending;
     cdb_status s;
 
     db_lock(db);
@@ -3265,9 +3309,20 @@ cdb_status cdb_db_close(cdb_db *db)
         db_unlock(db);
         return s;
     }
-    if (db->coord.live_others == 0 && db->coord.journals_others == 0 && db->fresh)
+    /* The last to close holds coord/lock and every slot, so no process joins
+     * or takes a slot over while it folds every journal in and removes the
+     * working directory (spec 5.9.5, 14.4.7 rule 7). */
+    if ((s = cdb_coord_hold_all(&db->coord, 1, &alone)) != CDB_OK) {
+        db_unlock(db);
+        return s;
+    }
+    if (alone && db->coord.journals_others == 0 && db->fresh)
         db->coord.me.nblocks = 0;
-    if ((s = reconcile_hold(db, 1)) != CDB_OK) {
+    /* Closing never waits for the baton (spec 5.9.1): only the holder or a
+     * process alone reconciles; any other leaves its journal pending. */
+    pending = !alone && !cdb_coord_baton_held(&db->coord);
+    if (!pending && (s = reconcile_hold(db, 1)) != CDB_OK) {
+        cdb_coord_release_all(&db->coord);
         db_unlock(db);
         return s;
     }
@@ -3277,7 +3332,18 @@ cdb_status cdb_db_close(cdb_db *db)
     stop_heartbeat_thread(db);
     db_lock(db);
 
-    alone = db->coord.live_others == 0;
+    if (pending) {
+        s = close_pending(db);
+        if (s != CDB_OK) {
+            db_unlock(db);
+            return s;
+        }
+        cdb_storage_close(&db->archive_st);
+        db_wipe_crypto(db);
+        db_unlock(db);
+        cleanup_concurrency(db);
+        return CDB_OK;
+    }
     release_slots(db); /* everything they held is in the archive */
     if ((s = cdb_coord_set_journal(&db->coord, 0)) != CDB_OK) {
         db_unlock(db);
@@ -3305,21 +3371,24 @@ cdb_status cdb_db_close(cdb_db *db)
         return s;
     }
     if (alone) {
+        if (db->coord.use_locks && (s = cdb_coord_remove_dir_lock(&db->coord)) != CDB_OK) {
+            cdb_coord_release_all(&db->coord);
+            db_unlock(db);
+            return s;
+        }
         s = db->env.ops->rmdir(db->env.ctx, db->coorddir);
-        if (s != CDB_OK && s != CDB_E_STATE && s != CDB_E_NOT_FOUND) {
-            db_unlock(db);
-            return s;
+        if (s == CDB_OK || s == CDB_E_STATE || s == CDB_E_NOT_FOUND) {
+            s = db->env.ops->rmdir(db->env.ctx, db->workdir);
+            if (s == CDB_OK || s == CDB_E_STATE)
+                s = env_sync_dir(db, db->parent);
         }
-        s = db->env.ops->rmdir(db->env.ctx, db->workdir);
-        if (s != CDB_OK && s != CDB_E_STATE) {
-            db_unlock(db);
-            return s;
-        }
-        if ((s = env_sync_dir(db, db->parent)) != CDB_OK) {
+        cdb_coord_release_all(&db->coord); /* only now, so a joiner never meets half-removed folders */
+        if (s != CDB_OK) {
             db_unlock(db);
             return s;
         }
     }
+    cdb_coord_release_all(&db->coord);
     cdb_storage_close(&db->archive_st);
     db_wipe_crypto(db);
     db_unlock(db);
