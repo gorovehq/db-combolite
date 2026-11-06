@@ -1067,6 +1067,52 @@ static void test_merge_defers_undecryptable(void)
     keyed_procs = 0;
 }
 
+/* With the key gone for good, the operator lets such records go with
+ * CDB_DB_DROP_UNREADABLE (CDB_DB_ACCEPT_LOSS is not enough): the merger
+ * drops only the transaction it cannot decrypt, whole, and merges the rest
+ * of the journal (spec 5.9.1). */
+static void test_accept_loss_drops_undecryptable(void)
+{
+    keyed_procs = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_enclave(&p1.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&p2.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, ENCLAVE, 5, CDB_OP_REPLACE, "secret", 6));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 3, CDB_OP_PATCH, "x", 1)); /* same transaction */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
+    crash_proc(&p2);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 2)); /* pending behind the encrypted one */
+    p1.db.cfg.flags |= CDB_DB_ACCEPT_LOSS; /* another loss: not this one */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 2));
+    p1.db.cfg.flags = CDB_DB_DROP_UNREADABLE;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 3)); /* dropped whole, never in part */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&p1.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 5)); /* given up */
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    keyed_procs = 0;
+}
+
 /* A transaction that was open while another process reconciled into the
  * archive is rejected: its view is older than the archive (spec 5.9.4). The
  * rejected process is rebased at once, so its retry builds on the new
@@ -2550,6 +2596,7 @@ int main(void)
     RUN_TEST(test_take_over_dead_slot_while_peer_live);
     RUN_TEST(test_take_over_encrypted_slot);
     RUN_TEST(test_merge_defers_undecryptable);
+    RUN_TEST(test_accept_loss_drops_undecryptable);
     RUN_TEST(test_missing_peer_journal_refused);
     RUN_TEST(test_crashed_process_recovered);
     RUN_TEST(test_id_block_claims);

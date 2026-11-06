@@ -45,6 +45,12 @@ typedef enum cdb_durability {
  * have been lost (spec 1.12.5). The operator accepts the loss. */
 #define CDB_DB_ACCEPT_LOSS 0x1u
 
+/* Merging, drop each transaction holding a journal record this process
+ * cannot decrypt, and merge the rest of that journal, instead of leaving it
+ * pending for a process with the key (spec 5.9.1). For a key gone for good;
+ * nothing else is accepted as lost. */
+#define CDB_DB_DROP_UNREADABLE 0x2u
+
 /* One committed change, as handed to the apply hook. data points into the
  * database's record buffer and is valid only during the call. */
 typedef struct cdb_delta {

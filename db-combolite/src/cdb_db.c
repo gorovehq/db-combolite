@@ -556,8 +556,10 @@ static cdb_status read_record(cdb_db *db, cdb_journal *j, uint64_t offset,
         s = cdb_journal_read_crypto(j, offset, buf, buf_size, r, next, db->aead_alg, key);
         cdb_crypto_wipe(key, sizeof key);
         if (s == CDB_E_CORRUPT && cdb_storage_read(&j->st, after, mark, sizeof mark) == CDB_OK
-            && mark[0] == 0xC0u && mark[1] == 0xDEu)
+            && mark[0] == 0xC0u && mark[1] == 0xDEu) {
+            *next = after;
             return CDB_E_SECURITY;
+        }
         return s;
     }
     return cdb_journal_read(j, offset, buf, buf_size, r, next);
@@ -780,6 +782,7 @@ struct jcursor {
     int rollbacks;      /* its commit record says it holds rollback records (14.4.9) */
     int deferred;       /* stopped at a record this process cannot decrypt: the rest
                            waits, pending, for a process that can (spec 5.9.5) */
+    uint64_t dropped_tx; /* with CDB_DB_DROP_UNREADABLE: the transaction given up instead */
 };
 
 /* The merge order (spec 5.9.2): stamp, then slot, then counter. */
@@ -814,6 +817,15 @@ static cdb_status scan_next(cdb_db *db, struct jcursor *c)
         cdb_record r;
         uint64_t next;
         if ((s = read_record(db, &db->rj, off, db->cfg.record_buf, db->cfg.record_buf_size, &r, &next)) != CDB_OK) {
+            /* The operator gave such records up: only the transaction that
+             * holds one is dropped, and the rest merges (spec 5.9.1). */
+            if (s == CDB_E_SECURITY && (db->cfg.flags & CDB_DB_DROP_UNREADABLE)) {
+                c->dropped_tx = cdb_load_u64(db->cfg.record_buf + 16, db->rj.order);
+                if (cur == c->dropped_tx)
+                    cur = 0;
+                off = next;
+                continue;
+            }
             /* Not the end: what follows waits for a process with the key,
              * from the start of the transaction it belongs to. */
             if (s == CDB_E_SECURITY) {
@@ -824,6 +836,10 @@ static cdb_status scan_next(cdb_db *db, struct jcursor *c)
                 return CDB_OK;
             }
             break;
+        }
+        if (c->dropped_tx != 0 && r.tx_id == c->dropped_tx) {
+            off = next;
+            continue;
         }
         if ((r.kind == CDB_RECORD_DATA || r.kind == CDB_RECORD_WRITE_KEY) && r.tx_id != cur) {
             cur = r.tx_id;
