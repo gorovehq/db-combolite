@@ -899,6 +899,14 @@ static void test_link_time_series_series_and_points(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
 }
 
+static cdb_status fixed_master_key(const char *uri, uint8_t key_out[CDB_CRYPTO_KEY_SIZE], void *user_data)
+{
+    (void)uri;
+    (void)user_data;
+    memset(key_out, 0x5A, CDB_CRYPTO_KEY_SIZE);
+    return CDB_OK;
+}
+
 static void test_link_enclave_opaque_pointers(void)
 {
     uint64_t type_nm;
@@ -906,6 +914,9 @@ static void test_link_enclave_opaque_pointers(void)
     cdb_link l;
     int found = 0;
 
+    /* Enclaves need a master key (spec 12.1). */
+    cfg.master_key_uri = "custom://mk";
+    cfg.key_provider = fixed_master_key;
     TEST_ASSERT_EQUAL_INT(CDB_OK, open_db());
     pool = make_pool("enc_docs");
     type_nm = define("enc_link", CDB_CARD_N_M, 1, CDB_LINK_ON_DELETE_TOMBSTONE);

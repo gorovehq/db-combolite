@@ -261,6 +261,7 @@ static cdb_status new_journal(cdb_db *db, const char *path, uint64_t unsealed_se
     memcpy(jh.db_id, db->pager.hs.record.db_id, sizeof jh.db_id);
     jh.unsealed_seq = unsealed_seq;
     jh.first_seq = 1;
+    memcpy(jh.salt, db->session_salt, sizeof jh.salt);
     if ((s = env_open(db, path, CDB_ENV_CREATE, &db->journal_st)) != CDB_OK)
         return s;
     if ((s = cdb_journal_create(&db->journal, &db->journal_st, db->pager.order, &jh)) != CDB_OK)
@@ -290,8 +291,8 @@ static uint64_t store_domain(cdb_db *db, uint64_t store_id)
     return 0;
 }
 
-/* The page subkey of an open domain, and its key version; NULL when the
- * domain is not open. */
+/* The page subkey of an open domain under this session's salt, and its key
+ * version; NULL when the domain is not open. */
 static const uint8_t *domain_page_key(cdb_db *db, uint64_t domain, uint32_t *version)
 {
     int i = enclave_index(db, domain);
@@ -302,18 +303,228 @@ static const uint8_t *domain_page_key(cdb_db *db, uint64_t domain, uint32_t *ver
     return db->enclaves[i].page_key;
 }
 
-static cdb_status cdb_db_domain_key_cb(void *ctx, uint64_t domain_id, uint32_t key_version, uint8_t key_out[32])
+/* The page subkey of an open domain under salt (spec 12.2, 14.2.8): this
+ * session's is kept, any other is derived from the domain key.
+ * CDB_E_SECURITY when the domain is not open. */
+static cdb_status domain_page_key_for(cdb_db *db, uint64_t domain, const uint8_t salt[16], uint8_t key_out[32])
+{
+    int i = enclave_index(db, domain);
+    if (i < 0)
+        return CDB_E_SECURITY;
+    if (db->has_salt && memcmp(salt, db->session_salt, 16) == 0) {
+        memcpy(key_out, db->enclaves[i].page_key, 32);
+        return CDB_OK;
+    }
+    return cdb_crypto_derive_subkey(db->enclaves[i].enclave_key, CDB_SUBKEY_PAGE, salt, key_out);
+}
+
+/* The in-memory salt-table entry with this index, or NULL. */
+static cdb_salt_entry *salt_at(cdb_db *db, uint16_t index)
+{
+    unsigned i;
+    for (i = 0; i < db->salt_count; i++)
+        if (db->salts[i].index == index)
+            return &db->salts[i];
+    return NULL;
+}
+
+/* The pager's key callback: an overlay page uses this session's salt, an
+ * archive page the salt its index names. A page naming a salt the table
+ * lacks is corrupt. */
+static cdb_status cdb_db_domain_key_cb(void *ctx, uint64_t domain_id, uint32_t key_version, uint16_t salt_index,
+                                       uint8_t key_out[32])
 {
     cdb_db *db = (cdb_db *)ctx;
-    const uint8_t *key;
+    const uint8_t *salt;
     (void)key_version;
 
     if (db == NULL || key_out == NULL)
         return CDB_E_INVALID_ARG;
-    if ((key = domain_page_key(db, domain_id, NULL)) == NULL)
-        return CDB_E_SECURITY;
-    memcpy(key_out, key, 32);
+    if (salt_index == CDB_SALT_INDEX_FILE) {
+        if (!db->has_salt)
+            return CDB_E_SECURITY;
+        salt = db->session_salt;
+    } else {
+        const cdb_salt_entry *e = salt_at(db, salt_index);
+        if (e == NULL)
+            return CDB_E_CORRUPT;
+        salt = e->salt;
+    }
+    return domain_page_key_for(db, domain_id, salt, key_out);
+}
+
+/* ------------------------------------------------- session salts (14.2.8) */
+
+#define SALT_KEY_LEN 2u
+#define SALT_VAL_LEN 24u /* the salt, then the last commit that used it */
+
+/* Opens the salt table, creating it (and recording its root in the catalog
+ * root slot) when create is set. *have 0: none yet. */
+static cdb_status salts_index(cdb_db *db, cdb_index *ix, int create, int *have)
+{
+    cdb_status s;
+    *have = 0;
+    if (db->pager.catroot.salt_root != 0) {
+        if ((s = cdb_index_open(ix, &db->pager, db->pager.catroot.salt_root, &db->cfg.catalog_work)) != CDB_OK)
+            return s;
+        *have = 1;
+        return CDB_OK;
+    }
+    if (!create)
+        return CDB_OK;
+    if ((s = cdb_index_create(ix, &db->pager, 0, CDB_INDEX_FLAG_UNIQUE, &db->cfg.catalog_work)) != CDB_OK)
+        return s;
+    {
+        cdb_catroot r = db->pager.catroot;
+        r.salt_root = ix->root;
+        cdb_pager_set_catroot(&db->pager, &r);
+    }
+    *have = 1;
     return CDB_OK;
+}
+
+/* Loads the salt table as the pager's committed state holds it. Scrub marks
+ * stay with the salts they were made for. Called only where no page read is
+ * under way: at open and after every reload. CDB_E_OUT_OF_BUDGET for a
+ * table bigger than this profile holds. */
+static cdb_status load_salts(cdb_db *db)
+{
+    cdb_salt_entry old[CDB_SALT_TABLE_MAX];
+    unsigned old_count = db->salt_count, i;
+    cdb_index ix;
+    cdb_index_cursor cur;
+    int have, done = 0;
+    cdb_status s;
+
+    memcpy(old, db->salts, old_count * sizeof old[0]);
+    db->salt_count = 0;
+    if ((s = salts_index(db, &ix, 0, &have)) != CDB_OK || !have)
+        return s;
+    if ((s = cdb_index_seek(&cur, &ix, db->cfg.catalog_page, NULL, 0)) != CDB_OK)
+        return s;
+    for (;;) {
+        uint8_t k[SALT_KEY_LEN], v[SALT_VAL_LEN];
+        size_t klen, vlen;
+        cdb_salt_entry *e;
+        if ((s = cdb_index_next(&cur, k, sizeof k, &klen, v, sizeof v, &vlen, &done)) != CDB_OK)
+            return s;
+        if (done)
+            break;
+        if (klen != SALT_KEY_LEN || vlen != SALT_VAL_LEN)
+            return CDB_E_CORRUPT;
+        if (db->salt_count == CDB_SALT_TABLE_MAX)
+            return CDB_E_OUT_OF_BUDGET;
+        e = &db->salts[db->salt_count++];
+        memset(e, 0, sizeof *e);
+        e->index = cdb_load_u16(k, CDB_ORDER_BIG);
+        memcpy(e->salt, v, 16);
+        e->last_commit = cdb_load_u64(v + 16, db->pager.order);
+        if (e->index == 0 || e->index == CDB_SALT_INDEX_FILE)
+            return CDB_E_CORRUPT;
+        for (i = 0; i < old_count; i++)
+            if (old[i].index == e->index && memcmp(old[i].salt, e->salt, 16) == 0) {
+                e->seen = old[i].seen;
+                e->prune_before = old[i].prune_before;
+                break;
+            }
+    }
+    return CDB_OK;
+}
+
+/* The pager's salt_assign hook: this session's salt's index, adding it at
+ * the lowest free index when the table lacks it. The entry reaches the
+ * archive in the next commit (salts_precommit). */
+static cdb_status salts_assign(void *ctx, uint16_t *index)
+{
+    cdb_db *db = (cdb_db *)ctx;
+    unsigned i;
+    uint16_t want = 1;
+
+    if (!db->has_salt)
+        return CDB_E_SECURITY;
+    for (i = 0; i < db->salt_count; i++)
+        if (memcmp(db->salts[i].salt, db->session_salt, 16) == 0) {
+            *index = db->salts[i].index;
+            return CDB_OK;
+        }
+    /* Re-encrypting under a newer salt to free an index is in the backlog. */
+    if (db->salt_count == CDB_SALT_TABLE_MAX)
+        return CDB_E_OUT_OF_BUDGET;
+    for (i = 0; i < db->salt_count && db->salts[i].index == want; i++)
+        want++;
+    if (want == CDB_SALT_INDEX_FILE)
+        return CDB_E_OUT_OF_BUDGET;
+    memmove(&db->salts[i + 1u], &db->salts[i], (db->salt_count - i) * sizeof db->salts[0]);
+    db->salt_count++;
+    memset(&db->salts[i], 0, sizeof db->salts[i]);
+    db->salts[i].index = want;
+    memcpy(db->salts[i].salt, db->session_salt, 16);
+    *index = want;
+    return CDB_OK;
+}
+
+/* The pager's precommit hook. In the commit that writes pages under this
+ * session's salt, the salt's entry records that commit. Salts a scrub pass
+ * found unused leave the table, unless a commit since has used them. */
+static cdb_status salts_precommit(void *ctx, uint64_t commit_seq, int salt_used)
+{
+    cdb_db *db = (cdb_db *)ctx;
+    cdb_index ix;
+    int have, found;
+    unsigned i, prune = 0;
+    cdb_status s;
+
+    for (i = 0; i < db->salt_count; i++)
+        if (db->salts[i].prune_before != 0)
+            prune++;
+    if (!salt_used && prune == 0)
+        return CDB_OK;
+    if ((s = salts_index(db, &ix, salt_used, &have)) != CDB_OK)
+        return s;
+    for (i = db->salt_count; have && i-- > 0;) {
+        cdb_salt_entry *e = &db->salts[i];
+        uint8_t k[SALT_KEY_LEN], v[SALT_VAL_LEN];
+        size_t vlen;
+        if (e->prune_before == 0)
+            continue;
+        if (salt_used && e->index == db->pager.salt_index) {
+            e->prune_before = 0;
+            continue;
+        }
+        cdb_store_u16(k, e->index, CDB_ORDER_BIG);
+        if ((s = cdb_index_get(&ix, k, sizeof k, v, sizeof v, &vlen, &found)) != CDB_OK)
+            return s;
+        if (found && (vlen != SALT_VAL_LEN || memcmp(v, e->salt, 16) != 0))
+            return CDB_E_CORRUPT;
+        if (found && cdb_load_u64(v + 16, db->pager.order) > e->prune_before) {
+            e->prune_before = 0; /* used again since the pass began */
+            continue;
+        }
+        if (found && (s = cdb_index_delete(&ix, k, sizeof k, &found)) != CDB_OK)
+            return s;
+        memmove(e, e + 1, (db->salt_count - i - 1u) * sizeof *e);
+        db->salt_count--;
+    }
+    if (salt_used) {
+        cdb_salt_entry *e = salt_at(db, db->pager.salt_index);
+        uint8_t k[SALT_KEY_LEN], v[SALT_VAL_LEN];
+        if (e == NULL)
+            return CDB_E_STATE;
+        cdb_store_u16(k, e->index, CDB_ORDER_BIG);
+        memcpy(v, e->salt, 16);
+        cdb_store_u64(v + 16, commit_seq, db->pager.order);
+        if ((s = cdb_index_put(&ix, k, sizeof k, v, sizeof v)) != CDB_OK)
+            return s;
+        e->last_commit = commit_seq;
+    }
+    return CDB_OK;
+}
+
+/* Reloads the pager's committed state and the salt table with it. */
+static cdb_status pager_reload(cdb_db *db)
+{
+    cdb_status s = cdb_pager_reload(&db->pager);
+    return s != CDB_OK ? s : load_salts(db);
 }
 
 /* Reads one record, decrypting it under its domain's key when it is
@@ -329,10 +540,13 @@ static cdb_status read_record(cdb_db *db, cdb_journal *j, uint64_t offset,
     if (buf[0] != 0xC0u || buf[1] != 0xDEu)
         return CDB_E_CORRUPT;
     if (buf[3] & CDB_RECORD_FLAG_ENCRYPTED) {
-        const uint8_t *key = domain_page_key(db, cdb_load_u64(buf + 24, j->order), NULL);
-        if (key == NULL)
-            return CDB_E_SECURITY;
-        return cdb_journal_read_crypto(j, offset, buf, buf_size, r, next, db->aead_alg, key);
+        uint8_t key[32];
+        /* Under the salt of the session that wrote the journal (14.2.8). */
+        if ((s = domain_page_key_for(db, cdb_load_u64(buf + 24, j->order), j->hdr.salt, key)) != CDB_OK)
+            return s;
+        s = cdb_journal_read_crypto(j, offset, buf, buf_size, r, next, db->aead_alg, key);
+        cdb_crypto_wipe(key, sizeof key);
+        return s;
     }
     return cdb_journal_read(j, offset, buf, buf_size, r, next);
 }
@@ -665,7 +879,7 @@ static cdb_status pin_archive(cdb_db *db)
         if ((s = cdb_header_open(&db->archive_st, &hs)) != CDB_OK)
             return s;
         if (hs.record.committed_seq != db->pager.hs.record.committed_seq
-            && (s = cdb_pager_reload(&db->pager)) != CDB_OK)
+            && (s = pager_reload(db)) != CDB_OK)
             return s;
         seq = db->pager.hs.record.committed_seq;
         if ((s = publish_pin(db, seq)) != CDB_OK)
@@ -1033,6 +1247,19 @@ static cdb_status enter_overlay(cdb_db *db)
     }
     if ((s = cdb_storage_truncate(&db->overlay_st, 0)) != CDB_OK)
         return s;
+    {
+        /* Its companion header names the salt its pages use (14.2.8), in the
+         * room before the first overlay page. */
+        cdb_journal_header oh;
+        memset(&oh, 0, sizeof oh);
+        oh.type_id = (uint16_t)CDB_COMPANION_OVERLAY;
+        oh.slot = db->coord.me.slot;
+        memcpy(oh.db_id, db->pager.hs.record.db_id, sizeof oh.db_id);
+        oh.unsealed_seq = db->pager.hs.record.committed_seq;
+        memcpy(oh.salt, db->session_salt, sizeof oh.salt);
+        if ((s = cdb_companion_write_header(&db->overlay_st, db->pager.order, &oh)) != CDB_OK)
+            return s;
+    }
     cdb_pager_set_guard(&db->pager, NULL, NULL);
     db->fresh = 0;
     return cdb_pager_set_private(&db->pager, &db->overlay_st);
@@ -1052,7 +1279,7 @@ static cdb_status rebase_pages(cdb_db *db)
     if ((s = cdb_header_open(&db->archive_st, &hs)) != CDB_OK)
         return s;
     if (db->pager.dirty || hs.record.committed_seq != db->pager.hs.record.committed_seq) {
-        if ((s = cdb_pager_reload(&db->pager)) != CDB_OK)
+        if ((s = pager_reload(db)) != CDB_OK)
             return s;
     }
     if ((s = pin_archive(db)) != CDB_OK || (s = enter_overlay(db)) != CDB_OK)
@@ -1291,6 +1518,14 @@ static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg
         if (s != CDB_OK)
             return s;
         db->has_integrity_key = 1;
+        /* Once per session, before the journal (spec 12.1, 14.2.8). Without
+         * entropy the database could only open read-only, which this
+         * build can't do yet. */
+        if (db->env.ops->random == NULL)
+            return CDB_E_READ_ONLY;
+        if ((s = db->env.ops->random(db->env.ctx, db->session_salt, sizeof db->session_salt)) != CDB_OK)
+            return s;
+        db->has_salt = 1;
     }
 
     if (create != NULL && (create->layout_flags & CDB_LAYOUT_GOVERNANCE) && !db->has_master_key)
@@ -1341,7 +1576,8 @@ static cdb_status open_db(cdb_db *db, const char *base, const cdb_db_config *cfg
         return s;
     journal_paths(db, db->coord.me.slot, db->journal_path, db->journal_tmp);
     overlay_path_of(db, db->coord.me.slot, db->overlay_path);
-    if ((s = pin_archive(db)) != CDB_OK)
+    cdb_pager_set_session(&db->pager, (uint16_t)db->coord.me.slot, salts_assign, salts_precommit, db);
+    if ((s = pin_archive(db)) != CDB_OK || (s = load_salts(db)) != CDB_OK)
         return s;
     if ((s = cdb_catalog_open(&db->catalog, &db->pager, &cfg->catalog_work, cfg->catalog_page)) != CDB_OK)
         return s;
@@ -2601,7 +2837,7 @@ static cdb_status reconcile_hold(cdb_db *db, int closing)
         return CDB_OK;
     }
 
-    if ((s = cdb_pager_reload(&db->pager)) != CDB_OK || (s = cdb_pager_set_private(&db->pager, NULL)) != CDB_OK)
+    if ((s = pager_reload(db)) != CDB_OK || (s = cdb_pager_set_private(&db->pager, NULL)) != CDB_OK)
         return s;
     cdb_pager_set_guard(&db->pager, (cdb_status (*)(void *))cdb_coord_guard, &db->coord);
     cdb_pager_set_reuse_below(&db->pager, db->coord.min_pin);
@@ -2869,6 +3105,85 @@ static cdb_status db_reclaim_in(cdb_db *db, uint64_t *pages_freed, uint64_t *nib
     return finish_archive_op(db, s);
 }
 
+static cdb_status db_scrub_in(cdb_db *db, uint64_t budget, int *pass_done);
+
+cdb_status cdb_db_scrub(cdb_db *db, uint64_t budget, int *pass_done)
+{
+    cdb_status r;
+    cdb_db_lock(db);
+    r = db_scrub_in(db, budget, pass_done);
+    cdb_db_unlock(db);
+    return r;
+}
+
+/* Walks the live logical pages in ID order, budget at a time, as the pager
+ * sees them now. A public page is verified from its bytes on disk. An
+ * encrypted page is only peeked: its salt is in use (spec 14.2.8). A salt
+ * with a committed page anywhere at the end of a pass that started after
+ * its last commit was seen at that page's ID, since no page moves to
+ * another ID and any page written under it since would have moved its last
+ * commit on; unless a newer version hid that page from the pass, which
+ * then marks nothing. */
+static cdb_status db_scrub_in(cdb_db *db, uint64_t budget, int *pass_done)
+{
+    cdb_pager *p;
+    uint8_t *page;
+    unsigned i;
+    cdb_status s;
+
+    if (db == NULL || pass_done == NULL)
+        return CDB_E_INVALID_ARG;
+    p = &db->pager;
+    page = db->cfg.catalog_page;
+    *pass_done = 0;
+    if ((s = usable(db)) != CDB_OK)
+        return s;
+    if (db->scrub_lid == 0) {
+        db->scrub_lid = 1;
+        db->scrub_start = p->hs.record.committed_seq;
+        db->scrub_hidden = 0;
+        for (i = 0; i < db->salt_count; i++)
+            db->salts[i].seen = 0;
+    }
+    for (; budget > 0 && db->scrub_lid < p->next_lid; budget--, db->scrub_lid++) {
+        cdb_page_header h;
+        int committed;
+        if ((s = cdb_pager_peek(p, db->scrub_lid, page, &h, &committed)) == CDB_E_NOT_FOUND)
+            continue;
+        if (s != CDB_OK)
+            return s;
+        if (!committed)
+            db->scrub_hidden = 1;
+        if (h.domain_id != 0 && h.salt_index != 0) {
+            cdb_salt_entry *e;
+            if (h.salt_index == CDB_SALT_INDEX_FILE) /* an overlay page: this session's salt */
+                continue;
+            if ((e = salt_at(db, h.salt_index)) == NULL)
+                return CDB_E_CORRUPT;
+            e->seen = 1;
+            continue;
+        }
+        if ((h.flags & CDB_PAGE_FLAG_TAMPER_EVIDENT) && !db->has_integrity_key)
+            return CDB_E_SECURITY;
+        if ((s = cdb_page_open_crypto(page, p->page_size, p->fmt, p->order, p->checksum_alg, CDB_AEAD_NONE,
+                                      db->has_integrity_key ? db->integrity_key : NULL, 0, &h)) != CDB_OK)
+            return s;
+        if (h.logical_id != db->scrub_lid)
+            return CDB_E_CORRUPT;
+    }
+    if (db->scrub_lid < p->next_lid)
+        return CDB_OK;
+    for (i = 0; i < db->salt_count; i++) {
+        cdb_salt_entry *e = &db->salts[i];
+        if (!db->scrub_hidden && !e->seen && e->last_commit != 0 && e->last_commit <= db->scrub_start)
+            e->prune_before = db->scrub_start;
+        e->seen = 0;
+    }
+    db->scrub_lid = 0;
+    *pass_done = 1;
+    return CDB_OK;
+}
+
 /* Compaction requires a clean pager, hence the reconcile first. It makes
  * its own archive commits under the same baton, so the journal is rotated
  * afterwards to match the new committed sequence. */
@@ -3014,6 +3329,20 @@ cdb_status cdb_db_close(cdb_db *db)
 
 /* -------------------------------------------------------- security & RBAC */
 
+/* Keeps an enclave's key and derives its subkeys: the page subkey under
+ * this session's salt, the others without one (spec 12.2, 14.2.8). */
+static cdb_status enclave_set_key(cdb_db *db, int idx, const uint8_t raw_key[32])
+{
+    cdb_status s;
+    memcpy(db->enclaves[idx].enclave_key, raw_key, 32);
+    s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_PAGE, db->session_salt, db->enclaves[idx].page_key);
+    if (s == CDB_OK)
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_CONTENT_HASH, NULL, db->enclaves[idx].hash_key);
+    if (s == CDB_OK)
+        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, NULL, db->enclaves[idx].index_key);
+    return s;
+}
+
 static cdb_status db_create_enclave_in(cdb_db *db, uint64_t enclave_id, const char *key_ref);
 
 cdb_status cdb_db_create_enclave(cdb_db *db, uint64_t enclave_id, const char *key_ref)
@@ -3034,6 +3363,8 @@ static cdb_status db_create_enclave_in(cdb_db *db, uint64_t enclave_id, const ch
 
     if (db == NULL || enclave_id == 0)
         return CDB_E_INVALID_ARG;
+    if (!db->has_salt) /* encryption needs a master key and its session salt (12.1) */
+        return CDB_E_SECURITY;
 
     for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
         if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == enclave_id)
@@ -3057,13 +3388,7 @@ static cdb_status db_create_enclave_in(cdb_db *db, uint64_t enclave_id, const ch
 
     db->enclaves[free_idx].enclave_id = enclave_id;
     db->enclaves[free_idx].key_version = 1;
-    memcpy(db->enclaves[free_idx].enclave_key, raw_key, 32);
-
-    s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_PAGE, NULL, db->enclaves[free_idx].page_key);
-    if (s == CDB_OK)
-        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_CONTENT_HASH, NULL, db->enclaves[free_idx].hash_key);
-    if (s == CDB_OK)
-        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, NULL, db->enclaves[free_idx].index_key);
+    s = enclave_set_key(db, free_idx, raw_key);
 
     cdb_crypto_wipe(raw_key, sizeof raw_key);
 
@@ -3094,6 +3419,8 @@ static cdb_status db_open_enclave_in(cdb_db *db, uint64_t enclave_id, const char
 
     if (db == NULL || enclave_id == 0 || key_ref == NULL)
         return CDB_E_INVALID_ARG;
+    if (!db->has_salt)
+        return CDB_E_SECURITY;
 
     for (i = 0; i < sizeof(db->enclaves) / sizeof(db->enclaves[0]); i++) {
         if (db->enclaves[i].in_use && db->enclaves[i].enclave_id == enclave_id) {
@@ -3114,13 +3441,7 @@ static cdb_status db_open_enclave_in(cdb_db *db, uint64_t enclave_id, const char
     db->enclaves[idx].enclave_id = enclave_id;
     if (db->enclaves[idx].key_version == 0)
         db->enclaves[idx].key_version = 1;
-    memcpy(db->enclaves[idx].enclave_key, raw_key, 32);
-
-    s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_PAGE, NULL, db->enclaves[idx].page_key);
-    if (s == CDB_OK)
-        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_CONTENT_HASH, NULL, db->enclaves[idx].hash_key);
-    if (s == CDB_OK)
-        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, NULL, db->enclaves[idx].index_key);
+    s = enclave_set_key(db, idx, raw_key);
 
     cdb_crypto_wipe(raw_key, sizeof raw_key);
 
@@ -3229,13 +3550,7 @@ static cdb_status db_rotate_enclave_key_in(cdb_db *db, uint64_t enclave_id, cons
     }
 
     db->enclaves[idx].key_version++;
-    memcpy(db->enclaves[idx].enclave_key, raw_key, 32);
-
-    s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_PAGE, NULL, db->enclaves[idx].page_key);
-    if (s == CDB_OK)
-        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_CONTENT_HASH, NULL, db->enclaves[idx].hash_key);
-    if (s == CDB_OK)
-        s = cdb_crypto_derive_subkey(raw_key, CDB_SUBKEY_INDEX, NULL, db->enclaves[idx].index_key);
+    s = enclave_set_key(db, idx, raw_key);
 
     cdb_crypto_wipe(raw_key, sizeof raw_key);
     if (s == CDB_OK)

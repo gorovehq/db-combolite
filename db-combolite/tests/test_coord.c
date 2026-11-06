@@ -59,9 +59,12 @@ static void init_env(void)
     cdb_faultenv_on_sleep(&fe, beat_others, NULL);
 }
 
+static int keyed_procs; /* processes open with a master key (test_two_processes_encrypted_merge) */
+
 void setUp(void)
 {
     init_env();
+    keyed_procs = 0;
 }
 
 void tearDown(void) {}
@@ -504,6 +507,17 @@ struct proc {
 };
 static struct proc p1, p2;
 
+/* Store ENCLAVE is enclave 42: its records and pages are encrypted when the
+ * processes open with keys (keyed_procs). */
+#define ENCLAVE 42u
+
+static cdb_status test_keys(const char *uri, uint8_t key_out[CDB_CRYPTO_KEY_SIZE], void *user_data)
+{
+    (void)user_data;
+    memset(key_out, strcmp(uri, "custom://mk") == 0 ? 0x11 : 0x22, CDB_CRYPTO_KEY_SIZE);
+    return CDB_OK;
+}
+
 /* Value encoding helpers for table tests. */
 typedef struct enc {
     uint8_t b[256];
@@ -603,6 +617,7 @@ static cdb_status kv_apply(void *ctx, cdb_pager *p, const cdb_delta *d)
     memset(&t, 0, sizeof t);
     t.type = CDB_PAGE_TYPE_DATA_TEST;
     t.store_id = d->store_id;
+    t.domain_id = d->store_id == ENCLAVE ? ENCLAVE : 0u;
     return cdb_pager_write(p, d->entry_id, &t, val, len + d->len);
 }
 
@@ -642,6 +657,11 @@ static cdb_status open_proc_max(struct proc *p, unsigned max_coords)
     p->cfg.catalog_page = p->cat_page;
     p->cfg.durability = CDB_DURABILITY_FULL;
     p->cfg.coord.max_coords = max_coords;
+    if (keyed_procs) {
+        p->cfg.master_key_uri = "custom://mk";
+        p->cfg.key_provider = test_keys;
+        p->cfg.aead_alg = CDB_AEAD_AES_256_GCM;
+    }
     memset(&h, 0, sizeof h);
     h.order = CDB_ORDER_LITTLE;
     h.layout_flags = CDB_LAYOUT_ADDR64;
@@ -784,6 +804,54 @@ static void test_two_processes_share_and_merge(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
     TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
     cdb_faultenv_on_sleep(&fe, NULL, NULL);
+}
+
+/* Every process writes under its own session salt (spec 12.1, 14.2.8): the
+ * private one's encrypted records carry its salt in their journal header and
+ * its overlay pages name the overlay's salt; the baton holder merges those
+ * records with that salt and writes archive pages under its own salt's
+ * index, which the other process finds in the salt table after a reload. */
+static void test_two_processes_encrypted_merge(void)
+{
+    cdb_page_header h;
+    uint8_t buf[PAGE];
+
+    keyed_procs = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_enclave(&p1.db, ENCLAVE, "custom://enc"));
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&p2.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_TRUE(memcmp(p1.db.session_salt, p2.db.session_salt, 16) != 0);
+    TEST_ASSERT_EQUAL_MEMORY(p2.db.session_salt, p2.db.journal.hdr.salt, 16);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, ENCLAVE, 5, CDB_OP_REPLACE, "secret", 6));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_peek(&p2.db.pager, 5, buf, &h, NULL));
+    TEST_ASSERT_EQUAL_UINT16(CDB_SALT_INDEX_FILE, h.salt_index);
+    TEST_ASSERT_EQUAL_STRING("secret", value_of(&p2, 5));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, ENCLAVE, 6, CDB_OP_REPLACE, "mine", 4));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("secret", value_of(&p1, 5));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_peek(&p1.db.pager, 5, buf, &h, NULL));
+    TEST_ASSERT_EQUAL_UINT16(1, h.salt_index);
+    TEST_ASSERT_EQUAL_UINT(1, p1.db.salt_count);
+    TEST_ASSERT_EQUAL_MEMORY(p1.db.session_salt, p1.db.salts[0].salt, 16);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p2.db));
+    TEST_ASSERT_EQUAL_STRING("secret", value_of(&p2, 5));
+    TEST_ASSERT_EQUAL_STRING("mine", value_of(&p2, 6));
+    TEST_ASSERT_EQUAL_UINT(1, p2.db.salt_count);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    keyed_procs = 0;
 }
 
 /* A transaction that was open while another process reconciled into the
@@ -2059,6 +2127,7 @@ int main(void)
     RUN_TEST(test_join_crash_sweep);
     RUN_TEST(test_second_process_is_busy);
     RUN_TEST(test_two_processes_share_and_merge);
+    RUN_TEST(test_two_processes_encrypted_merge);
     RUN_TEST(test_open_tx_rejected_after_peer_reconcile);
     RUN_TEST(test_reader_pin_blocks_reuse);
     RUN_TEST(test_live_peer_merges_crashed_peer);

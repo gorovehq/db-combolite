@@ -399,7 +399,7 @@ class cdb_db_config(Structure):
 
 
 class cdb_db(Structure):
-    # Opaque, and at least cdb_db_struct_size() bytes (about 31 KB today):
+    # Opaque, and at least cdb_db_struct_size() bytes (about 48 KB today):
     # ComboliteLib checks, so the engine growing it can't overrun this
     _fields_ = [
         ("_opaque", c_uint8 * 65536),

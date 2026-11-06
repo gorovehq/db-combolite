@@ -119,6 +119,7 @@ static void test_encrypted_page_roundtrip(void)
     memset(key, 0x88, sizeof(key));
     memset(page, 0, sizeof(page));
     h.domain_id = 42; /* Encrypted enclave domain */
+    h.salt_index = 1;
     h.write_seq = 1001;
     memcpy(page + hsize, "Super secret database enclave payload bytes", 43);
     h.payload_len = 43;
@@ -126,7 +127,7 @@ static void test_encrypted_page_roundtrip(void)
     /* Seal with AES-256-GCM */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_seal_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
                                                       CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
-                                                      CDB_AEAD_AES_256_GCM, key, &h));
+                                                      CDB_AEAD_AES_256_GCM, key, CDB_TRACK_ARCHIVE_PAGE, &h));
 
     /* Ciphertext must not match original plaintext */
     TEST_ASSERT_NOT_EQUAL(0, memcmp(page + hsize, "Super secret database enclave payload bytes", 43));
@@ -134,7 +135,7 @@ static void test_encrypted_page_roundtrip(void)
     /* Open and decrypt */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_open_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
                                                       CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
-                                                      CDB_AEAD_AES_256_GCM, key, &back));
+                                                      CDB_AEAD_AES_256_GCM, key, CDB_TRACK_ARCHIVE_PAGE, &back));
     TEST_ASSERT_EQUAL_UINT64(42, back.domain_id);
     TEST_ASSERT_EQUAL_UINT64(7, back.store_id); /* from the encrypted slot */
     TEST_ASSERT_EQUAL_MEMORY("Super secret database enclave payload bytes", page + hsize, 43);
@@ -143,7 +144,7 @@ static void test_encrypted_page_roundtrip(void)
     key[0] ^= 0x01;
     TEST_ASSERT_EQUAL_INT(CDB_E_CORRUPT, cdb_page_open_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
                                                              CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
-                                                             CDB_AEAD_AES_256_GCM, key, &back));
+                                                             CDB_AEAD_AES_256_GCM, key, CDB_TRACK_ARCHIVE_PAGE, &back));
     key[0] ^= 0x01;
 
     /* Seal with ChaCha20-Poly1305 */
@@ -152,10 +153,10 @@ static void test_encrypted_page_roundtrip(void)
     h.write_seq = 1002;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_seal_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
                                                       CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
-                                                      CDB_AEAD_CHACHA20_POLY1305, key, &h));
+                                                      CDB_AEAD_CHACHA20_POLY1305, key, CDB_TRACK_ARCHIVE_PAGE, &h));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_open_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
                                                       CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
-                                                      CDB_AEAD_CHACHA20_POLY1305, key, &back));
+                                                      CDB_AEAD_CHACHA20_POLY1305, key, CDB_TRACK_ARCHIVE_PAGE, &back));
     TEST_ASSERT_EQUAL_MEMORY("ChaCha encrypted page", page + hsize, 21);
 }
 
@@ -175,11 +176,11 @@ static void test_tamper_evident_page_roundtrip(void)
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_seal_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
                                                       CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
-                                                      CDB_AEAD_NONE, integrity_key, &h));
+                                                      CDB_AEAD_NONE, integrity_key, CDB_TRACK_ARCHIVE_PAGE, &h));
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_open_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
                                                       CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
-                                                      CDB_AEAD_NONE, integrity_key, &back));
+                                                      CDB_AEAD_NONE, integrity_key, CDB_TRACK_ARCHIVE_PAGE, &back));
     TEST_ASSERT_TRUE(back.flags & CDB_PAGE_FLAG_TAMPER_EVIDENT);
     TEST_ASSERT_EQUAL_MEMORY("Public governance page content", page + hsize, 30);
 
@@ -187,7 +188,7 @@ static void test_tamper_evident_page_roundtrip(void)
     page[hsize + 5] ^= 0x01;
     TEST_ASSERT_EQUAL_INT(CDB_E_CORRUPT, cdb_page_open_crypto(page, sizeof(page), CDB_PAGE_FMT_FULL64,
                                                              CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
-                                                             CDB_AEAD_NONE, integrity_key, &back));
+                                                             CDB_AEAD_NONE, integrity_key, CDB_TRACK_ARCHIVE_PAGE, &back));
 }
 
 /* The slot repeats a public page's store; a page whose header and slot
@@ -225,21 +226,33 @@ static void test_store_slot_hidden_and_salt(void)
     h.domain_id = 42;
     h.salt_index = 3;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_seal_crypto(page, sizeof page, CDB_PAGE_FMT_FULL64, CDB_ORDER_BIG,
-                                                      CDB_CHECKSUM_CRC32C, CDB_AEAD_AES_256_GCM, key, &h));
+                                                      CDB_CHECKSUM_CRC32C, CDB_AEAD_AES_256_GCM, key, CDB_TRACK_ARCHIVE_PAGE, &h));
     TEST_ASSERT_EQUAL_UINT64(0, cdb_load_u64(page + 32, CDB_ORDER_BIG));
     TEST_ASSERT_EQUAL_UINT16(3, cdb_load_u16(page + 50, CDB_ORDER_BIG));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_peek(page, sizeof page, CDB_PAGE_FMT_FULL64, CDB_ORDER_BIG, &back));
     TEST_ASSERT_EQUAL_UINT64(0, back.store_id);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_open_crypto(page, sizeof page, CDB_PAGE_FMT_FULL64, CDB_ORDER_BIG,
-                                                      CDB_CHECKSUM_CRC32C, CDB_AEAD_AES_256_GCM, key, &back));
+                                                      CDB_CHECKSUM_CRC32C, CDB_AEAD_AES_256_GCM, key, CDB_TRACK_ARCHIVE_PAGE, &back));
     TEST_ASSERT_EQUAL_UINT64(7, back.store_id);
     TEST_ASSERT_EQUAL_UINT16(3, back.salt_index);
 
+    /* Sealing refuses a public page with a salt or an encrypted one without;
+     * a public page given one on disk is malformed. */
     h = sample();
     h.salt_index = 3;
     memset(page, 0, sizeof page);
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_page_seal(page, sizeof page, CDB_PAGE_FMT_FULL64, CDB_ORDER_LITTLE,
+                                                           CDB_CHECKSUM_CRC32C, &h));
+    h.salt_index = 0;
+    h.domain_id = 42;
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_page_seal_crypto(page, sizeof page, CDB_PAGE_FMT_FULL64,
+                                                                  CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C,
+                                                                  CDB_AEAD_AES_256_GCM, key,
+                                                                  CDB_TRACK_ARCHIVE_PAGE, &h));
+    h = sample();
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_seal(page, sizeof page, CDB_PAGE_FMT_FULL64, CDB_ORDER_LITTLE,
                                                 CDB_CHECKSUM_CRC32C, &h));
+    cdb_store_u16(page + 50, 3, CDB_ORDER_LITTLE);
     cdb_store_u32(page + sizeof page - ts, cdb_crc32c(page, sizeof page - ts), CDB_ORDER_LITTLE);
     TEST_ASSERT_EQUAL_INT(CDB_E_MALFORMED, cdb_page_open(page, sizeof page, CDB_PAGE_FMT_FULL64,
                                                          CDB_ORDER_LITTLE, CDB_CHECKSUM_CRC32C, &back));
@@ -247,7 +260,7 @@ static void test_store_slot_hidden_and_salt(void)
     h = sample();
     TEST_ASSERT_EQUAL_INT(CDB_E_UNSUPPORTED, cdb_page_seal_crypto(page, 512, CDB_PAGE_FMT_COMPACT, CDB_ORDER_LITTLE,
                                                                   CDB_CHECKSUM_CRC32C, CDB_AEAD_AES_256_GCM,
-                                                                  key, &h));
+                                                                  key, CDB_TRACK_ARCHIVE_PAGE, &h));
 }
 
 int main(void)

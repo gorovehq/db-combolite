@@ -75,6 +75,29 @@ typedef struct cdb_pager_node {
     uint64_t lru;        /* last-use stamp, for choosing which clean node to evict */
 } cdb_pager_node;
 
+/* Resolves the page subkey of domain_id for a page naming salt_index: an
+ * index into the archive's salt table, or CDB_SALT_INDEX_FILE for the
+ * overlay's own salt (spec 14.2.8). It must do no I/O: it runs inside page
+ * reads and writes. */
+typedef cdb_status (*cdb_pager_key_fn)(void *ctx, uint64_t domain_id, uint32_t key_version,
+                                       uint16_t salt_index, uint8_t key_out[32]);
+
+/* The writing session (spec 12.1, 14.2.5, 14.2.8). Open and create clear
+ * it; reload keeps it. */
+typedef struct cdb_pager_session {
+    uint16_t slot;   /* coordinator slot: the overlay's nonce track is 0xFFFE << 16 | slot */
+    uint64_t ov_seq; /* next overlay page sequence; starts at 1, never goes back */
+    /* Gives the salt index for this session's encrypted archive pages, adding
+     * the session's salt to the in-memory table if it is not there. No I/O.
+     * Called at the first such page after an open, reload or commit. */
+    cdb_status (*salt_assign)(void *ctx, uint16_t *index);
+    /* Runs at the start of every archive commit, before anything is synced;
+     * it may write pages. commit_seq is the sequence the commit will have;
+     * salt_used says whether the commit holds a page under the assigned salt. */
+    cdb_status (*precommit)(void *ctx, uint64_t commit_seq, int salt_used);
+    void *ctx;
+} cdb_pager_session;
+
 /* Memory the caller lends the pager for its whole life. The pager keeps the
  * pointers and never frees them. The number of usable node slots is the
  * smaller of node_cap and what the arena holds; it must be at least 10. */
@@ -140,8 +163,11 @@ typedef struct cdb_pager {
     uint8_t integrity_key[32];
     int has_master_key;
     int has_integrity_key;
-    cdb_status (*domain_key_fn)(void *ctx, uint64_t domain_id, uint32_t key_version, uint8_t key_out[32]);
+    cdb_pager_key_fn domain_key_fn;
     void *domain_key_ctx;
+    cdb_pager_session sess;
+    uint16_t salt_index;  /* from sess.salt_assign since the last commit; 0 = not yet */
+    int salt_used;        /* an encrypted archive page was written since the last commit */
     /* Optional data page cache in caller memory. */
     cdb_page_cache_slot *cache_slots;
     size_t cache_count;
@@ -158,8 +184,15 @@ void cdb_pager_cache_wipe_domain(cdb_pager *p, uint64_t domain_id);
 /* Configures encryption, integrity keys, and enclave domain key resolver on the pager. */
 void cdb_pager_set_crypto(cdb_pager *p, unsigned aead_alg, const uint8_t *master_key,
                           const uint8_t *integrity_key,
-                          cdb_status (*domain_key_fn)(void *, uint64_t, uint32_t, uint8_t *),
-                          void *domain_key_ctx);
+                          cdb_pager_key_fn domain_key_fn, void *domain_key_ctx);
+
+/* Sets the writing session after open or create: slot, salt hooks and
+ * context. The overlay counter is left as it is. Without a session, an
+ * encrypted archive page can't be written (CDB_E_SECURITY). */
+void cdb_pager_set_session(cdb_pager *p, uint16_t slot,
+                           cdb_status (*salt_assign)(void *ctx, uint16_t *index),
+                           cdb_status (*precommit)(void *ctx, uint64_t commit_seq, int salt_used),
+                           void *ctx);
 
 /* Creates a new database on empty storage. h supplies the file settings:
  * byte order, page size (default_page_log2, used for every page), address
@@ -194,6 +227,13 @@ cdb_status cdb_pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header *tm
  * CDB_E_NOT_FOUND when lid has no live page, CDB_E_CORRUPT when the page
  * fails its checksum. */
 cdb_status cdb_pager_read(cdb_pager *p, uint64_t lid, uint8_t *page, cdb_page_header *h);
+
+/* Reads the current version of lid into page and decodes its header
+ * without verifying or decrypting it: enough to see a page's domain and
+ * salt index (the scrub, 14.2.8). *committed is 0 for a version in the
+ * overlay or written since the last commit, which hides the committed one.
+ * CDB_E_NOT_FOUND when lid has no live page. */
+cdb_status cdb_pager_peek(cdb_pager *p, uint64_t lid, uint8_t *page, cdb_page_header *h, int *committed);
 
 /* Releases logical page lid. Its ID is not reused. */
 cdb_status cdb_pager_free(cdb_pager *p, uint64_t lid);
@@ -240,8 +280,8 @@ cdb_status cdb_pager_set_private(cdb_pager *p, const cdb_storage *overlay);
 
 /* Drops every uncommitted change, private or not, and loads the committed
  * state the archive holds now, which another process may have moved on.
- * Keeps the private mode, overlay, reuse limit and guard; the overlay starts
- * over from its first page. */
+ * Keeps the private mode, overlay, reuse limit, guard and session; the
+ * overlay starts over from its first page, its sequence numbers do not. */
 cdb_status cdb_pager_reload(cdb_pager *p);
 
 /* Space freed by the commit with sequence f is reused only when f is below

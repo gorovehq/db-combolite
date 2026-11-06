@@ -22,16 +22,13 @@ static const uint8_t journal_magic[8] = { 0x89, 0x43, 0x44, 0x42, 0x43, 0x4D, 0x
 #define RECORD_MARKER_1 0xDEu
 #define JOURNAL_EPOCH 1u
 
-/* Encodes the 64-byte companion header (spec 14.4.1) and writes it at
- * offset 0. The handle starts with no records: the first record goes right
- * after the header and gets sequence hdr->first_seq. */
-cdb_status cdb_journal_create(cdb_journal *j, const cdb_storage *st, cdb_byte_order order,
-                              const cdb_journal_header *hdr)
+/* Encodes the 80-byte companion header (spec 14.4.1) and writes it at
+ * offset 0. */
+cdb_status cdb_companion_write_header(const cdb_storage *st, cdb_byte_order order, const cdb_journal_header *hdr)
 {
     uint8_t h[CDB_JOURNAL_HEADER_SIZE];
-    cdb_status s;
 
-    /* Reserved bytes (14..15 and 56..59) stay zero. */
+    /* Reserved bytes (14..15 and 72..75) stay zero. */
     memset(h, 0, sizeof h);
     memcpy(h, journal_magic, sizeof journal_magic);
     h[8] = (uint8_t)order;
@@ -42,8 +39,19 @@ cdb_status cdb_journal_create(cdb_journal *j, const cdb_storage *st, cdb_byte_or
     cdb_store_u64(h + 32, hdr->unsealed_seq, order);
     cdb_store_u64(h + 40, hdr->first_seq, order);
     cdb_store_u64(h + 48, hdr->domain_id, order);
-    cdb_store_u32(h + 60, cdb_crc32c(h, 60), order);
-    if ((s = cdb_storage_program(st, 0, h, sizeof h)) != CDB_OK)
+    memcpy(h + 56, hdr->salt, 16);
+    cdb_store_u32(h + 76, cdb_crc32c(h, 76), order);
+    return cdb_storage_program(st, 0, h, sizeof h);
+}
+
+/* The handle starts with no records: the first record goes right after the
+ * header and gets sequence hdr->first_seq. */
+cdb_status cdb_journal_create(cdb_journal *j, const cdb_storage *st, cdb_byte_order order,
+                              const cdb_journal_header *hdr)
+{
+    cdb_status s;
+
+    if ((s = cdb_companion_write_header(st, order, hdr)) != CDB_OK)
         return s;
     memset(j, 0, sizeof *j);
     j->st = *st;
@@ -57,7 +65,7 @@ cdb_status cdb_journal_create(cdb_journal *j, const cdb_storage *st, cdb_byte_or
 /* Reads and checks the companion header. Errors: CDB_E_CORRUPT for a short
  * file, wrong magic, a byte order different from the archive's, or a bad
  * CRC; CDB_E_UNSUPPORTED for another epoch; CDB_E_MALFORMED when reserved
- * bytes 14..15 are not zero. Matching the database ID and the unsealed
+ * bytes 14..15 or 72..75 are not zero. Matching the database ID and the unsealed
  * sequence is left to the caller. j->end is set to just after the header:
  * the caller finds the true end by reading records until one fails. */
 cdb_status cdb_journal_open(cdb_journal *j, const cdb_storage *st, cdb_byte_order order)
@@ -72,11 +80,14 @@ cdb_status cdb_journal_open(cdb_journal *j, const cdb_storage *st, cdb_byte_orde
      * the right byte order. */
     if (memcmp(h, journal_magic, sizeof journal_magic) != 0 || h[8] != (uint8_t)order)
         return CDB_E_CORRUPT;
-    if (cdb_load_u32(h + 60, order) != cdb_crc32c(h, 60))
+    if (cdb_load_u32(h + 76, order) != cdb_crc32c(h, 76))
         return CDB_E_CORRUPT;
     if (h[9] != JOURNAL_EPOCH)
         return CDB_E_UNSUPPORTED;
     for (i = 14; i < 16; i++)
+        if (h[i])
+            return CDB_E_MALFORMED;
+    for (i = 72; i < 76; i++)
         if (h[i])
             return CDB_E_MALFORMED;
     memset(j, 0, sizeof *j);
@@ -88,6 +99,7 @@ cdb_status cdb_journal_open(cdb_journal *j, const cdb_storage *st, cdb_byte_orde
     j->hdr.unsealed_seq = cdb_load_u64(h + 32, order);
     j->hdr.first_seq = cdb_load_u64(h + 40, order);
     j->hdr.domain_id = cdb_load_u64(h + 48, order);
+    memcpy(j->hdr.salt, h + 56, 16);
     j->end = CDB_JOURNAL_HEADER_SIZE;
     j->next_seq = j->hdr.first_seq;
     return CDB_OK;

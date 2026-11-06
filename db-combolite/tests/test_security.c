@@ -50,7 +50,7 @@ static cdb_status kv_apply(void *ctx, cdb_pager *p, const cdb_delta *d)
     memset(&t, 0, sizeof t);
     t.type = CDB_PAGE_TYPE_DATA_TEST;
     t.store_id = d->store_id;
-    t.domain_id = d->store_id;
+    t.domain_id = d->store_id >= 42u ? d->store_id : 0u; /* stores from 42 are enclaves */
     return cdb_pager_write(p, d->entry_id, &t, d->data, d->len);
 }
 
@@ -397,6 +397,310 @@ static void test_commit_identity_signing(void)
 
 /* ------------------------------------------------------------ Main */
 
+/* ------------------------------------------------------------ Session salts (12.1, 14.2.8) */
+
+/* Opens "name" with the master key and makes enclave 42 usable: created
+ * with the file, opened on a later session. */
+static void enc_open(const char *name, const cdb_header *h)
+{
+    cfg.master_key_uri = "env://CDB_TEST_MK";
+    cfg.aead_alg = CDB_AEAD_AES_256_GCM;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open(&db, &env, name, &cfg, h));
+    if (h != NULL)
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_enclave(&db, 42, "env://CDB_TEST_ENC"));
+    else
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&db, 42, "env://CDB_TEST_ENC"));
+}
+
+static cdb_status put_text(uint64_t store, uint64_t entry, const char *text)
+{
+    cdb_status s;
+    if ((s = cdb_tx_begin(&db, CDB_DURABILITY_FULL)) != CDB_OK)
+        return s;
+    if ((s = cdb_tx_put(&db, store, entry, CDB_OP_REPLACE, text, (uint32_t)strlen(text))) != CDB_OK)
+        return s;
+    return cdb_tx_commit(&db);
+}
+
+static void expect_text(uint64_t lid, const char *text)
+{
+    cdb_page_header ph;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db.pager, lid, page, &ph));
+    TEST_ASSERT_EQUAL_UINT32(strlen(text), ph.payload_len);
+    TEST_ASSERT_EQUAL_MEMORY(text, page + cdb_page_payload_offset(db.pager.fmt), strlen(text));
+}
+
+static uint16_t salt_index_of(uint64_t lid)
+{
+    cdb_page_header ph;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_peek(&db.pager, lid, page, &ph, NULL));
+    return ph.salt_index;
+}
+
+/* The salt table as the archive holds it: every encrypted page names an
+ * entry, and every entry's salt is one this test drew. */
+static void check_salts(void)
+{
+    int done = 0;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_scrub(&db, UINT64_MAX, &done));
+    TEST_ASSERT_EQUAL_INT(1, done);
+}
+
+/* Each session that opens with a master key draws its own salt, which its
+ * journal header carries; an archive page names its session's salt by its
+ * index in the salt table, which later sessions load (spec 12.1, 14.2.8). */
+static void test_session_salts(void)
+{
+    cdb_header h = settings();
+    uint8_t first[16], zero[16];
+
+    memset(zero, 0, sizeof zero);
+    enc_open("salts", &h);
+    TEST_ASSERT_TRUE(db.has_salt);
+    TEST_ASSERT_TRUE(memcmp(db.session_salt, zero, 16) != 0);
+    TEST_ASSERT_EQUAL_MEMORY(db.session_salt, db.journal.hdr.salt, 16);
+    memcpy(first, db.session_salt, 16);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put_text(42, 1, "first"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put_text(STORE, 3, "public"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db));
+    TEST_ASSERT_EQUAL_UINT(1, db.salt_count);
+    TEST_ASSERT_EQUAL_UINT16(1, db.salts[0].index);
+    TEST_ASSERT_EQUAL_MEMORY(first, db.salts[0].salt, 16);
+    TEST_ASSERT_EQUAL_UINT64(db.pager.hs.record.committed_seq, db.salts[0].last_commit);
+    TEST_ASSERT_EQUAL_UINT16(1, salt_index_of(1));
+    TEST_ASSERT_EQUAL_UINT16(0, salt_index_of(3)); /* a public page names none */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+
+    enc_open("salts", NULL);
+    TEST_ASSERT_TRUE(memcmp(first, db.session_salt, 16) != 0);
+    TEST_ASSERT_EQUAL_MEMORY(db.session_salt, db.journal.hdr.salt, 16);
+    TEST_ASSERT_EQUAL_UINT(1, db.salt_count);
+    expect_text(1, "first"); /* under the first session's salt */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put_text(42, 2, "second"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db));
+    TEST_ASSERT_EQUAL_UINT(2, db.salt_count);
+    TEST_ASSERT_EQUAL_UINT16(2, salt_index_of(2));
+    TEST_ASSERT_EQUAL_UINT16(1, salt_index_of(1));
+    check_salts();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+
+    enc_open("salts", NULL);
+    expect_text(1, "first");
+    expect_text(2, "second");
+    expect_text(3, "public");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+/* Without a random source, a database with a master key can't draw a salt,
+ * so it can't be written (read-only sessions don't exist yet); without a
+ * master key it needs none. Encryption needs a master key. */
+static void test_salt_needs_entropy_and_master_key(void)
+{
+    cdb_header h = settings();
+    cdb_env_ops ops = *env.ops;
+    cdb_env plain = env;
+
+    ops.random = NULL;
+    plain.ops = &ops;
+    cfg.master_key_uri = "env://CDB_TEST_MK";
+    TEST_ASSERT_EQUAL_INT(CDB_E_READ_ONLY, cdb_db_open(&db, &plain, "noentropy", &cfg, &h));
+
+    cfg.master_key_uri = NULL;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open(&db, &plain, "noentropy", &cfg, &h));
+    TEST_ASSERT_FALSE(db.has_salt);
+    TEST_ASSERT_EQUAL_INT(CDB_E_SECURITY, cdb_db_create_enclave(&db, 42, "env://CDB_TEST_ENC"));
+    TEST_ASSERT_EQUAL_INT(CDB_E_SECURITY, cdb_db_open_enclave(&db, 42, "env://CDB_TEST_ENC"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+/* A scrub pass finds which salts pages use; a salt no page used, last used
+ * before the pass began, leaves the table at the next archive commit, and
+ * its index is reused (spec 14.2.8). */
+static void test_scrub_prunes_salts(void)
+{
+    cdb_header h = settings();
+    int done = 0;
+    uint64_t pass_start;
+
+    enc_open("prune", &h);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put_text(42, 1, "s1"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    enc_open("prune", NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put_text(42, 2, "s2"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+
+    enc_open("prune", NULL);
+    TEST_ASSERT_EQUAL_UINT(2, db.salt_count);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put_text(42, 1, "s3 one"));
+    /* Not reconciled yet: page 1's new version hides its committed one,
+     * still under salt 1, so a pass now marks nothing. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_scrub(&db, UINT64_MAX, &done));
+    TEST_ASSERT_EQUAL_INT(1, done);
+    TEST_ASSERT_EQUAL_UINT64(0, db.salts[0].prune_before);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db));
+    TEST_ASSERT_EQUAL_UINT(3, db.salt_count);
+
+    /* A pass a page at a time: salt 2 is still in use. */
+    pass_start = db.pager.hs.record.committed_seq;
+    do
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_scrub(&db, 1, &done));
+    while (!done);
+    TEST_ASSERT_EQUAL_UINT64(pass_start, db.salts[0].prune_before);
+    TEST_ASSERT_EQUAL_UINT64(0, db.salts[1].prune_before);
+    TEST_ASSERT_EQUAL_UINT64(0, db.salts[2].prune_before); /* this session's */
+    TEST_ASSERT_EQUAL_UINT(3, db.salt_count); /* not before a commit */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put_text(STORE, 3, "public"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db));
+    TEST_ASSERT_EQUAL_UINT(2, db.salt_count);
+    TEST_ASSERT_EQUAL_UINT16(2, db.salts[0].index);
+    TEST_ASSERT_EQUAL_UINT16(3, db.salts[1].index);
+
+    /* Rewriting salt 2's page makes it a candidate on the next pass; a page
+     * written under it after the pass began would have saved it. */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put_text(42, 2, "s3 two"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db));
+    check_salts();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db)); /* the close's commit prunes */
+
+    enc_open("prune", NULL);
+    TEST_ASSERT_EQUAL_UINT(1, db.salt_count);
+    TEST_ASSERT_EQUAL_UINT16(3, db.salts[0].index);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put_text(42, 4, "s4"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&db));
+    TEST_ASSERT_EQUAL_UINT16(1, salt_index_of(4)); /* the lowest free index */
+    expect_text(1, "s3 one");
+    expect_text(2, "s3 two");
+    check_salts();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+/* Run before the crash clock is armed. Session 1 writes public entries
+ * 1..30 and encrypted 31..50; session 2 rewrites the encrypted ones and
+ * deletes the public ones, so session 1's salt is unused and the low pages
+ * are free for compaction. */
+static void salt_sweep_setup(void)
+{
+    cdb_header h = settings();
+    char v[16];
+    unsigned i;
+
+    enc_open("sweep", &h);
+    for (i = 1; i <= 50; i++) {
+        snprintf(v, sizeof v, "a%u", i);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, put_text(i <= 30 ? STORE : 42, i, v));
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    enc_open("sweep", NULL);
+    for (i = 31; i <= 50; i++) {
+        snprintf(v, sizeof v, "b%u", i);
+        TEST_ASSERT_EQUAL_INT(CDB_OK, put_text(42, i, v));
+    }
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db, CDB_DURABILITY_FULL));
+    for (i = 1; i <= 30; i++)
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&db, STORE, i, CDB_OP_DELETE, NULL, 0));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+/* The swept work. Session 3 finds salt 1 unused, prunes it in a commit, then
+ * compaction re-encrypts moved pages under its own salt, adding it to the
+ * table in the commit that writes them. Its journal holds only public
+ * records, so recovery needs no enclave key. */
+static cdb_status salt_sweep_work(uint64_t *moved)
+{
+    uint64_t reclaimed;
+    int done = 0;
+    cdb_status s;
+
+    cfg.master_key_uri = "env://CDB_TEST_MK";
+    cfg.aead_alg = CDB_AEAD_AES_256_GCM;
+    if ((s = cdb_db_open(&db, &env, "sweep", &cfg, NULL)) != CDB_OK
+        || (s = cdb_db_open_enclave(&db, 42, "env://CDB_TEST_ENC")) != CDB_OK
+        || (s = cdb_db_scrub(&db, UINT64_MAX, &done)) != CDB_OK
+        || (s = put_text(STORE, 70, "pruned")) != CDB_OK
+        || (s = cdb_db_reconcile(&db)) != CDB_OK
+        || (s = cdb_db_compact(&db, UINT64_MAX, moved, &reclaimed)) != CDB_OK)
+        return s;
+    return cdb_db_close(&db);
+}
+
+/* Whatever the crash left: every encrypted page decrypts under a salt the
+ * table holds, the data is session 2's, and the database still works. */
+static void salt_sweep_check(void)
+{
+    cdb_page_header ph;
+    cdb_status s;
+    char v[16];
+    unsigned i;
+
+    enc_open("sweep", NULL);
+    check_salts();
+    for (i = 31; i <= 50; i++) {
+        snprintf(v, sizeof v, "b%u", i);
+        expect_text(i, v);
+    }
+    s = cdb_pager_read(&db.pager, 70, page, &ph);
+    TEST_ASSERT_TRUE(s == CDB_E_NOT_FOUND || s == CDB_OK);
+    if (s == CDB_OK)
+        expect_text(70, "pruned");
+    TEST_ASSERT_EQUAL_INT(CDB_E_NOT_FOUND, cdb_pager_read(&db.pager, 1, page, &ph));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, put_text(42, 60, "later"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    enc_open("sweep", NULL);
+    expect_text(60, "later");
+    check_salts();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+}
+
+/* Crash sweep over the salt table's write sequences (spec 14.2.8): the
+ * prune commit and the commits that add a salt. */
+static void test_salt_crash_sweep(void)
+{
+    const cdb_crash_mode modes[4] = { CDB_CRASH_DROP_UNSYNCED, CDB_CRASH_KEEP_PREFIX, CDB_CRASH_TORN,
+                                      CDB_CRASH_REORDER };
+    const size_t tears[3] = { 0, 30, 300 };
+    uint64_t total, op, base, moved = 0;
+    unsigned runs = 0;
+    int m;
+
+    salt_sweep_setup();
+    base = fe.clock.ops;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, salt_sweep_work(&moved));
+    total = fe.clock.ops - base;
+    TEST_ASSERT_TRUE(moved > 0);
+    {
+        char msg[64];
+        snprintf(msg, sizeof msg, "crash points swept: %u", (unsigned)total);
+        TEST_MESSAGE(msg);
+    }
+    cdb_faultenv_reboot(&fe);
+    enc_open("sweep", NULL);
+    /* Session 1's salt was pruned and its index went to session 3's, which
+     * compaction wrote pages under after session 2's. */
+    TEST_ASSERT_EQUAL_UINT(2, db.salt_count);
+    TEST_ASSERT_EQUAL_UINT16(1, db.salts[0].index);
+    TEST_ASSERT_EQUAL_UINT16(2, db.salts[1].index);
+    TEST_ASSERT_TRUE(db.salts[0].last_commit > db.salts[1].last_commit);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db));
+    salt_sweep_check();
+
+    for (op = 1; op <= total; op++) {
+        for (m = 0; m < 4; m++) {
+            size_t t, nt = modes[m] == CDB_CRASH_TORN ? 3 : 1;
+            for (t = 0; t < nt; t++) {
+                init_env();
+                salt_sweep_setup();
+                cdb_faultenv_arm(&fe, op, modes[m], modes[m] == CDB_CRASH_KEEP_PREFIX ? 1 : 0, tears[t]);
+                TEST_ASSERT_NOT_EQUAL_INT(CDB_OK, salt_sweep_work(&moved));
+                cdb_faultenv_reboot(&fe);
+                salt_sweep_check();
+                runs++;
+            }
+        }
+    }
+    TEST_ASSERT_EQUAL_UINT((unsigned)(total * 6u), runs);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -409,5 +713,9 @@ int main(void)
     RUN_TEST(test_rotation_timer_policies);
     RUN_TEST(test_rbac_authorization);
     RUN_TEST(test_commit_identity_signing);
+    RUN_TEST(test_session_salts);
+    RUN_TEST(test_salt_needs_entropy_and_master_key);
+    RUN_TEST(test_scrub_prunes_salts);
+    RUN_TEST(test_salt_crash_sweep);
     return UNITY_END();
 }
