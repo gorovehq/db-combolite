@@ -612,8 +612,9 @@ A domain's held log keeps the committed changes of that domain that a process co
 
 ### 14.5.1 Placement
 
-- **Host files:** each coordinator slot is the file `coord/<slot>`, the slot number in decimal.
-- **Lobby files (5.9.5):** `coord/join.<session>`, the session identity as 32 lowercase hex digits. One 512-byte half in the layout below: request kind 4, the wanted slot at offset 10 and the wanted priority at offset 14. Times are µs of the primary's clock, as in the slot.
+- **Host files:** each coordinator slot is the file `coord/<slot>`, the slot number in decimal. With the lock hook (5.8), its owner holds an exclusive lock on the whole file for its session.
+- **Working-directory lock (5.9.5):** `coord/lock`, an empty file whose content is never read; joiners lock it shared, and a process removing the working directory locks it exclusively.
+- **Lobby files (5.9.5, fallback only):** `coord/join.<session>`, the session identity as 32 lowercase hex digits. One 512-byte half in the layout below: request kind 4, the wanted slot at offset 10 and the wanted priority at offset 14. Times are µs of the primary's clock, as in the slot.
 - **Raw flash:** each slot is a region.
 - **Two halves.** Every slot has two 512-byte halves, A and B. Writes alternate between them. The valid half with the higher heartbeat counter wins. A torn heartbeat write therefore never makes a live coordinator look dead.
 - **Maximum number of coordinators.** It can be configured. The default comes from the device-class table (Section 2.8): about 1–2 on microcontrollers and 64 on desktop and server hosts. On raw flash, the coordinator region is sized for this maximum.
@@ -624,10 +625,10 @@ A domain's held log keeps the committed changes of that domain that a process co
 |---|---|---|
 | 0 | 8 | Magic: `89 43 44 42 43 52 44 0A` (`\x89CDBCRD\n`) |
 | 8 | 1 | Byte-order flag |
-| 9 | 1 | Epoch |
+| 9 | 1 | Epoch: 2 (lock liveness and status, 5.8); a reader that finds another epoch reports `CDB_E_UNSUPPORTED` |
 | 10 | 2 | Slot number |
 | 12 | 1 | Role: 0 = free · 1 = subordinate · 2 = primary |
-| 13 | 1 | State flags: bit 0 alive · bit 1 unfinished baton session pending · bit 2 journal in use (14.4.7) |
+| 13 | 1 | State flags: bit 0 alive · bit 1 unfinished baton session pending · bit 2 journal in use (14.4.7) · bit 3 lock liveness: judge this slot by its lock (5.8) · bit 4 closed, journal pending (5.9.1) |
 | 14 | 2 | Priority value (Section 5.5) |
 | 16 | 16 | Database ID |
 | 32 | 16 | Session identity: a random 128-bit value (Section 5.1) |
@@ -636,10 +637,10 @@ A domain's held log keeps the committed changes of that domain that a process co
 | 64 | 8 | Heartbeat timestamp, from the primary's clock (µs) |
 | 72 | 8 | Delta-sequence high-water mark (Section 12.1) |
 | 80 | 8 | Transaction-counter high-water mark (14.4.3) |
-| 88 | 1 | Current request kind: 0 = none · 1 = baton · 2 = claim primary · 3 = priority value · 4 = join, only in a lobby file (5.9.5) · 5 = entry-ID block (5.9.3) |
-| 89 | 1 | Reserved, zero |
+| 88 | 1 | Current request kind: 0 = none · 1 = baton · 2 = claim primary · 3 = priority value · 4 = join, only in a lobby file (5.9.5) · 5 = entry-ID block (5.9.3) · 6 = reconciliation (5.9.8) |
+| 89 | 1 | Status operation (5.8): 0 idle · 1 transaction commit · 2 reconciliation · 3 compaction · 4 graph refresh · 5 recovery · 6 rebase · 255 other |
 | 90 | 2 | Heat ID: which baton is meant when several heats exist (Section 5.3) |
-| 92 | 4 | Reserved, zero |
+| 92 | 4 | Status estimate: milliseconds the operation still expects to take; `0xFFFFFFFF` unknown |
 | 96 | 8 | Request timestamp |
 | 104 | 8 | *x-total*: the declared size of the work |
 | 112 | 8 | ID (CTS) of the baton held, or of the last baton held |
@@ -650,7 +651,8 @@ A domain's held log keeps the committed changes of that domain that a process co
 | 152 | 1 | Number of held entry-ID blocks, at most 21 (5.9.3) |
 | 153 | 7 | Reserved, zero |
 | 160 | 336 | Held entry-ID blocks (5.9.3): 21 × 16 bytes: store ID (8), first ID of the 1024-ID block (8) |
-| 496 | 12 | Reserved, zero |
+| 496 | 8 | Status start: when the operation began, from the primary's clock (µs); 0 when idle |
+| 504 | 4 | Reserved, zero |
 | 508 | 4 | CRC32C over bytes 0–507 |
 
 ### 14.5.3 How the primary's clock is shared
