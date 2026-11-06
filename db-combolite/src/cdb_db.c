@@ -1350,6 +1350,10 @@ static cdb_status rebase_pages(cdb_db *db)
         return s;
 
     if (db->last_tx <= db->my_mark) {
+        /* Everything this process committed is in the archive: a
+         * reconciliation request is met (spec 5.9.8). */
+        if ((s = cdb_coord_request_reconcile(&db->coord, 0)) != CDB_OK)
+            return s;
         if (db->journal_st.ops != NULL)
             return rotate_journal(db);
         /* A journal adopted with a dead or closed slot, fully merged: an
@@ -2944,6 +2948,27 @@ cdb_status cdb_db_reconcile(cdb_db *db)
     db_lock(db);
     s = reconcile_hold(db, 0);
     if (s == CDB_OK)
+        s = finish_baton(db);
+    db_unlock(db);
+    return s;
+}
+
+cdb_status cdb_db_reconcile_request(cdb_db *db)
+{
+    int granted = 0;
+    cdb_status s;
+    db_lock(db);
+    s = usable(db);
+    if (s == CDB_OK && db->in_tx)
+        s = CDB_E_STATE;
+    if (s == CDB_OK && db->unsynced > 0 && (s = cdb_storage_sync(&db->journal_st)) == CDB_OK)
+        db->unsynced = 0;
+    if (s == CDB_OK && !cdb_coord_baton_held(&db->coord)) {
+        s = cdb_coord_baton_try(&db->coord, 0, &granted);
+        if (s == CDB_OK && !granted && (s = cdb_coord_baton_release(&db->coord)) == CDB_OK)
+            s = cdb_coord_request_reconcile(&db->coord, 1); /* the holder will */
+    }
+    if (s == CDB_OK && cdb_coord_baton_held(&db->coord) && (s = reconcile_hold(db, 0)) == CDB_OK)
         s = finish_baton(db);
     db_unlock(db);
     return s;

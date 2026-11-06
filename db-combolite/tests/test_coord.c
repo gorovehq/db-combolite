@@ -2316,6 +2316,52 @@ static void test_closed_slot_adopted(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
 }
 
+/* A reconciliation request returns at once; the baton holder meets it at
+ * its next tick, merging the requester's journal, and the requester
+ * withdraws it once it sees its changes in the archive. With nobody holding
+ * the baton, the requester reconciles itself (spec 5.9.8). */
+static void test_reconcile_request(void)
+{
+    int64_t t0;
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_TRUE(cdb_coord_baton_held(&p1.db.coord));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+
+    cdb_faultenv_on_sleep(&fe, NULL, NULL); /* p1 answers only when it ticks */
+    t0 = fe.mono_ns;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile_request(&p2.db));
+    TEST_ASSERT_TRUE(fe.mono_ns - t0 < SEC);
+    TEST_ASSERT_EQUAL_UINT(CDB_COORD_REQ_RECONCILE, p2.db.coord.me.req_kind);
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 2));
+
+    cdb_faultenv_advance(&fe, SEC);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    cdb_faultenv_advance(&fe, SEC);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p2.db));
+    TEST_ASSERT_EQUAL_UINT(CDB_COORD_REQ_NONE, p2.db.coord.me.req_kind);
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p2, 2));
+
+    /* Nobody holds the baton now: the request reconciles at once. */
+    TEST_ASSERT_FALSE(cdb_coord_baton_held(&p1.db.coord));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 3, CDB_OP_PATCH, "c", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile_request(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("c", value_of(&p1, 3));
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+}
+
 /* With the lock hook, an application idle past the dead timeout keeps its
  * slot: a newcomer takes another, and the idle one goes on (spec 5.9.6). */
 static void test_idle_process_keeps_slot(void)
@@ -2518,6 +2564,7 @@ int main(void)
     RUN_TEST(test_table_multi_process_e2e);
     RUN_TEST(test_close_leaves_journal_pending);
     RUN_TEST(test_closed_slot_adopted);
+    RUN_TEST(test_reconcile_request);
     RUN_TEST(test_idle_process_keeps_slot);
     RUN_TEST(test_idle_process_loses_slot);
     RUN_TEST(test_stalled_process_keeps_its_journal);

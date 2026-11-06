@@ -618,6 +618,13 @@ cdb_status cdb_db_read_record(cdb_db *db, uint64_t off, cdb_record *r, uint64_t 
  * CDB_E_BUSY when the wait passes its cap. */
 cdb_status cdb_db_reconcile(cdb_db *db);
 
+/* Asks for this process's committed changes to reach the archive without
+ * waiting for the baton (spec 5.9.8): makes the journal durable and records
+ * a reconciliation request, which the baton holder meets at its next
+ * reconciliation, merging every slot's journal. When nobody holds the baton
+ * and one attempt gets it, reconciles here and now. Returns at once. */
+cdb_status cdb_db_reconcile_request(cdb_db *db);
+
 /* The environment's clock, in nanoseconds since the Unix epoch. *have is 0
  * (and *ns 0) when the environment has none. Commit records carry it. */
 cdb_status cdb_db_now(cdb_db *db, int64_t *ns, int *have);

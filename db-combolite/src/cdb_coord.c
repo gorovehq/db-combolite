@@ -1044,9 +1044,28 @@ int cdb_coord_baton_wanted(const cdb_coord *c)
 {
     unsigned i;
     for (i = 0; i < c->cfg.max_coords; i++)
-        if (c->peers[i].live && c->peers[i].b.req_kind == CDB_COORD_REQ_BATON && c->peers[i].b.issued == 0)
+        if (c->peers[i].live && c->peers[i].b.issued == 0
+            && (c->peers[i].b.req_kind == CDB_COORD_REQ_BATON || c->peers[i].b.req_kind == CDB_COORD_REQ_RECONCILE))
             return 1;
     return 0;
+}
+
+cdb_status cdb_coord_request_reconcile(cdb_coord *c, int on)
+{
+    if (!c->joined)
+        return CDB_E_STATE;
+    if (on) {
+        if (c->me.issued != 0 || c->me.req_kind == CDB_COORD_REQ_BATON || c->me.req_kind == CDB_COORD_REQ_RECONCILE)
+            return CDB_OK;
+        c->me.req_kind = CDB_COORD_REQ_RECONCILE;
+        c->me.req_time = clock_us(c);
+    } else {
+        if (c->me.req_kind != CDB_COORD_REQ_RECONCILE)
+            return CDB_OK;
+        c->me.req_kind = CDB_COORD_REQ_NONE;
+        c->me.req_time = 0;
+    }
+    return write_half(c);
 }
 
 cdb_status cdb_coord_baton_fence(cdb_coord *c)

@@ -856,6 +856,8 @@ class ComboliteLib:
 
         c.cdb_db_reconcile.argtypes = [POINTER(cdb_db)]
         c.cdb_db_reconcile.restype = c_int
+        c.cdb_db_reconcile_request.argtypes = [POINTER(cdb_db)]  # spec 5.9.8
+        c.cdb_db_reconcile_request.restype = c_int
 
         c.cdb_db_compact.argtypes = [POINTER(cdb_db), c_uint64, POINTER(c_uint64), POINTER(c_uint64)]
         c.cdb_db_compact.restype = c_int

@@ -245,9 +245,15 @@ cdb_status cdb_coord_baton_release(cdb_coord *c);
 /* Nonzero while this coordinator holds the baton. */
 int cdb_coord_baton_held(const cdb_coord *c);
 
-/* Nonzero if another live coordinator was requesting the baton at the last
- * scan. */
+/* Nonzero if another live coordinator was requesting the baton, or a
+ * reconciliation, at the last scan. */
 int cdb_coord_baton_wanted(const cdb_coord *c);
+
+/* Records (on) or withdraws a reconciliation request in this slot (spec
+ * 5.9.8): the baton holder reconciles at its next chance, merging every
+ * slot's journal. A baton request or a held baton already covers it, and is
+ * left as it is. */
+cdb_status cdb_coord_request_reconcile(cdb_coord *c, int on);
 
 /* Before an archive commit: scans, and CDB_E_BUSY if this coordinator no
  * longer holds the highest CTS (spec 5.9.8, fencing). */
