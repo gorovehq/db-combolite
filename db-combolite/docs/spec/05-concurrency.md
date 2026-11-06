@@ -82,7 +82,7 @@ These are defined in Section 11.3. In brief:
 
 ## 5.7 Single-writer coordinator slots
 
-- Every coordinator owns one **slot**. No process other than the owner ever writes to it.
+- Every coordinator owns one **slot**. No process other than the owner ever writes to it. With lock liveness (5.8), taking a slot's lock is the only way to become its owner (5.9.5).
 - A coordinator writes its requests (5.5) and its heartbeats (5.8) to its own slot.
 - Its **delta tracks** follow the same rule: each process owns its own tracks and is their only writer (Section 1.3). At reconciliation, the baton holder merges every process's tracks in commit order, using commit timestamps from the primary's clock.
 - The primary reads every slot and puts the requests in order. Subordinates read the slots when they need to detect that the primary has failed, or to elect a new primary.
@@ -146,8 +146,14 @@ This implements the default policy of 11.3, where the later write is rejected. C
 
 ### 5.9.5 Joining and slot ownership
 
-- **Lobby.** A new coordinator first writes a join request to a lobby file, `coord/join.<session identity>`. Session identities are random, so no two processes ever write the same lobby file. The request names the slot it wants: the lowest free one, or the lowest one whose coordinator is dead. The join then follows append → settle → choose, and a loser tries the next slot. The winner writes its slot file and removes its lobby file.
+Status of the lock-mode rules below: **confirmed by the project owner on 2026-11-05** (with 5.8).
+
+- **Taking a slot is taking its lock.** With the lock hook (5.8), a joining coordinator tries the slots from the lowest, creating a slot's file when it does not exist yet. The first slot whose lock it gets is its own; the operating system settles any race between joiners, so there is no lobby and no append → settle → choose round.
+- **Lobby (fallback).** Without the lock hook, a new coordinator first writes a join request to a lobby file, `coord/join.<session identity>`. Session identities are random, so no two processes ever write the same lobby file. The request names the slot it wants: the lowest free one, or the lowest one whose coordinator is dead. The join then follows append → settle → choose, and a loser tries the next slot. The winner writes its slot file and removes its lobby file.
+- **Taking over a dead slot is adopting it.** A slot whose file exists but whose lock is free (in the fallback: whose heartbeat is past the dead timeout) is dead. The coordinator that takes it keeps its journal, its held ID blocks and its counters, and continues from them (5.9.1, 5.9.2).
 - **Single writer.** No process ever writes another process's slot file, even a dead one's. A dead slot keeps its contents, including its held blocks and its journal, until a new owner takes it over.
+- **Nobody removes another slot's files.** The baton holder may merge a dead slot's journal, since the slot's mark in the archive records how far it got (5.9.2), but it never removes that journal, its overlay or its slot file. Only a slot's owner removes them: the coordinator that wrote them, or the one that adopted the slot.
+- **Removing the working directory.** Joiners hold a shared lock on `coord/lock` while they create the working directory and claim a slot. A closing process removes the working directory only when it gets that lock exclusively and every slot's lock, none of them waiting; when any of them is held, a process is joining or alive, and the directory stays. In the fallback, the directory is removed only by a process that is alone by the heartbeat rules, as before.
 - **Journal in use.** A slot records whether its journal is in use (14.5.2, state flags). A slot that says its journal is in use, but whose journal is missing, means possible loss, as in 1.12.5.
 
 ### 5.9.6 Liveness and concurrency (spec 5.9.6, M20)
