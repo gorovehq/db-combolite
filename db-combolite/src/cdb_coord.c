@@ -157,6 +157,9 @@ static void brief_of(const cdb_coord_rec *r, cdb_coord_brief *b)
     b->issued = r->issued;
     b->x = r->x;
     b->x_total = r->x_total;
+    b->beat_time = r->beat_time;
+    b->status_op = r->status_op;
+    b->estimate_ms = r->estimate_ms;
 }
 
 /* -------------------------------------------------------- clocks */
@@ -205,10 +208,30 @@ static int wall_stale(cdb_coord *c, uint64_t beat_time_us)
            && now_us - beat_time_us > (uint64_t)(dead_ns(c) / 1000) * (uint64_t)WALL_STALE_FACTOR;
 }
 
+/* The lock shared with the responder (cdb_coord.h). Public calls take it
+ * once and call each other only through their static bodies, so it is held
+ * exactly once wherever pause_for runs. */
+static void mx_lock(cdb_coord *c)
+{
+    if (c->mx != NULL)
+        (void)c->env.ops->mutex_lock(c->env.ctx, c->mx);
+}
+
+static void mx_unlock(cdb_coord *c)
+{
+    if (c->mx != NULL)
+        (void)c->env.ops->mutex_unlock(c->env.ctx, c->mx);
+}
+
+/* Sleeps without the shared lock, so a wait (for the baton, a settle) never
+ * holds the responder up. */
 static void pause_for(cdb_coord *c, int64_t ns)
 {
-    if (c->env.ops->sleep != NULL)
+    if (c->env.ops->sleep != NULL) {
+        mx_unlock(c);
         c->env.ops->sleep(c->env.ctx, ns);
+        mx_lock(c);
+    }
 }
 
 /* -------------------------------------------------------- files */
@@ -244,6 +267,23 @@ static cdb_status read_file(cdb_coord *c, const char *path, unsigned halves, cdb
     return CDB_OK;
 }
 
+/* The status estimate (spec 5.8, offset 92): how long the current operation
+ * still expects to take, in ms, as of now. Only the baton's progress gives
+ * a basis: the time so far, scaled by the work left over the work done.
+ * Anything else busy is unknown; idle is 0. */
+static uint32_t estimate_of(const cdb_coord_rec *me, uint64_t now_us)
+{
+    double ms;
+    if (me->status_op == CDB_COORD_OP_IDLE)
+        return 0;
+    if (me->issued == 0 || me->x == 0 || me->x_total < me->x || me->status_start == 0 || now_us < me->status_start)
+        return CDB_COORD_ESTIMATE_UNKNOWN;
+    ms = (double)(now_us - me->status_start) * (double)(me->x_total - me->x) / (double)me->x / 1000.0;
+    if (ms >= (double)(CDB_COORD_ESTIMATE_UNKNOWN - 1u))
+        return CDB_COORD_ESTIMATE_UNKNOWN - 1u;
+    return (uint32_t)ms;
+}
+
 /* Writes this coordinator's record to the next half. Every write counts as
  * a heartbeat, so the counter always rises and the newest half wins. */
 static cdb_status write_half(cdb_coord *c)
@@ -254,10 +294,12 @@ static cdb_status write_half(cdb_coord *c)
     c->me.beat_time = clock_us(c);
     if (c->me.role == CDB_COORD_PRIMARY)
         c->me.clock = c->me.beat_time;
+    c->me.estimate_ms = estimate_of(&c->me, c->me.beat_time);
     cdb_coord_encode(&c->me, c->order, h);
     if ((s = cdb_storage_program(&c->st, (uint64_t)c->next_half * CDB_COORD_HALF, h, sizeof h)) != CDB_OK)
         return s;
     c->next_half ^= 1u;
+    c->wrote_at = mono_now(c);
     return CDB_OK;
 }
 
@@ -830,28 +872,40 @@ cdb_status cdb_coord_join_with(cdb_coord *c, const cdb_env *env, const char *dir
     return CDB_E_BUSY;
 }
 
-cdb_status cdb_coord_beat(cdb_coord *c, int force)
+/* Silent past the dead timeout (counting the responder's writes too): in the
+ * fallback, another coordinator may have taken this slot over (spec 5.9.6),
+ * and then nothing more may be written. Its lock keeps it otherwise. */
+static cdb_status check_still_mine(cdb_coord *c, int64_t now)
+{
+    cdb_coord_rec r;
+    int valid;
+    cdb_status s;
+    if (c->use_locks || now - c->wrote_at < dead_ns(c))
+        return CDB_OK;
+    if ((s = read_file(c, c->path, 2, &r, &valid)) != CDB_OK)
+        return s;
+    if (!valid || memcmp(r.session, c->me.session, 16) != 0) {
+        cdb_storage_close(&c->st);
+        c->joined = 0;
+        c->lost = 1;
+        return CDB_E_BUSY;
+    }
+    return CDB_OK;
+}
+
+static cdb_status beat_body(cdb_coord *c, int force)
 {
     int64_t now = mono_now(c);
     cdb_status s;
 
+    if (c->lost)
+        return CDB_E_BUSY;
     if (!c->joined)
         return CDB_E_STATE;
     if (!force && c->have_mono && now - c->last_beat < c->cfg.beat_ns)
         return CDB_OK;
-    /* Silent past the dead timeout: in the fallback, another coordinator may
-     * have taken this slot over (spec 5.9.6). Its lock keeps it otherwise. */
-    if (!c->use_locks && now - c->last_beat >= dead_ns(c)) {
-        cdb_coord_rec r;
-        int valid;
-        if ((s = read_file(c, c->path, 2, &r, &valid)) != CDB_OK)
-            return s;
-        if (!valid || memcmp(r.session, c->me.session, 16) != 0) {
-            cdb_storage_close(&c->st);
-            c->joined = 0;
-            return CDB_E_BUSY;
-        }
-    }
+    if ((s = check_still_mine(c, now)) != CDB_OK)
+        return s;
     if ((s = write_half(c)) != CDB_OK)
         return s;
     c->last_beat = now;
@@ -869,17 +923,108 @@ cdb_status cdb_coord_beat(cdb_coord *c, int force)
     return CDB_OK;
 }
 
-cdb_status cdb_coord_reserve_tx(cdb_coord *c, uint64_t hwm)
+cdb_status cdb_coord_beat(cdb_coord *c, int force)
 {
     cdb_status s;
+    mx_lock(c);
+    s = beat_body(c, force);
+    mx_unlock(c);
+    return s;
+}
+
+/* Whether another live coordinator asks for the baton or a reconciliation,
+ * read from the slot files now, into nothing the engine reads. A slot with
+ * lock liveness answers by its lock; any other by what the engine's last
+ * scan knew of it. */
+static cdb_status others_want(cdb_coord *c, int *want)
+{
+    char path[CDB_COORD_PATH];
+    cdb_coord_rec r;
+    unsigned s;
+    int valid, held;
+    cdb_status st;
+
+    *want = 0;
+    for (s = 0; s < c->cfg.max_coords && !*want; s++) {
+        if (s == c->me.slot)
+            continue;
+        slot_path(c, s, path);
+        if ((st = read_file(c, path, 2, &r, &valid)) != CDB_OK)
+            return st;
+        if (!valid || !(r.flags & CDB_COORD_ALIVE) || r.issued != 0 || memcmp(r.session, c->me.session, 16) == 0
+            || (r.req_kind != CDB_COORD_REQ_BATON && r.req_kind != CDB_COORD_REQ_RECONCILE))
+            continue;
+        if (c->use_locks && (r.flags & CDB_COORD_LOCKED)) {
+            if ((st = lock_held(c, s, path, &held)) != CDB_OK)
+                return st;
+            *want = held;
+        } else {
+            *want = c->peers[s].live;
+        }
+    }
+    return CDB_OK;
+}
+
+cdb_status cdb_coord_respond(cdb_coord *c, int *handover)
+{
+    cdb_status s = CDB_OK;
+    if (handover != NULL)
+        *handover = 0;
+    mx_lock(c);
+    if (c->joined && !c->lost) {
+        if ((s = check_still_mine(c, mono_now(c))) == CDB_OK)
+            s = write_half(c);
+        if (s == CDB_OK && handover != NULL && c->me.issued != 0)
+            s = others_want(c, handover);
+    }
+    mx_unlock(c);
+    return s;
+}
+
+void cdb_coord_status_begin(cdb_coord *c, uint8_t op, cdb_coord_status_save *save)
+{
+    save->op = c->me.status_op;
+    save->start = c->me.status_start;
+    if (c->env.ops == NULL)
+        return; /* never joined */
+    mx_lock(c);
+    if (op != c->me.status_op) {
+        c->me.status_op = op;
+        c->me.status_start = clock_us(c);
+        if (c->me.status_start == 0)
+            c->me.status_start = 1; /* no clock: still nonzero */
+    }
+    mx_unlock(c);
+}
+
+void cdb_coord_status_end(cdb_coord *c, const cdb_coord_status_save *save)
+{
+    mx_lock(c);
+    c->me.status_op = save->op;
+    c->me.status_start = save->op == CDB_COORD_OP_IDLE ? 0u : save->start;
+    mx_unlock(c);
+}
+
+void cdb_coord_forget_blocks(cdb_coord *c)
+{
+    mx_lock(c);
+    c->me.nblocks = 0;
+    mx_unlock(c);
+}
+
+cdb_status cdb_coord_reserve_tx(cdb_coord *c, uint64_t hwm)
+{
+    cdb_status s = CDB_OK;
+    mx_lock(c);
     if (!c->joined)
-        return CDB_E_STATE;
-    if (hwm <= c->me.tx_hwm)
-        return CDB_OK;
-    c->me.tx_hwm = hwm;
-    if ((s = write_half(c)) != CDB_OK)
-        return s;
-    return cdb_storage_sync(&c->st);
+        s = CDB_E_STATE;
+    else if (hwm > c->me.tx_hwm) {
+        c->me.tx_hwm = hwm;
+        if ((s = write_half(c)) == CDB_OK)
+            s = cdb_storage_sync(&c->st);
+    }
+    mx_unlock(c);
+    return s;
 }
 
 /* -------------------------------------------------------- baton */
@@ -925,7 +1070,7 @@ static cdb_status withdraw(cdb_coord *c)
  * a holder that is still alive but timed out waits one heartbeat interval
  * more, so that holder's guard sees the new CTS before anything is written
  * (cdb_coord_guard). */
-cdb_status cdb_coord_baton_try(cdb_coord *c, uint64_t x_total, int *granted)
+static cdb_status baton_try_body(cdb_coord *c, uint64_t x_total, int *granted)
 {
     cdb_coord_brief mine;
     uint64_t old_cts;
@@ -994,15 +1139,42 @@ cdb_status cdb_coord_baton_try(cdb_coord *c, uint64_t x_total, int *granted)
     return CDB_OK;
 }
 
-cdb_status cdb_coord_baton_take(cdb_coord *c, uint64_t x_total, int *granted)
+cdb_status cdb_coord_baton_try(cdb_coord *c, uint64_t x_total, int *granted)
+{
+    cdb_status s;
+    mx_lock(c);
+    s = baton_try_body(c, x_total, granted);
+    mx_unlock(c);
+    return s;
+}
+
+/* Whether the live baton holder's published estimate (spec 5.8) shows it
+ * busy past deadline_us, on the primary's clock. An unknown estimate says
+ * nothing: the waiter waits for its cap. */
+static int holder_outlasts(const cdb_coord *c, uint64_t deadline_us)
+{
+    unsigned i;
+    for (i = 0; i < c->cfg.max_coords; i++) {
+        const cdb_coord_brief *b = &c->peers[i].b;
+        if (!c->peers[i].live || b->issued == 0 || b->status_op == CDB_COORD_OP_IDLE
+            || b->estimate_ms == CDB_COORD_ESTIMATE_UNKNOWN)
+            continue;
+        if (b->beat_time + (uint64_t)b->estimate_ms * 1000u > deadline_us)
+            return 1;
+    }
+    return 0;
+}
+
+static cdb_status baton_take_body(cdb_coord *c, uint64_t x_total, int *granted)
 {
     int64_t start = mono_now(c);
+    uint64_t start_us = clock_us(c);
     cdb_status s;
 
     for (;;) {
         int64_t cap = c->cfg.baton_wait_ns;
         unsigned i;
-        if ((s = cdb_coord_baton_try(c, x_total, granted)) != CDB_OK || *granted)
+        if ((s = baton_try_body(c, x_total, granted)) != CDB_OK || *granted)
             return s;
         if (cap <= 0) {
             cap = window_ns(c, 0);
@@ -1011,20 +1183,31 @@ cdb_status cdb_coord_baton_take(cdb_coord *c, uint64_t x_total, int *granted)
                     cap = window_ns(c, c->peers[i].b.x_total);
             cap += dead_ns(c);
         }
-        if (!c->have_mono || mono_now(c) - start >= cap)
+        if (!c->have_mono || mono_now(c) - start >= cap || holder_outlasts(c, start_us + (uint64_t)(cap / 1000)))
             return withdraw(c);
         pause_for(c, c->cfg.beat_ns / 4 > c->cfg.settle_ns ? c->cfg.beat_ns / 4 : c->cfg.settle_ns);
-        if ((s = cdb_coord_beat(c, 0)) != CDB_OK)
+        if ((s = beat_body(c, 0)) != CDB_OK)
             return s;
     }
 }
 
-void cdb_coord_baton_progress(cdb_coord *c, uint64_t x)
+cdb_status cdb_coord_baton_take(cdb_coord *c, uint64_t x_total, int *granted)
 {
-    c->me.x = x;
+    cdb_status s;
+    mx_lock(c);
+    s = baton_take_body(c, x_total, granted);
+    mx_unlock(c);
+    return s;
 }
 
-cdb_status cdb_coord_baton_release(cdb_coord *c)
+void cdb_coord_baton_progress(cdb_coord *c, uint64_t x)
+{
+    mx_lock(c);
+    c->me.x = x;
+    mx_unlock(c);
+}
+
+static cdb_status baton_release_body(cdb_coord *c)
 {
     if (!c->joined)
         return CDB_OK;
@@ -1033,6 +1216,15 @@ cdb_status cdb_coord_baton_release(cdb_coord *c)
     c->me.issued = 0;
     c->me.x = 0;
     return withdraw(c);
+}
+
+cdb_status cdb_coord_baton_release(cdb_coord *c)
+{
+    cdb_status s;
+    mx_lock(c);
+    s = baton_release_body(c);
+    mx_unlock(c);
+    return s;
 }
 
 int cdb_coord_baton_held(const cdb_coord *c)
@@ -1050,7 +1242,7 @@ int cdb_coord_baton_wanted(const cdb_coord *c)
     return 0;
 }
 
-cdb_status cdb_coord_request_reconcile(cdb_coord *c, int on)
+static cdb_status request_reconcile_body(cdb_coord *c, int on)
 {
     if (!c->joined)
         return CDB_E_STATE;
@@ -1068,7 +1260,7 @@ cdb_status cdb_coord_request_reconcile(cdb_coord *c, int on)
     return write_half(c);
 }
 
-cdb_status cdb_coord_baton_fence(cdb_coord *c)
+static cdb_status baton_fence_body(cdb_coord *c)
 {
     cdb_status s;
     if (!cdb_coord_baton_held(c))
@@ -1085,7 +1277,7 @@ cdb_status cdb_coord_baton_fence(cdb_coord *c)
  * scan means the baton has passed on. With the lock hook nobody takes the
  * baton from a live holder, so there is no margin; without a monotonic clock
  * there are no timeouts, for this coordinator or anyone. */
-cdb_status cdb_coord_guard(cdb_coord *c)
+static cdb_status guard_body(cdb_coord *c)
 {
     int64_t now = mono_now(c);
     cdb_status s;
@@ -1093,18 +1285,18 @@ cdb_status cdb_coord_guard(cdb_coord *c)
         return CDB_E_BUSY;
     if (!c->have_mono)
         return CDB_OK;
-    if (!c->use_locks && now - c->last_beat >= dead_ns(c) / 2) {
-        if ((s = cdb_coord_beat(c, 1)) != CDB_OK)
+    if (!c->use_locks && now - c->wrote_at >= dead_ns(c) / 2) {
+        if ((s = beat_body(c, 1)) != CDB_OK)
             return s;
         if (c->live_others > 0)
             return CDB_E_BUSY;
-    } else if (now - c->last_beat >= c->cfg.beat_ns && (s = cdb_coord_beat(c, 0)) != CDB_OK) {
+    } else if (now - c->last_beat >= c->cfg.beat_ns && (s = beat_body(c, 0)) != CDB_OK) {
         return s;
     }
     return c->max_cts > c->me.cts ? CDB_E_BUSY : CDB_OK;
 }
 
-cdb_status cdb_coord_set_journal(cdb_coord *c, int in_use)
+static cdb_status set_journal_body(cdb_coord *c, int in_use)
 {
     cdb_status s;
     if (!c->joined)
@@ -1115,7 +1307,7 @@ cdb_status cdb_coord_set_journal(cdb_coord *c, int in_use)
     return cdb_storage_sync(&c->st);
 }
 
-cdb_status cdb_coord_publish_pin(cdb_coord *c, uint64_t seq)
+static cdb_status publish_pin_body(cdb_coord *c, uint64_t seq)
 {
     if (!c->joined)
         return CDB_E_STATE;
@@ -1125,7 +1317,7 @@ cdb_status cdb_coord_publish_pin(cdb_coord *c, uint64_t seq)
     return write_half(c);
 }
 
-cdb_status cdb_coord_claim_block(cdb_coord *c, uint64_t store, uint64_t floor, uint64_t *first)
+static cdb_status claim_block_body(cdb_coord *c, uint64_t store, uint64_t floor, uint64_t *first)
 {
     uint8_t old_kind;
     uint64_t old_time, cand;
@@ -1251,7 +1443,7 @@ cdb_status cdb_coord_claim_block(cdb_coord *c, uint64_t store, uint64_t floor, u
     }
 }
 
-cdb_status cdb_coord_drop_block(cdb_coord *c, uint64_t store, uint64_t first)
+static cdb_status drop_block_body(cdb_coord *c, uint64_t store, uint64_t first)
 {
     unsigned i, j = 0;
     if (!c->joined)
@@ -1268,7 +1460,7 @@ cdb_status cdb_coord_drop_block(cdb_coord *c, uint64_t store, uint64_t first)
     return write_half(c);
 }
 
-cdb_status cdb_coord_commit_ready(cdb_coord *c)
+static cdb_status commit_ready_body(cdb_coord *c)
 {
     cdb_status s;
     if (!c->joined)
@@ -1276,7 +1468,7 @@ cdb_status cdb_coord_commit_ready(cdb_coord *c)
     if (!c->have_mono)
         return CDB_OK;
     if (mono_now(c) - c->scanned_at >= c->cfg.beat_ns / 2) {
-        if ((s = cdb_coord_beat(c, 1)) != CDB_OK)
+        if ((s = beat_body(c, 1)) != CDB_OK)
             return s;
     }
     if (!c->commit_ready) {
@@ -1285,10 +1477,10 @@ cdb_status cdb_coord_commit_ready(cdb_coord *c)
             int64_t rem = wait - (mono_now(c) - c->joined_at);
             int64_t step = c->cfg.beat_ns / 2 > 0 && c->cfg.beat_ns / 2 < rem ? c->cfg.beat_ns / 2 : rem;
             pause_for(c, step);
-            if ((s = cdb_coord_beat(c, 0)) != CDB_OK)
+            if ((s = beat_body(c, 0)) != CDB_OK)
                 return s;
         }
-        if ((s = cdb_coord_beat(c, 1)) != CDB_OK)
+        if ((s = beat_body(c, 1)) != CDB_OK)
             return s;
         c->commit_ready = 1;
     }
@@ -1302,7 +1494,7 @@ cdb_status cdb_coord_read_slot(cdb_coord *c, unsigned s, cdb_coord_rec *r, int *
     return read_file(c, path, 2, r, valid);
 }
 
-void cdb_coord_release_all(cdb_coord *c)
+static void release_all_body(cdb_coord *c)
 {
     unsigned s;
     for (s = 0; s < CDB_COORD_MAX; s++)
@@ -1311,7 +1503,7 @@ void cdb_coord_release_all(cdb_coord *c)
     c->holding_all = 0;
 }
 
-cdb_status cdb_coord_hold_all(cdb_coord *c, int dir, int *all)
+static cdb_status hold_all_body(cdb_coord *c, int dir, int *all)
 {
     char path[CDB_COORD_PATH];
     struct names n;
@@ -1342,7 +1534,7 @@ cdb_status cdb_coord_hold_all(cdb_coord *c, int dir, int *all)
     memset(&n, 0, sizeof n);
     n.max = c->cfg.max_coords;
     if (c->env.ops->list != NULL && (st = c->env.ops->list(c->env.ctx, c->dir, on_name, &n)) != CDB_OK) {
-        cdb_coord_release_all(c);
+        release_all_body(c);
         return st;
     }
     for (s = 0; s < c->cfg.max_coords; s++) {
@@ -1351,7 +1543,7 @@ cdb_status cdb_coord_hold_all(cdb_coord *c, int dir, int *all)
         slot_path(c, s, path);
         st = c->env.ops->lock_open(c->env.ctx, path, 1, &c->held[s]);
         if (st != CDB_OK) {
-            cdb_coord_release_all(c);
+            release_all_body(c);
             return st == CDB_E_BUSY ? CDB_OK : st;
         }
     }
@@ -1360,7 +1552,7 @@ cdb_status cdb_coord_hold_all(cdb_coord *c, int dir, int *all)
     return scan(c); /* every other slot is now known dead */
 }
 
-cdb_status cdb_coord_remove_slot(cdb_coord *c, unsigned s)
+static cdb_status remove_slot_body(cdb_coord *c, unsigned s)
 {
     char path[CDB_COORD_PATH];
     cdb_status st;
@@ -1375,7 +1567,7 @@ cdb_status cdb_coord_remove_slot(cdb_coord *c, unsigned s)
 
 /* The slot file goes while its lock is still held, so no joiner takes the
  * slot and then sees its file vanish. */
-cdb_status cdb_coord_leave(cdb_coord *c)
+static cdb_status leave_body(cdb_coord *c)
 {
     cdb_status s;
     if (!c->joined)
@@ -1389,7 +1581,7 @@ cdb_status cdb_coord_leave(cdb_coord *c)
     return s;
 }
 
-cdb_status cdb_coord_close_pending(cdb_coord *c)
+static cdb_status close_pending_body(cdb_coord *c)
 {
     cdb_status s;
     if (!c->joined)
@@ -1410,7 +1602,7 @@ cdb_status cdb_coord_close_pending(cdb_coord *c)
     return CDB_OK;
 }
 
-cdb_status cdb_coord_remove_dir_lock(cdb_coord *c)
+static cdb_status remove_dir_lock_body(cdb_coord *c)
 {
     char path[CDB_COORD_PATH];
     cdb_status s;
@@ -1422,13 +1614,58 @@ cdb_status cdb_coord_remove_dir_lock(cdb_coord *c)
     return CDB_OK;
 }
 
-void cdb_coord_abandon(cdb_coord *c)
+static void abandon_body(cdb_coord *c)
 {
     if (c->joined)
         cdb_storage_close(&c->st);
     c->joined = 0;
     if (c->use_locks) {
         unlock(c, &c->slot_lock);
-        cdb_coord_release_all(c);
+        release_all_body(c);
     }
+}
+
+/* -------------------------------------------------------- locked entry points */
+
+#define LOCKED(call)        \
+    do {                    \
+        cdb_status s_;      \
+        mx_lock(c);         \
+        s_ = (call);        \
+        mx_unlock(c);       \
+        return s_;          \
+    } while (0)
+
+cdb_status cdb_coord_request_reconcile(cdb_coord *c, int on) { LOCKED(request_reconcile_body(c, on)); }
+cdb_status cdb_coord_baton_fence(cdb_coord *c) { LOCKED(baton_fence_body(c)); }
+cdb_status cdb_coord_guard(cdb_coord *c) { LOCKED(guard_body(c)); }
+cdb_status cdb_coord_set_journal(cdb_coord *c, int in_use) { LOCKED(set_journal_body(c, in_use)); }
+cdb_status cdb_coord_publish_pin(cdb_coord *c, uint64_t seq) { LOCKED(publish_pin_body(c, seq)); }
+cdb_status cdb_coord_claim_block(cdb_coord *c, uint64_t store, uint64_t floor, uint64_t *first)
+{
+    LOCKED(claim_block_body(c, store, floor, first));
+}
+cdb_status cdb_coord_drop_block(cdb_coord *c, uint64_t store, uint64_t first)
+{
+    LOCKED(drop_block_body(c, store, first));
+}
+cdb_status cdb_coord_commit_ready(cdb_coord *c) { LOCKED(commit_ready_body(c)); }
+cdb_status cdb_coord_hold_all(cdb_coord *c, int dir, int *all) { LOCKED(hold_all_body(c, dir, all)); }
+cdb_status cdb_coord_remove_slot(cdb_coord *c, unsigned s) { LOCKED(remove_slot_body(c, s)); }
+cdb_status cdb_coord_leave(cdb_coord *c) { LOCKED(leave_body(c)); }
+cdb_status cdb_coord_close_pending(cdb_coord *c) { LOCKED(close_pending_body(c)); }
+cdb_status cdb_coord_remove_dir_lock(cdb_coord *c) { LOCKED(remove_dir_lock_body(c)); }
+
+void cdb_coord_release_all(cdb_coord *c)
+{
+    mx_lock(c);
+    release_all_body(c);
+    mx_unlock(c);
+}
+
+void cdb_coord_abandon(cdb_coord *c)
+{
+    mx_lock(c);
+    abandon_body(c);
+    mx_unlock(c);
 }

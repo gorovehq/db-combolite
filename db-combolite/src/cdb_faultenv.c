@@ -406,7 +406,8 @@ static const cdb_env_ops faultenv_ops = {
     NULL, NULL, NULL, NULL,
     NULL, NULL, NULL, NULL, NULL,
     NULL, NULL,
-    fe_lock_open, fe_lock_close
+    fe_lock_open, fe_lock_close,
+    NULL
 };
 
 static const cdb_env_ops faultenv_ops_nolock = {
@@ -415,7 +416,8 @@ static const cdb_env_ops faultenv_ops_nolock = {
     NULL, NULL, NULL, NULL,
     NULL, NULL, NULL, NULL, NULL,
     NULL, NULL,
-    NULL, NULL
+    NULL, NULL,
+    NULL
 };
 
 unsigned cdb_faultenv_held_locks(const cdb_faultenv *fe)

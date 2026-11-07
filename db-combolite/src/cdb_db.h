@@ -449,12 +449,14 @@ typedef struct cdb_db {
         uint64_t end;
     } id_ranges[CDB_COORD_MAX_BLOCKS];
     unsigned nid_ranges;
-    /* Background heartbeat thread (spec 5.9.6, M20). */
-    cdb_mutex *mutex;         /* protects cdb_db state against concurrent heartbeat/calls */
-    cdb_cond *hb_cond;        /* wakes the heartbeat thread on shutdown */
-    cdb_thread *hb_thread;    /* the heartbeat thread itself */
-    int hb_stop;              /* set to 1 to tell the heartbeat thread to exit */
+    /* The coordinator's responder thread (spec 5.8). */
+    cdb_mutex *mutex;         /* the database's re-entrant lock (cdb_db_lock) */
+    cdb_mutex *coord_mutex;   /* the coordinator's own (coord.mx), never the database's */
+    cdb_cond *hb_cond;        /* wakes the responder on shutdown; waited on with coord_mutex */
+    cdb_thread *hb_thread;    /* the responder itself */
+    int hb_stop;              /* set under coord_mutex to tell the responder to exit */
     int hb_running;           /* 1 if hb_thread is running and must be joined */
+    int closing;              /* cdb_db_close has begun: the responder hands nothing over */
     /* Background worker threads (spec 5.9.6, M20). */
     cdb_worker_pool workers;
     /* Graph refreshes whose list of entries to check overflowed, so every

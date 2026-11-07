@@ -1221,7 +1221,12 @@ static cdb_status merge_journals(cdb_db *db, int keep_in_use)
 
 static cdb_status recover(cdb_db *db)
 {
-    return merge_journals(db, 0);
+    cdb_coord_status_save sv;
+    cdb_status s;
+    cdb_coord_status_begin(&db->coord, CDB_COORD_OP_RECOVER, &sv);
+    s = merge_journals(db, 0);
+    cdb_coord_status_end(&db->coord, &sv);
+    return s;
 }
 
 /* -------------------------------------------------------- session */
@@ -1477,9 +1482,13 @@ static cdb_status rebase_pages(cdb_db *db)
  * holder trims what the catch-up reads; then the pin moves up. */
 static cdb_status rebase(cdb_db *db)
 {
-    cdb_status s = rebase_pages(db);
+    cdb_coord_status_save sv;
+    cdb_status s;
+    cdb_coord_status_begin(&db->coord, CDB_COORD_OP_REBASE, &sv);
+    s = rebase_pages(db);
     if (s == CDB_OK && (s = cdb_vec_accel_rebase(db)) == CDB_OK)
         s = publish_pin(db, db->pager.hs.record.committed_seq);
+    cdb_coord_status_end(&db->coord, &sv);
     return s;
 }
 
@@ -1778,29 +1787,57 @@ static void db_unlock(cdb_db *db)
     cdb_db_unlock(db);
 }
 
+/* A standing baton another process asks for, seen by the responder: handed
+ * over if the database's lock is free right now and no transaction or
+ * operation scope is open, so the application's own thread never waits on
+ * the responder for long (spec 5.9.8). The responder holds no coordinator
+ * lock here. */
+static void respond_handover(cdb_db *db)
+{
+    if (db->env.ops->mutex_trylock == NULL || db->env.ops->mutex_trylock(db->env.ctx, db->mutex) != CDB_OK)
+        return;
+    if (!db->failed && !db->closing && !db->in_tx && db->op_depth == 0 && cdb_coord_baton_held(&db->coord))
+        (void)cdb_db_reconcile(db);
+    db_unlock(db);
+}
+
+/* The responder (spec 5.8): writes this coordinator's heartbeat and status
+ * every half heartbeat interval, taking only the coordinator's lock, so no
+ * engine call, however long, can hold it up. */
 static void heartbeat_worker(void *arg)
 {
     cdb_db *db = (cdb_db *)arg;
-    int64_t interval_ns;
-
-    if (db->coord.cfg.beat_ns > 0)
-        interval_ns = (int64_t)(db->coord.cfg.beat_ns / 2);
-    else
-        interval_ns = 500000000; /* 500 ms default */
+    int64_t interval_ns = db->coord.cfg.beat_ns / 2;
 
     if (interval_ns < 1000000) /* floor at 1 ms */
         interval_ns = 1000000;
 
-    db_lock(db);
-    while (!db->hb_stop && !db->failed) {
-        (void)db->env.ops->cond_wait(db->env.ctx, db->hb_cond, db->mutex, interval_ns);
-        if (db->hb_stop || db->failed)
+    (void)db->env.ops->mutex_lock(db->env.ctx, db->coord_mutex);
+    while (!db->hb_stop) {
+        int handover = 0;
+        (void)db->env.ops->cond_wait(db->env.ctx, db->hb_cond, db->coord_mutex, interval_ns);
+        if (db->hb_stop)
             break;
-        (void)beat_only(db);
+        if (cdb_coord_respond(&db->coord, &handover) != CDB_OK || !handover)
+            continue;
+        (void)db->env.ops->mutex_unlock(db->env.ctx, db->coord_mutex);
+        respond_handover(db);
+        (void)db->env.ops->mutex_lock(db->env.ctx, db->coord_mutex);
     }
-    db_unlock(db);
+    (void)db->env.ops->mutex_unlock(db->env.ctx, db->coord_mutex);
 }
 
+static void destroy_mutex(cdb_db *db, cdb_mutex **m)
+{
+    if (*m != NULL) {
+        if (db->env.ops != NULL && db->env.ops->mutex_destroy != NULL)
+            db->env.ops->mutex_destroy(db->env.ctx, *m);
+        *m = NULL;
+    }
+}
+
+/* Starts the responder once the coordinator has joined. Without every
+ * thread hook there is none, and heartbeats stay cooperative (5.9.6). */
 static void start_heartbeat(cdb_db *db)
 {
     if (db->env.ops == NULL || db->env.ops->mutex_create == NULL ||
@@ -1808,20 +1845,22 @@ static void start_heartbeat(cdb_db *db)
         return;
     if (db->env.ops->mutex_create(db->env.ctx, &db->mutex) != CDB_OK)
         return;
-    if (db->env.ops->cond_create(db->env.ctx, &db->hb_cond) != CDB_OK) {
-        if (db->env.ops->mutex_destroy != NULL)
-            db->env.ops->mutex_destroy(db->env.ctx, db->mutex);
-        db->mutex = NULL;
+    if (db->env.ops->mutex_create(db->env.ctx, &db->coord_mutex) != CDB_OK) {
+        destroy_mutex(db, &db->mutex);
         return;
     }
+    if (db->env.ops->cond_create(db->env.ctx, &db->hb_cond) != CDB_OK) {
+        destroy_mutex(db, &db->coord_mutex);
+        destroy_mutex(db, &db->mutex);
+        return;
+    }
+    db->coord.mx = db->coord_mutex;
     db->hb_stop = 0;
     if (db->env.ops->thread_create(db->env.ctx, &db->hb_thread, heartbeat_worker, db) != CDB_OK) {
         if (db->env.ops->cond_destroy != NULL)
             db->env.ops->cond_destroy(db->env.ctx, db->hb_cond);
-        if (db->env.ops->mutex_destroy != NULL)
-            db->env.ops->mutex_destroy(db->env.ctx, db->mutex);
         db->hb_cond = NULL;
-        db->mutex = NULL;
+        /* The database's lock stays: it needs no responder. */
         return;
     }
     db->hb_running = 1;
@@ -1830,11 +1869,11 @@ static void start_heartbeat(cdb_db *db)
 static void stop_heartbeat_thread(cdb_db *db)
 {
     if (db->hb_running) {
-        db_lock(db);
+        (void)db->env.ops->mutex_lock(db->env.ctx, db->coord_mutex);
         db->hb_stop = 1;
         if (db->env.ops != NULL && db->env.ops->cond_signal != NULL)
             (void)db->env.ops->cond_signal(db->env.ctx, db->hb_cond);
-        db_unlock(db);
+        (void)db->env.ops->mutex_unlock(db->env.ctx, db->coord_mutex);
 
         if (db->env.ops != NULL && db->env.ops->thread_join != NULL)
             (void)db->env.ops->thread_join(db->env.ctx, db->hb_thread);
@@ -1852,11 +1891,9 @@ static void cleanup_concurrency(cdb_db *db)
             db->env.ops->cond_destroy(db->env.ctx, db->hb_cond);
         db->hb_cond = NULL;
     }
-    if (db->mutex != NULL) {
-        if (db->env.ops != NULL && db->env.ops->mutex_destroy != NULL)
-            db->env.ops->mutex_destroy(db->env.ctx, db->mutex);
-        db->mutex = NULL;
-    }
+    db->coord.mx = NULL;
+    destroy_mutex(db, &db->coord_mutex);
+    destroy_mutex(db, &db->mutex);
 }
 
 static cdb_status heartbeat(cdb_db *db)
@@ -2702,9 +2739,12 @@ static cdb_status tx_commit_locked(cdb_db *db)
 
 cdb_status cdb_tx_commit(cdb_db *db)
 {
+    cdb_coord_status_save sv;
     cdb_status s;
     db_lock(db);
+    cdb_coord_status_begin(&db->coord, CDB_COORD_OP_COMMIT, &sv);
     s = tx_commit_locked(db);
+    cdb_coord_status_end(&db->coord, &sv);
     db_unlock(db);
     /* A used-up entry-ID block is released only once reconciliation has
      * recorded its store's next entry ID (prune_held_blocks), and the slot
@@ -2879,7 +2919,19 @@ static cdb_status on_baton_err(cdb_db *db, cdb_status s)
  * archive, and leaves the baton held so a caller (catalog change,
  * compaction, close) can continue under the same baton session (spec 5.9.8).
  * When closing is 0, the journal is rotated and the reader pin updated. */
+static cdb_status reconcile_hold_body(cdb_db *db, int closing);
+
 static cdb_status reconcile_hold(cdb_db *db, int closing)
+{
+    cdb_coord_status_save sv;
+    cdb_status s;
+    cdb_coord_status_begin(&db->coord, CDB_COORD_OP_RECONCILE, &sv);
+    s = reconcile_hold_body(db, closing);
+    cdb_coord_status_end(&db->coord, &sv);
+    return s;
+}
+
+static cdb_status reconcile_hold_body(cdb_db *db, int closing)
 {
     int keep_in_use;
     cdb_status s;
@@ -3313,9 +3365,12 @@ static cdb_status db_compact_in(cdb_db *db, uint64_t max_moves, uint64_t *moved,
 
 cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint64_t *reclaimed)
 {
+    cdb_coord_status_save sv;
     cdb_status r;
     cdb_db_lock(db);
+    cdb_coord_status_begin(&db->coord, CDB_COORD_OP_COMPACT, &sv);
     r = db_compact_in(db, max_moves, moved, reclaimed);
+    cdb_coord_status_end(&db->coord, &sv);
     cdb_db_unlock(db);
     return r;
 }
@@ -3401,6 +3456,7 @@ cdb_status cdb_db_close(cdb_db *db)
     cdb_status s;
 
     db_lock(db);
+    db->closing = 1; /* the responder hands no baton over from here on */
     /* First, so the closing reconciliation fills no mirror (spec 18). */
     cdb_vec_accel_close(db);
     if (db->failed) {
@@ -3431,7 +3487,7 @@ cdb_status cdb_db_close(cdb_db *db)
         return s;
     }
     if (alone && db->coord.journals_others == 0 && db->fresh)
-        db->coord.me.nblocks = 0;
+        cdb_coord_forget_blocks(&db->coord);
     /* Closing never waits for the baton (spec 5.9.1): only the holder or a
      * process alone reconciles; any other leaves its journal pending. */
     pending = !alone && !cdb_coord_baton_held(&db->coord);

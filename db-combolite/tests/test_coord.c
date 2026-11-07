@@ -67,7 +67,6 @@ void setUp(void)
     keyed_procs = 0;
 }
 
-void tearDown(void) {}
 
 /* The rest of the test runs without the lock hook: liveness by heartbeat
  * (spec 5.8, fallback). setUp restores the hook. */
@@ -616,6 +615,16 @@ struct proc {
 };
 static struct proc p1, p2;
 
+/* A host test that failed midway leaves its handles open, their responders
+ * running; they are stopped here, before the next test reuses p1 and p2. */
+void tearDown(void)
+{
+    if (p2.db.hb_running)
+        (void)cdb_db_close(&p2.db);
+    if (p1.db.hb_running)
+        (void)cdb_db_close(&p1.db);
+}
+
 /* Store ENCLAVE is enclave 42: its records and pages are encrypted when the
  * processes open with keys (keyed_procs). */
 #define ENCLAVE 42u
@@ -746,7 +755,8 @@ static const char *value_of(struct proc *p, uint64_t e)
     return out;
 }
 
-static cdb_status open_proc_max(struct proc *p, unsigned max_coords)
+static cdb_status open_proc_with(struct proc *p, unsigned max_coords, const cdb_env *e, const char *base,
+                                 int64_t beat_ns)
 {
     cdb_header h;
     memset(&p->cfg, 0, sizeof p->cfg);
@@ -766,6 +776,7 @@ static cdb_status open_proc_max(struct proc *p, unsigned max_coords)
     p->cfg.catalog_page = p->cat_page;
     p->cfg.durability = CDB_DURABILITY_FULL;
     p->cfg.coord.max_coords = max_coords;
+    p->cfg.coord.beat_ns = beat_ns;
     if (keyed_procs) {
         p->cfg.master_key_uri = "custom://mk";
         p->cfg.key_provider = test_keys;
@@ -776,7 +787,12 @@ static cdb_status open_proc_max(struct proc *p, unsigned max_coords)
     h.layout_flags = CDB_LAYOUT_ADDR64;
     h.default_page_log2 = (uint8_t)PAGE_LOG2;
     memcpy(h.db_id, db_id, 16);
-    return cdb_db_open(&p->db, &env, DIR "/db", &p->cfg, &h);
+    return cdb_db_open(&p->db, e, base, &p->cfg, &h);
+}
+
+static cdb_status open_proc_max(struct proc *p, unsigned max_coords)
+{
+    return open_proc_with(p, max_coords, &env, DIR "/db", 0);
 }
 
 static cdb_status open_proc(struct proc *p)
@@ -2567,6 +2583,186 @@ static void test_host_hooks(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->rmdir(h.ctx, dir));
 }
 
+/* -------------------------------------------------------- the responder, on the host */
+
+#define HOST_BEAT (50 * 1000000) /* 50 ms: a dead timeout of 150 ms */
+
+/* Static, so a handle a failed test left open can still be closed in
+ * tearDown. */
+static cdb_hostenv host_he;
+static cdb_env host_env;
+static cdb_env_ops host_ops;
+
+static int64_t host_now(const cdb_env *h)
+{
+    int64_t t = 0;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h->ops->mono(h->ctx, &t));
+    return t;
+}
+
+/* A fresh folder for a host database; *base is its database path. */
+static void host_dir(const cdb_env *h, const char *name, char *dir, size_t dsize, char *base, size_t bsize)
+{
+    snprintf(dir, dsize, "%s/%s_%ld", CDB_TEST_TMPDIR, name, (long)getpid());
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h->ops->mkdir(h->ctx, dir));
+    snprintf(base, bsize, "%s/db", dir);
+}
+
+/* After both closes: the working directory is gone; the archive goes too. */
+static void host_cleanup(const cdb_env *h, const char *dir, const char *base)
+{
+    char path[240];
+    int there = 1;
+    snprintf(path, sizeof path, "%s.cdbwork", base);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h->ops->exists(h->ctx, path, &there));
+    TEST_ASSERT_FALSE(there);
+    snprintf(path, sizeof path, "%s.cdbarch", base);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h->ops->remove(h->ctx, path));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h->ops->rmdir(h->ctx, dir));
+}
+
+/* The value of entry e in p's pages, read under p's lock: p's responder may
+ * be reconciling on its own thread. */
+static const char *host_value_of(struct proc *p, uint64_t e)
+{
+    const char *v;
+    cdb_db_lock(&p->db);
+    v = value_of(p, e);
+    cdb_db_unlock(&p->db);
+    return v;
+}
+
+/* A standing baton held by an idle process is handed over by its responder
+ * (spec 5.9.8): p1 makes no call at all, yet p2's reconciliation gets the
+ * baton, with p2's change merged by p1 first. Without the responder p2 would
+ * wait out its cap and get CDB_E_BUSY. */
+static void test_host_responder_hands_over(void)
+{
+    cdb_env h;
+    char dir[160], base[200];
+    int64_t t0;
+
+    cdb_hostenv_init(&host_he, &host_env);
+    h = host_env;
+    host_dir(&h, "handover", dir, sizeof dir, base, sizeof base);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_with(&p1, 0, &h, base, HOST_BEAT));
+    TEST_ASSERT_TRUE(p1.db.hb_running);
+    TEST_ASSERT_TRUE(cdb_coord_baton_held(&p1.db.coord));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_with(&p2, 0, &h, base, HOST_BEAT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_REPLACE, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_STRING("", host_value_of(&p1, 2));
+
+    t0 = host_now(&h);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p2.db));
+    TEST_ASSERT_TRUE(host_now(&h) - t0 < 2 * HOST_BEAT * 3);
+    TEST_ASSERT_FALSE(cdb_coord_baton_held(&p2.db.coord) && cdb_coord_baton_held(&p1.db.coord));
+    TEST_ASSERT_EQUAL_STRING("b", host_value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_STRING("b", host_value_of(&p2, 2));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    host_cleanup(&h, dir, base);
+}
+
+/* Publishes, as p1's engine would, that p1 is reconciling with work left far
+ * beyond any cap: one unit of a million done after a second. */
+static void stall_with_estimate(struct proc *p, cdb_coord_status_save *sv)
+{
+    cdb_coord *c = &p->db.coord;
+    cdb_coord_status_begin(c, CDB_COORD_OP_RECONCILE, sv);
+    (void)c->env.ops->mutex_lock(c->env.ctx, c->mx);
+    c->me.x_total = 1000000;
+    c->me.x = 1;
+    c->me.status_start -= 1000000; /* started a second ago, in microseconds */
+    (void)c->env.ops->mutex_unlock(c->env.ctx, c->mx);
+}
+
+/* p1 stalls inside an engine call (the test holds its database lock) for
+ * many dead timeouts: its responder still writes heartbeats and its status
+ * (spec 5.8), and p2, waiting for the baton, reads the estimate and gives up
+ * at once with CDB_E_BUSY instead of waiting out its cap, never taking p1
+ * for dead. */
+static void test_host_stalled_holder_publishes_estimate(void)
+{
+    cdb_env h;
+    cdb_coord_status_save sv;
+    cdb_coord_rec r;
+    char dir[160], base[200];
+    uint64_t beat0;
+    int64_t t0;
+    int valid;
+
+    cdb_hostenv_init(&host_he, &host_env);
+    h = host_env;
+    host_dir(&h, "stalled", dir, sizeof dir, base, sizeof base);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_with(&p1, 0, &h, base, HOST_BEAT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_with(&p2, 0, &h, base, HOST_BEAT));
+    TEST_ASSERT_TRUE(cdb_coord_baton_held(&p1.db.coord));
+
+    cdb_db_lock(&p1.db); /* p1's long engine call begins */
+    stall_with_estimate(&p1, &sv);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_read_slot(&p2.db.coord, p1.db.coord.me.slot, &r, &valid));
+    TEST_ASSERT_TRUE(valid);
+    beat0 = r.beat;
+    h.ops->sleep(h.ctx, 4 * 3 * HOST_BEAT); /* four dead timeouts */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_read_slot(&p2.db.coord, p1.db.coord.me.slot, &r, &valid));
+    TEST_ASSERT_TRUE(r.beat >= beat0 + 4u);
+    TEST_ASSERT_EQUAL_UINT(CDB_COORD_OP_RECONCILE, r.status_op);
+    TEST_ASSERT_TRUE(r.estimate_ms != CDB_COORD_ESTIMATE_UNKNOWN && r.estimate_ms > 60u * 1000u);
+
+    t0 = host_now(&h);
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, cdb_db_reconcile(&p2.db));
+    TEST_ASSERT_TRUE(host_now(&h) - t0 < 3 * HOST_BEAT);
+    TEST_ASSERT_TRUE(p2.db.coord.peers[p1.db.coord.me.slot].live);
+    TEST_ASSERT_TRUE(cdb_coord_baton_held(&p1.db.coord));
+
+    cdb_coord_status_end(&p1.db.coord, &sv);
+    cdb_db_unlock(&p1.db); /* the call ends */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    host_cleanup(&h, dir, base);
+}
+
+/* The original bug, in the fallback (no lock hook): a process inside a long
+ * engine call, its database lock held for many dead timeouts, keeps
+ * heartbeating through its responder, so another process never judges it
+ * dead and never merges and removes its journal. */
+static void test_host_fallback_stall_stays_alive(void)
+{
+    cdb_env h;
+    char dir[160], base[200];
+    unsigned slot;
+
+    cdb_hostenv_init(&host_he, &host_env);
+    host_ops = *host_env.ops;
+    host_ops.lock_open = NULL;
+    host_ops.lock_close = NULL;
+    host_env.ops = &host_ops;
+    h = host_env;
+    host_dir(&h, "fallback", dir, sizeof dir, base, sizeof base);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_with(&p1, 0, &h, base, HOST_BEAT));
+    TEST_ASSERT_FALSE(p1.db.coord.use_locks);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_with(&p2, 0, &h, base, HOST_BEAT));
+    slot = p1.db.coord.me.slot;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 3, CDB_OP_REPLACE, "c", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+
+    cdb_db_lock(&p1.db);
+    h.ops->sleep(h.ctx, 5 * 3 * HOST_BEAT);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_beat(&p2.db.coord, 1));
+    TEST_ASSERT_TRUE(p2.db.coord.peers[slot].live);
+    cdb_db_unlock(&p1.db);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p1.db));
+    TEST_ASSERT_FALSE(p1.db.failed);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    host_cleanup(&h, dir, base);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -2621,5 +2817,8 @@ int main(void)
     RUN_TEST(test_recovery_crash_sweep_prepare_write_key);
     RUN_TEST(test_counters_survive_crash);
     RUN_TEST(test_host_hooks);
+    RUN_TEST(test_host_responder_hands_over);
+    RUN_TEST(test_host_stalled_holder_publishes_estimate);
+    RUN_TEST(test_host_fallback_stall_stays_alive);
     return UNITY_END();
 }

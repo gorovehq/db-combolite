@@ -94,6 +94,12 @@ typedef struct cdb_env_ops {
      * system releases it when the process ends, however it ends. */
     cdb_status (*lock_open)(void *ctx, const char *path, int exclusive, cdb_lock **out);
     void (*lock_close)(void *ctx, cdb_lock *l);
+    /* Optional: takes m without waiting. CDB_OK when this thread now holds
+     * it (also when it already did: mutexes are re-entrant), CDB_E_BUSY when
+     * another thread holds it. Without it, the coordinator's responder never
+     * takes the database's lock, so a standing baton is handed over only at
+     * the holder's next library call or cdb_db_tick (spec 5.8, 5.9.8). */
+    cdb_status (*mutex_trylock)(void *ctx, cdb_mutex *m);
 } cdb_env_ops;
 
 /* ------------------------------------------------- accelerator (spec 18) */

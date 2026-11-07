@@ -257,6 +257,18 @@ static cdb_status he_mutex_lock(void *ctx, cdb_mutex *m)
     return pthread_mutex_lock(&m->m) == 0 ? CDB_OK : CDB_E_IO;
 }
 
+static cdb_status he_mutex_trylock(void *ctx, cdb_mutex *m)
+{
+    int rc;
+    (void)ctx;
+    if (m == NULL)
+        return CDB_E_INVALID_ARG;
+    rc = pthread_mutex_trylock(&m->m);
+    if (rc == 0)
+        return CDB_OK;
+    return rc == EBUSY ? CDB_E_BUSY : CDB_E_IO;
+}
+
 static cdb_status he_mutex_unlock(void *ctx, cdb_mutex *m)
 {
     (void)ctx;
@@ -441,7 +453,8 @@ static const cdb_env_ops hostenv_ops = {
     he_mutex_create, he_mutex_lock, he_mutex_unlock, he_mutex_destroy,
     he_cond_create, he_cond_signal, he_cond_broadcast, he_cond_wait, he_cond_destroy,
     he_thread_create, he_thread_join,
-    he_lock_open, he_lock_close
+    he_lock_open, he_lock_close,
+    he_mutex_trylock
 };
 
 void cdb_hostenv_init(cdb_hostenv *he, cdb_env *out)

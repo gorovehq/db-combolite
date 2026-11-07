@@ -23,8 +23,17 @@
  * while its heartbeat counter keeps changing. Each observer measures that on
  * its own monotonic clock, so no two processes' clocks have to agree; a
  * heartbeat already older than the dead timeout on the wall clock counts as
- * dead at once. There are no threads: cdb_coord_beat writes a heartbeat when
- * one is due, and callers call it from their own entry points (spec 5.9.6). */
+ * dead at once. cdb_coord_beat writes a heartbeat when one is due, and
+ * callers call it from their own entry points (spec 5.9.6).
+ *
+ * Where the environment has thread hooks, the database also runs the
+ * responder (spec 5.8): a thread that calls cdb_coord_respond every half
+ * heartbeat interval, so heartbeats and status go on while an engine call
+ * runs. It shares the coordinator through mx, set by the caller after the
+ * join and cleared before the leave: every call that changes the record or
+ * probes locks takes it, and gives it up while it sleeps. Fields read only
+ * by the engine's thread (peers, live_others and the other scan results)
+ * are written only by that thread; the responder never touches them. */
 #ifndef CDB_COORD_H
 #define CDB_COORD_H
 
@@ -135,6 +144,9 @@ typedef struct cdb_coord_brief {
     uint64_t cts;
     uint64_t issued;             /* nonzero while it holds the baton */
     uint64_t x, x_total;
+    uint64_t beat_time;          /* when its record was written */
+    uint8_t status_op;           /* CDB_COORD_OP_* */
+    uint32_t estimate_ms;        /* as of beat_time */
 } cdb_coord_brief;
 
 /* What one observer knows about another coordinator: when its counter last
@@ -186,7 +198,16 @@ typedef struct cdb_coord {
     cdb_lock *dir_lock;          /* coord/lock: shared while joining, exclusive to remove the directory */
     cdb_lock *held[CDB_COORD_MAX]; /* other slots' locks, while holding them all */
     int holding_all;             /* cdb_coord_hold_all succeeded and is not released */
+    cdb_mutex *mx;               /* shared with the responder; NULL without one */
+    int64_t wrote_at;            /* monotonic time of the last record written, by either thread */
+    int lost;                    /* the responder found the slot taken over (fallback) */
 } cdb_coord;
+
+/* What cdb_coord_status_begin replaced, for cdb_coord_status_end. */
+typedef struct cdb_coord_status_save {
+    uint8_t op;
+    uint64_t start;
+} cdb_coord_status_save;
 
 /* Joins the coordinators of the database in dir (created if missing; its
  * parent must exist). With the lock hook, holds coord/lock shared while it
@@ -218,6 +239,27 @@ cdb_status cdb_coord_join_with(cdb_coord *c, const cdb_env *env, const char *dir
  * fallback happens after this process was silent past the dead timeout. */
 cdb_status cdb_coord_beat(cdb_coord *c, int force);
 
+/* The responder's turn (spec 5.8): writes a heartbeat carrying the current
+ * status, whatever the engine is doing. Never scans: what the engine knows
+ * of the others is left alone. In the fallback, after a silence past the
+ * dead timeout (the process was stopped), it first checks that the slot is
+ * still this session's; if not, nothing more is written and every later
+ * cdb_coord_beat returns CDB_E_BUSY. When handover is not NULL and this
+ * coordinator holds the baton, *handover is set if another live coordinator
+ * is asking for the baton or a reconciliation, read from the slot files
+ * there and then. */
+cdb_status cdb_coord_respond(cdb_coord *c, int *handover);
+
+/* Publishes the operation this process is busy with (spec 5.8, offset 89),
+ * from now; written with the next heartbeat, with an estimate the
+ * coordinator keeps from the baton's progress where it can. Nested
+ * operations save the outer one and restore it with cdb_coord_status_end. */
+void cdb_coord_status_begin(cdb_coord *c, uint8_t op, cdb_coord_status_save *save);
+void cdb_coord_status_end(cdb_coord *c, const cdb_coord_status_save *save);
+
+/* Lets go of every held entry-ID block (a fresh database closing alone). */
+void cdb_coord_forget_blocks(cdb_coord *c);
+
 /* Raises the slot's transaction-counter high-water mark to hwm and makes it
  * durable (spec 14.4.3): counters below it may then be used. */
 cdb_status cdb_coord_reserve_tx(cdb_coord *c, uint64_t hwm);
@@ -228,7 +270,8 @@ cdb_status cdb_coord_reserve_tx(cdb_coord *c, uint64_t hwm);
  * cdb_coord_baton_take requests it, declaring x_total units of work, and
  * waits: it sleeps through the environment and heartbeats, until the baton
  * is granted or the holder times out. *granted is 0 when the wait cap
- * passed; the request is then withdrawn. With no other live coordinator it
+ * passed, or at once when the holder's published estimate shows it busy
+ * past the cap (spec 5.8); the request is then withdrawn. With no other live coordinator it
  * is granted at once, with no settle. Holding it already is a grant. */
 cdb_status cdb_coord_baton_take(cdb_coord *c, uint64_t x_total, int *granted);
 
