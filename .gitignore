@@ -1,27 +1,21 @@
-build/
-db-combolite/build/
+build*/
+*.legacy/
 *.o
 *.a
 .claude/
-db-combolite/build-rel/
-db-combolite/build-demo/
-db-combolite/build-demo-rel/
-db-combolite/build*/
 # Databases and models are never committed: anyone can build their own.
 *.cdbarch
 *.cdbwork/
 *.gguf
-# Test data pools: fetched, not committed (Project Gutenberg index and books).
-db-combolite/datastore/gutenberg/
-# The demo's binary and local data (only data/README.md is tracked).
-db-combolite/demo/gutenfree/gutenfree
-db-combolite/demo/gutenfree/data/*
-!db-combolite/demo/gutenfree/data/README.md
+# Test data pools: fetched, not committed.
+**/datastore/
+**/data/*
+!**/data/README.md
 __pycache__/
 *.so
 *.egg-info/
 dist/
-# Sub-agent activity log, tailed by the user.
-db-combolite/workspace/agents.log
 # Handoff prompt for other AI agents; holds local paths and process notes.
 /GEMINI.md
+# Local agent telemetry and live monitoring dashboard
+agent-dashboard/
