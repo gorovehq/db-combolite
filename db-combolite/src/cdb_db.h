@@ -45,6 +45,12 @@ typedef enum cdb_durability {
  * have been lost (spec 1.12.5). The operator accepts the loss. */
 #define CDB_DB_ACCEPT_LOSS 0x1u
 
+/* Merging, drop each transaction holding a journal record this process
+ * cannot decrypt, and merge the rest of that journal, instead of leaving it
+ * pending for a process with the key (spec 5.9.1). For a key gone for good;
+ * nothing else is accepted as lost. */
+#define CDB_DB_DROP_UNREADABLE 0x2u
+
 /* One committed change, as handed to the apply hook. data points into the
  * database's record buffer and is valid only during the call. */
 typedef struct cdb_delta {
@@ -443,12 +449,14 @@ typedef struct cdb_db {
         uint64_t end;
     } id_ranges[CDB_COORD_MAX_BLOCKS];
     unsigned nid_ranges;
-    /* Background heartbeat thread (spec 5.9.6, M20). */
-    cdb_mutex *mutex;         /* protects cdb_db state against concurrent heartbeat/calls */
-    cdb_cond *hb_cond;        /* wakes the heartbeat thread on shutdown */
-    cdb_thread *hb_thread;    /* the heartbeat thread itself */
-    int hb_stop;              /* set to 1 to tell the heartbeat thread to exit */
+    /* The coordinator's responder thread (spec 5.8). */
+    cdb_mutex *mutex;         /* the database's re-entrant lock (cdb_db_lock) */
+    cdb_mutex *coord_mutex;   /* the coordinator's own (coord.mx), never the database's */
+    cdb_cond *hb_cond;        /* wakes the responder on shutdown; waited on with coord_mutex */
+    cdb_thread *hb_thread;    /* the responder itself */
+    int hb_stop;              /* set under coord_mutex to tell the responder to exit */
     int hb_running;           /* 1 if hb_thread is running and must be joined */
+    int closing;              /* cdb_db_close has begun: the responder hands nothing over */
     /* Background worker threads (spec 5.9.6, M20). */
     cdb_worker_pool workers;
     /* Graph refreshes whose list of entries to check overflowed, so every
@@ -617,6 +625,13 @@ cdb_status cdb_db_read_record(cdb_db *db, uint64_t off, cdb_record *r, uint64_t 
  * need be, and merges every process's committed transactions (spec 5.9.1);
  * CDB_E_BUSY when the wait passes its cap. */
 cdb_status cdb_db_reconcile(cdb_db *db);
+
+/* Asks for this process's committed changes to reach the archive without
+ * waiting for the baton (spec 5.9.8): makes the journal durable and records
+ * a reconciliation request, which the baton holder meets at its next
+ * reconciliation, merging every slot's journal. When nobody holds the baton
+ * and one attempt gets it, reconciles here and now. Returns at once. */
+cdb_status cdb_db_reconcile_request(cdb_db *db);
 
 /* The environment's clock, in nanoseconds since the Unix epoch. *have is 0
  * (and *ns 0) when the environment has none. Commit records carry it. */

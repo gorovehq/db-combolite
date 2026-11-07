@@ -67,7 +67,13 @@ void setUp(void)
     keyed_procs = 0;
 }
 
-void tearDown(void) {}
+
+/* The rest of the test runs without the lock hook: liveness by heartbeat
+ * (spec 5.8, fallback). setUp restores the hook. */
+static void fallback(void)
+{
+    cdb_faultenv_without_locks(&env);
+}
 
 static cdb_status join(cdb_coord *c)
 {
@@ -123,6 +129,9 @@ static cdb_coord_rec sample(void)
     r.blocks[0].first = 1024;
     r.blocks[1].store = 6;
     r.blocks[1].first = 2048;
+    r.status_op = CDB_COORD_OP_RECONCILE;
+    r.estimate_ms = 6400;
+    r.status_start = 870;
     return r;
 }
 
@@ -153,7 +162,17 @@ static void test_record_rejects(void)
     TEST_ASSERT_EQUAL_INT(CDB_E_CORRUPT, cdb_coord_decode(h, CDB_ORDER_LITTLE, &back));
 
     cdb_coord_encode(&r, CDB_ORDER_LITTLE, h);
-    h[92] = 1; /* reserved */
+    h[153] = 1; /* reserved */
+    reseal(h);
+    TEST_ASSERT_EQUAL_INT(CDB_E_MALFORMED, cdb_coord_decode(h, CDB_ORDER_LITTLE, &back));
+
+    cdb_coord_encode(&r, CDB_ORDER_LITTLE, h);
+    h[504] = 1; /* reserved, after the status start */
+    reseal(h);
+    TEST_ASSERT_EQUAL_INT(CDB_E_MALFORMED, cdb_coord_decode(h, CDB_ORDER_LITTLE, &back));
+
+    cdb_coord_encode(&r, CDB_ORDER_LITTLE, h);
+    h[88] = CDB_COORD_REQ_RECONCILE + 1u; /* no such request */
     reseal(h);
     TEST_ASSERT_EQUAL_INT(CDB_E_MALFORMED, cdb_coord_decode(h, CDB_ORDER_LITTLE, &back));
 
@@ -173,7 +192,7 @@ static void test_record_rejects(void)
     TEST_ASSERT_EQUAL_INT(CDB_E_MALFORMED, cdb_coord_decode(h, CDB_ORDER_LITTLE, &back));
 
     cdb_coord_encode(&r, CDB_ORDER_LITTLE, h);
-    h[9] = 2; /* another epoch */
+    h[9] = 1; /* another epoch: heartbeat liveness, before spec 5.8 */
     reseal(h);
     TEST_ASSERT_EQUAL_INT(CDB_E_UNSUPPORTED, cdb_coord_decode(h, CDB_ORDER_LITTLE, &back));
 }
@@ -222,9 +241,11 @@ static void test_alone(void)
     TEST_ASSERT_FALSE(file_exists(DIR "/coord/0"));
 }
 
+/* Fallback: a primary that goes silent is dead after the dead timeout. */
 static void test_two_then_primary_dies(void)
 {
     static cdb_coord a, b;
+    fallback();
     TEST_ASSERT_EQUAL_INT(CDB_OK, join(&a));
     beating[nbeating++] = &a;
     TEST_ASSERT_EQUAL_INT(CDB_OK, join(&b));
@@ -316,13 +337,14 @@ static void test_baton_passes_on_release(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&b));
 }
 
-/* A holder that goes silent loses the baton once it is dead; when it wakes,
- * its guard and its fence both refuse further writes. */
+/* Fallback: a holder that goes silent loses the baton once it is dead; when
+ * it wakes, its guard and its fence both refuse further writes. */
 static void test_baton_dead_holder(void)
 {
     static cdb_coord a, b;
     int64_t t0;
     int granted;
+    fallback();
     TEST_ASSERT_EQUAL_INT(CDB_OK, join(&a));
     beating[nbeating++] = &a;
     TEST_ASSERT_EQUAL_INT(CDB_OK, join(&b));
@@ -340,14 +362,16 @@ static void test_baton_dead_holder(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&b));
 }
 
-/* A holder that stays alive but neither progresses nor releases loses the
- * baton after its service window. The new holder waits one more heartbeat
- * interval, by which time the old holder's guard has seen the higher CTS. */
+/* Fallback: a holder that stays alive but neither progresses nor releases
+ * loses the baton after its service window. The new holder waits one more
+ * heartbeat interval, by which time the old holder's guard has seen the
+ * higher CTS. */
 static void test_baton_window_passes(void)
 {
     static cdb_coord a, b;
     int64_t t0;
     int granted;
+    fallback();
     TEST_ASSERT_EQUAL_INT(CDB_OK, join(&a));
     beating[nbeating++] = &a;
     TEST_ASSERT_EQUAL_INT(CDB_OK, join(&b));
@@ -386,13 +410,15 @@ static void test_baton_wait_cap(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&b));
 }
 
-/* A coordinator that stopped without leaving (a crash) holds its slot only
- * until it has been watched for the dead timeout; the next joiner takes the
- * slot over, counters included, and the silent one learns it lost it. */
+/* Fallback: a coordinator that stopped without leaving (a crash) holds its
+ * slot only until it has been watched for the dead timeout; the next joiner
+ * takes the slot over, counters included, and the silent one learns it lost
+ * it. */
 static void test_dead_slot_taken_over(void)
 {
     static cdb_coord a, c;
     uint64_t a_beat;
+    fallback();
     TEST_ASSERT_EQUAL_INT(CDB_OK, join(&a));
     a.me.tx_hwm = 5000; /* as if it had reserved counters */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_beat(&a, 1));
@@ -411,7 +437,88 @@ static void test_dead_slot_taken_over(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&c));
 }
 
-/* Another joiner's earlier lobby request for slot 0 wins it. */
+/* With the lock hook, a holder that stalls far past the dead timeout keeps
+ * the baton and may still write; once it dies, the next requester takes the
+ * baton at once, with a higher CTS (spec 5.8, 5.9.8). */
+static void test_stalled_holder_keeps_baton(void)
+{
+    static cdb_coord a, b;
+    cdb_coord_config cfg;
+    int64_t t0;
+    int granted;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.baton_wait_ns = 10 * (int64_t)SEC;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, join(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_join(&b, &env, DIR "/coord", db_id, CDB_ORDER_LITTLE, &cfg));
+    TEST_ASSERT_TRUE(b.peers[0].by_lock);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_take(&a, 0, &granted));
+    TEST_ASSERT_TRUE(granted);
+    beating[nbeating++] = &b; /* a stalls */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_take(&b, 0, &granted));
+    TEST_ASSERT_FALSE(granted);
+    TEST_ASSERT_TRUE(cdb_coord_baton_held(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_guard(&a)); /* no lease margin */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_fence(&a));
+
+    cdb_coord_abandon(&a);
+    t0 = fe.mono_ns;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_baton_take(&b, 0, &granted));
+    TEST_ASSERT_TRUE(granted);
+    TEST_ASSERT_TRUE(fe.mono_ns - t0 < SEC);
+    TEST_ASSERT_TRUE(b.me.cts > a.me.cts);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&b));
+}
+
+/* With the lock hook, a crashed coordinator's slot is free as soon as the
+ * system releases its lock: the next joiner takes it over at once, counters
+ * included (spec 5.9.5). */
+static void test_dead_slot_taken_over_by_lock(void)
+{
+    static cdb_coord a, c;
+    int64_t t0;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, join(&a));
+    a.me.tx_hwm = 5000;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_beat(&a, 1));
+    cdb_coord_abandon(&a);
+    t0 = fe.mono_ns;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, join(&c));
+    TEST_ASSERT_TRUE(fe.mono_ns - t0 < SEC);
+    TEST_ASSERT_EQUAL_UINT(0, c.me.slot);
+    TEST_ASSERT_EQUAL_UINT(CDB_COORD_PRIMARY, c.me.role);
+    TEST_ASSERT_EQUAL_UINT64(5000, c.me.tx_hwm);
+    TEST_ASSERT_TRUE(c.me.flags & CDB_COORD_LOCKED);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&c));
+    TEST_ASSERT_EQUAL_UINT(0, cdb_faultenv_held_locks(&fe));
+}
+
+/* Only a coordinator holding every slot removes another slot's file
+ * (spec 5.9.5); while the other lives, it cannot hold them all. */
+static void test_remove_slot_needs_every_lock(void)
+{
+    static cdb_coord a, b;
+    int all;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, join(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, join(&b));
+    TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_coord_remove_slot(&a, 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_hold_all(&a, 1, &all));
+    TEST_ASSERT_FALSE(all);
+    TEST_ASSERT_FALSE(a.holding_all);
+    TEST_ASSERT_EQUAL_UINT(2, cdb_faultenv_held_locks(&fe)); /* the slots' own */
+
+    cdb_coord_abandon(&b);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_hold_all(&a, 1, &all));
+    TEST_ASSERT_TRUE(all);
+    TEST_ASSERT_EQUAL_UINT(0, a.live_others);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_remove_slot(&a, 1));
+    TEST_ASSERT_FALSE(file_exists(DIR "/coord/1"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_remove_dir_lock(&a));
+    cdb_coord_release_all(&a);
+    TEST_ASSERT_EQUAL_UINT(0, cdb_faultenv_held_locks(&fe));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->rmdir(env.ctx, DIR "/coord"));
+}
+
+/* Fallback: another joiner's earlier lobby request for slot 0 wins it. */
 static void test_lobby_race_lost(void)
 {
     cdb_coord_rec r;
@@ -419,6 +526,7 @@ static void test_lobby_race_lost(void)
     cdb_storage st;
     cdb_coord b;
 
+    fallback();
     TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->mkdir(env.ctx, DIR "/coord"));
     memset(&r, 0, sizeof r);
     memcpy(r.db_id, db_id, 16);
@@ -506,6 +614,16 @@ struct proc {
     cdb_db db;
 };
 static struct proc p1, p2;
+
+/* A host test that failed midway leaves its handles open, their responders
+ * running; they are stopped here, before the next test reuses p1 and p2. */
+void tearDown(void)
+{
+    if (p2.db.hb_running)
+        (void)cdb_db_close(&p2.db);
+    if (p1.db.hb_running)
+        (void)cdb_db_close(&p1.db);
+}
 
 /* Store ENCLAVE is enclave 42: its records and pages are encrypted when the
  * processes open with keys (keyed_procs). */
@@ -637,7 +755,8 @@ static const char *value_of(struct proc *p, uint64_t e)
     return out;
 }
 
-static cdb_status open_proc_max(struct proc *p, unsigned max_coords)
+static cdb_status open_proc_with(struct proc *p, unsigned max_coords, const cdb_env *e, const char *base,
+                                 int64_t beat_ns)
 {
     cdb_header h;
     memset(&p->cfg, 0, sizeof p->cfg);
@@ -657,6 +776,7 @@ static cdb_status open_proc_max(struct proc *p, unsigned max_coords)
     p->cfg.catalog_page = p->cat_page;
     p->cfg.durability = CDB_DURABILITY_FULL;
     p->cfg.coord.max_coords = max_coords;
+    p->cfg.coord.beat_ns = beat_ns;
     if (keyed_procs) {
         p->cfg.master_key_uri = "custom://mk";
         p->cfg.key_provider = test_keys;
@@ -667,7 +787,12 @@ static cdb_status open_proc_max(struct proc *p, unsigned max_coords)
     h.layout_flags = CDB_LAYOUT_ADDR64;
     h.default_page_log2 = (uint8_t)PAGE_LOG2;
     memcpy(h.db_id, db_id, 16);
-    return cdb_db_open(&p->db, &env, DIR "/db", &p->cfg, &h);
+    return cdb_db_open(&p->db, e, base, &p->cfg, &h);
+}
+
+static cdb_status open_proc_max(struct proc *p, unsigned max_coords)
+{
+    return open_proc_with(p, max_coords, &env, DIR "/db", 0);
 }
 
 static cdb_status open_proc(struct proc *p)
@@ -711,10 +836,26 @@ static cdb_status open_proc_table(struct proc *p)
     return open_proc_table_max(p, 0);
 }
 
+/* p crashes while the others go on: its files stay as they are, and the
+ * system releases its locks (spec 5.8). */
+static void crash_proc(struct proc *p)
+{
+    cdb_storage_close(&p->db.overlay_st);
+    cdb_storage_close(&p->db.journal_st);
+    cdb_storage_close(&p->db.archive_st);
+    cdb_coord_abandon(&p->db.coord);
+}
+
 static void tick_p1(void *arg)
 {
     (void)arg;
     (void)cdb_db_tick(&p1.db);
+}
+
+static void tick_p2(void *arg)
+{
+    (void)arg;
+    (void)cdb_db_tick(&p2.db);
 }
 
 static void tick_both(void *arg)
@@ -854,6 +995,140 @@ static void test_two_processes_encrypted_merge(void)
     keyed_procs = 0;
 }
 
+/* A newcomer cannot rotate encrypted records of an enclave it has not
+ * opened, so it passes over a crashed slot whose journal holds some and
+ * takes the next slot (spec 5.9.5, 14.4.7 rule 9). The journal stays
+ * pending, whole, until the baton holder, which has the enclave open,
+ * merges it: the encrypted transaction and the plain one after it. */
+static void test_take_over_encrypted_slot(void)
+{
+    keyed_procs = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_enclave(&p1.db, ENCLAVE, "custom://enc"));
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&p2.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, ENCLAVE, 5, CDB_OP_REPLACE, "secret", 6));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
+    crash_proc(&p2);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_UINT(2, p2.db.coord.me.slot);
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/main.1.cdb"));
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/coord/1"));
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("secret", value_of(&p1, 5));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&p1.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_STRING("secret", value_of(&p1, 5));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    keyed_procs = 0;
+}
+
+/* A merger without an enclave's key leaves the rest of a journal that holds
+ * the enclave's records pending, from the first such transaction on; it
+ * neither drops nor removes it, and the database stays in use, so a process
+ * with the key merges it later (spec 5.9.5, 14.4.7 rule 7). */
+static void test_merge_defers_undecryptable(void)
+{
+    keyed_procs = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_enclave(&p1.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1)); /* p1 never opens the enclave */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&p2.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 1, CDB_OP_PATCH, "a", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, ENCLAVE, 5, CDB_OP_REPLACE, "secret", 6));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
+    crash_proc(&p2);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("a", value_of(&p1, 1)); /* before the encrypted one */
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 2));  /* after it: pending */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/main.1.cdb"));
+
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1)); /* alone: recovery defers it again */
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&p1.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("secret", value_of(&p1, 5));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+    keyed_procs = 0;
+}
+
+/* With the key gone for good, the operator lets such records go with
+ * CDB_DB_DROP_UNREADABLE (CDB_DB_ACCEPT_LOSS is not enough): the merger
+ * drops only the transaction it cannot decrypt, whole, and merges the rest
+ * of the journal (spec 5.9.1). */
+static void test_accept_loss_drops_undecryptable(void)
+{
+    keyed_procs = 1;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_create_enclave(&p1.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&p2.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, ENCLAVE, 5, CDB_OP_REPLACE, "secret", 6));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 3, CDB_OP_PATCH, "x", 1)); /* same transaction */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
+    crash_proc(&p2);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 2)); /* pending behind the encrypted one */
+    p1.db.cfg.flags |= CDB_DB_ACCEPT_LOSS; /* another loss: not this one */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 2));
+    p1.db.cfg.flags = CDB_DB_DROP_UNREADABLE;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 3)); /* dropped whole, never in part */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_open_enclave(&p1.db, ENCLAVE, "custom://enc"));
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 5)); /* given up */
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    keyed_procs = 0;
+}
+
 /* A transaction that was open while another process reconciled into the
  * archive is rejected: its view is older than the archive (spec 5.9.4). The
  * rejected process is rebased at once, so its retry builds on the new
@@ -944,7 +1219,8 @@ static void test_reader_pin_blocks_reuse(void)
 }
 
 /* When one of two open processes crashes, the survivor's next reconciliation
- * merges the dead slot's journal and cleans up its files (spec 5.9.1,
+ * merges the dead slot's journal but keeps its files; the survivor removes
+ * them only as the last to close, holding every slot (spec 5.9.1, 5.9.5,
  * 14.4.7 rule 9). */
 static void test_live_peer_merges_crashed_peer(void)
 {
@@ -964,11 +1240,7 @@ static void test_live_peer_merges_crashed_peer(void)
     /* p2 crashes: close its handles without leaving or removing its files,
      * then let the dead timeout pass while p1 keeps ticking. */
     cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
-    cdb_storage_close(&p2.db.overlay_st);
-    cdb_storage_close(&p2.db.journal_st);
-    cdb_storage_close(&p2.db.archive_st);
-    cdb_storage_close(&p2.db.coord.st);
-    p2.db.coord.joined = 0;
+    crash_proc(&p2);
     {
         int64_t step = SEC / 4, rem = 4 * (int64_t)SEC;
         while (rem > 0) {
@@ -981,11 +1253,12 @@ static void test_live_peer_merges_crashed_peer(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
     TEST_ASSERT_EQUAL_STRING("a", value_of(&p1, 1));
     TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
-    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork/main.1.cdb"));
-    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork/pages.1.cdb"));
-    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork/coord/1"));
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/main.1.cdb"));
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/pages.1.cdb"));
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/coord/1"));
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_EQUAL_UINT(0, cdb_faultenv_held_locks(&fe));
     TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
     cdb_faultenv_on_sleep(&fe, NULL, NULL);
 }
@@ -1006,11 +1279,7 @@ static void test_take_over_dead_slot_while_peer_live(void)
 
     /* p2 crashes while p1 stays alive without reconciling. */
     cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
-    cdb_storage_close(&p2.db.overlay_st);
-    cdb_storage_close(&p2.db.journal_st);
-    cdb_storage_close(&p2.db.archive_st);
-    cdb_storage_close(&p2.db.coord.st);
-    p2.db.coord.joined = 0;
+    crash_proc(&p2);
 
     /* A new process opens, waits slot 1's dead timeout out, claims slot 1,
      * and adopts main.1.cdb into its overlay. */
@@ -1419,11 +1688,7 @@ static void test_rebase_preserves_write_keys(void)
 
     /* p2 crashes while p1 stays alive without reconciling. */
     cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
-    cdb_storage_close(&p2.db.overlay_st);
-    cdb_storage_close(&p2.db.journal_st);
-    cdb_storage_close(&p2.db.archive_st);
-    cdb_storage_close(&p2.db.coord.st);
-    p2.db.coord.joined = 0;
+    crash_proc(&p2);
 
     /* A newcomer opens, claims dead slot 1, and adopts/rebases its journal */
     TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
@@ -1491,11 +1756,7 @@ static void test_rebase_drops_rolled_back(void)
 
     /* p2 crashes while p1 stays alive without reconciling. */
     cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
-    cdb_storage_close(&p2.db.overlay_st);
-    cdb_storage_close(&p2.db.journal_st);
-    cdb_storage_close(&p2.db.archive_st);
-    cdb_storage_close(&p2.db.coord.st);
-    p2.db.coord.joined = 0;
+    crash_proc(&p2);
 
     /* A newcomer claims dead slot 1 and rebases its journal. */
     TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
@@ -2048,15 +2309,207 @@ static void test_counters_survive_crash(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
 }
 
-/* An application idle past the dead timeout loses its slot to a newcomer
- * and is told so; its database refuses further work. */
+/* Closing never waits for the baton (spec 5.9.1): beside a live holder that
+ * never answers, a process closes at once, leaving its journal pending and
+ * its slot recorded as closed. The holder merges it and, as the last to
+ * close, removes its files. */
+static void test_close_leaves_journal_pending(void)
+{
+    cdb_coord_rec r;
+    int valid;
+    int64_t t0;
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+
+    cdb_faultenv_on_sleep(&fe, NULL, NULL); /* p1 never answers */
+    t0 = fe.mono_ns;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_TRUE(fe.mono_ns - t0 < SEC);
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/main.1.cdb"));
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork/pages.1.cdb"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_read_slot(&p1.db.coord, 1, &r, &valid));
+    TEST_ASSERT_TRUE(valid);
+    TEST_ASSERT_EQUAL_UINT(CDB_COORD_CLOSED | CDB_COORD_JOURNAL | CDB_COORD_LOCKED, r.flags);
+    TEST_ASSERT_EQUAL_UINT(1, cdb_faultenv_held_locks(&fe)); /* p1's slot only */
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/main.1.cdb")); /* not p1's to remove yet */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+    TEST_ASSERT_EQUAL_UINT(0, cdb_faultenv_held_locks(&fe));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+}
+
+/* A newcomer takes over a slot closed with its journal pending and adopts
+ * the journal, so its changes are its own again (spec 5.9.5). */
+static void test_closed_slot_adopted(void)
+{
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_UINT(1, p2.db.coord.me.slot);
+    TEST_ASSERT_TRUE(p2.db.coord.me.flags & CDB_COORD_ALIVE);
+    TEST_ASSERT_FALSE(p2.db.coord.me.flags & CDB_COORD_CLOSED);
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p2, 2));
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+}
+
+/* A reconciliation request returns at once; the baton holder meets it at
+ * its next tick, merging the requester's journal, and the requester
+ * withdraws it once it sees its changes in the archive. With nobody holding
+ * the baton, the requester reconciles itself (spec 5.9.8). */
+static void test_reconcile_request(void)
+{
+    int64_t t0;
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_TRUE(cdb_coord_baton_held(&p1.db.coord));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+
+    cdb_faultenv_on_sleep(&fe, NULL, NULL); /* p1 answers only when it ticks */
+    t0 = fe.mono_ns;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile_request(&p2.db));
+    TEST_ASSERT_TRUE(fe.mono_ns - t0 < SEC);
+    TEST_ASSERT_EQUAL_UINT(CDB_COORD_REQ_RECONCILE, p2.db.coord.me.req_kind);
+    TEST_ASSERT_EQUAL_STRING("", value_of(&p1, 2));
+
+    cdb_faultenv_advance(&fe, SEC);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    cdb_faultenv_advance(&fe, SEC);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p2.db));
+    TEST_ASSERT_EQUAL_UINT(CDB_COORD_REQ_NONE, p2.db.coord.me.req_kind);
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p2, 2));
+
+    /* Nobody holds the baton now: the request reconciles at once. */
+    TEST_ASSERT_FALSE(cdb_coord_baton_held(&p1.db.coord));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 3, CDB_OP_PATCH, "c", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile_request(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("c", value_of(&p1, 3));
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+}
+
+/* With the lock hook, an application idle past the dead timeout keeps its
+ * slot: a newcomer takes another, and the idle one goes on (spec 5.9.6). */
+static void test_idle_process_keeps_slot(void)
+{
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2)); /* p1 never beats */
+    TEST_ASSERT_EQUAL_UINT(1, p2.db.coord.me.slot);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p1.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_abort(&p1.db));
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL); /* p1 hands its standing baton over */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+}
+
+/* Fallback: an application idle past the dead timeout loses its slot to a
+ * newcomer and is told so; its database refuses further work. */
 static void test_idle_process_loses_slot(void)
 {
+    fallback();
     TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
     TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2)); /* p1 never beats: it is taken for dead */
     TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, cdb_db_tick(&p1.db));
     TEST_ASSERT_EQUAL_INT(CDB_E_STATE, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+}
+
+/* A live process that stalls past the dead timeout is still alive (spec
+ * 5.8): a peer's reconciliation may merge its journal but never removes its
+ * journal, overlay or slot file (5.9.5), and its later commits survive.
+ * The demo pipeline's unopenable database: a long engine call held the db
+ * lock, so its heartbeat thread stalled; here the stall is a process that
+ * does not tick while time passes. */
+static void test_stalled_process_keeps_its_journal(void)
+{
+    int kept_journal, kept_slot;
+    cdb_status tick_s, begin_s, commit_s = CDB_E_STATE;
+
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 1, CDB_OP_PATCH, "a", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+    cdb_faultenv_advance(&fe, 10000000);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+
+    /* p1 stalls for four seconds while p2 keeps ticking, then p2 reconciles. */
+    cdb_faultenv_on_sleep(&fe, tick_p2, NULL);
+    {
+        int64_t step = SEC / 4, rem = 4 * (int64_t)SEC;
+        while (rem > 0) {
+            cdb_faultenv_advance(&fe, step);
+            (void)cdb_db_tick(&p2.db);
+            rem -= step;
+        }
+    }
+    (void)cdb_db_reconcile(&p2.db);
+    kept_journal = file_exists(DIR "/db.cdbwork/main.0.cdb");
+    kept_slot = file_exists(DIR "/db.cdbwork/coord/0");
+
+    /* p1 wakes up and commits again; both close, and the database reopens
+     * with every commit. */
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    tick_s = cdb_db_tick(&p1.db);
+    begin_s = cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT);
+    if (begin_s == CDB_OK) {
+        (void)cdb_tx_put(&p1.db, 1, 1, CDB_OP_PATCH, "c", 1);
+        commit_s = cdb_tx_commit(&p1.db);
+    }
+    (void)cdb_db_close(&p1.db);
+    (void)cdb_db_close(&p2.db);
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_TRUE(kept_journal);
+    TEST_ASSERT_TRUE(kept_slot);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, tick_s);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, begin_s);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, commit_s);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_STRING("ac", value_of(&p1, 1));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
 }
 
 /* -------------------------------------------------------- host environment */
@@ -2080,6 +2533,7 @@ static void test_host_hooks(void)
     unsigned n = 0;
     cdb_coord c;
     cdb_storage st;
+    cdb_lock *l1, *l2, *l3;
 
     cdb_hostenv_init(&he, &h);
     snprintf(dir, sizeof dir, "%s/coord_%ld", CDB_TEST_TMPDIR, (long)getpid());
@@ -2089,6 +2543,23 @@ static void test_host_hooks(void)
     cdb_storage_close(&st);
     TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->list(h.ctx, dir, count_name, &n));
     TEST_ASSERT_EQUAL_UINT(1, n);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->remove(h.ctx, path));
+
+    /* The lock hook (spec 5.8): flock semantics, so two handles conflict
+     * within one process, and closing another descriptor of the file leaves
+     * the lock held. */
+    snprintf(path, sizeof path, "%s/l", dir);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->lock_open(h.ctx, path, 1, &l1));
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, h.ops->lock_open(h.ctx, path, 0, &l2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->open(h.ctx, path, 0, &st));
+    cdb_storage_close(&st);
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, h.ops->lock_open(h.ctx, path, 1, &l2));
+    h.ops->lock_close(h.ctx, l1);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->lock_open(h.ctx, path, 0, &l1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->lock_open(h.ctx, path, 0, &l2));
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, h.ops->lock_open(h.ctx, path, 1, &l3));
+    h.ops->lock_close(h.ctx, l1);
+    h.ops->lock_close(h.ctx, l2);
     TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->remove(h.ctx, path));
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->mono(h.ctx, &t0));
@@ -2103,9 +2574,193 @@ static void test_host_hooks(void)
     snprintf(path, sizeof path, "%s/coord", dir);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_join(&c, &h, path, db_id, CDB_ORDER_LITTLE, NULL));
     TEST_ASSERT_EQUAL_UINT(CDB_COORD_PRIMARY, c.me.role);
+    TEST_ASSERT_TRUE(c.use_locks);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_leave(&c));
+    snprintf(path, sizeof path, "%s/coord/lock", dir);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->remove(h.ctx, path));
+    snprintf(path, sizeof path, "%s/coord", dir);
     TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->rmdir(h.ctx, path));
     TEST_ASSERT_EQUAL_INT(CDB_OK, h.ops->rmdir(h.ctx, dir));
+}
+
+/* -------------------------------------------------------- the responder, on the host */
+
+#define HOST_BEAT (50 * 1000000) /* 50 ms: a dead timeout of 150 ms */
+
+/* Static, so a handle a failed test left open can still be closed in
+ * tearDown. */
+static cdb_hostenv host_he;
+static cdb_env host_env;
+static cdb_env_ops host_ops;
+
+static int64_t host_now(const cdb_env *h)
+{
+    int64_t t = 0;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h->ops->mono(h->ctx, &t));
+    return t;
+}
+
+/* A fresh folder for a host database; *base is its database path. */
+static void host_dir(const cdb_env *h, const char *name, char *dir, size_t dsize, char *base, size_t bsize)
+{
+    snprintf(dir, dsize, "%s/%s_%ld", CDB_TEST_TMPDIR, name, (long)getpid());
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h->ops->mkdir(h->ctx, dir));
+    snprintf(base, bsize, "%s/db", dir);
+}
+
+/* After both closes: the working directory is gone; the archive goes too. */
+static void host_cleanup(const cdb_env *h, const char *dir, const char *base)
+{
+    char path[240];
+    int there = 1;
+    snprintf(path, sizeof path, "%s.cdbwork", base);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h->ops->exists(h->ctx, path, &there));
+    TEST_ASSERT_FALSE(there);
+    snprintf(path, sizeof path, "%s.cdbarch", base);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h->ops->remove(h->ctx, path));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, h->ops->rmdir(h->ctx, dir));
+}
+
+/* The value of entry e in p's pages, read under p's lock: p's responder may
+ * be reconciling on its own thread. */
+static const char *host_value_of(struct proc *p, uint64_t e)
+{
+    const char *v;
+    cdb_db_lock(&p->db);
+    v = value_of(p, e);
+    cdb_db_unlock(&p->db);
+    return v;
+}
+
+/* A standing baton held by an idle process is handed over by its responder
+ * (spec 5.9.8): p1 makes no call at all, yet p2's reconciliation gets the
+ * baton, with p2's change merged by p1 first. Without the responder p2 would
+ * wait out its cap and get CDB_E_BUSY. */
+static void test_host_responder_hands_over(void)
+{
+    cdb_env h;
+    char dir[160], base[200];
+    int64_t t0;
+
+    cdb_hostenv_init(&host_he, &host_env);
+    h = host_env;
+    host_dir(&h, "handover", dir, sizeof dir, base, sizeof base);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_with(&p1, 0, &h, base, HOST_BEAT));
+    TEST_ASSERT_TRUE(p1.db.hb_running);
+    TEST_ASSERT_TRUE(cdb_coord_baton_held(&p1.db.coord));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_with(&p2, 0, &h, base, HOST_BEAT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_REPLACE, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    TEST_ASSERT_EQUAL_STRING("", host_value_of(&p1, 2));
+
+    t0 = host_now(&h);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p2.db));
+    TEST_ASSERT_TRUE(host_now(&h) - t0 < 2 * HOST_BEAT * 3);
+    TEST_ASSERT_FALSE(cdb_coord_baton_held(&p2.db.coord) && cdb_coord_baton_held(&p1.db.coord));
+    TEST_ASSERT_EQUAL_STRING("b", host_value_of(&p1, 2));
+    TEST_ASSERT_EQUAL_STRING("b", host_value_of(&p2, 2));
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    host_cleanup(&h, dir, base);
+}
+
+/* Publishes, as p1's engine would, that p1 is reconciling with work left far
+ * beyond any cap: one unit of a million done after a second. */
+static void stall_with_estimate(struct proc *p, cdb_coord_status_save *sv)
+{
+    cdb_coord *c = &p->db.coord;
+    cdb_coord_status_begin(c, CDB_COORD_OP_RECONCILE, sv);
+    (void)c->env.ops->mutex_lock(c->env.ctx, c->mx);
+    c->me.x_total = 1000000;
+    c->me.x = 1;
+    c->me.status_start -= 1000000; /* started a second ago, in microseconds */
+    (void)c->env.ops->mutex_unlock(c->env.ctx, c->mx);
+}
+
+/* p1 stalls inside an engine call (the test holds its database lock) for
+ * many dead timeouts: its responder still writes heartbeats and its status
+ * (spec 5.8), and p2, waiting for the baton, reads the estimate and gives up
+ * at once with CDB_E_BUSY instead of waiting out its cap, never taking p1
+ * for dead. */
+static void test_host_stalled_holder_publishes_estimate(void)
+{
+    cdb_env h;
+    cdb_coord_status_save sv;
+    cdb_coord_rec r;
+    char dir[160], base[200];
+    uint64_t beat0;
+    int64_t t0;
+    int valid;
+
+    cdb_hostenv_init(&host_he, &host_env);
+    h = host_env;
+    host_dir(&h, "stalled", dir, sizeof dir, base, sizeof base);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_with(&p1, 0, &h, base, HOST_BEAT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_with(&p2, 0, &h, base, HOST_BEAT));
+    TEST_ASSERT_TRUE(cdb_coord_baton_held(&p1.db.coord));
+
+    cdb_db_lock(&p1.db); /* p1's long engine call begins */
+    stall_with_estimate(&p1, &sv);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_read_slot(&p2.db.coord, p1.db.coord.me.slot, &r, &valid));
+    TEST_ASSERT_TRUE(valid);
+    beat0 = r.beat;
+    h.ops->sleep(h.ctx, 4 * 3 * HOST_BEAT); /* four dead timeouts */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_read_slot(&p2.db.coord, p1.db.coord.me.slot, &r, &valid));
+    TEST_ASSERT_TRUE(r.beat >= beat0 + 4u);
+    TEST_ASSERT_EQUAL_UINT(CDB_COORD_OP_RECONCILE, r.status_op);
+    TEST_ASSERT_TRUE(r.estimate_ms != CDB_COORD_ESTIMATE_UNKNOWN && r.estimate_ms > 60u * 1000u);
+
+    t0 = host_now(&h);
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, cdb_db_reconcile(&p2.db));
+    TEST_ASSERT_TRUE(host_now(&h) - t0 < 3 * HOST_BEAT);
+    TEST_ASSERT_TRUE(p2.db.coord.peers[p1.db.coord.me.slot].live);
+    TEST_ASSERT_TRUE(cdb_coord_baton_held(&p1.db.coord));
+
+    cdb_coord_status_end(&p1.db.coord, &sv);
+    cdb_db_unlock(&p1.db); /* the call ends */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    host_cleanup(&h, dir, base);
+}
+
+/* The original bug, in the fallback (no lock hook): a process inside a long
+ * engine call, its database lock held for many dead timeouts, keeps
+ * heartbeating through its responder, so another process never judges it
+ * dead and never merges and removes its journal. */
+static void test_host_fallback_stall_stays_alive(void)
+{
+    cdb_env h;
+    char dir[160], base[200];
+    unsigned slot;
+
+    cdb_hostenv_init(&host_he, &host_env);
+    host_ops = *host_env.ops;
+    host_ops.lock_open = NULL;
+    host_ops.lock_close = NULL;
+    host_env.ops = &host_ops;
+    h = host_env;
+    host_dir(&h, "fallback", dir, sizeof dir, base, sizeof base);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_with(&p1, 0, &h, base, HOST_BEAT));
+    TEST_ASSERT_FALSE(p1.db.coord.use_locks);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc_with(&p2, 0, &h, base, HOST_BEAT));
+    slot = p1.db.coord.me.slot;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 3, CDB_OP_REPLACE, "c", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+
+    cdb_db_lock(&p1.db);
+    h.ops->sleep(h.ctx, 5 * 3 * HOST_BEAT);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_coord_beat(&p2.db.coord, 1));
+    TEST_ASSERT_TRUE(p2.db.coord.peers[slot].live);
+    cdb_db_unlock(&p1.db);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_tick(&p1.db));
+    TEST_ASSERT_FALSE(p1.db.failed);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    host_cleanup(&h, dir, base);
 }
 
 int main(void)
@@ -2122,6 +2777,9 @@ int main(void)
     RUN_TEST(test_baton_window_passes);
     RUN_TEST(test_baton_wait_cap);
     RUN_TEST(test_dead_slot_taken_over);
+    RUN_TEST(test_stalled_holder_keeps_baton);
+    RUN_TEST(test_dead_slot_taken_over_by_lock);
+    RUN_TEST(test_remove_slot_needs_every_lock);
     RUN_TEST(test_lobby_race_lost);
     RUN_TEST(test_full);
     RUN_TEST(test_join_crash_sweep);
@@ -2132,6 +2790,9 @@ int main(void)
     RUN_TEST(test_reader_pin_blocks_reuse);
     RUN_TEST(test_live_peer_merges_crashed_peer);
     RUN_TEST(test_take_over_dead_slot_while_peer_live);
+    RUN_TEST(test_take_over_encrypted_slot);
+    RUN_TEST(test_merge_defers_undecryptable);
+    RUN_TEST(test_accept_loss_drops_undecryptable);
     RUN_TEST(test_missing_peer_journal_refused);
     RUN_TEST(test_crashed_process_recovered);
     RUN_TEST(test_id_block_claims);
@@ -2144,12 +2805,20 @@ int main(void)
     RUN_TEST(test_rebase_preserves_write_keys);
     RUN_TEST(test_rebase_drops_rolled_back);
     RUN_TEST(test_table_multi_process_e2e);
+    RUN_TEST(test_close_leaves_journal_pending);
+    RUN_TEST(test_closed_slot_adopted);
+    RUN_TEST(test_reconcile_request);
+    RUN_TEST(test_idle_process_keeps_slot);
     RUN_TEST(test_idle_process_loses_slot);
+    RUN_TEST(test_stalled_process_keeps_its_journal);
     RUN_TEST(test_recovery_merges_slots_by_stamp);
     RUN_TEST(test_journal_from_newer_archive_set_aside);
     RUN_TEST(test_recovery_crash_sweep);
     RUN_TEST(test_recovery_crash_sweep_prepare_write_key);
     RUN_TEST(test_counters_survive_crash);
     RUN_TEST(test_host_hooks);
+    RUN_TEST(test_host_responder_hands_over);
+    RUN_TEST(test_host_stalled_holder_publishes_estimate);
+    RUN_TEST(test_host_fallback_stall_stays_alive);
     return UNITY_END();
 }

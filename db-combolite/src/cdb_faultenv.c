@@ -97,6 +97,7 @@ static cdb_status fe_open(void *ctx, const char *path, unsigned flags, cdb_stora
     memset(f, 0, sizeof *f);
     strcpy(f->name, path);
     f->exists = 1;
+    f->gen = ++fe->next_gen;
     base = fe->cfg.arena + (size_t)slot * 3u * fe->cfg.file_capacity;
     memset(&dc, 0, sizeof dc);
     dc.current = base;
@@ -353,13 +354,85 @@ void cdb_faultenv_on_sleep(cdb_faultenv *fe, void (*fn)(void *arg), void *arg)
     fe->on_sleep_arg = arg;
 }
 
+/* Locks are not durable state, so taking one is no crash point; creating
+ * the file is, as for open. A lock conflicts with another on the same file
+ * when either is exclusive. */
+static cdb_status fe_lock_open(void *ctx, const char *path, int exclusive, cdb_lock **out)
+{
+    cdb_faultenv *fe = (cdb_faultenv *)ctx;
+    cdb_faultenv_file *f;
+    cdb_storage st;
+    cdb_status s;
+    int i, file, free_at = -1;
+
+    if (fe->clock.crashed)
+        return CDB_E_IO;
+    if ((s = fe_open(ctx, path, CDB_ENV_CREATE, &st)) != CDB_OK)
+        return s;
+    cdb_storage_close(&st);
+    f = find_file(fe, path);
+    file = (int)(f - fe->files);
+    for (i = 0; i < CDB_FAULTENV_MAX_LOCKS; i++) {
+        cdb_lock *l = &fe->locks[i];
+        if (!l->used) {
+            if (free_at < 0)
+                free_at = i;
+        } else if (l->file == file && l->gen == f->gen && (l->exclusive || exclusive)) {
+            return CDB_E_BUSY;
+        }
+    }
+    if (free_at < 0)
+        return CDB_E_BUFFER_TOO_SMALL;
+    fe->locks[free_at].used = 1;
+    fe->locks[free_at].exclusive = exclusive != 0;
+    fe->locks[free_at].file = file;
+    fe->locks[free_at].gen = f->gen;
+    *out = &fe->locks[free_at];
+    return CDB_OK;
+}
+
+/* A handle from before a reboot is already released and must not be closed:
+ * its entry may hold another lock by then. */
+static void fe_lock_close(void *ctx, cdb_lock *l)
+{
+    (void)ctx;
+    if (l != NULL)
+        memset(l, 0, sizeof *l);
+}
+
 static const cdb_env_ops faultenv_ops = {
     fe_open, fe_remove, fe_rename, fe_mkdir, fe_rmdir, fe_exists, fe_sync_dir, fe_now, fe_alloc, fe_free,
     fe_list, fe_mono, fe_random, fe_sleep,
     NULL, NULL, NULL, NULL,
     NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL
+    NULL, NULL,
+    fe_lock_open, fe_lock_close,
+    NULL
 };
+
+static const cdb_env_ops faultenv_ops_nolock = {
+    fe_open, fe_remove, fe_rename, fe_mkdir, fe_rmdir, fe_exists, fe_sync_dir, fe_now, fe_alloc, fe_free,
+    fe_list, fe_mono, fe_random, fe_sleep,
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL,
+    NULL, NULL,
+    NULL
+};
+
+unsigned cdb_faultenv_held_locks(const cdb_faultenv *fe)
+{
+    unsigned n = 0;
+    int i;
+    for (i = 0; i < CDB_FAULTENV_MAX_LOCKS; i++)
+        n += fe->locks[i].used != 0;
+    return n;
+}
+
+void cdb_faultenv_without_locks(cdb_env *env)
+{
+    env->ops = &faultenv_ops_nolock;
+}
 
 void cdb_faultenv_advance(cdb_faultenv *fe, int64_t ns)
 {
@@ -424,8 +497,10 @@ void cdb_faultenv_reboot(cdb_faultenv *fe)
 
     /* Without a crash every current state is kept (an orderly shutdown);
      * after one, only the durable state survives. Directories first, so a
-     * file whose directory was lost is lost too. */
+     * file whose directory was lost is lost too. Every process has ended,
+     * so every lock is released. */
     free_all(fe);
+    memset(fe->locks, 0, sizeof fe->locks);
     for (i = 0; i < CDB_FAULTENV_MAX_DIRS; i++) {
         cdb_faultenv_dir *d = &fe->dirs[i];
         if (!crashed)
