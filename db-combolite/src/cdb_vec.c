@@ -92,7 +92,7 @@ static size_t vector_bytes(unsigned elem, uint32_t dims)
  * boundary of the page after the entry IDs and norms. */
 static size_t data_off(const cdb_db *db, const coll *c, uint32_t count)
 {
-    size_t h = cdb_page_header_size(db->pager.fmt);
+    size_t h = cdb_page_payload_offset(db->pager.fmt);
     size_t end = h + BLOCK_HDR + (size_t)count * (8u + (c->norms ? 4u : 0u));
     return ((end + 15u) & ~(size_t)15u) - h;
 }
@@ -763,7 +763,7 @@ static cdb_status block_read(cdb_db *db, const coll *c, uint64_t lid, block *b)
     cdb_status s = cdb_pager_read(&db->pager, lid, vbuf(db, V_BLOCK), &h);
     if (s != CDB_OK)
         return s == CDB_E_NOT_FOUND ? CDB_E_CORRUPT : s;
-    b->p = vbuf(db, V_BLOCK) + cdb_page_header_size(db->pager.fmt);
+    b->p = vbuf(db, V_BLOCK) + cdb_page_payload_offset(db->pager.fmt);
     if (h.type != CDB_PAGE_TYPE_VECTOR || h.payload_len < BLOCK_HDR)
         return CDB_E_CORRUPT;
     b->count = cdb_load_u32(b->p + 8, db->pager.order);

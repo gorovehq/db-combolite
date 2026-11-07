@@ -31,12 +31,17 @@
 
 /* Assigned feature flags (spec 14.1.10). */
 #define CDB_FEATURE_RO_VEC_CHANGES (UINT64_C(1) << 0) /* read-only compatible: vector change logs (14.12.5) */
+#define CDB_FEATURE_IN_STORE_SLOT (UINT64_C(1) << 0)  /* incompatible: every page's store ID slot (14.2.7) */
 
 /* Feature flags this build understands, per class (spec 1.2). Each feature
  * adds its bit here as it is implemented. */
 #define CDB_FEATURES_COMPAT_KNOWN UINT64_C(0)
 #define CDB_FEATURES_ROCOMPAT_KNOWN CDB_FEATURE_RO_VEC_CHANGES
-#define CDB_FEATURES_INCOMPAT_KNOWN UINT64_C(0)
+#define CDB_FEATURES_INCOMPAT_KNOWN CDB_FEATURE_IN_STORE_SLOT
+
+/* Incompatible features every file this build opens must have: the format
+ * before them is not supported (spec 14.2.7). cdb_header_create sets them. */
+#define CDB_FEATURES_INCOMPAT_REQUIRED CDB_FEATURE_IN_STORE_SLOT
 
 typedef struct cdb_companion_slot {
     uint16_t type_id;
@@ -95,7 +100,7 @@ cdb_status cdb_header_encode(const cdb_header *h, uint8_t out[CDB_HEADER_SLOT_SI
 cdb_status cdb_header_decode(const uint8_t in[CDB_HEADER_SLOT_SIZE], cdb_header *h);
 
 /* Checks feature flags against this build (spec 1.2): an unknown
- * incompatible flag refuses the file; an unknown read-only-compatible flag
+ * incompatible flag, or a missing required one, refuses the file; an unknown read-only-compatible flag
  * sets *read_only. Unknown compatible flags are ignored. */
 cdb_status cdb_header_check_features(const cdb_header *h, int *read_only);
 

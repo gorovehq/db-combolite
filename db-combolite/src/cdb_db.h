@@ -20,6 +20,7 @@
 #include "cdb_coord.h"
 #include "cdb_journal.h"
 #include "cdb_pager.h"
+#include "cdb_profile.h"
 #include "cdb_slots.h"
 #include "cdb_worker.h"
 #include "cdb_trigger.h"
@@ -187,6 +188,15 @@ typedef struct cdb_db_config {
  * reconciliation or tick); FILLING: being filled, a chunk at a time;
  * DECLINED: the accelerator would not mirror it, the CPU serves it. */
 enum { CDB_ACCEL_FREE = 0, CDB_ACCEL_WANTED, CDB_ACCEL_READY, CDB_ACCEL_FILLING, CDB_ACCEL_DECLINED };
+
+/* One salt-table entry (spec 14.2.8), as held in memory. */
+typedef struct cdb_salt_entry {
+    uint16_t index;
+    uint8_t salt[16];
+    uint64_t last_commit;  /* the last archive commit with a page under it */
+    uint64_t prune_before; /* nonzero: unused in a scrub pass that started at this commit */
+    int seen;              /* a page under it was found in the scrub pass under way */
+} cdb_salt_entry;
 
 /* A fill queued on the worker pool, for entry `index` as it was at `token`. */
 typedef struct cdb_accel_task {
@@ -465,11 +475,23 @@ typedef struct cdb_db {
     int rotation_expired;
     cdb_identity active_identity;
     int has_identity;
+    /* Session salts (spec 12.1, 14.2.8): this session's, drawn at open when
+     * there is a master key, and the archive's salt table, in index order. */
+    uint8_t session_salt[16];
+    int has_salt;
+    cdb_salt_entry salts[CDB_SALT_TABLE_MAX];
+    unsigned salt_count;
+    /* The scrub (cdb_db_scrub): the next lid to look at, 0 between passes,
+     * the committed sequence when the pass started, and whether the pass
+     * met a page version that hid the committed one. */
+    uint64_t scrub_lid;
+    uint64_t scrub_start;
+    int scrub_hidden;
     struct {
         uint64_t enclave_id;
         uint32_t key_version;
         uint8_t enclave_key[32];
-        uint8_t page_key[32];
+        uint8_t page_key[32]; /* under this session's salt */
         uint8_t hash_key[32];
         uint8_t index_key[32];
         int in_use;
@@ -620,6 +642,16 @@ cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint6
 /* Space reclamation (spec 3.7, 16.2): sweeps the archive for pages and
  * nibblet records belonging to dropped stores, freeing them for reuse. */
 cdb_status cdb_db_reclaim(cdb_db *db, uint64_t *pages_freed, uint64_t *nibblets_freed);
+
+/* Checks the archive a budget of pages at a time (spec 3.5, 14.2.8): public
+ * pages are verified, encrypted ones only show which salt they use. After
+ * a whole pass, *pass_done is 1, and a salt no page used and last used by a
+ * commit before the pass began is removed from the salt table by the next
+ * archive commit. A pass that met a page not yet committed (in the overlay,
+ * or written since the last commit) can't see the committed page beneath
+ * it, so it removes nothing. CDB_E_CORRUPT for a public page that fails
+ * verification. */
+cdb_status cdb_db_scrub(cdb_db *db, uint64_t budget, int *pass_done);
 
 /* Security, enclaves, and key rotation (spec 12). */
 cdb_status cdb_db_create_enclave(cdb_db *db, uint64_t enclave_id, const char *key_ref);

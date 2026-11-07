@@ -243,6 +243,7 @@ void cdb_crypto_hash_free(cdb_crypto_hash_ctx *ctx)
 
 cdb_status cdb_crypto_derive_subkey(const uint8_t base_key[CDB_CRYPTO_KEY_SIZE],
                                     cdb_subkey_purpose purpose,
+                                    const uint8_t *salt,
                                     uint8_t subkey_out[CDB_CRYPTO_KEY_SIZE])
 {
     const mbedtls_md_info_t *md;
@@ -252,30 +253,30 @@ cdb_status cdb_crypto_derive_subkey(const uint8_t base_key[CDB_CRYPTO_KEY_SIZE],
     if (base_key == NULL || subkey_out == NULL)
         return CDB_E_INVALID_ARG;
 
+    /* The labels of spec 12.2. "cdb integrity" is not in the spec's table. */
     switch (purpose) {
-    case CDB_SUBKEY_PAGE:
-        info_str = "combolite:page";
-        break;
-    case CDB_SUBKEY_CONTENT_HASH:
-        info_str = "combolite:hash";
-        break;
-    case CDB_SUBKEY_INDEX:
-        info_str = "combolite:index";
-        break;
-    case CDB_SUBKEY_INTEGRITY:
-        info_str = "combolite:integrity";
-        break;
-    default:
-        return CDB_E_INVALID_ARG;
+    case CDB_SUBKEY_PAGE: info_str = "cdb page"; break;
+    case CDB_SUBKEY_CONTENT_HASH: info_str = "cdb hash"; break;
+    case CDB_SUBKEY_INDEX: info_str = "cdb index"; break;
+    case CDB_SUBKEY_INTEGRITY: info_str = "cdb integrity"; break;
+    case CDB_SUBKEY_SEAL: info_str = "cdb seal"; break;
+    case CDB_SUBKEY_SEAL_NONCE: info_str = "cdb seal nonce"; break;
+    case CDB_SUBKEY_REPL: info_str = "cdb repl"; break;
+    case CDB_SUBKEY_REPL_NONCE: info_str = "cdb repl nonce"; break;
+    default: return CDB_E_INVALID_ARG;
     }
+    /* Only the page subkey feeds a counter nonce, so only it is salted. */
+    if (salt != NULL && purpose != CDB_SUBKEY_PAGE)
+        return CDB_E_INVALID_ARG;
 
     md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
     if (md == NULL)
         return CDB_E_UNSUPPORTED;
 
-    ret = mbedtls_hkdf_expand(md, base_key, CDB_CRYPTO_KEY_SIZE,
-                              (const unsigned char *)info_str, strlen(info_str),
-                              subkey_out, CDB_CRYPTO_KEY_SIZE);
+    ret = mbedtls_hkdf(md, salt, salt != NULL ? CDB_SESSION_SALT_SIZE : 0u,
+                       base_key, CDB_CRYPTO_KEY_SIZE,
+                       (const unsigned char *)info_str, strlen(info_str),
+                       subkey_out, CDB_CRYPTO_KEY_SIZE);
     return ret == 0 ? CDB_OK : CDB_E_CORRUPT;
 }
 

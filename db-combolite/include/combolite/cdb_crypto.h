@@ -24,13 +24,21 @@
 /* Nonce track IDs (spec 14.2.5). */
 #define CDB_TRACK_ARCHIVE_PAGE 0xFFFFFFFFu
 
-/* Subkey purposes for enclave key derivation (spec 12.2). */
+/* Subkey purposes (spec 12.2): one subkey per job, each derived from a
+ * domain key (or, for integrity, the master key) with HKDF-SHA-256 and the
+ * job's label as the info. */
 typedef enum cdb_subkey_purpose {
-    CDB_SUBKEY_PAGE = 1,      /* Page encryption */
-    CDB_SUBKEY_CONTENT_HASH,  /* Keyed content hashes (HMAC-SHA-256) */
-    CDB_SUBKEY_INDEX,         /* Enclave index protection */
-    CDB_SUBKEY_INTEGRITY      /* Tamper-evident tags (derived from master key) */
+    CDB_SUBKEY_PAGE = 1,      /* "cdb page": pages and delta records; takes the session salt */
+    CDB_SUBKEY_CONTENT_HASH,  /* "cdb hash": keyed content hashes */
+    CDB_SUBKEY_INDEX,         /* "cdb index": the domain's indexes, joined-store tags */
+    CDB_SUBKEY_INTEGRITY,     /* "cdb integrity": tamper-evident tags, from the master key (12.7) */
+    CDB_SUBKEY_SEAL,          /* "cdb seal": sealed references in joined stores */
+    CDB_SUBKEY_SEAL_NONCE,    /* "cdb seal nonce": their synthetic nonces */
+    CDB_SUBKEY_REPL,          /* "cdb repl": sealed replication changes */
+    CDB_SUBKEY_REPL_NONCE     /* "cdb repl nonce": their synthetic nonces */
 } cdb_subkey_purpose;
+
+#define CDB_SESSION_SALT_SIZE 16u
 
 /* Overdue key rotation actions (spec 12.4). */
 typedef enum cdb_rotation_policy {
@@ -119,9 +127,14 @@ cdb_status cdb_crypto_hash_update(cdb_crypto_hash_ctx *ctx, const void *data, si
 cdb_status cdb_crypto_hash_final(cdb_crypto_hash_ctx *ctx, uint8_t out_hash[CDB_CRYPTO_HASH_SIZE]);
 void cdb_crypto_hash_free(cdb_crypto_hash_ctx *ctx);
 
-/* Purpose-separated subkey derivation via HKDF-SHA256 (spec 12.2). */
+/* Purpose-separated subkey derivation via HKDF-SHA-256 (spec 12.2, 14.2.8).
+ * salt is the 16-byte session salt, used as the HKDF salt; only the page
+ * subkey takes one, and the others are derived with an empty salt so that
+ * every copy and session computes them alike. CDB_E_INVALID_ARG for a salt
+ * given to any other purpose. */
 cdb_status cdb_crypto_derive_subkey(const uint8_t base_key[CDB_CRYPTO_KEY_SIZE],
                                     cdb_subkey_purpose purpose,
+                                    const uint8_t *salt,
                                     uint8_t subkey_out[CDB_CRYPTO_KEY_SIZE]);
 
 /* Key wrapping for envelope encryption (spec 12.2):

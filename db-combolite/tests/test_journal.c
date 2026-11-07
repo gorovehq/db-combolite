@@ -3,6 +3,7 @@
 #include "unity.h"
 #include "combolite/cdb_crypto.h"
 #include "cdb_faultdev.h"
+#include "cdb_endian.h"
 #include "cdb_journal.h"
 
 #define CAP 8192u
@@ -138,14 +139,16 @@ static void test_encrypted_records_roundtrip(void)
     r1.payload_len = (uint32_t)strlen(p1) + 1;
     r1.store_id = 10;
     r1.entry_id = 101;
+    r1.domain_id = 42;
 
     memset(&r2, 0, sizeof(r2));
     r2.kind = CDB_RECORD_DATA;
     r2.flags = CDB_RECORD_FLAG_ENCRYPTED;
     r2.payload = (const uint8_t *)p2;
     r2.payload_len = (uint32_t)strlen(p2) + 1;
-    r2.store_id = 10;
+    r2.store_id = 300;
     r2.entry_id = 102;
+    r2.domain_id = 42;
 
     /* Append using AES-256-GCM */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_journal_append_crypto(&j, &r1, buf, sizeof(buf),
@@ -160,6 +163,20 @@ static void test_encrypted_records_roundtrip(void)
                                                          CDB_AEAD_AES_256_GCM, key));
     TEST_ASSERT_TRUE(read.flags & CDB_RECORD_FLAG_ENCRYPTED);
     TEST_ASSERT_EQUAL_STRING(p1, (const char *)read.payload);
+    TEST_ASSERT_EQUAL_UINT32(strlen(p1) + 1, read.payload_len);
+    TEST_ASSERT_EQUAL_UINT64(10, read.store_id);
+    TEST_ASSERT_EQUAL_UINT64(101, read.entry_id);
+    TEST_ASSERT_EQUAL_UINT64(42, read.domain_id);
+
+    /* The header shows only the domain (spec 14.4.2); the payload length
+     * counts the two varints (1 and 1 byte). */
+    {
+        uint8_t raw[CDB_RECORD_HEADER_SIZE];
+        TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_storage_read(&j.st, CDB_JOURNAL_HEADER_SIZE, raw, sizeof raw));
+        TEST_ASSERT_EQUAL_UINT64(42, cdb_load_u64(raw + 24, j.order));
+        TEST_ASSERT_EQUAL_UINT64(0, cdb_load_u64(raw + 32, j.order));
+        TEST_ASSERT_EQUAL_UINT32(strlen(p1) + 1 + 2, cdb_load_u32(raw + 4, j.order));
+    }
 
     /* Read back r2 */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_journal_read_crypto(&j, next, buf, sizeof(buf),
@@ -167,12 +184,20 @@ static void test_encrypted_records_roundtrip(void)
                                                          CDB_AEAD_CHACHA20_POLY1305, key));
     TEST_ASSERT_TRUE(read.flags & CDB_RECORD_FLAG_ENCRYPTED);
     TEST_ASSERT_EQUAL_STRING(p2, (const char *)read.payload);
+    TEST_ASSERT_EQUAL_UINT64(300, read.store_id); /* a two-byte varint */
+    TEST_ASSERT_EQUAL_UINT64(102, read.entry_id);
 
     /* Read with wrong key fails verification */
     key[0] ^= 0x01;
     TEST_ASSERT_EQUAL_INT(CDB_E_CORRUPT, cdb_journal_read_crypto(&j, CDB_JOURNAL_HEADER_SIZE, buf, sizeof(buf),
                                                                 &read, &next,
                                                                 CDB_AEAD_AES_256_GCM, key));
+    key[0] ^= 0x01;
+
+    /* An encrypted record must name its domain. */
+    r1.domain_id = 0;
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_journal_append_crypto(&j, &r1, buf, sizeof(buf),
+                                                                      CDB_AEAD_AES_256_GCM, key));
 }
 
 int main(void)

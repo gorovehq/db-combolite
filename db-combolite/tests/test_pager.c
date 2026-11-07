@@ -86,7 +86,7 @@ static void expect_text(cdb_pager *p, uint64_t lid, const char *text)
     cdb_page_header h;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(p, lid, page, &h));
     TEST_ASSERT_EQUAL_UINT32(strlen(text), h.payload_len);
-    TEST_ASSERT_EQUAL_MEMORY(text, page + cdb_page_header_size(p->fmt), strlen(text));
+    TEST_ASSERT_EQUAL_MEMORY(text, page + cdb_page_payload_offset(p->fmt), strlen(text));
 }
 
 static void create(cdb_pager *p)
@@ -949,15 +949,35 @@ static void test_page_cache_hits_misses_eviction(void)
 }
 
 static int mock_enclave_allowed = 1;
-static cdb_status mock_enclave_key_cb(void *ctx, uint64_t domain_id, uint32_t key_version, uint8_t key_out[32])
+static cdb_status mock_enclave_key_cb(void *ctx, uint64_t domain_id, uint32_t key_version, uint16_t salt_index,
+                                      uint8_t key_out[32])
 {
     (void)ctx;
     (void)key_version;
+    (void)salt_index;
     if (domain_id == 42 && mock_enclave_allowed) {
         memset(key_out, 0x42, 32);
         return CDB_OK;
     }
     return CDB_E_SECURITY;
+}
+
+static unsigned mock_assigns, mock_precommits_used;
+static cdb_status mock_salt_assign(void *ctx, uint16_t *index)
+{
+    (void)ctx;
+    mock_assigns++;
+    *index = 5;
+    return CDB_OK;
+}
+
+static cdb_status mock_precommit(void *ctx, uint64_t commit_seq, int salt_used)
+{
+    (void)ctx;
+    (void)commit_seq;
+    if (salt_used)
+        mock_precommits_used++;
+    return CDB_OK;
 }
 
 static void test_page_cache_enclave_security(void)
@@ -976,17 +996,30 @@ static void test_page_cache_enclave_security(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_alloc(&p, &lid));
     memset(&t, 0, sizeof t);
     t.type = CDB_PAGE_TYPE_DATA_TEST;
+    t.domain_id = 42;
+    /* Without a session there is no salt to write an encrypted page under. */
+    TEST_ASSERT_EQUAL_INT(CDB_E_SECURITY, cdb_pager_write(&p, lid, &t, "x", 1));
+    mock_assigns = mock_precommits_used = 0;
+    cdb_pager_set_session(&p, 3, mock_salt_assign, mock_precommit, NULL);
+    memset(&t, 0, sizeof t);
+    t.type = CDB_PAGE_TYPE_DATA_TEST;
     t.store_id = 1;
     t.domain_id = 42;
     t.key_version = 1;
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_write(&p, lid, &t, "secret_enclave_data", 19));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_write(&p, lid, &t, "secret_enclave_data", 19));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&p));
+    /* One assignment per commit; the commit reports the salt as used. */
+    TEST_ASSERT_EQUAL_UINT(1, mock_assigns);
+    TEST_ASSERT_EQUAL_UINT(1, mock_precommits_used);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_peek(&p, lid, page, &h, NULL));
+    TEST_ASSERT_EQUAL_UINT16(5, h.salt_index);
 
     /* Authorized read: succeeds and populates cache */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&p, lid, page, &h));
     TEST_ASSERT_EQUAL_UINT32(19, h.payload_len);
-    TEST_ASSERT_EQUAL_MEMORY("secret_enclave_data", page + cdb_page_header_size(p.fmt), 19);
+    TEST_ASSERT_EQUAL_MEMORY("secret_enclave_data", page + cdb_page_payload_offset(p.fmt), 19);
 
     /* Revoke enclave access / lock enclave */
     mock_enclave_allowed = 0;
@@ -995,7 +1028,7 @@ static void test_page_cache_enclave_security(void)
     memset(page, 0, sizeof page);
     TEST_ASSERT_EQUAL_INT(CDB_E_SECURITY, cdb_pager_read(&p, lid, page, &h));
     /* Verify zero plaintext was leaked into caller's buffer */
-    TEST_ASSERT_EQUAL_UINT8(0, page[cdb_page_header_size(p.fmt)]);
+    TEST_ASSERT_EQUAL_UINT8(0, page[cdb_page_payload_offset(p.fmt)]);
 
     /* Wipe enclave domain 42 from cache */
     cdb_pager_cache_wipe_domain(&p, 42);
@@ -1003,7 +1036,56 @@ static void test_page_cache_enclave_security(void)
     /* Re-allow enclave access */
     mock_enclave_allowed = 1;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&p, lid, page, &h));
-    TEST_ASSERT_EQUAL_MEMORY("secret_enclave_data", page + cdb_page_header_size(p.fmt), 19);
+    TEST_ASSERT_EQUAL_MEMORY("secret_enclave_data", page + cdb_page_payload_offset(p.fmt), 19);
+}
+
+/* Overlay pages (spec 14.2.5, 14.2.8): salt index 0xFFFF, the overlay's own
+ * track (0xFFFE and the slot), and a sequence counter of their own that a
+ * reload does not reset. */
+static void test_overlay_track_and_counter(void)
+{
+    cdb_pager a, b;
+    cdb_page_header t, h;
+    uint8_t key[32], raw[PAGE];
+    uint64_t lid;
+
+    create(&a);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_alloc(&a, &lid));
+    write_text(&a, lid, "base");
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_commit(&a));
+
+    memset(&b, 0, sizeof b);
+    open_second(&b, 1);
+    mock_enclave_allowed = 1;
+    cdb_pager_set_crypto(&b, CDB_AEAD_AES_256_GCM, NULL, NULL, mock_enclave_key_cb, NULL);
+    mock_assigns = 0;
+    cdb_pager_set_session(&b, 3, mock_salt_assign, mock_precommit, NULL);
+    memset(&t, 0, sizeof t);
+    t.type = CDB_PAGE_TYPE_DATA_TEST;
+    t.domain_id = 42;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_write(&b, lid, &t, "one", 3));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_write(&b, lid, &t, "two", 3)); /* in place */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_peek(&b, lid, raw, &h, NULL));
+    TEST_ASSERT_EQUAL_UINT16(CDB_SALT_INDEX_FILE, h.salt_index);
+    TEST_ASSERT_EQUAL_UINT64(2, h.write_seq);
+    TEST_ASSERT_EQUAL_UINT(0, mock_assigns); /* the archive's table is not involved */
+
+    /* Sealed on track 0xFFFE0003, not the archive's. */
+    memset(key, 0x42, sizeof key);
+    memcpy(page, raw, PAGE);
+    TEST_ASSERT_EQUAL_INT(CDB_E_CORRUPT, cdb_page_open_crypto(page, PAGE, b.fmt, b.order, b.checksum_alg,
+                                                              CDB_AEAD_AES_256_GCM, key, CDB_TRACK_ARCHIVE_PAGE, &h));
+    memcpy(page, raw, PAGE);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_page_open_crypto(page, PAGE, b.fmt, b.order, b.checksum_alg,
+                                                       CDB_AEAD_AES_256_GCM, key, 0xFFFE0003u, &h));
+    TEST_ASSERT_EQUAL_MEMORY("two", page + cdb_page_payload_offset(b.fmt), 3);
+
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_reload(&b));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_write(&b, lid, &t, "three", 5));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_peek(&b, lid, raw, &h, NULL));
+    TEST_ASSERT_EQUAL_UINT64(3, h.write_seq); /* the counter went on */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&b, lid, page, &h));
+    TEST_ASSERT_EQUAL_MEMORY("three", page + cdb_page_payload_offset(b.fmt), 5);
 }
 
 int main(void)
@@ -1033,6 +1115,7 @@ int main(void)
     RUN_TEST(test_guard_stops_archive_writes);
     RUN_TEST(test_page_cache_hits_misses_eviction);
     RUN_TEST(test_page_cache_enclave_security);
+    RUN_TEST(test_overlay_track_and_counter);
     RUN_TEST(test_compaction_crash_sweep);
     RUN_TEST(test_crash_sweep);
     return UNITY_END();

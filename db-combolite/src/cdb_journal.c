@@ -12,6 +12,7 @@
 #include "cdb_crc32c.h"
 #include "cdb_endian.h"
 #include "cdb_journal.h"
+#include "cdb_varint.h"
 
 /* "\x89CDBCMP\n", the companion-file magic (spec 14.4.1). */
 static const uint8_t journal_magic[8] = { 0x89, 0x43, 0x44, 0x42, 0x43, 0x4D, 0x50, 0x0A };
@@ -21,16 +22,13 @@ static const uint8_t journal_magic[8] = { 0x89, 0x43, 0x44, 0x42, 0x43, 0x4D, 0x
 #define RECORD_MARKER_1 0xDEu
 #define JOURNAL_EPOCH 1u
 
-/* Encodes the 64-byte companion header (spec 14.4.1) and writes it at
- * offset 0. The handle starts with no records: the first record goes right
- * after the header and gets sequence hdr->first_seq. */
-cdb_status cdb_journal_create(cdb_journal *j, const cdb_storage *st, cdb_byte_order order,
-                              const cdb_journal_header *hdr)
+/* Encodes the 80-byte companion header (spec 14.4.1) and writes it at
+ * offset 0. */
+cdb_status cdb_companion_write_header(const cdb_storage *st, cdb_byte_order order, const cdb_journal_header *hdr)
 {
     uint8_t h[CDB_JOURNAL_HEADER_SIZE];
-    cdb_status s;
 
-    /* Reserved bytes (14..15 and 56..59) stay zero. */
+    /* Reserved bytes (14..15 and 72..75) stay zero. */
     memset(h, 0, sizeof h);
     memcpy(h, journal_magic, sizeof journal_magic);
     h[8] = (uint8_t)order;
@@ -41,8 +39,19 @@ cdb_status cdb_journal_create(cdb_journal *j, const cdb_storage *st, cdb_byte_or
     cdb_store_u64(h + 32, hdr->unsealed_seq, order);
     cdb_store_u64(h + 40, hdr->first_seq, order);
     cdb_store_u64(h + 48, hdr->domain_id, order);
-    cdb_store_u32(h + 60, cdb_crc32c(h, 60), order);
-    if ((s = cdb_storage_program(st, 0, h, sizeof h)) != CDB_OK)
+    memcpy(h + 56, hdr->salt, 16);
+    cdb_store_u32(h + 76, cdb_crc32c(h, 76), order);
+    return cdb_storage_program(st, 0, h, sizeof h);
+}
+
+/* The handle starts with no records: the first record goes right after the
+ * header and gets sequence hdr->first_seq. */
+cdb_status cdb_journal_create(cdb_journal *j, const cdb_storage *st, cdb_byte_order order,
+                              const cdb_journal_header *hdr)
+{
+    cdb_status s;
+
+    if ((s = cdb_companion_write_header(st, order, hdr)) != CDB_OK)
         return s;
     memset(j, 0, sizeof *j);
     j->st = *st;
@@ -56,7 +65,7 @@ cdb_status cdb_journal_create(cdb_journal *j, const cdb_storage *st, cdb_byte_or
 /* Reads and checks the companion header. Errors: CDB_E_CORRUPT for a short
  * file, wrong magic, a byte order different from the archive's, or a bad
  * CRC; CDB_E_UNSUPPORTED for another epoch; CDB_E_MALFORMED when reserved
- * bytes 14..15 are not zero. Matching the database ID and the unsealed
+ * bytes 14..15 or 72..75 are not zero. Matching the database ID and the unsealed
  * sequence is left to the caller. j->end is set to just after the header:
  * the caller finds the true end by reading records until one fails. */
 cdb_status cdb_journal_open(cdb_journal *j, const cdb_storage *st, cdb_byte_order order)
@@ -71,11 +80,14 @@ cdb_status cdb_journal_open(cdb_journal *j, const cdb_storage *st, cdb_byte_orde
      * the right byte order. */
     if (memcmp(h, journal_magic, sizeof journal_magic) != 0 || h[8] != (uint8_t)order)
         return CDB_E_CORRUPT;
-    if (cdb_load_u32(h + 60, order) != cdb_crc32c(h, 60))
+    if (cdb_load_u32(h + 76, order) != cdb_crc32c(h, 76))
         return CDB_E_CORRUPT;
     if (h[9] != JOURNAL_EPOCH)
         return CDB_E_UNSUPPORTED;
     for (i = 14; i < 16; i++)
+        if (h[i])
+            return CDB_E_MALFORMED;
+    for (i = 72; i < 76; i++)
         if (h[i])
             return CDB_E_MALFORMED;
     memset(j, 0, sizeof *j);
@@ -87,6 +99,7 @@ cdb_status cdb_journal_open(cdb_journal *j, const cdb_storage *st, cdb_byte_orde
     j->hdr.unsealed_seq = cdb_load_u64(h + 32, order);
     j->hdr.first_seq = cdb_load_u64(h + 40, order);
     j->hdr.domain_id = cdb_load_u64(h + 48, order);
+    memcpy(j->hdr.salt, h + 56, 16);
     j->end = CDB_JOURNAL_HEADER_SIZE;
     j->next_seq = j->hdr.first_seq;
     return CDB_OK;
@@ -106,13 +119,22 @@ static size_t record_size(uint32_t payload_len)
 cdb_status cdb_journal_append_crypto(cdb_journal *j, cdb_record *r, uint8_t *buf, size_t buf_size,
                                      unsigned aead_alg, const uint8_t *key)
 {
-    size_t size = record_size(r->payload_len);
+    int hide = (r->flags & CDB_RECORD_FLAG_ENCRYPTED) != 0;
+    size_t ids = hide ? cdb_varint_size(r->store_id) + cdb_varint_size(r->entry_id) : 0u;
+    uint32_t body_len;
+    size_t size;
     uint8_t *p = buf;
     uint8_t *trailer;
     cdb_status s;
 
+    if (r->payload_len > UINT32_MAX - ids)
+        return CDB_E_OVERFLOW;
+    body_len = (uint32_t)(r->payload_len + ids);
+    size = record_size(body_len);
     if (size > buf_size)
         return CDB_E_BUFFER_TOO_SMALL;
+    if (hide && r->domain_id == 0)
+        return CDB_E_INVALID_ARG;
     r->seq = j->next_seq;
     /* 48-byte header (spec 14.4.2); bytes 44..47 are reserved, left zero. */
     memset(p, 0, CDB_RECORD_HEADER_SIZE);
@@ -120,25 +142,29 @@ cdb_status cdb_journal_append_crypto(cdb_journal *j, cdb_record *r, uint8_t *buf
     p[1] = RECORD_MARKER_1;
     p[2] = r->kind;
     p[3] = r->flags;
-    cdb_store_u32(p + 4, r->payload_len, j->order);
+    cdb_store_u32(p + 4, body_len, j->order);
     cdb_store_u64(p + 8, r->seq, j->order);
     cdb_store_u64(p + 16, r->tx_id, j->order);
-    cdb_store_u64(p + 24, r->store_id, j->order);
-    cdb_store_u64(p + 32, r->entry_id, j->order);
+    cdb_store_u64(p + 24, hide ? r->domain_id : r->store_id, j->order);
+    cdb_store_u64(p + 32, hide ? 0u : r->entry_id, j->order);
     cdb_store_u32(p + 40, r->key_version, j->order);
     if (r->payload_len) /* the payload may already sit in place inside buf */
-        memmove(p + CDB_RECORD_HEADER_SIZE, r->payload, r->payload_len);
+        memmove(p + CDB_RECORD_HEADER_SIZE + ids, r->payload, r->payload_len);
+    if (hide) { /* the real target, inside the encryption (spec 14.4.2) */
+        size_t n = cdb_varint_encode(r->store_id, p + CDB_RECORD_HEADER_SIZE);
+        cdb_varint_encode(r->entry_id, p + CDB_RECORD_HEADER_SIZE + n);
+    }
 
     trailer = p + size - CDB_RECORD_TRAILER_SIZE;
 
-    if (r->flags & CDB_RECORD_FLAG_ENCRYPTED) {
+    if (hide) {
         uint8_t nonce[CDB_AEAD_NONCE_SIZE];
         uint32_t track_id = ((uint32_t)j->hdr.slot << 16) | (uint32_t)j->hdr.type_id;
         if (key == NULL || aead_alg == CDB_AEAD_NONE)
             return CDB_E_INVALID_ARG;
         cdb_crypto_make_nonce(track_id, r->seq, nonce);
         s = cdb_crypto_aead_encrypt(aead_alg, key, nonce, p, CDB_RECORD_HEADER_SIZE,
-                                    p + CDB_RECORD_HEADER_SIZE, r->payload_len,
+                                    p + CDB_RECORD_HEADER_SIZE, body_len,
                                     p + CDB_RECORD_HEADER_SIZE, trailer);
         if (s != CDB_OK)
             return s;
@@ -210,6 +236,20 @@ cdb_status cdb_journal_read_crypto(cdb_journal *j, uint64_t offset, uint8_t *buf
                                     trailer, buf + CDB_RECORD_HEADER_SIZE);
         if (s != CDB_OK)
             return CDB_E_CORRUPT;
+        /* The hidden target: two shortest-form varints (spec 14.4.2). */
+        {
+            uint64_t store, entry;
+            size_t n1, n2;
+            if (cdb_varint_decode(r->payload, payload_len, &store, &n1) != CDB_OK
+                || cdb_varint_decode(r->payload + n1, payload_len - n1, &entry, &n2) != CDB_OK
+                || r->entry_id != 0 || r->store_id == 0)
+                return CDB_E_CORRUPT;
+            r->domain_id = r->store_id;
+            r->store_id = store;
+            r->entry_id = entry;
+            r->payload += n1 + n2;
+            r->payload_len = payload_len - (uint32_t)(n1 + n2);
+        }
     } else {
         size_t i;
         if (cdb_load_u32(trailer, j->order) != cdb_crc32c(buf, size - CDB_RECORD_TRAILER_SIZE))

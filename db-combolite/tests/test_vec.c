@@ -254,7 +254,7 @@ static uint64_t verify_coll(uint64_t store, const vec *want, const int *live, ui
         count = cdb_load_u32(v + 4, CDB_ORDER_BIG);
         TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db.pager, cdb_load_u64(k, CDB_ORDER_BIG), pg, &h));
         TEST_ASSERT_EQUAL_HEX16(CDB_PAGE_TYPE_VECTOR, h.type);
-        p = pg + cdb_page_header_size(db.pager.fmt);
+        p = pg + cdb_page_payload_offset(db.pager.fmt);
         TEST_ASSERT_EQUAL_UINT32(count, cdb_load_u32(p + 8, CDB_ORDER_LITTLE));
         TEST_ASSERT_TRUE_MESSAGE(count > 0 && count <= c->slots, "block count");
         for (i = 0; i < count; i++)
