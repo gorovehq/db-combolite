@@ -92,7 +92,7 @@ static uint8_t *page_buf(cdb_db *db, unsigned i)
 
 static uint8_t *payload(cdb_db *db, unsigned i)
 {
-    return page_buf(db, i) + cdb_page_header_size(db->pager.fmt);
+    return page_buf(db, i) + cdb_page_payload_offset(db->pager.fmt);
 }
 
 static unsigned get16(const uint8_t *p, size_t off, cdb_byte_order o)

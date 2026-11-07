@@ -77,6 +77,15 @@ cdb_status gf_books_ingest_file(gf_db *g, const gf_catalog *c, const gf_books *b
 cdb_status gf_books_add_text_file(gf_db *g, const gf_catalog *c, const gf_books *b, int64_t ebook, const char *dir,
                                   gf_book_stats *st);
 
+/* The file of ebook in dir: the name its line in dir/manifest.tsv gives
+ * (gf_fetch.py names books by title), else the older <ebook>.txt. */
+void gf_books_path(const char *dir, int64_t ebook, char *path, size_t cap);
+
+/* The next passage of text[*pos..len), as stored books are cut: whole
+ * paragraphs up to GF_PASSAGE_MAX bytes, or a piece of a longer one.
+ * Returns its length (0 at the end) and sets *start. */
+size_t gf_books_next_passage(const char *text, size_t len, size_t *pos, size_t *start);
+
 /* Reads passage `entry`: its text (terminated, truncated to cap), ebook and
  * position in the book. */
 cdb_status gf_books_passage(gf_db *g, const gf_books *b, uint64_t entry, char *text, size_t cap, int64_t *ebook,

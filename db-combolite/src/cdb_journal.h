@@ -1,7 +1,7 @@
 /* Delta journal: a companion file of delta and commit records
  * (spec 1.3, 1.12.2, 3.3, 14.4).
  *
- * A journal is a 64-byte companion header followed by records. Each record
+ * A journal is an 80-byte companion header followed by records. Each record
  * is a 48-byte header, a payload and a 16-byte trailer whose first four bytes
  * are a CRC32C over header and payload. Records are only ever appended; a
  * reader stops at the first record that fails verification (spec 3.3). */
@@ -14,7 +14,7 @@
 #include "combolite/cdb_common.h"
 #include "combolite/cdb_storage.h"
 
-#define CDB_JOURNAL_HEADER_SIZE 64u
+#define CDB_JOURNAL_HEADER_SIZE 80u
 #define CDB_RECORD_HEADER_SIZE 48u
 #define CDB_RECORD_TRAILER_SIZE 16u
 #define CDB_COMMIT_PAYLOAD_SIZE 34u
@@ -28,6 +28,9 @@
 
 /* Companion type IDs (spec 1.12.3). */
 #define CDB_COMPANION_MAIN_JOURNAL 1u
+/* The page overlay (spec 5.9.1). It is never in the header's companion
+ * slots; the type only labels its companion header. */
+#define CDB_COMPANION_OVERLAY 2u
 
 /* Record kinds (spec 14.4.2). */
 #define CDB_RECORD_DATA 0u
@@ -61,11 +64,18 @@ typedef struct cdb_journal_header {
     uint64_t unsealed_seq; /* archive committed sequence at creation */
     uint64_t first_seq;    /* delta sequence of the first record in this file */
     uint64_t domain_id;    /* encryption domain; 0 = public */
+    uint8_t salt[16];      /* the writing session's salt (spec 14.2.8); zero without a master key */
 } cdb_journal_header;
 
 /* One delta record (spec 14.4.2). On append the caller fills every field
  * except seq; on read every field is filled and payload points into the
- * caller's buffer. */
+ * caller's buffer.
+ *
+ * An encrypted record hides its target: its header's store field holds
+ * domain_id and its entry field 0, and the real store and entry IDs lead
+ * the encrypted plaintext as two varints. Append and read do this, so
+ * store_id and entry_id are always the real ones here, and payload and
+ * payload_len never include the varints. */
 typedef struct cdb_record {
     uint8_t kind;          /* CDB_RECORD_* */
     uint8_t flags;         /* encrypted, compressed (none used yet) */
@@ -73,6 +83,7 @@ typedef struct cdb_record {
     uint64_t tx_id;        /* owning transaction (spec 14.4.3) */
     uint64_t store_id;     /* target store */
     uint64_t entry_id;     /* target entry, or 0 */
+    uint64_t domain_id;    /* encryption domain of an encrypted record; 0 otherwise */
     uint32_t key_version;
     const uint8_t *payload;
     uint32_t payload_len;
@@ -95,6 +106,10 @@ typedef struct cdb_journal {
     uint64_t end;      /* offset where the next record goes */
     uint64_t next_seq; /* delta sequence of the next record */
 } cdb_journal;
+
+/* Writes a companion header (spec 14.4.1) at offset 0 of st, without a
+ * barrier. Journals and overlays both start with one. */
+cdb_status cdb_companion_write_header(const cdb_storage *st, cdb_byte_order order, const cdb_journal_header *hdr);
 
 /* Writes a new journal's header (no barrier: the caller syncs). */
 cdb_status cdb_journal_create(cdb_journal *j, const cdb_storage *st, cdb_byte_order order,

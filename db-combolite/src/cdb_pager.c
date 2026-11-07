@@ -66,11 +66,11 @@ static uint64_t load_addr(const cdb_pager *p, const uint8_t *at)
     return p->addr_width == 8 ? cdb_load_u64(at, p->order) : cdb_load_u32(at, p->order);
 }
 
-/* Byte offset of the payload inside a page: the payload starts right after
- * the common page header, whose size depends on the page format. */
+/* Byte offset of the payload inside a page: the payload starts after the
+ * common page header and the store ID slot (spec 14.2.7). */
 static size_t payload_off(const cdb_pager *p)
 {
-    return cdb_page_header_size(p->fmt);
+    return cdb_page_payload_offset(p->fmt);
 }
 
 /* Size of one anchor-map leaf entry: the physical address, then page size
@@ -179,8 +179,7 @@ static uint64_t alloc_phys(cdb_pager *p)
 
 void cdb_pager_set_crypto(cdb_pager *p, unsigned aead_alg, const uint8_t *master_key,
                           const uint8_t *integrity_key,
-                          cdb_status (*domain_key_fn)(void *, uint64_t, uint32_t, uint8_t *),
-                          void *domain_key_ctx)
+                          cdb_pager_key_fn domain_key_fn, void *domain_key_ctx)
 {
     if (p == NULL)
         return;
@@ -201,21 +200,58 @@ void cdb_pager_set_crypto(cdb_pager *p, unsigned aead_alg, const uint8_t *master
     p->domain_key_ctx = domain_key_ctx;
 }
 
-static cdb_status pager_seal_page(cdb_pager *p, uint8_t *buf, cdb_page_header *h)
+void cdb_pager_set_session(cdb_pager *p, uint16_t slot,
+                           cdb_status (*salt_assign)(void *ctx, uint16_t *index),
+                           cdb_status (*precommit)(void *ctx, uint64_t commit_seq, int salt_used),
+                           void *ctx)
+{
+    p->sess.slot = slot;
+    p->sess.salt_assign = salt_assign;
+    p->sess.precommit = precommit;
+    p->sess.ctx = ctx;
+    if (p->sess.ov_seq == 0)
+        p->sess.ov_seq = 1;
+}
+
+/* The nonce track of a page (spec 14.2.5): the overlay's is 0xFFFE and the
+ * slot, the archive's 0xFFFFFFFF. */
+static uint32_t page_track(const cdb_pager *p, int overlay)
+{
+    return overlay ? (0xFFFEu << 16) | (uint32_t)p->sess.slot : CDB_TRACK_ARCHIVE_PAGE;
+}
+
+/* Seals buf with h. An encrypted page names its salt (spec 14.2.8): an
+ * overlay page the overlay's own, an archive page the session's index in
+ * the salt table, assigned at the first such page since the last commit. */
+static cdb_status pager_seal_page(cdb_pager *p, uint8_t *buf, cdb_page_header *h, int overlay)
 {
     const uint8_t *key = NULL;
     uint8_t key_buf[32];
     unsigned aead_alg = CDB_AEAD_NONE;
     cdb_status s;
 
+    h->salt_index = 0;
     if (h->domain_id > 0 && p->aead_alg != CDB_AEAD_NONE) {
-        if (p->domain_key_fn != NULL &&
-            p->domain_key_fn(p->domain_key_ctx, h->domain_id, h->key_version, key_buf) == CDB_OK) {
-            key = key_buf;
-            aead_alg = p->aead_alg;
+        if (overlay) {
+            h->salt_index = CDB_SALT_INDEX_FILE;
         } else {
-            return CDB_E_SECURITY;
+            if (p->salt_index == 0) {
+                if (p->sess.salt_assign == NULL)
+                    return CDB_E_SECURITY;
+                if ((s = p->sess.salt_assign(p->sess.ctx, &p->salt_index)) != CDB_OK)
+                    return s;
+                if (p->salt_index == 0 || p->salt_index == CDB_SALT_INDEX_FILE)
+                    return CDB_E_STATE;
+            }
+            h->salt_index = p->salt_index;
+            p->salt_used = 1;
         }
+        if (p->domain_key_fn == NULL)
+            return CDB_E_SECURITY;
+        if ((s = p->domain_key_fn(p->domain_key_ctx, h->domain_id, h->key_version, h->salt_index, key_buf)) != CDB_OK)
+            return s;
+        key = key_buf;
+        aead_alg = p->aead_alg;
     } else if ((p->hs.record.layout_flags & CDB_LAYOUT_GOVERNANCE) || (h->flags & CDB_PAGE_FLAG_TAMPER_EVIDENT)) {
         if (!p->has_integrity_key)
             return CDB_E_SECURITY;
@@ -224,62 +260,40 @@ static cdb_status pager_seal_page(cdb_pager *p, uint8_t *buf, cdb_page_header *h
     }
 
     s = cdb_page_seal_crypto(buf, p->page_size, p->fmt, p->order, p->checksum_alg,
-                             aead_alg, key, h);
+                             aead_alg, key, page_track(p, overlay), h);
     cdb_crypto_wipe(key_buf, sizeof key_buf);
     return s;
 }
 
-static uint64_t load_domain_id(const uint8_t *p, unsigned w, cdb_byte_order o)
-{
-    if (w == 8)
-        return cdb_load_u64(p, o);
-    if (w == 4)
-        return cdb_load_u32(p, o);
-    return cdb_load_u16(p, o);
-}
-
-static cdb_status pager_open_page(cdb_pager *p, uint8_t *buf, cdb_page_header *h)
+/* Verifies the page in buf and decrypts it when it is encrypted. The
+ * header, read without verifying it first, names the domain and salt whose
+ * key opens the page; only an overlay page names the overlay's salt. */
+static cdb_status pager_open_page(cdb_pager *p, uint8_t *buf, cdb_page_header *h, int overlay)
 {
     const uint8_t *key = NULL;
     uint8_t key_buf[32];
     unsigned aead_alg = CDB_AEAD_NONE;
     cdb_status s;
 
-    /* First attempt to open unencrypted */
-    s = cdb_page_open(buf, p->page_size, p->fmt, p->order, p->checksum_alg, h);
-    if (s != CDB_OK) {
-        /* Peek header to determine domain_id and flags without CRC check */
-        if (buf[0] != 0xC0u || buf[1] != 0xDBu)
-            return CDB_E_CORRUPT;
-        h->flags = buf[5];
-        if (p->fmt == CDB_PAGE_FMT_COMPACT) {
-            h->domain_id = load_domain_id(buf + 24, 2, p->order);
-            h->key_version = cdb_load_u16(buf + 16, p->order);
-        } else {
-            unsigned w = p->fmt == CDB_PAGE_FMT_FULL64 ? 8u : 4u;
-            h->domain_id = load_domain_id(buf + 24 + 2 * w, w, p->order);
-            h->key_version = cdb_load_u32(buf + 8, p->order);
-        }
-    }
-
+    if ((s = cdb_page_peek(buf, p->page_size, p->fmt, p->order, h)) != CDB_OK)
+        return s;
     if (h->domain_id > 0 && p->aead_alg != CDB_AEAD_NONE) {
-        if (p->domain_key_fn != NULL &&
-            p->domain_key_fn(p->domain_key_ctx, h->domain_id, h->key_version, key_buf) == CDB_OK) {
-            key = key_buf;
-            aead_alg = p->aead_alg;
-        } else {
+        if (h->salt_index == 0 || (h->salt_index == CDB_SALT_INDEX_FILE) != (overlay != 0))
+            return CDB_E_MALFORMED;
+        if (p->domain_key_fn == NULL)
             return CDB_E_SECURITY;
-        }
+        if ((s = p->domain_key_fn(p->domain_key_ctx, h->domain_id, h->key_version, h->salt_index, key_buf)) != CDB_OK)
+            return s;
+        key = key_buf;
+        aead_alg = p->aead_alg;
     } else if (h->flags & CDB_PAGE_FLAG_TAMPER_EVIDENT) {
         if (!p->has_integrity_key)
             return CDB_E_SECURITY;
         key = p->integrity_key;
-    } else if (s == CDB_OK) {
-        return CDB_OK;
     }
 
     s = cdb_page_open_crypto(buf, p->page_size, p->fmt, p->order, p->checksum_alg,
-                             aead_alg, key, h);
+                             aead_alg, key, page_track(p, overlay), h);
     cdb_crypto_wipe(key_buf, sizeof key_buf);
     return s;
 }
@@ -294,19 +308,21 @@ static cdb_status write_page_at(cdb_pager *p, uint8_t *buf, cdb_page_header *h, 
         return s;
     if ((s = next_seq(p, &h->write_seq)) != CDB_OK)
         return s;
-    if ((s = pager_seal_page(p, buf, h)) != CDB_OK)
+    if ((s = pager_seal_page(p, buf, h, 0)) != CDB_OK)
         return s;
     return cdb_storage_program(&p->st, phys_offset(p, phys), buf, p->page_size);
 }
 
 /* Seals buf and writes it at page phys of the overlay (spec 5.9.1). The
- * sequence number is taken without reserving it: overlay pages never reach
- * the archive, and the pager reloads before it writes the archive again. */
+ * sequence number comes from the session's overlay counter, which no
+ * rebase resets: the overlay's nonces never repeat under its salt (14.2.5). */
 static cdb_status write_overlay(cdb_pager *p, uint8_t *buf, cdb_page_header *h, uint64_t phys)
 {
     cdb_status s;
-    h->write_seq = p->next_seq++;
-    if ((s = pager_seal_page(p, buf, h)) != CDB_OK)
+    if (p->sess.ov_seq == 0)
+        p->sess.ov_seq = 1;
+    h->write_seq = p->sess.ov_seq++;
+    if ((s = pager_seal_page(p, buf, h, 1)) != CDB_OK)
         return s;
     return cdb_storage_program(&p->overlay, phys_offset(p, phys), buf, p->page_size);
 }
@@ -329,7 +345,7 @@ static cdb_status read_page(cdb_pager *p, uint64_t phys, uint8_t *buf, uint16_t 
         return CDB_E_CORRUPT;
     if ((s = cdb_storage_read(&p->st, phys_offset(p, phys), buf, p->page_size)) != CDB_OK)
         return s == CDB_E_TRUNCATED ? CDB_E_CORRUPT : s;
-    if ((s = pager_open_page(p, buf, h)) != CDB_OK)
+    if ((s = pager_open_page(p, buf, h, 0)) != CDB_OK)
         return s;
     return h->type == type && h->payload_len == cdb_page_capacity(p->fmt, p->page_size) ? CDB_OK : CDB_E_CORRUPT;
 }
@@ -1066,7 +1082,7 @@ cdb_status cdb_pager_open(cdb_pager *p, const cdb_storage *st, const cdb_pager_c
     int saved_hik = p ? p->has_integrity_key : 0;
     uint8_t saved_mk[32];
     uint8_t saved_ik[32];
-    cdb_status (*saved_fn)(void *, uint64_t, uint32_t, uint8_t *) = p ? p->domain_key_fn : NULL;
+    cdb_pager_key_fn saved_fn = p ? p->domain_key_fn : NULL;
     void *saved_ctx = p ? p->domain_key_ctx : NULL;
 
     if (p == NULL || st == NULL || cfg == NULL)
@@ -1204,7 +1220,7 @@ static int written_since_commit(cdb_pager *p, uint64_t phys, uint64_t lid)
 {
     cdb_page_header h;
     if (phys < p->data_start || cdb_storage_read(&p->st, phys_offset(p, phys), p->scratch, p->page_size) != CDB_OK
-        || pager_open_page(p, p->scratch, &h) != CDB_OK)
+        || pager_open_page(p, p->scratch, &h, 0) != CDB_OK)
         return 0;
     return h.write_seq >= p->seq_at_commit && h.logical_id == lid;
 }
@@ -1347,6 +1363,27 @@ cdb_status cdb_pager_write(cdb_pager *p, uint64_t lid, const cdb_page_header *tm
     return s;
 }
 
+cdb_status cdb_pager_peek(cdb_pager *p, uint64_t lid, uint8_t *page, cdb_page_header *h, int *committed)
+{
+    cdb_pager_node *leaf;
+    cdb_anchor_entry e;
+    size_t slot;
+    cdb_status s;
+
+    if ((s = entry_get(p, lid, &leaf, &slot, &e)) != CDB_OK)
+        return s;
+    if (e.state != CDB_ANCHOR_LIVE && e.state != CDB_ANCHOR_PRIVATE)
+        return CDB_E_NOT_FOUND;
+    if ((s = cdb_storage_read(e.state == CDB_ANCHOR_PRIVATE ? &p->overlay : &p->st, phys_offset(p, e.phys), page,
+                              p->page_size)) != CDB_OK)
+        return s == CDB_E_TRUNCATED ? CDB_E_CORRUPT : s;
+    if ((s = cdb_page_peek(page, p->page_size, p->fmt, p->order, h)) != CDB_OK)
+        return s;
+    if (committed != NULL)
+        *committed = e.state == CDB_ANCHOR_LIVE && h->write_seq < p->seq_at_commit;
+    return CDB_OK;
+}
+
 /* Reads the current version of lid, including changes not yet committed.
  * CDB_E_NOT_FOUND if the lid has no live page; CDB_E_CORRUPT if the page
  * fails verification or carries a different lid (a stale pointer). */
@@ -1373,7 +1410,8 @@ cdb_status cdb_pager_read(cdb_pager *p, uint64_t lid, uint8_t *page, cdb_page_he
                 if (cs->hdr.domain_id > 0 && p->aead_alg != CDB_AEAD_NONE) {
                     uint8_t key_buf[32];
                     if (p->domain_key_fn == NULL
-                        || p->domain_key_fn(p->domain_key_ctx, cs->hdr.domain_id, cs->hdr.key_version, key_buf) != CDB_OK) {
+                        || p->domain_key_fn(p->domain_key_ctx, cs->hdr.domain_id, cs->hdr.key_version,
+                                            cs->hdr.salt_index, key_buf) != CDB_OK) {
                         cdb_crypto_wipe(key_buf, sizeof key_buf);
                         return CDB_E_SECURITY;
                     }
@@ -1394,7 +1432,7 @@ cdb_status cdb_pager_read(cdb_pager *p, uint64_t lid, uint8_t *page, cdb_page_he
     if ((s = cdb_storage_read(e.state == CDB_ANCHOR_PRIVATE ? &p->overlay : &p->st, phys_offset(p, e.phys), page,
                               p->page_size)) != CDB_OK)
         return s == CDB_E_TRUNCATED ? CDB_E_CORRUPT : s;
-    if ((s = pager_open_page(p, page, h)) != CDB_OK)
+    if ((s = pager_open_page(p, page, h, e.state == CDB_ANCHOR_PRIVATE)) != CDB_OK)
         return s;
     if (h->logical_id != lid)
         return CDB_E_CORRUPT;
@@ -1538,6 +1576,10 @@ cdb_status cdb_pager_commit(cdb_pager *p)
         return CDB_OK;
     if (p->private_mode)
         return CDB_E_STATE; /* only the baton holder commits (spec 5.9.1) */
+    /* The salt table (spec 14.2.8) changes in the commit whose pages use it. */
+    if (p->sess.precommit != NULL
+        && (s = p->sess.precommit(p->sess.ctx, p->hs.record.committed_seq + 1u, p->salt_used)) != CDB_OK)
+        return s;
 
     /* Step 1 barrier: data pages written since the last commit are durable. */
     if ((s = cdb_storage_sync(&p->st)) != CDB_OK)
@@ -1617,6 +1659,8 @@ cdb_status cdb_pager_commit(cdb_pager *p)
      * overwritten in place until the next one (see written_since_commit). */
     p->dirty = 0;
     p->seq_at_commit = p->next_seq;
+    p->salt_index = 0; /* the table may change before the next commit */
+    p->salt_used = 0;
     if (p->cat_dirty) {
         p->cat_dirty = 0;
         p->cat_exists = 1;
@@ -1824,7 +1868,7 @@ cdb_status cdb_pager_set_private(cdb_pager *p, const cdb_storage *overlay)
 }
 
 /* Opening again is exactly "load the committed state"; the settings for
- * sharing are the only things that outlive it. */
+ * sharing and the session are the only things that outlive it. */
 cdb_status cdb_pager_reload(cdb_pager *p)
 {
     cdb_storage st = p->st, overlay = p->overlay;
@@ -1833,7 +1877,9 @@ cdb_status cdb_pager_reload(cdb_pager *p)
     uint64_t reuse_below = p->reuse_below;
     cdb_status (*guard)(void *) = p->guard;
     void *guard_ctx = p->guard_ctx;
+    cdb_pager_session sess = p->sess;
     cdb_status s = cdb_pager_open(p, &st, &cfg);
+    p->sess = sess;
     p->private_mode = private_mode;
     p->overlay = overlay;
     p->ov_next = 1;

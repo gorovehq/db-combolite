@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "gf_books.h"
+#include "gf_bench.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -224,7 +225,7 @@ static size_t copy_line(char *dst, size_t cap, const char *src, size_t n)
  * GF_PASSAGE_MAX bytes, or a piece of one paragraph that is longer, cut at
  * a line end or space and at a character boundary. Returns its length
  * (0 at the end) and sets *start. */
-static size_t next_passage(const char *text, size_t len, size_t *pos, size_t *start)
+size_t gf_books_next_passage(const char *text, size_t len, size_t *pos, size_t *start)
 {
     size_t p = *pos, end, cut = 0;
 
@@ -293,9 +294,9 @@ static cdb_status store_text(gf_db *g, const gf_catalog *c, const gf_books *b, u
     v[1].id = b->tcol[GF_T_TITLE], v[1].s = book->title, v[1].n = title_len;
     v[2].id = b->tcol[GF_T_BODY], v[2].s = text, v[2].n = len;
     if ((s = encode_fields(v, GF_NT, row, cap, &n)) == CDB_OK
-        && (s = cdb_table_insert(&g->db, b->text_table, row, n, &entry)) == CDB_OK)
-        s = cdb_link_add(&g->db, b->full_text, cdb_ref_entry(c->lib_store, lib_row),
-                         cdb_ref_entry(b->text_table, entry), 1.0f, 0);
+        && (s = GF_T("table.insert_text", cdb_table_insert(&g->db, b->text_table, row, n, &entry))) == CDB_OK)
+        s = GF_T("link.add_full_text", cdb_link_add(&g->db, b->full_text, cdb_ref_entry(c->lib_store, lib_row),
+                         cdb_ref_entry(b->text_table, entry), 1.0f, 0));
     free(row);
     return s;
 }
@@ -331,7 +332,7 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
 
     /* The library row comes first, so the passages can be linked to it:
      * count them before writing any */
-    while ((n = next_passage(text, len, &pos, &start)) > 0)
+    while ((n = gf_books_next_passage(text, len, &pos, &start)) > 0)
         count++;
     if (count == 0)
         return CDB_OK;
@@ -348,7 +349,7 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
     }
     heading[0] = '\0';
     pos = 0;
-    while (s == CDB_OK && (n = next_passage(text, len, &pos, &start)) > 0) {
+    while (s == CDB_OK && (n = gf_books_next_passage(text, len, &pos, &start)) > 0) {
         const char *t = text + start, *h1, *hl;
         size_t h1len, hllen, at, hlen;
         pfield v[GF_NP];
@@ -385,20 +386,20 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
         if ((s = encode_fields(v, k, body, sizeof body, &w)) != CDB_OK)
             break;
         st->step = "document insert";
-        if ((s = cdb_doc_insert(&g->db, b->pool, summary, strlen(summary), body, w, &entry)) != CDB_OK)
+        if ((s = GF_T("doc.insert_passage", cdb_doc_insert(&g->db, b->pool, summary, strlen(summary), body, w, &entry))) != CDB_OK)
             break;
         if (seq > 0 && entry != prev + 1) {
             s = CDB_E_STATE; /* the reader relies on consecutive entry IDs */
             break;
         }
         st->step = "link has_passage";
-        if ((s = cdb_link_add(&g->db, c->has_passage, cdb_ref_entry(c->lib_store, lib_row),
-                              cdb_ref_entry(b->pool, entry), 1.0f, 0)) != CDB_OK)
+        if ((s = GF_T("link.add_has_passage", cdb_link_add(&g->db, c->has_passage, cdb_ref_entry(c->lib_store, lib_row),
+                              cdb_ref_entry(b->pool, entry), 1.0f, 0))) != CDB_OK)
             break;
         if (seq > 0) {
             st->step = "link next_passage";
-            if ((s = cdb_link_add(&g->db, b->next_passage, cdb_ref_entry(b->pool, prev), cdb_ref_entry(b->pool, entry),
-                                  1.0f, 0)) != CDB_OK)
+            if ((s = GF_T("link.add_next", cdb_link_add(&g->db, b->next_passage, cdb_ref_entry(b->pool, prev), cdb_ref_entry(b->pool, entry),
+                                  1.0f, 0))) != CDB_OK)
                 break;
         }
         /* The next passage falls under the last heading this one has */
@@ -413,14 +414,40 @@ cdb_status gf_books_ingest(gf_db *g, const gf_catalog *c, const gf_books *b, int
     }
     st->step = "commit";
     tc = gf_now_ms();
-    s = cdb_tx_commit(&g->db);
+    s = GF_T("tx.commit_book", cdb_tx_commit(&g->db));
     st->commit_ms = gf_now_ms() - tc;
     st->passages = seq;
     st->ms = gf_now_ms() - t0;
     return s;
 }
 
-/* dir/<ebook>.txt, read whole into a malloc'd, terminated buffer */
+/* The file of ebook in dir: the name its manifest line gives (gf_fetch.py
+ * names books by title, "number<TAB>url<TAB>bytes<TAB>file"), else the
+ * older <ebook>.txt. */
+void gf_books_path(const char *dir, int64_t ebook, char *path, size_t cap)
+{
+    char line[2048];
+    FILE *mf;
+
+    snprintf(path, cap, "%s/%lld.txt", dir, (long long)ebook);
+    snprintf(line, sizeof line, "%s/manifest.tsv", dir);
+    if ((mf = fopen(line, "r")) == NULL)
+        return;
+    while (fgets(line, sizeof line, mf) != NULL) {
+        char *f1, *f2, *f3, *nl;
+        if (strtoll(line, NULL, 10) != ebook || (f1 = strchr(line, '\t')) == NULL
+            || (f2 = strchr(f1 + 1, '\t')) == NULL || (f3 = strchr(f2 + 1, '\t')) == NULL)
+            continue;
+        if ((nl = strpbrk(f3 + 1, "\r\n")) != NULL)
+            *nl = '\0';
+        if (f3[1] != '\0')
+            snprintf(path, cap, "%s/%s", dir, f3 + 1);
+    }
+    fclose(mf);
+}
+
+/* The file of ebook in dir (gf_books_path), read whole into a malloc'd,
+ * terminated buffer. */
 static cdb_status read_book_file(const char *dir, int64_t ebook, char **text, size_t *len)
 {
     char path[1024];
@@ -428,7 +455,7 @@ static cdb_status read_book_file(const char *dir, int64_t ebook, char **text, si
     long size;
 
     *text = NULL;
-    snprintf(path, sizeof path, "%s/%lld.txt", dir, (long long)ebook);
+    gf_books_path(dir, ebook, path, sizeof path);
     if ((f = fopen(path, "rb")) == NULL)
         return CDB_E_IO;
     if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 0) {

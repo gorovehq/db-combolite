@@ -126,7 +126,7 @@ static int get(uint64_t entry, char *out, size_t cap)
         return 0;
     TEST_ASSERT_EQUAL_INT(CDB_OK, s);
     TEST_ASSERT_TRUE(h.payload_len < cap);
-    memcpy(out, page + cdb_page_header_size(db.pager.fmt), h.payload_len);
+    memcpy(out, page + cdb_page_payload_offset(db.pager.fmt), h.payload_len);
     out[h.payload_len] = '\0';
     return 1;
 }

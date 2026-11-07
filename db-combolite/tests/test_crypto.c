@@ -163,10 +163,10 @@ static void test_subkey_derivation(void)
 
     memset(base_key, 0xA5, sizeof(base_key));
 
-    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_crypto_derive_subkey(base_key, CDB_SUBKEY_PAGE, page_key));
-    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_crypto_derive_subkey(base_key, CDB_SUBKEY_CONTENT_HASH, hash_key));
-    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_crypto_derive_subkey(base_key, CDB_SUBKEY_INDEX, idx_key));
-    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_crypto_derive_subkey(base_key, CDB_SUBKEY_INTEGRITY, integ_key));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_crypto_derive_subkey(base_key, CDB_SUBKEY_PAGE, NULL, page_key));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_crypto_derive_subkey(base_key, CDB_SUBKEY_CONTENT_HASH, NULL, hash_key));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_crypto_derive_subkey(base_key, CDB_SUBKEY_INDEX, NULL, idx_key));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_crypto_derive_subkey(base_key, CDB_SUBKEY_INTEGRITY, NULL, integ_key));
 
     /* All derived subkeys must be mutually distinct */
     TEST_ASSERT_NOT_EQUAL(0, memcmp(page_key, hash_key, CDB_CRYPTO_KEY_SIZE));
@@ -174,6 +174,36 @@ static void test_subkey_derivation(void)
     TEST_ASSERT_NOT_EQUAL(0, memcmp(page_key, integ_key, CDB_CRYPTO_KEY_SIZE));
     TEST_ASSERT_NOT_EQUAL(0, memcmp(hash_key, idx_key, CDB_CRYPTO_KEY_SIZE));
     TEST_ASSERT_NOT_EQUAL(0, memcmp(base_key, page_key, CDB_CRYPTO_KEY_SIZE));
+}
+
+/* HKDF-SHA-256 with the spec 12.2 labels: an empty salt for every subkey but
+ * the page subkey, which takes the session salt (14.2.8). The expected keys
+ * were computed independently with Python's hmac module. */
+static void test_subkey_known_answers(void)
+{
+    static const uint8_t want_hash[32] = {
+        0x86, 0xc0, 0x90, 0x5a, 0xb2, 0x84, 0x21, 0xf0, 0xdd, 0x0b, 0xb3, 0x33, 0x22, 0x0b, 0xc0, 0x2a,
+        0x54, 0xdc, 0x58, 0x93, 0x0c, 0xf2, 0x8f, 0x07, 0xe9, 0xd7, 0xc1, 0xf1, 0xc2, 0x29, 0xa3, 0x19 };
+    static const uint8_t want_page[32] = {
+        0xc8, 0xba, 0x46, 0x39, 0xa7, 0x3f, 0x3b, 0xd8, 0x5f, 0xba, 0x89, 0x29, 0xb9, 0xc6, 0xcd, 0x15,
+        0xf3, 0xe5, 0x54, 0x61, 0x21, 0x8e, 0x57, 0x09, 0xec, 0x44, 0x2a, 0xbf, 0xf4, 0x37, 0xbe, 0x72 };
+    static const uint8_t want_seal[32] = {
+        0x00, 0xae, 0x5e, 0xb0, 0x71, 0x28, 0x6e, 0xff, 0x57, 0x6c, 0xd4, 0xc3, 0xf4, 0x75, 0x76, 0x10,
+        0x22, 0x00, 0x73, 0x3a, 0x19, 0x67, 0x05, 0x82, 0xaa, 0x5d, 0xce, 0x29, 0xab, 0xf7, 0xd0, 0x4a };
+    uint8_t base_key[CDB_CRYPTO_KEY_SIZE], salt[CDB_SESSION_SALT_SIZE], out[CDB_CRYPTO_KEY_SIZE];
+    unsigned i;
+
+    memset(base_key, 0xA5, sizeof base_key);
+    for (i = 0; i < sizeof salt; i++)
+        salt[i] = (uint8_t)(i + 1u);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_crypto_derive_subkey(base_key, CDB_SUBKEY_CONTENT_HASH, NULL, out));
+    TEST_ASSERT_EQUAL_MEMORY(want_hash, out, 32);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_crypto_derive_subkey(base_key, CDB_SUBKEY_PAGE, salt, out));
+    TEST_ASSERT_EQUAL_MEMORY(want_page, out, 32);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_crypto_derive_subkey(base_key, CDB_SUBKEY_SEAL, NULL, out));
+    TEST_ASSERT_EQUAL_MEMORY(want_seal, out, 32);
+    /* Only the page subkey takes a salt. */
+    TEST_ASSERT_EQUAL_INT(CDB_E_INVALID_ARG, cdb_crypto_derive_subkey(base_key, CDB_SUBKEY_INDEX, salt, out));
 }
 
 static void test_key_wrapping(void)
@@ -297,6 +327,7 @@ int main(void)
     RUN_TEST(test_aead_chacha20_poly1305_roundtrip);
     RUN_TEST(test_sha256_and_hmac);
     RUN_TEST(test_subkey_derivation);
+    RUN_TEST(test_subkey_known_answers);
     RUN_TEST(test_key_wrapping);
     RUN_TEST(test_key_providers);
     RUN_TEST(test_identities_and_signatures);

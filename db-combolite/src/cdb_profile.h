@@ -25,10 +25,14 @@
  * costs about 0.25 ms, the CPU's exact pass about that per 300 KB on the
  * development machine. */
 #define CDB_ACCEL_MIN_BYTES_DEFAULT (1024u * 1024u)
+/* Session salts one process holds in memory (spec 14.2.8). A bigger salt
+ * table opens with CDB_E_OUT_OF_BUDGET. */
+#define CDB_SALT_TABLE_MAX 256u
 #else
 #define CDB_PROFILE_NAME "mcu"
 #define CDB_QUERY_MEM_DEFAULT 0u /* no growth: caller memory only */
 #define CDB_VEC_MEM_DEFAULT 0u
+#define CDB_SALT_TABLE_MAX 16u
 #endif
 
 #endif /* CDB_PROFILE_H */

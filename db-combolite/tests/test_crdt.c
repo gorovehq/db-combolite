@@ -430,7 +430,7 @@ static void test_db_multi_peer_replication_sync(void)
 
     /* Verify Peer 2 now has the data on page 5 */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db2.pager, 5u, page_buf, &ph));
-    TEST_ASSERT_EQUAL_STRING_LEN("Peer1Data", page_buf + sizeof(cdb_page_header), 9);
+    TEST_ASSERT_EQUAL_STRING_LEN("Peer1Data", page_buf + cdb_page_payload_offset(CDB_PAGE_FMT_FULL64), 9);
 
     /* Peer 2 now commits its own change on page 6 */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&db2, CDB_DURABILITY_FULL));
@@ -445,7 +445,7 @@ static void test_db_multi_peer_replication_sync(void)
 
     /* Verify Peer 1 now has page 6 */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db1.pager, 6u, page_buf, &ph));
-    TEST_ASSERT_EQUAL_STRING_LEN("Peer2Data", page_buf + sizeof(cdb_page_header), 9);
+    TEST_ASSERT_EQUAL_STRING_LEN("Peer2Data", page_buf + cdb_page_payload_offset(CDB_PAGE_FMT_FULL64), 9);
 
     /* Re-importing already seen deltas applies 0 records (idempotence) */
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_crdt_import_slice(&db1, slice, slice_len, &applied));
@@ -492,11 +492,11 @@ static void test_export_skips_aborted_and_rolled_back(void)
     TEST_ASSERT_EQUAL_UINT32(1u, (uint32_t)applied);
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db2.pager, 8u, page_buf, &ph));
-    TEST_ASSERT_EQUAL_STRING_LEN("Kept", page_buf + sizeof(cdb_page_header), 4);
+    TEST_ASSERT_EQUAL_STRING_LEN("Kept", page_buf + cdb_page_payload_offset(CDB_PAGE_FMT_FULL64), 4);
     if (cdb_pager_read(&db2.pager, 7u, page_buf, &ph) == CDB_OK)
-        TEST_ASSERT_TRUE(memcmp("Aborted", page_buf + sizeof(cdb_page_header), 7) != 0);
+        TEST_ASSERT_TRUE(memcmp("Aborted", page_buf + cdb_page_payload_offset(CDB_PAGE_FMT_FULL64), 7) != 0);
     if (cdb_pager_read(&db2.pager, 9u, page_buf, &ph) == CDB_OK)
-        TEST_ASSERT_TRUE(memcmp("Dropped", page_buf + sizeof(cdb_page_header), 7) != 0);
+        TEST_ASSERT_TRUE(memcmp("Dropped", page_buf + cdb_page_payload_offset(CDB_PAGE_FMT_FULL64), 7) != 0);
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db1));
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&db2));
@@ -574,7 +574,7 @@ static void test_import_vector_advances_at_commit(void)
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_crdt_import_slice(&db2, slice, len, &applied));
     TEST_ASSERT_EQUAL_UINT32(2u, (uint32_t)applied);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db2.pager, 21u, page_buf, &ph));
-    TEST_ASSERT_EQUAL_STRING_LEN("R1", page_buf + sizeof(cdb_page_header), 2);
+    TEST_ASSERT_EQUAL_STRING_LEN("R1", page_buf + cdb_page_payload_offset(CDB_PAGE_FMT_FULL64), 2);
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_crdt_import_slice(&db2, slice, len, &applied));
     TEST_ASSERT_EQUAL_UINT32(0u, (uint32_t)applied);
 

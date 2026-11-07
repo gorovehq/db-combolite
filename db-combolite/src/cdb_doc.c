@@ -389,7 +389,7 @@ static cdb_status read_revision(cdb_db *db, uint64_t lid, envelope *e, uint8_t *
         /* A nibblet: its data is the payload a page would have had. */
         size_t n;
         memset(&h, 0, sizeof h);
-        if ((s = cdb_nib_get(db, lid, buf(db, B_PAGE) + cdb_page_header_size(db->pager.fmt), capacity(db), &n))
+        if ((s = cdb_nib_get(db, lid, buf(db, B_PAGE) + cdb_page_payload_offset(db->pager.fmt), capacity(db), &n))
             != CDB_OK)
             return s;
         h.type = CDB_PAGE_TYPE_DOCUMENT;
@@ -399,7 +399,7 @@ static cdb_status read_revision(cdb_db *db, uint64_t lid, envelope *e, uint8_t *
     }
     if (h.type != CDB_PAGE_TYPE_DOCUMENT || h.payload_len < ENV_SIZE)
         return CDB_E_CORRUPT;
-    pl = buf(db, B_PAGE) + cdb_page_header_size(db->pager.fmt);
+    pl = buf(db, B_PAGE) + cdb_page_payload_offset(db->pager.fmt);
     end = pl + h.payload_len;
     memset(e, 0, sizeof *e);
     e->entry = cdb_load_u64(pl, o);
@@ -2326,7 +2326,7 @@ cdb_status cdb_doc_overflow_tail_moved(cdb_db *db, uint64_t store, const uint8_t
     if (h.type != CDB_PAGE_TYPE_DOCUMENT || h.store_id != store)
         return CDB_E_NOT_FOUND;
 
-    pl = pbuf + cdb_page_header_size(db->pager.fmt);
+    pl = pbuf + cdb_page_payload_offset(db->pager.fmt);
     if (h.payload_len < ENV_SIZE || !(pl[45] & ENV_FLAG_OVERFLOW))
         return CDB_E_NOT_FOUND;
 

@@ -20,6 +20,7 @@
 #include "cdb_coord.h"
 #include "cdb_journal.h"
 #include "cdb_pager.h"
+#include "cdb_profile.h"
 #include "cdb_slots.h"
 #include "cdb_worker.h"
 #include "cdb_trigger.h"
@@ -43,6 +44,12 @@ typedef enum cdb_durability {
 /* Open the database even if a companion is missing or set aside and data may
  * have been lost (spec 1.12.5). The operator accepts the loss. */
 #define CDB_DB_ACCEPT_LOSS 0x1u
+
+/* Merging, drop each transaction holding a journal record this process
+ * cannot decrypt, and merge the rest of that journal, instead of leaving it
+ * pending for a process with the key (spec 5.9.1). For a key gone for good;
+ * nothing else is accepted as lost. */
+#define CDB_DB_DROP_UNREADABLE 0x2u
 
 /* One committed change, as handed to the apply hook. data points into the
  * database's record buffer and is valid only during the call. */
@@ -187,6 +194,15 @@ typedef struct cdb_db_config {
  * reconciliation or tick); FILLING: being filled, a chunk at a time;
  * DECLINED: the accelerator would not mirror it, the CPU serves it. */
 enum { CDB_ACCEL_FREE = 0, CDB_ACCEL_WANTED, CDB_ACCEL_READY, CDB_ACCEL_FILLING, CDB_ACCEL_DECLINED };
+
+/* One salt-table entry (spec 14.2.8), as held in memory. */
+typedef struct cdb_salt_entry {
+    uint16_t index;
+    uint8_t salt[16];
+    uint64_t last_commit;  /* the last archive commit with a page under it */
+    uint64_t prune_before; /* nonzero: unused in a scrub pass that started at this commit */
+    int seen;              /* a page under it was found in the scrub pass under way */
+} cdb_salt_entry;
 
 /* A fill queued on the worker pool, for entry `index` as it was at `token`. */
 typedef struct cdb_accel_task {
@@ -433,12 +449,14 @@ typedef struct cdb_db {
         uint64_t end;
     } id_ranges[CDB_COORD_MAX_BLOCKS];
     unsigned nid_ranges;
-    /* Background heartbeat thread (spec 5.9.6, M20). */
-    cdb_mutex *mutex;         /* protects cdb_db state against concurrent heartbeat/calls */
-    cdb_cond *hb_cond;        /* wakes the heartbeat thread on shutdown */
-    cdb_thread *hb_thread;    /* the heartbeat thread itself */
-    int hb_stop;              /* set to 1 to tell the heartbeat thread to exit */
+    /* The coordinator's responder thread (spec 5.8). */
+    cdb_mutex *mutex;         /* the database's re-entrant lock (cdb_db_lock) */
+    cdb_mutex *coord_mutex;   /* the coordinator's own (coord.mx), never the database's */
+    cdb_cond *hb_cond;        /* wakes the responder on shutdown; waited on with coord_mutex */
+    cdb_thread *hb_thread;    /* the responder itself */
+    int hb_stop;              /* set under coord_mutex to tell the responder to exit */
     int hb_running;           /* 1 if hb_thread is running and must be joined */
+    int closing;              /* cdb_db_close has begun: the responder hands nothing over */
     /* Background worker threads (spec 5.9.6, M20). */
     cdb_worker_pool workers;
     /* Graph refreshes whose list of entries to check overflowed, so every
@@ -465,11 +483,23 @@ typedef struct cdb_db {
     int rotation_expired;
     cdb_identity active_identity;
     int has_identity;
+    /* Session salts (spec 12.1, 14.2.8): this session's, drawn at open when
+     * there is a master key, and the archive's salt table, in index order. */
+    uint8_t session_salt[16];
+    int has_salt;
+    cdb_salt_entry salts[CDB_SALT_TABLE_MAX];
+    unsigned salt_count;
+    /* The scrub (cdb_db_scrub): the next lid to look at, 0 between passes,
+     * the committed sequence when the pass started, and whether the pass
+     * met a page version that hid the committed one. */
+    uint64_t scrub_lid;
+    uint64_t scrub_start;
+    int scrub_hidden;
     struct {
         uint64_t enclave_id;
         uint32_t key_version;
         uint8_t enclave_key[32];
-        uint8_t page_key[32];
+        uint8_t page_key[32]; /* under this session's salt */
         uint8_t hash_key[32];
         uint8_t index_key[32];
         int in_use;
@@ -596,6 +626,13 @@ cdb_status cdb_db_read_record(cdb_db *db, uint64_t off, cdb_record *r, uint64_t 
  * CDB_E_BUSY when the wait passes its cap. */
 cdb_status cdb_db_reconcile(cdb_db *db);
 
+/* Asks for this process's committed changes to reach the archive without
+ * waiting for the baton (spec 5.9.8): makes the journal durable and records
+ * a reconciliation request, which the baton holder meets at its next
+ * reconciliation, merging every slot's journal. When nobody holds the baton
+ * and one attempt gets it, reconciles here and now. Returns at once. */
+cdb_status cdb_db_reconcile_request(cdb_db *db);
+
 /* The environment's clock, in nanoseconds since the Unix epoch. *have is 0
  * (and *ns 0) when the environment has none. Commit records carry it. */
 cdb_status cdb_db_now(cdb_db *db, int64_t *ns, int *have);
@@ -620,6 +657,16 @@ cdb_status cdb_db_compact(cdb_db *db, uint64_t max_moves, uint64_t *moved, uint6
 /* Space reclamation (spec 3.7, 16.2): sweeps the archive for pages and
  * nibblet records belonging to dropped stores, freeing them for reuse. */
 cdb_status cdb_db_reclaim(cdb_db *db, uint64_t *pages_freed, uint64_t *nibblets_freed);
+
+/* Checks the archive a budget of pages at a time (spec 3.5, 14.2.8): public
+ * pages are verified, encrypted ones only show which salt they use. After
+ * a whole pass, *pass_done is 1, and a salt no page used and last used by a
+ * commit before the pass began is removed from the salt table by the next
+ * archive commit. A pass that met a page not yet committed (in the overlay,
+ * or written since the last commit) can't see the committed page beneath
+ * it, so it removes nothing. CDB_E_CORRUPT for a public page that fails
+ * verification. */
+cdb_status cdb_db_scrub(cdb_db *db, uint64_t budget, int *pass_done);
 
 /* Security, enclaves, and key rotation (spec 12). */
 cdb_status cdb_db_create_enclave(cdb_db *db, uint64_t enclave_id, const char *key_ref);

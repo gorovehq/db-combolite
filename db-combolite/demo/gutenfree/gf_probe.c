@@ -3,7 +3,9 @@
 
 #include <string.h>
 
+#include "gf_bench.h"
 #include "gf_metrics.h"
+#include "gf_vec.h"
 #include "cdb_doc.h"
 
 static uint32_t rnd(gf_probe *p)
@@ -39,15 +41,20 @@ void gf_probe_tick(gf_app *a, gf_probe *p)
     static const char *const words[] = { "love", "war", "sea", "god", "night", "king", "river", "gold",
                                          "death", "light", "house", "horse", "ship", "fire", "heart", "old man" };
     static char text[GF_PASSAGE_MAX + 1];
+    static float q[2][GF_EMBED_DIMS];
     uint64_t rows[200], e;
     cdb_fts_hit hits[20];
     size_t n;
     int found, i, hit = 0;
+    unsigned nq = 0;
     double t0;
+    cdb_status s;
 
+    /* Every call is timed on its own (gf_bench); the per-tick averages
+     * below feed the diagnostics screen's gauges. */
     t0 = gf_now_ms();
     for (i = 0; i < 200; i++) {
-        gf_catalog_find(a->g, &a->cat, (int64_t)(rnd(p) % 79900u) + 1, &e, &found);
+        GF_TIME("probe.pk_lookup", gf_catalog_find(a->g, &a->cat, (int64_t)(rnd(p) % 79900u) + 1, &e, &found));
         if (found && hit < 50)
             rows[hit++] = e;
     }
@@ -57,7 +64,7 @@ void gf_probe_tick(gf_app *a, gf_probe *p)
         gf_book b;
         t0 = gf_now_ms();
         for (i = 0; i < hit; i++)
-            gf_catalog_read(a->g, &a->cat, rows[i], &b);
+            GF_TIME("probe.row_read", gf_catalog_read(a->g, &a->cat, rows[i], &b));
         gf_metric("probe.row_read_us", (gf_now_ms() - t0) * 1000.0 / hit);
     }
 
@@ -66,24 +73,33 @@ void gf_probe_tick(gf_app *a, gf_probe *p)
         t0 = gf_now_ms();
         for (i = 0; i < 50; i++) {
             unsigned k = rnd(p) % p->nbooks;
-            gf_books_passage(a->g, &a->books, p->first[k] + rnd(p) % p->count[k], text, sizeof text, &eb, &seq);
+            uint64_t passage = p->first[k] + rnd(p) % p->count[k];
+            GF_TIME("probe.passage_read", gf_books_passage(a->g, &a->books, passage, text, sizeof text, &eb, &seq));
         }
         gf_metric("probe.passage_read_us", (gf_now_ms() - t0) * 1000.0 / 50.0);
     }
 
     t0 = gf_now_ms();
-    if (cdb_table_scan(&a->g->db, a->cat.store, GF_CATALOG_SORT_INDEX, NULL, 0, NULL, 0, &p->scan, rows, 200, &n)
-            == CDB_OK
-        && n > 0)
+    GF_TIME("probe.scan_200_rows", s = cdb_table_scan(&a->g->db, a->cat.store, GF_CATALOG_SORT_INDEX, NULL, 0, NULL,
+                                                      0, &p->scan, rows, 200, &n));
+    if (s == CDB_OK && n > 0)
         gf_metric("probe.scan_us_per_row", (gf_now_ms() - t0) * 1000.0 / (double)n);
     else
         memset(&p->scan, 0, sizeof p->scan); /* the end: start over */
 
     for (i = 0; i < 2; i++) {
-        const char *q = words[rnd(p) % (sizeof words / sizeof words[0])];
+        const char *w = words[rnd(p) % (sizeof words / sizeof words[0])];
         t0 = gf_now_ms();
-        if (cdb_doc_search(&a->g->db, a->books.pool, q, strlen(q), CDB_FTS_ANY, hits, 20, &n) == CDB_OK)
+        GF_TIME("fts.search", s = cdb_doc_search(&a->g->db, a->books.pool, w, strlen(w), CDB_FTS_ANY, hits, 20, &n));
+        if (s == CDB_OK)
             gf_metric("probe.search_ms", gf_now_ms() - t0);
+    }
+
+    /* Two vector queries a tick: stored passages, the only queries the
+     * probe has without loading the model (embed runs fresh ones). */
+    if (a->vec.passages != 0 && gf_vec_stored_queries(a->g, &a->vec, 2, &p->rng, q, &nq) == CDB_OK && nq > 0) {
+        gf_vec_check ck;
+        (void)gf_vec_check_search(a->g, &a->vec, (const float (*)[GF_EMBED_DIMS])q, nq, "probe", &ck);
     }
     gf_metrics_flush(a->g);
 }

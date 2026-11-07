@@ -282,9 +282,9 @@ static void test_blob_tamper_detection(void)
     cdb_page_header ph;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&db.pager, ref.first_page, page_buf, &ph));
     /* Modify payload byte */
-    page_buf[cdb_page_header_size(db.pager.fmt) + db.pager.addr_width + 10] ^= 0xAA;
+    page_buf[cdb_page_payload_offset(db.pager.fmt) + db.pager.addr_width + 10] ^= 0xAA;
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_write(&db.pager, ref.first_page, &ph,
-                                                 page_buf + cdb_page_header_size(db.pager.fmt),
+                                                 page_buf + cdb_page_payload_offset(db.pager.fmt),
                                                  ph.payload_len));
 
     TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_blob_read_begin(&db.pager, TEST_STORE_ID, &ref, page_buf, 1, NULL, &reader));

@@ -152,6 +152,9 @@ class cdb_env_ops(Structure):
         ("cond_destroy", c_void_p),
         ("thread_create", c_void_p),
         ("thread_join", c_void_p),
+        ("lock_open", c_void_p),   # the file lock hook (spec 5.8)
+        ("lock_close", c_void_p),
+        ("mutex_trylock", c_void_p),  # optional, for the responder's handover (spec 5.8)
     ]
 
 
@@ -399,7 +402,7 @@ class cdb_db_config(Structure):
 
 
 class cdb_db(Structure):
-    # Opaque, and at least cdb_db_struct_size() bytes (about 31 KB today):
+    # Opaque, and at least cdb_db_struct_size() bytes (about 48 KB today):
     # ComboliteLib checks, so the engine growing it can't overrun this
     _fields_ = [
         ("_opaque", c_uint8 * 65536),
@@ -854,6 +857,8 @@ class ComboliteLib:
 
         c.cdb_db_reconcile.argtypes = [POINTER(cdb_db)]
         c.cdb_db_reconcile.restype = c_int
+        c.cdb_db_reconcile_request.argtypes = [POINTER(cdb_db)]  # spec 5.9.8
+        c.cdb_db_reconcile_request.restype = c_int
 
         c.cdb_db_compact.argtypes = [POINTER(cdb_db), c_uint64, POINTER(c_uint64), POINTER(c_uint64)]
         c.cdb_db_compact.restype = c_int

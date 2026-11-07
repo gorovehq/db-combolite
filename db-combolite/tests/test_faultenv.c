@@ -103,6 +103,68 @@ static void test_clean_reboot_keeps_everything(void)
     TEST_ASSERT_TRUE(exists("a"));
 }
 
+/* The lock hook (spec 5.8): exclusive conflicts with anything, shared with
+ * shared does not, closing releases, and taking a lock creates the file. */
+static void test_locks_conflict_and_release(void)
+{
+    cdb_lock *a, *b, *c;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->lock_open(env.ctx, "l", 1, &a));
+    TEST_ASSERT_TRUE(exists("l"));
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, env.ops->lock_open(env.ctx, "l", 1, &b));
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, env.ops->lock_open(env.ctx, "l", 0, &b));
+    env.ops->lock_close(env.ctx, a);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->lock_open(env.ctx, "l", 0, &b));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->lock_open(env.ctx, "l", 0, &c));
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, env.ops->lock_open(env.ctx, "l", 1, &a));
+    TEST_ASSERT_EQUAL_UINT(2, cdb_faultenv_held_locks(&fe));
+    env.ops->lock_close(env.ctx, b);
+    env.ops->lock_close(env.ctx, c);
+    TEST_ASSERT_EQUAL_UINT(0, cdb_faultenv_held_locks(&fe));
+}
+
+/* A lock belongs to the file: a rename keeps it, and a file created at the
+ * path of a removed one is not locked. */
+static void test_lock_follows_the_file(void)
+{
+    cdb_lock *a, *b;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->lock_open(env.ctx, "l", 1, &a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->rename(env.ctx, "l", "m"));
+    TEST_ASSERT_EQUAL_INT(CDB_E_BUSY, env.ops->lock_open(env.ctx, "m", 0, &b));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->remove(env.ctx, "m"));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->lock_open(env.ctx, "m", 1, &b));
+    env.ops->lock_close(env.ctx, b);
+    env.ops->lock_close(env.ctx, a);
+}
+
+/* A reboot ends every process, so every lock is released; taking one is no
+ * crash point, but creating its file is. */
+static void test_reboot_releases_locks(void)
+{
+    cdb_lock *a;
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->lock_open(env.ctx, "l", 1, &a));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->sync_dir(env.ctx, "."));
+    cdb_faultenv_reboot(&fe);
+    TEST_ASSERT_EQUAL_UINT(0, cdb_faultenv_held_locks(&fe));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->lock_open(env.ctx, "l", 1, &a));
+    env.ops->lock_close(env.ctx, a);
+
+    cdb_faultenv_arm(&fe, 1, CDB_CRASH_DROP_UNSYNCED, 0, 0);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, env.ops->lock_open(env.ctx, "l", 1, &a)); /* exists: no op */
+    env.ops->lock_close(env.ctx, a);
+    TEST_ASSERT_EQUAL_INT(CDB_E_IO, env.ops->lock_open(env.ctx, "n", 1, &a)); /* the create */
+    cdb_faultenv_reboot(&fe);
+    TEST_ASSERT_FALSE(exists("n"));
+}
+
+static void test_without_locks(void)
+{
+    cdb_env e = env;
+    cdb_faultenv_without_locks(&e);
+    TEST_ASSERT_NULL(e.ops->lock_open);
+    TEST_ASSERT_NULL(e.ops->lock_close);
+    TEST_ASSERT_TRUE(e.ops->open == env.ops->open);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -111,5 +173,9 @@ int main(void)
     RUN_TEST(test_remove_and_rename_roll_back);
     RUN_TEST(test_shared_clock_crashes_every_file);
     RUN_TEST(test_clean_reboot_keeps_everything);
+    RUN_TEST(test_locks_conflict_and_release);
+    RUN_TEST(test_lock_follows_the_file);
+    RUN_TEST(test_reboot_releases_locks);
+    RUN_TEST(test_without_locks);
     return UNITY_END();
 }

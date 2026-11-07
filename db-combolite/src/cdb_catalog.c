@@ -210,7 +210,7 @@ static cdb_status read_record(cdb_catalog *cat, const uint8_t ref[REF_SIZE], con
     }
     if (s != CDB_OK)
         return s;
-    *payload = cat->page + cdb_page_header_size(cat->pager->fmt);
+    *payload = cat->page + cdb_page_payload_offset(cat->pager->fmt);
     *len = h.payload_len;
     return CDB_OK;
 }

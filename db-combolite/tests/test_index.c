@@ -207,7 +207,7 @@ static void test_many_keys_shuffled(void)
     {
         cdb_page_header h;
         TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&pager, ix.root, cursor_page, &h));
-        TEST_ASSERT_TRUE_MESSAGE(cursor_page[cdb_page_header_size(pager.fmt)] >= 2,
+        TEST_ASSERT_TRUE_MESSAGE(cursor_page[cdb_page_payload_offset(pager.fmt)] >= 2,
                                  "expected a tree at least three levels deep");
     }
     TEST_ASSERT_EQUAL_size_t(2000, scan(INT64_MIN, seen, 2000));
@@ -238,7 +238,7 @@ static void test_many_keys_shuffled(void)
     {
         cdb_page_header h;
         TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&pager, ix.root, cursor_page, &h));
-        TEST_ASSERT_EQUAL_UINT8(0, cursor_page[cdb_page_header_size(pager.fmt)]);
+        TEST_ASSERT_EQUAL_UINT8(0, cursor_page[cdb_page_payload_offset(pager.fmt)]);
     }
 }
 
@@ -293,7 +293,7 @@ static void test_prefix_compression(void)
         cdb_page_header h;
         const uint8_t *pl;
         TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_pager_read(&pager, ix.root, cursor_page, &h));
-        pl = cursor_page + cdb_page_header_size(pager.fmt);
+        pl = cursor_page + cdb_page_payload_offset(pager.fmt);
         TEST_ASSERT_TRUE(pl[1] & CDB_INDEX_FLAG_PREFIX);
         TEST_ASSERT_TRUE(cdb_load_u16(pl + 4, pager.order) >= 20); /* the shared prefix length */
     }
