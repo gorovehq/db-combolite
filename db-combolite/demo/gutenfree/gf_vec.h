@@ -80,6 +80,25 @@ cdb_status gf_vec_refresh_graph(gf_db *g, const gf_vec *v, gf_graph_progress_fn 
  * *copied how many were copied. CDB_E_EXISTS if graph_bench exists. */
 cdb_status gf_vec_bench_copy(gf_db *g, const gf_vec *v, uint64_t *bench, uint64_t *copied);
 
+/* Vector search measured from the command line. Each query gets an exact
+ * search (the reference top 10), a neighbour-graph search and a 1-bit
+ * Hamming search, timed into vec.search_exact.<set>, vec.search_graph.<set>
+ * and vec.search_bits.<set>; the last two are scored by how many of the
+ * exact 10 they also find. Query sets differ in what they say: a stored
+ * passage finds its own precomputed neighbours, so "stored" queries flatter
+ * the graph; "fresh" ones (text never stored) are what real searches are. */
+typedef struct gf_vec_check {
+    unsigned queries;
+    double recall, recall_min;          /* graph search, of 10 */
+    double bits_agree, bits_min;        /* 1-bit search, of 10 */
+    unsigned worst_query;               /* the query with the lowest recall */
+} gf_vec_check;
+cdb_status gf_vec_check_search(gf_db *g, const gf_vec *v, const float (*q)[GF_EMBED_DIMS], unsigned nq,
+                               const char *set, gf_vec_check *out);
+/* Up to n stored passage vectors picked at random, decoded into out. */
+cdb_status gf_vec_stored_queries(gf_db *g, const gf_vec *v, unsigned n, uint32_t *rng, float (*out)[GF_EMBED_DIMS],
+                                 unsigned *got);
+
 /* Encodes a vector value: f32, or with bits set, its sign bits. */
 size_t gf_vec_encode(const float *f, int bits, uint8_t *out, size_t cap);
 
