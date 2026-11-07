@@ -34,11 +34,11 @@ Ensure the following prerequisites are installed for the components you intend t
 
 | Component | Requirements |
 |---|---|
-| **All / Core** | C99 compiler (`gcc` >= 9 or `clang` >= 11), CMake >= 3.20, `git` |
+| **All / Core** | C99 compiler (`gcc` >= 9 or `clang` >= 11), C++ compiler (`g++` or `clang++` for demo/tests), CMake >= 3.20, `git` |
 | **CUDA Accelerator** | NVIDIA CUDA Toolkit >= 11.8 (with `nvcc` and `cublas`), NVIDIA GPU (Turing, Ampere, Ada, Blackwell: sm_75, 86, 89, 120) |
 | **Vulkan Accelerator** | Vulkan SDK (Vulkan loader >= 1.3, headers, and `glslc` compiler) |
-| **GutenFree Demo** | `ncurses` development libraries (`libncurses-dev`) |
-| **Combolite Studio** | Python >= 3.9, GTK 4, libadwaita >= 1.2, PyGObject (`python3-gi`, `gir1.2-adw-1`) |
+| **GutenFree Demo** | `ncurses` development libraries (`libncurses-dev` / `ncurses-devel`), C++ compiler |
+| **Combolite Studio** | Python >= 3.9, GTK 4, libadwaita >= 1.4, PyGObject (`python3-gi`, `gir1.2-gtk-4.0`, `gir1.2-adw-1`, `gir1.2-gtksource-5`, `python3-numpy`) |
 
 ---
 
@@ -70,7 +70,7 @@ All builds use [CMake Presets](CMakePresets.json) from the repository root:
 cmake --preset core-both-debug
 cmake --build --preset core-both-debug -j
 
-# Run the complete test suite (67 tests)
+# Run the complete test suite (68 tests across core, accelerator, studio, and demo)
 ctest --preset core-both-debug -j4
 
 # Run one test executable
