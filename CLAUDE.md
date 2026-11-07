@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. Reference material lives in `db-combolite/docs/dev/`; read the file that matches the task:
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. Reference material lives in `combolite-core/docs/dev/`; read the file that matches the task:
 
 | File | Read it when |
 |---|---|
@@ -10,25 +10,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-The spec in `db-combolite/docs/spec/` is complete; start with its `README.md`, which lists every section, its dependencies and what is still open. Every spec section records its confirmed decisions; code follows the spec, and spec section numbers are cited in code comments. Implementation in C99 follows the milestone plan in `docs/dev/milestones.md`. The user reviews each milestone before the next one starts.
+The spec in `combolite-core/docs/spec/` is complete; start with its `README.md`, which lists every section, its dependencies and what is still open. Every spec section records its confirmed decisions; code follows the spec, and spec section numbers are cited in code comments. Implementation in C99 follows the milestone plan in `docs/dev/milestones.md`. The user reviews each milestone before the next one starts.
 
 ## Commands
 
-All commands run from `db-combolite/`:
+All commands run from the repository root using CMake presets:
 
 ```sh
-cmake -S . -B build                          # configure (Debug by default: ASan and UBSan on)
-cmake --build build -j                       # build the library and the tests
-ctest --test-dir build --output-on-failure   # run every test
-ctest --test-dir build -R test_value         # run one test executable
-./build/tests/test_value                     # run one executable directly (Unity output)
-cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release   # optimised build, sanitizers off
-cmake --preset noxz                          # mcu-profile test build (spec 17): Debug, xz off, in build-noxz/ (paused until after 1.0)
-cmake -S . -B build-cuda -DCDB_ACCEL_CUDA=ON -DCDB_ACCEL_VULKAN=ON # the build to test in: host tests plus combolite_accel with both backends, their device tests and bench_accel
-python3 tools/gen_spirv.py                   # after editing accel/vulkan/shaders: rewrites the checked-in SPIR-V (needs glslc)
+git submodule update --init --recursive --depth 1     # once per checkout or worktree
+cmake --preset core-both-debug                        # configure (Debug: ASan and UBSan on, CUDA and Vulkan accelerators)
+cmake --build --preset core-both-debug -j             # build library and tests
+ctest --preset core-both-debug -j4                    # run full test suite (67 tests)
+ctest --preset core-both-debug -R test_value          # run one test executable
+./build-core-both-debug/combolite-core/tests/test_coord  # run one executable directly (Unity output)
+python3 combolite-core/tools/gen_spirv.py             # after editing shaders: rewrites checked-in SPIR-V in combolite-accelerator (needs glslc)
 ```
 
-The demo is built separately; see `demo/gutenfree/README.md`.
+The demo and studio have their own presets: see `combolite-demo/README.md` and `combolite-studio/README.md`.
 
 ## Git workflow
 
@@ -57,17 +55,17 @@ These were agreed with the user:
 - **C99 only.** `CMAKE_C_EXTENSIONS` is off.
 - **Warnings are errors.** The flags include `-Wconversion`, `-Wsign-conversion` and `-Wvla`, so write explicit casts and never use VLAs.
 - **No heap allocation in the core.** Memory comes from the caller: buffers, and the environment's optional `alloc`/`free` hooks (`cdb_env.h`), which only the host environment backs with malloc. Anything that grows must also work from caller memory alone, so microcontroller builds can use static pools. Readers return views into caller-owned buffers.
-- **Build profiles (spec 17).** `CDB_PROFILE=host` (the default) or `mcu`, in `src/cdb_profile.h`. Both read and write the same files; only a process's limits differ. On host, query working memory grows through the environment's `alloc` hooks up to `cdb_db_config.query_mem`, so size host limits for speed. On mcu, everything stays in caller memory. A profile limit that is reached is `CDB_E_OUT_OF_BUDGET` in both. **Until after 1.0, test in `build-cuda` only** (host profile, Debug with sanitizers, configured with `-DCDB_ACCEL_CUDA=ON -DCDB_ACCEL_VULKAN=ON`): it runs every host test plus the accelerator's, so the CPU-only `build` is not run separately, to save time and tokens. Microcontroller work and the `build-noxz` (mcu) suite are paused until after 1.0: the mcu profile's code stays and must keep compiling in principle, but its suite is not run.
-- **Bindings mirror structs.** The studio's `binding.py` mirrors `cdb_db_config`, `cdb_exec_row` and others, and checks their sizes at load (`cdb_db_config_size`, `cdb_exec_row_size`, ...). Add new config fields at the end, and update `binding.py` with any struct change.
+- **Build profiles (spec 17).** `CDB_PROFILE=host` (the default) or `mcu`, in `src/cdb_profile.h`. Both read and write the same files; only a process's limits differ. On host, query working memory grows through the environment's `alloc` hooks up to `cdb_db_config.query_mem`, so size host limits for speed. On mcu, everything stays in caller memory. A profile limit that is reached is `CDB_E_OUT_OF_BUDGET` in both. **Until after 1.0, test in `core-both-debug` only** (host profile, Debug with sanitizers, CUDA and Vulkan accelerators enabled): it runs every host test plus the accelerator's, so the CPU-only `build` is not run separately, to save time and tokens. Microcontroller work and the `noxz` (mcu) suite are paused until after 1.0: the mcu profile's code stays and must keep compiling in principle, but its suite is not run.
+- **Bindings mirror structs.** The studio's `combolite-studio/combolite_gui/binding.py` mirrors `cdb_db_config`, `cdb_exec_row` and others, and checks their sizes at load (`cdb_db_config_size`, `cdb_exec_row_size`, ...). Add new config fields at the end, and update `binding.py` with any struct change.
 - **Fallible functions return `cdb_status`**, defined in `include/combolite/cdb_common.h`. The value writer's errors are sticky.
 - **Explicit byte order.** Every multi-byte on-disk field goes through `src/cdb_endian.h`, using the file's declared byte order. Never cast raw bytes to integers.
 - **Canonical encoding.** Writers produce the one canonical form, and validators reject anything else (spec 14.6.5).
-- **Tests use Unity**, vendored in `third-party/unity/` (v2.6.1, MIT). Add a test executable with `cdb_add_test(<name>)` in `tests/CMakeLists.txt`.
+- **Tests use Unity**, vendored in `combolite-tests/unity/` (v2.6.1, MIT). Add a test executable with `cdb_add_test(<name>)` in `combolite-core/tests/CMakeLists.txt`.
 
 Plus four rules moved up from the code layout, because most changes need them:
 
 - **Locking.** Every public data call holds the database's re-entrant lock (`cdb_db_lock`) for its whole run, so worker-pool tasks never overlap an application call. A new public call takes it too: wrap an unchanged static body.
-- **Crash sweeps.** Every new write sequence needs a sweep: count the workload's mutating operations, crash at each one in every mode of the fault devices (`src/cdb_faultdev.*`, `src/cdb_faultenv.*`), reboot, and check what recovery sees. The reorder mode is what catches a missing barrier.
+- **Crash sweeps.** Every new write sequence needs a sweep: count the workload's mutating operations, crash at each one in every mode of the fault devices (`combolite-core/src/cdb_faultdev.*`, `combolite-core/src/cdb_faultenv.*`), reboot, and check what recovery sees. The reorder mode is what catches a missing barrier.
 - **The apply hook must never fail for logical reasons,** because it runs again during recovery.
 - **Slot pointers** are valid until the next open of the same model outside a transaction or operation scope. Code that holds one store while opening another of the same model wraps the work in `cdb_db_op_begin`/`cdb_db_op_end`.
 
