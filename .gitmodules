@@ -14,3 +14,18 @@
 	path = db-combolite/demo/third-party/llama.cpp
 	url = https://github.com/ggml-org/llama.cpp.git
 	shallow = true
+[submodule "combolite-core"]
+	path = combolite-core
+	url = https://github.com/gorovehq/combolite-core.git
+[submodule "combolite-accelerator"]
+	path = combolite-accelerator
+	url = https://github.com/gorovehq/combolite-accelerator.git
+[submodule "combolite-studio"]
+	path = combolite-studio
+	url = https://github.com/gorovehq/combolite-studio.git
+[submodule "combolite-demo"]
+	path = combolite-demo
+	url = https://github.com/gorovehq/combolite-demo.git
+[submodule "combolite-tests"]
+	path = combolite-tests
+	url = https://github.com/gorovehq/combolite-tests.git
