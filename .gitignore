@@ -17,3 +17,5 @@ __pycache__/
 dist/
 # Handoff prompt for other AI agents; holds local paths and process notes.
 /GEMINI.md
+# Local agent telemetry and live monitoring dashboard
+agent-dashboard/
