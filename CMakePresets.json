@@ -115,6 +115,14 @@
     { "name": "core-vulkan-release", "configurePreset": "core-vulkan-release", "output": { "outputOnFailure": true } },
     { "name": "core-both-debug", "configurePreset": "core-both-debug", "output": { "outputOnFailure": true } },
     { "name": "core-both-release", "configurePreset": "core-both-release", "output": { "outputOnFailure": true } },
+    { "name": "gutenfree-cpu", "configurePreset": "gutenfree-cpu", "output": { "outputOnFailure": true } },
+    { "name": "gutenfree-cuda", "configurePreset": "gutenfree-cuda", "output": { "outputOnFailure": true } },
+    { "name": "gutenfree-vulkan", "configurePreset": "gutenfree-vulkan", "output": { "outputOnFailure": true } },
+    { "name": "gutenfree-both", "configurePreset": "gutenfree-both", "output": { "outputOnFailure": true } },
+    { "name": "studio-cpu", "configurePreset": "studio-cpu", "output": { "outputOnFailure": true } },
+    { "name": "studio-cuda", "configurePreset": "studio-cuda", "output": { "outputOnFailure": true } },
+    { "name": "studio-vulkan", "configurePreset": "studio-vulkan", "output": { "outputOnFailure": true } },
+    { "name": "studio-both", "configurePreset": "studio-both", "output": { "outputOnFailure": true } },
     { "name": "noxz", "configurePreset": "noxz", "output": { "outputOnFailure": true } }
   ]
 }

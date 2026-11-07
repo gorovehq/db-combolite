@@ -11,3 +11,14 @@ endif()
 
 # Core engine (and accelerators, tests, and demo if enabled)
 add_subdirectory(combolite-core)
+
+# Combolite Studio tests
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/combolite-studio/tests)
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_FOUND)
+    add_test(NAME "combolite-studio:python_tests"
+      COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/combolite-studio/tests
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/combolite-studio)
+    set_tests_properties("combolite-studio:python_tests" PROPERTIES LABELS "combolite-studio")
+  endif()
+endif()
