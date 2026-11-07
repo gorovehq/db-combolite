@@ -2,9 +2,82 @@
   "version": 3,
   "configurePresets": [
     {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build-${presetName}"
+    },
+    {
+      "name": "cuda",
+      "hidden": true,
+      "description": "The CUDA accelerator, for RTX 20 to 50 series (sm_75, 86, 89, 120) plus PTX for newer cards. nvcc must be on PATH (/usr/local/cuda/bin).",
+      "cacheVariables": {
+        "CDB_ACCEL_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "75-real;86-real;89-real;120"
+      }
+    },
+    {
+      "name": "vulkan",
+      "hidden": true,
+      "description": "The Vulkan accelerator (needs the Vulkan loader and headers).",
+      "cacheVariables": { "CDB_ACCEL_VULKAN": "ON" }
+    },
+    {
+      "name": "debug",
+      "hidden": true,
+      "description": "Debug, with AddressSanitizer and UBSan, and the test suite.",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "CDB_BUILD_TESTS": "ON" }
+    },
+    {
+      "name": "release",
+      "hidden": true,
+      "description": "Release: optimised, sanitizers off, with the test suite.",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "CDB_BUILD_TESTS": "ON" }
+    },
+    {
+      "name": "demo",
+      "hidden": true,
+      "description": "The GutenFree Diet demo (needs ncurses), RelWithDebInfo so its timings mean something.",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "CDB_BUILD_DEMO": "ON", "CDB_BUILD_TESTS": "OFF" }
+    },
+    {
+      "name": "studio",
+      "hidden": true,
+      "description": "The shared library libcombolite.so that Combolite Studio loads, Release.",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "BUILD_SHARED_LIBS": "ON", "CMAKE_POSITION_INDEPENDENT_CODE": "ON", "CDB_BUILD_TESTS": "OFF" }
+    },
+
+    { "name": "core-cpu-debug", "displayName": "Core, CPU only, Debug", "inherits": ["base", "debug"] },
+    { "name": "core-cpu-release", "displayName": "Core, CPU only, Release", "inherits": ["base", "release"] },
+    { "name": "core-cuda-debug", "displayName": "Core, CUDA, Debug", "inherits": ["base", "debug", "cuda"] },
+    { "name": "core-cuda-release", "displayName": "Core, CUDA, Release", "inherits": ["base", "release", "cuda"] },
+    { "name": "core-vulkan-debug", "displayName": "Core, Vulkan, Debug", "inherits": ["base", "debug", "vulkan"] },
+    { "name": "core-vulkan-release", "displayName": "Core, Vulkan, Release", "inherits": ["base", "release", "vulkan"] },
+    { "name": "core-both-debug", "displayName": "Core, CUDA + Vulkan, Debug (the build to test in until 1.0)", "inherits": ["base", "debug", "cuda", "vulkan"] },
+    { "name": "core-both-release", "displayName": "Core, CUDA + Vulkan, Release", "inherits": ["base", "release", "cuda", "vulkan"] },
+
+    { "name": "gutenfree-cpu", "displayName": "GutenFree Diet, CPU only", "inherits": ["base", "demo"] },
+    {
+      "name": "gutenfree-cuda", "displayName": "GutenFree Diet, CUDA (engine and embeddings)", "inherits": ["base", "demo", "cuda"],
+      "cacheVariables": { "GGML_CUDA": "ON" }
+    },
+    {
+      "name": "gutenfree-vulkan", "displayName": "GutenFree Diet, Vulkan (engine and embeddings)", "inherits": ["base", "demo", "vulkan"],
+      "cacheVariables": { "GGML_VULKAN": "ON" }
+    },
+    {
+      "name": "gutenfree-both", "displayName": "GutenFree Diet, CUDA + Vulkan engine, CUDA embeddings", "inherits": ["base", "demo", "cuda", "vulkan"],
+      "cacheVariables": { "GGML_CUDA": "ON" }
+    },
+
+    { "name": "studio-cpu", "displayName": "Studio library, CPU only", "inherits": ["base", "studio"] },
+    { "name": "studio-cuda", "displayName": "Studio library, with the CUDA accelerator built (the Studio does not use it yet)", "inherits": ["base", "studio", "cuda"] },
+    { "name": "studio-vulkan", "displayName": "Studio library, with the Vulkan accelerator built (the Studio does not use it yet)", "inherits": ["base", "studio", "vulkan"] },
+    { "name": "studio-both", "displayName": "Studio library, with both accelerators built (the Studio does not use them yet)", "inherits": ["base", "studio", "cuda", "vulkan"] },
+
+    {
       "name": "noxz",
       "displayName": "No xz: micro-controller test build",
-      "description": "Debug with sanitizers, the mcu profile (spec 17) and CDB_WITH_XZ=OFF: the engine the way a micro-controller build will run it, with caller memory only and without LZMA2 (xz). A host build for testing that configuration; not a micro-controller target.",
+      "description": "Debug with sanitizers, the mcu profile (spec 17) and CDB_WITH_XZ=OFF: the engine the way a micro-controller build will run it, with caller memory only and without LZMA2 (xz). A host build for testing that configuration; not a micro-controller target. Paused until after 1.0.",
       "binaryDir": "${sourceDir}/build-noxz",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
@@ -15,9 +88,33 @@
     }
   ],
   "buildPresets": [
+    { "name": "core-cpu-debug", "configurePreset": "core-cpu-debug" },
+    { "name": "core-cpu-release", "configurePreset": "core-cpu-release" },
+    { "name": "core-cuda-debug", "configurePreset": "core-cuda-debug" },
+    { "name": "core-cuda-release", "configurePreset": "core-cuda-release" },
+    { "name": "core-vulkan-debug", "configurePreset": "core-vulkan-debug" },
+    { "name": "core-vulkan-release", "configurePreset": "core-vulkan-release" },
+    { "name": "core-both-debug", "configurePreset": "core-both-debug" },
+    { "name": "core-both-release", "configurePreset": "core-both-release" },
+    { "name": "gutenfree-cpu", "configurePreset": "gutenfree-cpu", "targets": ["gutenfree"] },
+    { "name": "gutenfree-cuda", "configurePreset": "gutenfree-cuda", "targets": ["gutenfree"] },
+    { "name": "gutenfree-vulkan", "configurePreset": "gutenfree-vulkan", "targets": ["gutenfree"] },
+    { "name": "gutenfree-both", "configurePreset": "gutenfree-both", "targets": ["gutenfree"] },
+    { "name": "studio-cpu", "configurePreset": "studio-cpu", "targets": ["combolite"] },
+    { "name": "studio-cuda", "configurePreset": "studio-cuda" },
+    { "name": "studio-vulkan", "configurePreset": "studio-vulkan" },
+    { "name": "studio-both", "configurePreset": "studio-both" },
     { "name": "noxz", "configurePreset": "noxz" }
   ],
   "testPresets": [
+    { "name": "core-cpu-debug", "configurePreset": "core-cpu-debug", "output": { "outputOnFailure": true } },
+    { "name": "core-cpu-release", "configurePreset": "core-cpu-release", "output": { "outputOnFailure": true } },
+    { "name": "core-cuda-debug", "configurePreset": "core-cuda-debug", "output": { "outputOnFailure": true } },
+    { "name": "core-cuda-release", "configurePreset": "core-cuda-release", "output": { "outputOnFailure": true } },
+    { "name": "core-vulkan-debug", "configurePreset": "core-vulkan-debug", "output": { "outputOnFailure": true } },
+    { "name": "core-vulkan-release", "configurePreset": "core-vulkan-release", "output": { "outputOnFailure": true } },
+    { "name": "core-both-debug", "configurePreset": "core-both-debug", "output": { "outputOnFailure": true } },
+    { "name": "core-both-release", "configurePreset": "core-both-release", "output": { "outputOnFailure": true } },
     { "name": "noxz", "configurePreset": "noxz", "output": { "outputOnFailure": true } }
   ]
 }

@@ -34,8 +34,18 @@ endif()
 # machine.
 option(CDB_NATIVE "Optimise for this machine's CPU (-march=native); never for distributed builds" OFF)
 
+# Third-party sources are git submodules (third-party/*.VENDORED.md). A
+# clone without --recursive, or a pull that added them, leaves their folders
+# empty: say what to run instead of failing later on a missing file.
+foreach(sub third-party/mbedtls third-party/mbedtls/framework third-party/xz third-party/unity)
+  if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${sub}/CMakeLists.txt
+     AND NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${sub}/src/unity.c)
+    message(FATAL_ERROR "${sub} is empty: run `git submodule update --init --recursive` in the repository root.")
+  endif()
+endforeach()
+
 # LZMA2 compression through the vendored liblzma (spec 15.7,
-# third-party/xz/VENDORED.md). Without it, compression defaults are off and
+# third-party/xz.VENDORED.md). Without it, compression defaults are off and
 # files that use compression are refused.
 option(CDB_WITH_XZ "Build the xz (LZMA2) codec" ON)
 if(CDB_WITH_XZ)
@@ -52,10 +62,15 @@ if(CDB_WITH_XZ)
               XZ_TOOL_LZMADEC XZ_TOOL_LZMAINFO XZ_TOOL_SCRIPTS XZ_TOOL_SYMLINKS XZ_TOOL_SYMLINKS_LZMA)
     set(${off} OFF CACHE BOOL "" FORCE)
   endforeach()
+  # The submodule carries xz's own tests, whose targets (test_index, ...)
+  # clash with ours: keep them out.
+  set(CDB_SAVED_BUILD_TESTING ${BUILD_TESTING})
+  set(BUILD_TESTING OFF)
   add_subdirectory(third-party/xz EXCLUDE_FROM_ALL)
+  set(BUILD_TESTING ${CDB_SAVED_BUILD_TESTING})
 endif()
 
-# Mbed TLS crypto library (spec 12, third-party/mbedtls/VENDORED.md).
+# Mbed TLS crypto library (spec 12, third-party/mbedtls.VENDORED.md).
 set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)

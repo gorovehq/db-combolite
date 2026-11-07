@@ -1,0 +1,16 @@
+[submodule "db-combolite/third-party/mbedtls"]
+	path = db-combolite/third-party/mbedtls
+	url = https://github.com/Mbed-TLS/mbedtls.git
+	shallow = true
+[submodule "db-combolite/third-party/xz"]
+	path = db-combolite/third-party/xz
+	url = https://github.com/tukaani-project/xz.git
+	shallow = true
+[submodule "db-combolite/third-party/unity"]
+	path = db-combolite/third-party/unity
+	url = https://github.com/ThrowTheSwitch/Unity.git
+	shallow = true
+[submodule "db-combolite/demo/third-party/llama.cpp"]
+	path = db-combolite/demo/third-party/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git
+	shallow = true

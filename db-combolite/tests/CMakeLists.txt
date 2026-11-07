@@ -1,6 +1,6 @@
 # Unity is third-party code: built without the project's strict warnings.
-add_library(unity STATIC ${PROJECT_SOURCE_DIR}/third-party/unity/unity.c)
-target_include_directories(unity PUBLIC ${PROJECT_SOURCE_DIR}/third-party/unity)
+add_library(unity STATIC ${PROJECT_SOURCE_DIR}/third-party/unity/src/unity.c)
+target_include_directories(unity PUBLIC ${PROJECT_SOURCE_DIR}/third-party/unity/src)
 target_compile_definitions(unity PUBLIC UNITY_INCLUDE_DOUBLE UNITY_SUPPORT_64)
 if(CDB_SANITIZE)
   target_compile_options(unity PRIVATE ${CDB_SANITIZER_FLAGS})
