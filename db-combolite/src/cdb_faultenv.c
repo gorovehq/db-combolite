@@ -489,6 +489,12 @@ void cdb_faultenv_crash_now(cdb_faultenv *fe, cdb_crash_mode mode,
     fe->clock.torn_bytes = torn_bytes;
 }
 
+void cdb_faultenv_resume(cdb_faultenv *fe)
+{
+    fe->clock.crashed = 0;
+    fe->clock.crash_at = 0;
+}
+
 void cdb_faultenv_reboot(cdb_faultenv *fe)
 {
     char parent[CDB_FAULTENV_NAME];

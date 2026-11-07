@@ -2424,6 +2424,298 @@ static void test_reconcile_request(void)
     TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
 }
 
+/* -------------------------------------------------------- liveness crash sweeps
+ *
+ * The write orders the liveness redesign added (spec 5.9.1, 5.9.5, 14.4.7
+ * rule 9): a close that leaves its journal pending, the last close that
+ * merges and removes everyone's files, and a newcomer adopting a closed
+ * slot's journal, merged (replaced by an empty one) or not (rebased). Each
+ * sweep crashes at every mutating operation of the phase, in every mode,
+ * reboots, and checks that a fresh open sees each commit exactly once and
+ * that a clean close then leaves nothing behind. */
+
+static int sweep_fallback; /* run the sweep's processes without the lock hook */
+
+/* p1 commits "a" to entry 1 and p2 commits "b" to entry 2; p1 holds the
+ * baton and, from here on, never answers. */
+static void two_writers(void)
+{
+    if (sweep_fallback)
+        fallback();
+    cdb_faultenv_on_sleep(&fe, tick_both, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p1.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p1.db, 1, 1, CDB_OP_PATCH, "a", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p1.db));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_put(&p2.db, 1, 2, CDB_OP_PATCH, "b", 1));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_tx_commit(&p2.db));
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+}
+
+static void setup_close_pending(void)
+{
+    two_writers();
+}
+
+static void phase_close_p2(void)
+{
+    (void)cdb_db_close(&p2.db);
+}
+
+/* p2 has closed with its journal pending. */
+static void setup_p2_closed(void)
+{
+    two_writers();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/main.1.cdb"));
+}
+
+static void phase_close_p1(void)
+{
+    (void)cdb_db_close(&p1.db);
+}
+
+/* p2 has closed pending, and p1 has merged its journal. */
+static void setup_p2_closed_merged(void)
+{
+    setup_p2_closed();
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
+}
+
+static void setup_p2_closed_unmerged(void)
+{
+    setup_p2_closed();
+    cdb_faultenv_on_sleep(&fe, tick_p1, NULL);
+}
+
+/* p2 reopens, adopting slot 1's journal, and commits "c" to entry 3: the
+ * adopted journal's first new record lands after the new header. */
+static void phase_reopen_p2(void)
+{
+    if (open_proc(&p2) != CDB_OK)
+        return;
+    if (cdb_tx_begin(&p2.db, CDB_DURABILITY_DEFAULT) != CDB_OK)
+        return;
+    if (cdb_tx_put(&p2.db, 1, 3, CDB_OP_PATCH, "c", 1) != CDB_OK)
+        return;
+    (void)cdb_tx_commit(&p2.db);
+}
+
+/* Entry 3 holds p2's commit after adoption, or nothing if the crash came
+ * first: never anything else. */
+static void check_entry3(struct proc *p)
+{
+    const char *v = value_of(p, 3);
+    TEST_ASSERT_TRUE_MESSAGE(strcmp(v, "") == 0 || strcmp(v, "c") == 0, v);
+}
+
+/* After the reboot: one fresh open recovers both commits, once each, and a
+ * clean close removes the working directory. */
+static void check_after_crash(void)
+{
+    if (sweep_fallback)
+        fallback();
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p1));
+    TEST_ASSERT_EQUAL_STRING("a", value_of(&p1, 1));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    check_entry3(&p1);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+    TEST_ASSERT_EQUAL_UINT(0, cdb_faultenv_held_locks(&fe));
+}
+
+/* Counts the phase's mutating operations in a clean run, after which
+ * verify(), when given, checks the clean run took the intended path; then
+ * crashes at each of them in every mode. Returns the count. */
+static uint64_t liveness_sweep(void (*setup)(void), void (*phase)(void), void (*verify)(void))
+{
+    static const cdb_crash_mode modes[] = { CDB_CRASH_DROP_UNSYNCED, CDB_CRASH_KEEP_PREFIX, CDB_CRASH_TORN,
+                                            CDB_CRASH_REORDER };
+    uint64_t ops, op;
+    unsigned m;
+
+    init_env();
+    setup();
+    {
+        uint64_t before = fe.clock.ops;
+        phase();
+        ops = fe.clock.ops - before;
+    }
+    if (verify != NULL)
+        verify();
+    TEST_ASSERT_TRUE(ops > 0);
+    for (m = 0; m < sizeof modes / sizeof modes[0]; m++) {
+        for (op = 1; op <= ops; op++) {
+            init_env();
+            setup();
+            cdb_faultenv_arm(&fe, op, modes[m], 1, 100);
+            phase();
+            cdb_faultenv_crash_now(&fe, modes[m], 1, 100);
+            cdb_faultenv_reboot(&fe);
+            check_after_crash();
+        }
+    }
+    return ops;
+}
+
+static void verify_closed_pending(void)
+{
+    TEST_ASSERT_TRUE(file_exists(DIR "/db.cdbwork/main.1.cdb"));
+    TEST_ASSERT_TRUE(cdb_coord_baton_held(&p1.db.coord));
+}
+
+static void verify_last_close(void)
+{
+    TEST_ASSERT_FALSE(file_exists(DIR "/db.cdbwork"));
+}
+
+/* The merged journal is replaced whole: this session has nothing above
+ * its mark (the path at cdb_db.c rebase_pages, 14.4.7 rule 9). */
+static void verify_adopted_merged(void)
+{
+    TEST_ASSERT_EQUAL_UINT(1, p2.db.coord.me.slot);
+    TEST_ASSERT_EQUAL_STRING("c", value_of(&p2, 3));
+}
+
+static void verify_adopted_unmerged(void)
+{
+    TEST_ASSERT_EQUAL_UINT(1, p2.db.coord.me.slot);
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p2, 2));
+    TEST_ASSERT_EQUAL_STRING("c", value_of(&p2, 3));
+}
+
+static void run_liveness_sweeps(int use_fallback, int keyed)
+{
+    sweep_fallback = use_fallback;
+    keyed_procs = keyed;
+    printf("%s%s: close pending %u ops, last close %u, adopt merged %u, adopt unmerged %u\n",
+           use_fallback ? "fallback" : "locks", keyed ? ", keyed" : "",
+           (unsigned)liveness_sweep(setup_close_pending, phase_close_p2, verify_closed_pending),
+           (unsigned)liveness_sweep(setup_p2_closed, phase_close_p1, verify_last_close),
+           (unsigned)liveness_sweep(setup_p2_closed_merged, phase_reopen_p2, verify_adopted_merged),
+           (unsigned)liveness_sweep(setup_p2_closed_unmerged, phase_reopen_p2, verify_adopted_unmerged));
+    sweep_fallback = 0;
+    keyed_procs = 0;
+}
+
+static void test_liveness_crash_sweeps(void)
+{
+    run_liveness_sweeps(0, 0);
+}
+
+static void test_liveness_crash_sweeps_fallback(void)
+{
+    run_liveness_sweeps(1, 0);
+}
+
+/* With a master key every journal record is encrypted under its session's
+ * salt, so an adopted journal's old records must never follow a header
+ * carrying the adopter's salt (14.4.7 rule 9). */
+static void test_liveness_crash_sweeps_keyed(void)
+{
+    run_liveness_sweeps(0, 1);
+}
+
+/* Kill sweeps: one process dies at each mutating operation of its phase
+ * while the other lives on (spec 5.8: the system releases a dead process's
+ * locks; its files keep whatever it wrote, synced or not). The survivor
+ * then does its own work, a fresh open sees every commit once, and a clean
+ * close leaves nothing. */
+
+static void survive_p1(void)
+{
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p1.db));
+    TEST_ASSERT_EQUAL_STRING("a", value_of(&p1, 1));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p1, 2));
+    check_entry3(&p1);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p1.db));
+}
+
+static void survive_p2(void)
+{
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_reconcile(&p2.db));
+    TEST_ASSERT_EQUAL_STRING("a", value_of(&p2, 1));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p2, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+}
+
+/* A newcomer opens after the last process died mid-close. */
+static void survive_newcomer(void)
+{
+    cdb_faultenv_on_sleep(&fe, NULL, NULL);
+    if (sweep_fallback)
+        cdb_faultenv_advance(&fe, 10 * (int64_t)SEC); /* the dead one falls silent */
+    TEST_ASSERT_EQUAL_INT(CDB_OK, open_proc(&p2));
+    TEST_ASSERT_EQUAL_STRING("a", value_of(&p2, 1));
+    TEST_ASSERT_EQUAL_STRING("b", value_of(&p2, 2));
+    TEST_ASSERT_EQUAL_INT(CDB_OK, cdb_db_close(&p2.db));
+}
+
+/* p1, holding the baton, reconciles p2's journal while p2 lives. */
+static void phase_reconcile_p1(void)
+{
+    (void)cdb_db_reconcile(&p1.db);
+}
+
+static uint64_t liveness_kill_sweep(void (*setup)(void), void (*phase)(void), struct proc *victim,
+                                    void (*survive)(void))
+{
+    uint64_t ops, op;
+
+    init_env();
+    setup();
+    {
+        uint64_t before = fe.clock.ops;
+        phase();
+        ops = fe.clock.ops - before;
+    }
+    TEST_ASSERT_TRUE(ops > 0);
+    for (op = 1; op <= ops; op++) {
+        init_env();
+        setup();
+        cdb_faultenv_arm(&fe, op, CDB_CRASH_DROP_UNSYNCED, 0, 0);
+        phase();
+        TEST_ASSERT_TRUE(fe.clock.crashed);
+        cdb_faultenv_resume(&fe);
+        crash_proc(victim);
+        survive();
+        cdb_faultenv_reboot(&fe); /* orderly: nothing is lost */
+        check_after_crash();
+    }
+    return ops;
+}
+
+static void run_kill_sweeps(int keyed)
+{
+    keyed_procs = keyed;
+    printf("kill%s: p2 mid-close %u ops, p2 mid-adopt merged %u, unmerged %u, holder mid-merge %u, "
+           "last mid-close %u\n",
+           keyed ? ", keyed" : "",
+           (unsigned)liveness_kill_sweep(setup_close_pending, phase_close_p2, &p2, survive_p1),
+           (unsigned)liveness_kill_sweep(setup_p2_closed_merged, phase_reopen_p2, &p2, survive_p1),
+           (unsigned)liveness_kill_sweep(setup_p2_closed_unmerged, phase_reopen_p2, &p2, survive_p1),
+           (unsigned)liveness_kill_sweep(two_writers, phase_reconcile_p1, &p1, survive_p2),
+           (unsigned)liveness_kill_sweep(setup_p2_closed, phase_close_p1, &p1, survive_newcomer));
+    keyed_procs = 0;
+}
+
+static void test_liveness_kill_sweeps(void)
+{
+    run_kill_sweeps(0);
+}
+
+static void test_liveness_kill_sweeps_keyed(void)
+{
+    run_kill_sweeps(1);
+}
+
 /* With the lock hook, an application idle past the dead timeout keeps its
  * slot: a newcomer takes another, and the idle one goes on (spec 5.9.6). */
 static void test_idle_process_keeps_slot(void)
@@ -2808,6 +3100,11 @@ int main(void)
     RUN_TEST(test_close_leaves_journal_pending);
     RUN_TEST(test_closed_slot_adopted);
     RUN_TEST(test_reconcile_request);
+    RUN_TEST(test_liveness_crash_sweeps);
+    RUN_TEST(test_liveness_crash_sweeps_fallback);
+    RUN_TEST(test_liveness_crash_sweeps_keyed);
+    RUN_TEST(test_liveness_kill_sweeps);
+    RUN_TEST(test_liveness_kill_sweeps_keyed);
     RUN_TEST(test_idle_process_keeps_slot);
     RUN_TEST(test_idle_process_loses_slot);
     RUN_TEST(test_stalled_process_keeps_its_journal);

@@ -114,6 +114,12 @@ void cdb_faultenv_arm(cdb_faultenv *fe, uint64_t op, cdb_crash_mode mode,
 void cdb_faultenv_crash_now(cdb_faultenv *fe, cdb_crash_mode mode,
                             size_t keep_writes, size_t torn_bytes);
 
+/* Ends an armed crash as a killed process, not a power cut: the operation
+ * it struck did not happen, every earlier one stays as it is, durable or
+ * not, and later operations succeed again, so the other processes go on.
+ * The test then ends the killed process with its locks (crash_proc). */
+void cdb_faultenv_resume(cdb_faultenv *fe);
+
 /* Restarts after a crash, or after an orderly shutdown if none happened. */
 void cdb_faultenv_reboot(cdb_faultenv *fe);
 
