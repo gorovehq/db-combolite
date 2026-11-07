@@ -154,6 +154,7 @@ class cdb_env_ops(Structure):
         ("thread_join", c_void_p),
         ("lock_open", c_void_p),   # the file lock hook (spec 5.8)
         ("lock_close", c_void_p),
+        ("mutex_trylock", c_void_p),  # optional, for the responder's handover (spec 5.8)
     ]
 
 
