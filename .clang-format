@@ -1,0 +1,25 @@
+# db-combolite C99 formatting — shared across packages, calibrated to the existing tree (do not
+# reformat wholesale; CI runs `clang-format --dry-run -Werror` on changed lines). See CLAUDE.md.
+# A small amount of intentional hand-formatting (packed byte-tables, grouped short assignments) is
+# guarded with `// clang-format off` / `// clang-format on`.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+PointerAlignment: Right
+DerivePointerAlignment: false
+BreakBeforeBraces: Linux
+BreakBeforeBinaryOperators: NonAssignment
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: true
+AlignAfterOpenBracket: Align
+AlignEscapedNewlines: Left
+SortIncludes: false
+KeepEmptyLinesAtTheStartOfBlocks: false
+SpaceAfterCStyleCast: false
+...

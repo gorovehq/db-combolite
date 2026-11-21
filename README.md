@@ -132,6 +132,26 @@ cmake --build --preset gutenfree-cpu -j
 
 ---
 
+## Community & Contributing
+
+- **Contributing:** see [`CONTRIBUTING.md`](CONTRIBUTING.md) (packages, submodules, build/test,
+  style, branch & PR workflow) — the authoritative ruleset is [`CLAUDE.md`](CLAUDE.md).
+- **Code of Conduct:** [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+- **Getting help:** [`SUPPORT.md`](SUPPORT.md).
+- **Architecture decisions:** [`docs/adr/`](docs/adr/) (workspace); per-package logs under each package.
+
+## Security
+
+To report a security vulnerability, please **do not** open a public issue. Use the private GitHub
+Security Advisory flow (repository **Security** tab → **Report a vulnerability**). See
+[`SECURITY.md`](SECURITY.md) for scope, response expectations, and the coordinated-disclosure process.
+
+## Citing
+
+If you use Combolite in research or software, cite it via [`CITATION.cff`](CITATION.cff).
+
+---
+
 ## Licence and Attributions
 
 MIT: see [`LICENSE`](LICENSE) or component submodules. Third-party components and data sources are documented in [`ATTRIBUTIONS.md`](ATTRIBUTIONS.md).
