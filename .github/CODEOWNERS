@@ -1,0 +1,23 @@
+# CODEOWNERS — required reviewers per path (GitHub auto-requests review on matching PRs).
+# Security-relevant paths (crypto/parsers/CI) carry the maintainers as security-focused reviewers.
+
+# Default owner:
+*                         @gorovedev @0xb007ab1e
+
+# Per-package:
+/combolite-core/          @gorovedev @0xb007ab1e
+/combolite-accelerator/   @gorovedev @0xb007ab1e
+/combolite-tests/         @gorovedev @0xb007ab1e
+/combolite-studio/        @gorovedev @0xb007ab1e
+/combolite-demo/          @gorovedev @0xb007ab1e
+
+# Security-sensitive:
+/combolite-core/src/cdb_crypto.*   @gorovedev @0xb007ab1e
+/SECURITY.md                        @gorovedev @0xb007ab1e
+
+# Build, CI, governance:
+/CMakeLists.txt           @gorovedev @0xb007ab1e
+/CMakePresets.json        @gorovedev @0xb007ab1e
+/.github/                 @gorovedev @0xb007ab1e
+/.clang-format            @gorovedev @0xb007ab1e
+/CLAUDE.md                @gorovedev @0xb007ab1e

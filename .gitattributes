@@ -1,0 +1,28 @@
+# db-combolite — normalize line endings + mark binary + vendored. See CLAUDE.md / workflow-git.
+* text=auto eol=lf
+
+*.c      text eol=lf
+*.h      text eol=lf
+*.py     text eol=lf
+*.md     text eol=lf
+*.txt    text eol=lf
+*.cmake  text eol=lf
+*.json   text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.cff    text eol=lf
+CMakeLists.txt text eol=lf
+
+# Binary
+*.png    binary
+*.jpg    binary
+*.bin    binary
+*.xz     binary
+*.gz     binary
+*.gguf   binary
+
+# Vendored submodules / third-party: leave to upstream, exclude from language stats
+**/third-party/** linguist-vendored
+
+# Generated API docs (HTML)
+**/docs/*.html linguist-documentation

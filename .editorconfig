@@ -1,0 +1,31 @@
+# db-combolite — editor defaults (see .clang-format for C formatting). https://editorconfig.org
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{c,h}]
+indent_size = 4
+max_line_length = 100
+
+[*.py]
+indent_size = 4
+
+[*.{md,markdown}]
+trim_trailing_whitespace = false  # trailing two-space = hard line break
+
+[*.{yml,yaml,json,cff}]
+indent_size = 2
+
+[{Makefile,*.mk}]
+indent_style = tab
+
+[**/third-party/**]
+# Vendored code keeps upstream style; do not enforce.
+trim_trailing_whitespace = false
+insert_final_newline = false

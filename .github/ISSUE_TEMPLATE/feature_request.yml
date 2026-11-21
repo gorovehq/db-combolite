@@ -1,0 +1,52 @@
+name: Feature request / suggestion
+description: Propose a new capability or improvement.
+title: "feat: <concise summary>"
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: dropdown
+    id: package
+    attributes:
+      label: Package
+      options:
+        - combolite-core
+        - combolite-accelerator
+        - combolite-tests
+        - combolite-studio
+        - combolite-demo
+        - workspace-wide
+        - not sure
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and why is it hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: >
+        What you'd like. Note any impact on the on-disk / wire format or the CMBQL spec, the memory
+        model (no-heap / caller-owned buffers), or the public C99 API.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Does this change a public contract?
+      options:
+        - "No — internal only"
+        - "Yes — public C99 API"
+        - "Yes — on-disk / wire format (needs a spec + ADR)"
+        - "Not sure"
+    validations:
+      required: true
